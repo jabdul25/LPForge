@@ -11,18 +11,18 @@
     "eligibleTiers": ["A"],
     "maxCandidates": 10,
     "maxCandidateAgeMs": 900000,
-    "maxCapitalSol": "0.02",
+    "maxCapitalSol": "0.5",
     "maxOpenPositions": 1
   },
   "pools": [
     {
       "address": "Cfc6zeThDv58QEQqNYN2jfTVKoLhrEevNXesPTQk5yGW",
-      "maxCapitalSol": "0.02",
+      "maxCapitalSol": "0.5",
       "maxOpenPositions": 1
     },
     {
       "address": "CCHw81WFvz8SE4g9YSxRPs7ndZKhAsMsi2np2M2F6trW",
-      "maxCapitalSol": "0.02",
+      "maxCapitalSol": "0.5",
       "maxOpenPositions": 1
     }
   ]
