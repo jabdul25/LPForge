@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "policyId": "lpforge-live-execution-v1",
-  "status": "DISABLED",
+  "status": "ENABLED",
   "approvalTtlMs": 15000,
   "minDevnetConfirmedRuns": 3,
   "maxActionsPerDay": 2,

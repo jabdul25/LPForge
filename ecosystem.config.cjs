@@ -25,7 +25,7 @@ module.exports = {
     name: 'lpforge-execution',
     cwd: __dirname,
     script: process.execPath,
-    args: '--env-file=.env --enable-source-maps .build/apps/execution/src/main.js start',
+    args: '--env-file=.env.execution --enable-source-maps .build/apps/execution/src/main.js start',
     exec_mode: 'fork',
     instances: 1,
     autorestart: false,
