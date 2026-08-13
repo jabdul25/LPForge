@@ -1,6 +1,19 @@
 # Phase 6 remote signer service contract
 
-`lpforge-execution` supports either a local owner-only JSON keypair file—matching the other LP repositories on this VPS—or an operator-managed HTTPS signer service. In both modes, Phase 6 gates must authorize an action before the signer can be used.
+`lpforge-execution` supports a local Base58 private key in the ignored `.env.execution` file—matching LPERS and Meribot—a local owner-only JSON keypair file, or an operator-managed HTTPS signer service. In every mode, Phase 6 gates must authorize an action before the signer can be used.
+
+## Local Base58 private-key mode
+
+This is the direct `.env` model used by LPERS and Meribot. Enter the private key only on the VPS in the ignored `.env.execution` file:
+
+```dotenv
+LPFORGE_P6_SIGNER_MODE=LOCAL_PRIVATE_KEY
+LPFORGE_P6_SIGNER_BACKEND_ID=lpforge-local-mainnet-owner
+LPFORGE_P6_SIGNER_PUBLIC_KEY=OWNER_PUBLIC_KEY
+LPFORGE_P6_PRIVATE_KEY=BASE58_64_BYTE_SOLANA_PRIVATE_KEY
+```
+
+LPForge derives the public address from the supplied key and refuses to sign if it differs from `LPFORGE_P6_SIGNER_PUBLIC_KEY`. It never writes or logs the key. The key necessarily exists in the execution process memory during signing, so keep `.env.execution` mode `0600`, do not reuse this wallet elsewhere, and do not paste its value into chat.
 
 ## Local keypair-file mode
 
