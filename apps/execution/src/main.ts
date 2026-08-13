@@ -19,6 +19,7 @@ import { EXPECTED_DLMM_PROGRAM_ID } from "../../../packages/meteora/src/index.js
 import { loadMainnetCanaryDeploymentPolicyFile } from "../../../packages/canary/src/index.js";
 import { validateClaimedPlan } from "../../../packages/phase6-claim-guard/src/index.js";
 import { createMeteoraReadAdapter } from "../../../packages/meteora/src/index.js";
+import { resolveLiveExecutionUniverse } from "../../../packages/live-execution-universe/src/index.js";
 
 const json = (value: unknown) => JSON.stringify(value, null, 2);
 const yes = (value: string | undefined) =>
@@ -123,10 +124,15 @@ async function dispatchOne() {
         transactionSubmitted: false,
       };
     const config = workerConfig(),
-      policy = loadMainnetCanaryDeploymentPolicyFile(
+      staticPolicy = loadMainnetCanaryDeploymentPolicyFile(
         process.env.LPFORGE_EXECUTION_POLICY_PATH?.trim() ||
           "policies/live-execution-policy.json",
       ),
+      universe = await resolveLiveExecutionUniverse({
+        policy: staticPolicy,
+        store,
+        observedAt: new Date().toISOString(),
+      }),
       owned = await store.loadOwnedPositions(plan.ownerAddress);
     let positionTruth;
     if (plan.positionAddress) {
@@ -143,7 +149,7 @@ async function dispatchOne() {
     }
     const guard = validateClaimedPlan({
       plan,
-      policy,
+      policy: universe.policy,
       ownedPositions: owned,
       ...(positionTruth ? { positionTruth } : {}),
     });

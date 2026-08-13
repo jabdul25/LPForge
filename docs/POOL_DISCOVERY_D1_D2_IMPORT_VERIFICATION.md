@@ -20,6 +20,17 @@ Validation after import:
 - One `discovery:once` cycle completed at 2026-08-13T13:48:46.690Z.
 
 That first cycle persisted 107 registry entries, 107 observations, and 64
-rankings (10 tier A, 30 tier B, 24 tier C). These are D1/D2 observation
-candidates only. This import has no execution-intent, plan, signing,
-submission, swap, or capital-deployment authority.
+rankings (10 tier A, 30 tier B, 24 tier C). D1/D2 itself remains an
+observation service: it has no signer, transaction planner, or submission
+path.
+
+## Live-universe bridge
+
+The versioned live-execution policy can explicitly enable a discovery feed.
+When enabled, production evaluates only fresh PREFILTERED discovery records in
+the configured tiers, and execution resolves that same universe again at
+claim time before it signs. Pool capital and position limits come solely from
+the live-execution policy; discovery records cannot set them.
+
+The current policy enables up to ten fresh tier-A records, each with 0.02 SOL
+and one position, subject to the policy's global two-position limit.
