@@ -1,6 +1,7 @@
 import type { Phase3OpportunityEconomicsContract, Phase3OpportunityState } from '../../contracts/src/index.js';
 import type { PoolAssessment } from '../../pool-intelligence/src/index.js';
 import type { RegimeAssessment } from '../../regime/src/index.js';
+import type { RegimeHistoryAnalysis } from '../../regime/src/index.js';
 import type { StructureFeatureVector } from '../../structure-features/src/index.js';
 
 export interface OpportunityRateEvidence {
@@ -23,13 +24,41 @@ export interface OpportunityEconomics extends Phase3OpportunityEconomicsContract
   evidenceSampleCount:number;
   evidenceUncertainty:number;
   forecastUncertainty:number;
-  forecastUncertaintyComponents:{evidence:number;regimeConfidence:number;effectiveSample:number;fidelity:number;};
+  forecastUncertaintyComponents:{evidence:number;regimeAmbiguity:number;outcomeDispersion:number;};
   economicallyPositive:boolean;
   reasonCodes:string[];
 }
 const clamp=(x:number,min=0,max=1)=>Math.max(min,Math.min(max,x));
 function prob(r:RegimeAssessment,label:string){return r.probabilities.find((x)=>x.label===label)?.probability??0;}
-export function estimateOpportunityEconomics(input:{capitalValue:number;horizonMinutes:number;rates:OpportunityRateEvidence;pool:PoolAssessment;regime:RegimeAssessment;structure:StructureFeatureVector;}):OpportunityEconomics{
+export interface RegimeAmbiguity {normalizedEntropy:number;topTwoMargin:number;transitionRisk:number;historyTransitionRisk:number;flappingRate:number;shortStability:number;penalty:number;}
+/**
+ * Regime confidence is a top-label probability across thirteen mutually
+ * exclusive labels.  It is not a probability that an LP forecast is correct.
+ * This derives an independent ambiguity measure from the distribution shape
+ * and observed regime stability, without reusing evidence sample counts.
+ */
+export function deriveRegimeAmbiguity(regime:RegimeAssessment,history?:Pick<RegimeHistoryAnalysis,'transitionRisk'|'flappingRate'|'stableDurationMinutes'>):RegimeAmbiguity{
+ const raw=regime.probabilities.map(x=>Math.max(0,Number(x.probability)||0)),total=raw.reduce((a,b)=>a+b,0),probabilities=total>0?raw.map(x=>x/total):[1],count=Math.max(2,probabilities.length),entropy=-probabilities.reduce((sum,p)=>p>0?sum+p*Math.log(p):sum,0)/Math.log(count),sorted=[...probabilities].sort((a,b)=>b-a),margin=clamp((sorted[0]??0)-(sorted[1]??0)),transitionProbability=clamp(prob(regime,'TRANSITION')),historyTransition=clamp(history?.transitionRisk??regime.transitionRisk),flapping=clamp(history?.flappingRate??0),shortStability=history?clamp(1-history.stableDurationMinutes/60):clamp(1-regime.stability/.20);
+ // Entropy and top-two margin capture label ambiguity.  Use the explicit
+ // TRANSITION label rather than regime.transitionRisk here: transitionRisk
+ // already embeds top-label confidence and margin, which would double count
+ // the same uncertainty.  Evidence sample/fidelity penalties remain solely
+ // in evidenceUncertainty.
+ const penalty=clamp(.18*entropy+.12*(1-margin)+.28*transitionProbability+.25*flapping+.17*shortStability);
+ return{normalizedEntropy:entropy,topTwoMargin:margin,transitionRisk:clamp(regime.transitionRisk),historyTransitionRisk:historyTransition,flappingRate:flapping,shortStability,penalty};
+}
+export interface OutcomeDispersionInput {netValue:number;evidenceActionable?:boolean;}
+/**
+ * Candidate outcome disagreement is independent of observation provenance:
+ * it measures how much admissible range/strategy simulations disagree.  It is
+ * deliberately not based on raw capital scale.
+ */
+export function deriveOutcomeDispersion(outcomes:OutcomeDispersionInput[]):number{
+ const values=outcomes.filter(x=>x.evidenceActionable!==false&&Number.isFinite(x.netValue)).map(x=>x.netValue);if(values.length<2)return 0;
+ const mean=values.reduce((sum,value)=>sum+value,0)/values.length,variance=values.reduce((sum,value)=>sum+(value-mean)**2,0)/values.length,spread=Math.sqrt(variance),relativeSpread=spread/(spread+Math.abs(mean)+1e-12),negativeShare=values.filter(value=>value<0).length/values.length;
+ return clamp(.65*relativeSpread+.35*negativeShare);
+}
+export function estimateOpportunityEconomics(input:{capitalValue:number;horizonMinutes:number;rates:OpportunityRateEvidence;pool:PoolAssessment;regime:RegimeAssessment;structure:StructureFeatureVector;regimeHistory?:Pick<RegimeHistoryAnalysis,'transitionRisk'|'flappingRate'|'stableDurationMinutes'>;outcomeDispersion?:number;}):OpportunityEconomics{
  const {capitalValue, horizonMinutes, rates, pool, regime:r, structure:s}=input;if(!(capitalValue>0)||!(horizonMinutes>0))throw new Error('LPFORGE_OPPORTUNITY_INVALID_CAPITAL_OR_HORIZON');
  const hours=horizonMinutes/60;
  const favorable=clamp(prob(r,'SIDEWAYS')+prob(r,'CONSOLIDATION')+prob(r,'CONTROLLED_PULLBACK')*.8+prob(r,'BREAKOUT_CONTROLLED_PULLBACK')*.65+prob(r,'RECOVERY')*.55);
@@ -46,9 +75,9 @@ export function estimateOpportunityEconomics(input:{capitalValue:number;horizonM
  const expectedRepositionCost=capitalValue*rates.repositionRatePerCapitalHour*hours*clamp((1-active)+r.transitionRisk);
  const expectedTailRiskCharge=capitalValue*rates.tailRiskRatePerCapitalHour*hours*clamp(.5+dangerous+r.transitionRisk);
  const expectedNetLpValue=expectedFeeValue+expectedRewardValue+expectedInventoryPnl-expectedExecutionCost-expectedRepositionCost-expectedTailRiskCharge;
- const regimeConfidencePenalty=.25*(1-r.confidence),effectiveSamplePenalty=.2*(1-Math.min(1,rates.sampleCount/50)),fidelityPenalty=.15*(rates.fidelity==='AGGREGATE_ESTIMATE'?1:rates.fidelity==='EVENT_PATH_ESTIMATE'?.6:.2),uncertainty=clamp(rates.uncertainty+regimeConfidencePenalty+effectiveSamplePenalty+fidelityPenalty);
+ const regimeAmbiguity=deriveRegimeAmbiguity(r,input.regimeHistory),outcomeDispersion=clamp(input.outcomeDispersion??0),uncertainty=clamp(1-(1-clamp(rates.uncertainty))*(1-regimeAmbiguity.penalty)*(1-outcomeDispersion));
  const reasonCodes:string[]=[];if(expectedNetLpValue<=0)reasonCodes.push('EXPECTED_NET_VALUE_NON_POSITIVE');if(dangerous>.35)reasonCodes.push('DANGEROUS_REGIME_MASS_HIGH');if(pool.toxicityProbability>.55)reasonCodes.push('FLOW_TOXICITY_HIGH');if(active<.5)reasonCodes.push('EXPECTED_ACTIVE_TIME_LOW');if(uncertainty>.65)reasonCodes.push('ECONOMIC_FORECAST_UNCERTAIN');
- return{capitalValue,horizonMinutes,expectedFeeValue,expectedRewardValue,expectedInventoryPnl,expectedHodlRelativePnl,expectedExecutionCost,expectedRepositionCost,expectedTailRiskCharge,expectedNetLpValue,uncertainty,evidenceUncertainty:rates.uncertainty,forecastUncertainty:uncertainty,forecastUncertaintyComponents:{evidence:rates.uncertainty,regimeConfidence:regimeConfidencePenalty,effectiveSample:effectiveSamplePenalty,fidelity:fidelityPenalty},expectedActiveTimeRatio:active,favorableRegimeMass:favorable,dangerousRegimeMass:dangerous,evidenceFidelity:rates.fidelity,evidenceSampleCount:rates.sampleCount,economicallyPositive:expectedNetLpValue>0,reasonCodes};
+ return{capitalValue,horizonMinutes,expectedFeeValue,expectedRewardValue,expectedInventoryPnl,expectedHodlRelativePnl,expectedExecutionCost,expectedRepositionCost,expectedTailRiskCharge,expectedNetLpValue,uncertainty,evidenceUncertainty:rates.uncertainty,forecastUncertainty:uncertainty,forecastUncertaintyComponents:{evidence:rates.uncertainty,regimeAmbiguity:regimeAmbiguity.penalty,outcomeDispersion},expectedActiveTimeRatio:active,favorableRegimeMass:favorable,dangerousRegimeMass:dangerous,evidenceFidelity:rates.fidelity,evidenceSampleCount:rates.sampleCount,economicallyPositive:expectedNetLpValue>0,reasonCodes};
 }
 
 export interface OpportunityRecord { id:string; state:Phase3OpportunityState; observedAt:string; expiresAt:string; reasonCodes:string[]; economics:OpportunityEconomics; }
