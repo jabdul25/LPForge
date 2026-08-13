@@ -14,6 +14,7 @@ import { buildTransactionPlan } from '../../transaction-planner/src/index.js';
 import type { TransactionPlan } from '../../execution-contracts/src/index.js';
 import type { OpportunityRateEvidence } from '../../opportunity/src/index.js';
 import type { RegimeHistorySample } from '../../regime/src/index.js';
+import { planPhase6SolEntryFunding, type Phase6EntryFundingPlan } from '../../phase6-inventory-routing/src/index.js';
 
 export interface OperationalHistory {
   marketObservations:MarketObservation[];
@@ -61,6 +62,7 @@ export interface OperationalCycleResult {
   entry?:EntryRecommendation;
   risk?:RiskDecision;
   allocation?:CapitalAllocationResult;
+  entryFunding?:Phase6EntryFundingPlan;
   plan?:TransactionPlan;
   reasonCodes:string[];
   evidence:{history:{market:number;activeBins:number;frames:number;swaps:number};rateEvidence:OpportunityRateEvidence;valuation:CandidateValuationCalibration;policyId:string};
@@ -121,11 +123,13 @@ export async function evaluateOperationalCycle(input:OperationalCycleInput):Prom
   const context=await buildMarketContext(input.pool.address,input.observedAt,market);const structure=computeStructureFeatures({context,observations:market,bin,flow});const candidate=candidateFromThesis(shadow.thesis);const entryFeatures=computeEntryTimingFeatures({context,regime:shadow.regime,structure,pool:poolAssessment,candidate,activeBinId:input.pool.activeBinId,...(market.slice(0,-1).at(-1)?.twoWayRatio!==undefined?{previousTwoWayRatio:market.slice(0,-1).at(-1)!.twoWayRatio}:{} )});const entry=evaluateEntry({features:entryFeatures,economics:shadow.economics,thesis:shadow.thesis,observedAt:input.observedAt,expiresAt});
   const risk=governRisk({now:input.observedAt,protocolCompatible:input.protocolCompatible,criticalDataObservedAt:input.pool.stamp.observedAt,dailyDrawdownFraction:0,rollingDrawdownFraction:0,tokenExposureFraction:0,poolExposureFraction:0,referenceDivergenceBps:0,liquidityChangeFraction:0,reconciliationRequired:false,signerHealthy:true});
   const allocation=allocateCapital({walletCapital:input.walletCapital,requests:[{id:`alloc-${shadow.thesis.thesisId}`,pool:input.pool.address,token:input.dataApiPool.token_y?.address??input.pool.tokenYMint,requested:input.walletCapital*shadow.thesis.selectedCandidate.capitalFraction,confidence:entry.confidence,expectedNetValueRate:shadow.economics.expectedNetLpValue/Math.max(input.walletCapital,Number.EPSILON),downsideRisk:clamp(entryFeatures.dangerousRegimeMass)}]});
+  const capitalLamports=BigInt(Math.max(1,Math.floor(allocation.totalAllocated*1_000_000_000)));
+  const entryFunding=planPhase6SolEntryFunding({strategy:candidate.strategy,capitalLamports,activeBinId:input.pool.activeBinId,lowerBinId:candidate.lowerBinId,upperBinId:candidate.upperBinId});
   let phase4Status:OperationalStatus=entry.decision==='ENTRY_READY'&&risk.decision==='APPROVE'&&allocation.totalAllocated>0?'ENTRY_READY':entry.decision;
   let phase5Status:OperationalCycleResult['phase5Status']='NOT_REACHED';let plan:TransactionPlan|undefined;
   if(phase4Status==='ENTRY_READY'){
     if(!input.ownerAddress||!input.replacementPositionAddress){phase5Status='PREPARE_BLOCKED_PUBLIC_ADDRESSES';reasonCodes.push('OPERATIONAL_P5_PUBLIC_ADDRESSES_REQUIRED');}
-    else {const capitalLamports=BigInt(Math.max(1,Math.floor(allocation.totalAllocated*1_000_000_000)));plan=buildTransactionPlan({action:'OPEN',cluster:'mainnet-beta',ownerAddress:input.ownerAddress,poolAddress:input.pool.address,replacementPositionAddress:input.replacementPositionAddress,thesisId:shadow.thesis.thesisId,candidateId:candidate.id,observedAt:input.observedAt,expiresAt,capitalLamports,lowerBinId:candidate.lowerBinId,upperBinId:candidate.upperBinId,strategy:candidate.strategy,metadata:{authority:'BUILD_ONLY',operationalCompletion:true}});phase5Status='PLAN_PREPARED_BUILD_ONLY';phase4Status='PLAN_PREPARED';reasonCodes.push('OPERATIONAL_P5_PLAN_BUILD_ONLY');}
+    else {plan=buildTransactionPlan({action:'OPEN',cluster:'mainnet-beta',ownerAddress:input.ownerAddress,poolAddress:input.pool.address,replacementPositionAddress:input.replacementPositionAddress,thesisId:shadow.thesis.thesisId,candidateId:candidate.id,observedAt:input.observedAt,expiresAt,capitalLamports,lowerBinId:entryFunding.lowerBinId,upperBinId:entryFunding.upperBinId,strategy:entryFunding.strategy,metadata:{authority:'BUILD_ONLY',operationalCompletion:true,entryFunding:{orientation:entryFunding.orientation,solForLpLamports:entryFunding.solForLpLamports.toString(),solToPairedTokenLamports:entryFunding.solToPairedTokenLamports.toString(),reasonCodes:entryFunding.reasonCodes}}});phase5Status='PLAN_PREPARED_BUILD_ONLY';phase4Status='PLAN_PREPARED';reasonCodes.push('OPERATIONAL_P5_PLAN_BUILD_ONLY');}
   }
-  reasonCodes.push(...entry.reasonCodes,...risk.reasonCodes);const core={...base,phase3Status:'ENTRY_READY' as const,phase4Status,phase5Status,shadow,entry,risk,allocation,...(plan?{plan}:{}),reasonCodes:[...new Set(reasonCodes)].sort()};return{cycleId:await sha256Hex(canonicalJson(core)),...core};
+  reasonCodes.push(...entry.reasonCodes,...risk.reasonCodes,...entryFunding.reasonCodes);const core={...base,phase3Status:'ENTRY_READY' as const,phase4Status,phase5Status,shadow,entry,risk,allocation,entryFunding,...(plan?{plan}:{}),reasonCodes:[...new Set(reasonCodes)].sort()};return{cycleId:await sha256Hex(canonicalJson(core)),...core};
 }
