@@ -108,6 +108,8 @@ importers:
 
   packages/hold-boundary: {}
 
+  packages/live-exit-governor: {}
+
   packages/management-execution: {}
 
   packages/market-context: {}
