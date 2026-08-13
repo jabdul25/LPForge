@@ -21,6 +21,9 @@ export interface OpportunityEconomics extends Phase3OpportunityEconomicsContract
   dangerousRegimeMass:number;
   evidenceFidelity:OpportunityRateEvidence['fidelity'];
   evidenceSampleCount:number;
+  evidenceUncertainty:number;
+  forecastUncertainty:number;
+  forecastUncertaintyComponents:{evidence:number;regimeConfidence:number;effectiveSample:number;fidelity:number;};
   economicallyPositive:boolean;
   reasonCodes:string[];
 }
@@ -43,9 +46,9 @@ export function estimateOpportunityEconomics(input:{capitalValue:number;horizonM
  const expectedRepositionCost=capitalValue*rates.repositionRatePerCapitalHour*hours*clamp((1-active)+r.transitionRisk);
  const expectedTailRiskCharge=capitalValue*rates.tailRiskRatePerCapitalHour*hours*clamp(.5+dangerous+r.transitionRisk);
  const expectedNetLpValue=expectedFeeValue+expectedRewardValue+expectedInventoryPnl-expectedExecutionCost-expectedRepositionCost-expectedTailRiskCharge;
- const uncertainty=clamp(rates.uncertainty+.25*(1-r.confidence)+.2*(1-Math.min(1,rates.sampleCount/50))+.15*(rates.fidelity==='AGGREGATE_ESTIMATE'?1:rates.fidelity==='EVENT_PATH_ESTIMATE'?.6:.2));
+ const regimeConfidencePenalty=.25*(1-r.confidence),effectiveSamplePenalty=.2*(1-Math.min(1,rates.sampleCount/50)),fidelityPenalty=.15*(rates.fidelity==='AGGREGATE_ESTIMATE'?1:rates.fidelity==='EVENT_PATH_ESTIMATE'?.6:.2),uncertainty=clamp(rates.uncertainty+regimeConfidencePenalty+effectiveSamplePenalty+fidelityPenalty);
  const reasonCodes:string[]=[];if(expectedNetLpValue<=0)reasonCodes.push('EXPECTED_NET_VALUE_NON_POSITIVE');if(dangerous>.35)reasonCodes.push('DANGEROUS_REGIME_MASS_HIGH');if(pool.toxicityProbability>.55)reasonCodes.push('FLOW_TOXICITY_HIGH');if(active<.5)reasonCodes.push('EXPECTED_ACTIVE_TIME_LOW');if(uncertainty>.65)reasonCodes.push('ECONOMIC_FORECAST_UNCERTAIN');
- return{capitalValue,horizonMinutes,expectedFeeValue,expectedRewardValue,expectedInventoryPnl,expectedHodlRelativePnl,expectedExecutionCost,expectedRepositionCost,expectedTailRiskCharge,expectedNetLpValue,uncertainty,expectedActiveTimeRatio:active,favorableRegimeMass:favorable,dangerousRegimeMass:dangerous,evidenceFidelity:rates.fidelity,evidenceSampleCount:rates.sampleCount,economicallyPositive:expectedNetLpValue>0,reasonCodes};
+ return{capitalValue,horizonMinutes,expectedFeeValue,expectedRewardValue,expectedInventoryPnl,expectedHodlRelativePnl,expectedExecutionCost,expectedRepositionCost,expectedTailRiskCharge,expectedNetLpValue,uncertainty,evidenceUncertainty:rates.uncertainty,forecastUncertainty:uncertainty,forecastUncertaintyComponents:{evidence:rates.uncertainty,regimeConfidence:regimeConfidencePenalty,effectiveSample:effectiveSamplePenalty,fidelity:fidelityPenalty},expectedActiveTimeRatio:active,favorableRegimeMass:favorable,dangerousRegimeMass:dangerous,evidenceFidelity:rates.fidelity,evidenceSampleCount:rates.sampleCount,economicallyPositive:expectedNetLpValue>0,reasonCodes};
 }
 
 export interface OpportunityRecord { id:string; state:Phase3OpportunityState; observedAt:string; expiresAt:string; reasonCodes:string[]; economics:OpportunityEconomics; }
@@ -65,5 +68,5 @@ export function transitionOpportunity(state:Phase3OpportunityState,event:Opportu
  const to=transitionMap[state][event];if(!to)throw new Error(`LPFORGE_OPPORTUNITY_ILLEGAL_TRANSITION:${state}:${event}`);return{from:state,to,event,at,reasonCodes:[...new Set(reasonCodes)].sort(),recommendationOnly:true};
 }
 export function deriveOpportunityProgress(input:{pool:PoolAssessment;economics:OpportunityEconomics;regime:RegimeAssessment;now:string;expiresAt:string;}):{state:Phase3OpportunityState;reasonCodes:string[]}{
- const reasons:string[]=[];if(input.pool.dataQuality==='BAD'){reasons.push('DATA_QUALITY_BAD');return{state:'DATA_BLOCKED',reasonCodes:reasons};}if(input.pool.eligibility==='BLOCK'){reasons.push(...input.pool.blockers);return{state:'REJECTED',reasonCodes:[...new Set(reasons)].sort()};}if(Date.parse(input.now)>=Date.parse(input.expiresAt)){reasons.push('OPPORTUNITY_EXPIRED');return{state:'EXPIRED',reasonCodes:reasons};}if(!input.economics.economicallyPositive){reasons.push(...input.economics.reasonCodes);return{state:'REJECTED',reasonCodes:[...new Set(reasons)].sort()};}if(input.regime.transitionRisk>.65){reasons.push('REGIME_TRANSITION_RISK_HIGH');return{state:'WATCHING',reasonCodes:reasons};}if(input.economics.uncertainty>.65){reasons.push('ECONOMIC_UNCERTAINTY_HIGH');return{state:'WATCHING',reasonCodes:reasons};}if(input.economics.expectedActiveTimeRatio<.5){reasons.push('ACTIVE_TIME_NOT_READY');return{state:'WATCHING',reasonCodes:reasons};}return{state:'QUALIFIED',reasonCodes:['POSITIVE_LP_OPPORTUNITY']};
+ const reasons:string[]=[];if(input.pool.dataQuality==='BAD'){reasons.push('DATA_QUALITY_BAD');return{state:'DATA_BLOCKED',reasonCodes:reasons};}if(input.pool.eligibility==='BLOCK'){reasons.push(...input.pool.blockers);return{state:'REJECTED',reasonCodes:[...new Set(reasons)].sort()};}if(Date.parse(input.now)>=Date.parse(input.expiresAt)){reasons.push('OPPORTUNITY_EXPIRED');return{state:'EXPIRED',reasonCodes:reasons};}if(!input.economics.economicallyPositive){reasons.push(...input.economics.reasonCodes);return{state:'REJECTED',reasonCodes:[...new Set(reasons)].sort()};}if(input.regime.transitionRisk>.65){reasons.push('REGIME_TRANSITION_RISK_HIGH');return{state:'WATCHING',reasonCodes:reasons};}if(input.economics.forecastUncertainty>.65){reasons.push('ECONOMIC_UNCERTAINTY_HIGH','ECONOMIC_FORECAST_UNCERTAINTY_HIGH');return{state:'WATCHING',reasonCodes:reasons};}if(input.economics.expectedActiveTimeRatio<.5){reasons.push('ACTIVE_TIME_NOT_READY');return{state:'WATCHING',reasonCodes:reasons};}return{state:'QUALIFIED',reasonCodes:['POSITIVE_LP_OPPORTUNITY']};
 }
