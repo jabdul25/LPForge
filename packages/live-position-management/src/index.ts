@@ -1,11 +1,13 @@
 import { readFileSync } from "node:fs";
 import type { PositionV2Fact } from "../../domain/src/index.js";
+import type { LiveExitGovernorDecision } from "../../live-exit-governor/src/index.js";
 
 export type LiveManagementAction =
   | "HOLD"
   | "CLAIM"
   | "RESHAPE"
   | "REBALANCE"
+  | "REDUCE"
   | "CLOSE"
   | "EMERGENCY_CLOSE";
 export interface LivePositionManagementPolicy {
@@ -28,6 +30,7 @@ export interface OwnedLivePosition {
   upperBinId: number;
   initialCapitalLamports: bigint;
   thesisId: string;
+  enteredAt?: string;
 }
 export interface LivePositionManagementDecision {
   action: LiveManagementAction;
@@ -93,6 +96,7 @@ export function decideLivePositionManagement(input: {
   owned: OwnedLivePosition;
   position?: PositionV2Fact;
   activeBinId: number;
+  exitDecision?: LiveExitGovernorDecision;
 }): LivePositionManagementDecision {
   const { policy, owned, position, activeBinId } = input;
   if (!policy.enabled)
@@ -112,6 +116,10 @@ export function decideLivePositionManagement(input: {
       action: "HOLD",
       reasonCodes: ["OWNED_POSITION_IDENTITY_MISMATCH"],
     };
+  if (input.exitDecision && input.exitDecision.action !== "HOLD") {
+    const action = input.exitDecision.action === "EMERGENCY_CLOSE" ? "EMERGENCY_CLOSE" : input.exitDecision.action === "CLOSE" ? "CLOSE" : "REDUCE";
+    return { action, reasonCodes: input.exitDecision.reasonCodes };
+  }
   if (activeBinId < position.lowerBinId || activeBinId > position.upperBinId) {
     if (policy.outOfRangeAction === "HOLD")
       return {

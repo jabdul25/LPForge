@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "enabled": true,
+  "hardStopLossFraction": 0.12,
+  "emergencyStopLossFraction": 0.2,
+  "profitProtection": {
+    "enabled": true,
+    "triggerFraction": 0.08,
+    "maxGivebackFraction": 0.05,
+    "minRetainedProfitFraction": 0.02
+  },
+  "closeOnThesisInvalidated": true,
+  "closeOnNonPositiveForwardEv": true,
+  "reduceOnRiskBlock": true,
+  "reduceFraction": 0.5,
+  "maxHoldMinutes": 0,
+  "maxHoldRequiresNonPositiveForwardEv": true,
+  "toxicityCloseThreshold": 0.8,
+  "toxicityEmergencyThreshold": 0.95,
+  "takeProfitFraction": 0
+}

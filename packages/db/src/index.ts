@@ -421,6 +421,12 @@ export interface Phase1Store {
     payload: Record<string, unknown>;
   }): Promise<void>;
   loadOwnedPositions(ownerAddress: string): Promise<Record<string, unknown>[]>;
+  loadPositionExitState(lpforgePositionId: string): Promise<Record<string, unknown> | null>;
+  upsertPositionExitState(value: {
+    lpforgePositionId:string; observedAt:string; evidenceState:string; initialCapitalUsd?:number; currentEconomicValueUsd?:number;
+    netPnlUsd?:number; netReturnFraction?:number; peakNetReturnFraction:number; peakEconomicValueUsd?:number; peakObservedAt:string;
+    lastAction:string; reasonCodes:string[]; payload:Record<string,unknown>;
+  }): Promise<void>;
   hasActiveAutonomousPlan(positionAddress: string): Promise<boolean>;
   markOwnedPositionLifecycle(value: {
     positionAddress: string;
@@ -1658,6 +1664,13 @@ export async function createPostgresStore(
       );
       return r.rows;
     },
+    async loadPositionExitState(lpforgePositionId) {
+      const r=await db.query(`SELECT * FROM execution.position_exit_state WHERE lpforge_position_id=$1`,[lpforgePositionId]);
+      return (r.rows[0] as Record<string,unknown>|undefined)??null;
+    },
+    async upsertPositionExitState(v) {
+      await db.query(`INSERT INTO execution.position_exit_state(lpforge_position_id,observed_at,evidence_state,initial_capital_usd,current_economic_value_usd,net_pnl_usd,net_return_fraction,peak_net_return_fraction,peak_economic_value_usd,peak_observed_at,last_action,last_reason_codes,payload,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$2) ON CONFLICT(lpforge_position_id) DO UPDATE SET observed_at=EXCLUDED.observed_at,evidence_state=EXCLUDED.evidence_state,initial_capital_usd=COALESCE(EXCLUDED.initial_capital_usd,execution.position_exit_state.initial_capital_usd),current_economic_value_usd=EXCLUDED.current_economic_value_usd,net_pnl_usd=EXCLUDED.net_pnl_usd,net_return_fraction=EXCLUDED.net_return_fraction,peak_net_return_fraction=GREATEST(execution.position_exit_state.peak_net_return_fraction,EXCLUDED.peak_net_return_fraction),peak_economic_value_usd=CASE WHEN EXCLUDED.peak_net_return_fraction>=execution.position_exit_state.peak_net_return_fraction THEN EXCLUDED.peak_economic_value_usd ELSE execution.position_exit_state.peak_economic_value_usd END,peak_observed_at=CASE WHEN EXCLUDED.peak_net_return_fraction>=execution.position_exit_state.peak_net_return_fraction THEN EXCLUDED.peak_observed_at ELSE execution.position_exit_state.peak_observed_at END,last_action=EXCLUDED.last_action,last_reason_codes=EXCLUDED.last_reason_codes,payload=EXCLUDED.payload,updated_at=EXCLUDED.updated_at`,[v.lpforgePositionId,v.observedAt,v.evidenceState,v.initialCapitalUsd??null,v.currentEconomicValueUsd??null,v.netPnlUsd??null,v.netReturnFraction??null,v.peakNetReturnFraction,v.peakEconomicValueUsd??null,v.peakObservedAt,v.lastAction,json(v.reasonCodes),json(v.payload)]);
+    },
     async hasActiveAutonomousPlan(positionAddress) {
       const r = await db.query(
         `SELECT EXISTS(SELECT 1 FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id WHERE i.position_address=$1 AND p.cluster='mainnet-beta' AND p.state IN ('PLANNED','CLAIMED','DISPATCHING','BUILDING','BUILT','SIMULATING','SIMULATED','RISK_APPROVED','SIGNING','SIGNED','SUBMITTING','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILING','RECOVERING','RECONCILIATION_REQUIRED')) AS active`,
@@ -2526,6 +2539,8 @@ export function createMemoryStore(): Phase1Store {
     async loadOwnedPositions() {
       return [];
     },
+    async loadPositionExitState() { return null; },
+    async upsertPositionExitState() {},
     async hasActiveAutonomousPlan() {
       return false;
     },

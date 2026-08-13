@@ -26,6 +26,12 @@ import {
   type OwnedLivePosition,
 } from "../../../packages/live-position-management/src/index.js";
 import {
+  assessLiveExit,
+  derivePositionEconomics,
+  loadLiveExitGovernorPolicy,
+  type ExitHighWaterState,
+} from "../../../packages/live-exit-governor/src/index.js";
+import {
   fixtureBins,
   fixtureDataApiPool,
   fixturePool,
@@ -106,18 +112,25 @@ function owned(row: Record<string, unknown>): OwnedLivePosition {
       ((row.payload as Record<string, unknown>) ?? {}).thesisId ??
         `owned-${row.position_address}`,
     ),
+    enteredAt: String(row.entered_at ?? ''),
   };
 }
 async function observeAndPlanOwnedPositions(input: {
   store: Phase1Store;
   adapter: ReturnType<typeof createMeteoraReadAdapter>;
+  api: ReturnType<typeof createMeteoraDataApi>;
   ownerAddress?: string | undefined;
   observedAt: string;
+  currentResult?: OperationalCycleResult;
 }) {
   if (!input.ownerAddress) return { observed: 0, planned: 0 };
   const policy = loadLivePositionManagementPolicy(
       process.env.LPFORGE_LIVE_MANAGEMENT_POLICY_PATH ??
         "policies/live-position-management-policy.json",
+    ),
+    exitPolicy = loadLiveExitGovernorPolicy(
+      process.env.LPFORGE_LIVE_EXIT_POLICY_PATH ??
+        "policies/live-exit-governor-policy.json",
     ),
     positions = await input.store.loadOwnedPositions(input.ownerAddress);
   let planned = 0;
@@ -137,11 +150,53 @@ async function observeAndPlanOwnedPositions(input: {
       activeBinId = (await input.adapter.getPool(position.poolAddress))
         .activeBinId;
     } catch {}
+    let economics = { evidenceState: "UNAVAILABLE" as const, observedAt: input.observedAt, reasonCodes: ["EXIT_VALUATION_POOL_DATA_UNAVAILABLE"] };
+    if (fact) {
+      try {
+        const apiPool = await input.api.getPool(position.poolAddress);
+        economics = derivePositionEconomics({position: fact, pool: apiPool, initialCapitalLamports: position.initialCapitalLamports, observedAt: input.observedAt}) as typeof economics;
+      } catch {}
+    }
+    const priorExitRow=await input.store.loadPositionExitState(position.lpforgePositionId);
+    const priorHighWater:ExitHighWaterState|undefined=priorExitRow?{
+      peakNetReturnFraction:Number(priorExitRow.peak_net_return_fraction??0),
+      ...(priorExitRow.peak_economic_value_usd!==null&&priorExitRow.peak_economic_value_usd!==undefined?{peakEconomicValueUsd:Number(priorExitRow.peak_economic_value_usd)}:{}),
+      peakObservedAt:String(priorExitRow.peak_observed_at??input.observedAt),
+    }:undefined;
+    const current=input.currentResult?.poolAddress===position.poolAddress?input.currentResult:undefined;
+    const regime=current?.shadow?.regime.primary;
+    const thesisStatus=regime==='FREEFALL'?'EMERGENCY':regime==='DISTRIBUTION'||regime==='TREND_DOWN'?'DETERIORATING':'VALID';
+    const currentForwardEv=current?.shadow?.economics.expectedNetLpValue;
+    const toxicity=current?.poolAssessment.toxicityProbability;
+    const liquidityChange=Number(current?.poolAssessment.evidence.recentLiquidityChangePct??0);
+    const exitDecision=assessLiveExit({
+      policy:exitPolicy,
+      economics,
+      ...(priorHighWater?{highWater:priorHighWater}:{}),
+      thesisStatus,
+      ...(typeof currentForwardEv==='number'?{currentForwardEv}:{}),
+      ...(current?.risk?{riskDecision:current.risk.decision,riskReasonCodes:current.risk.reasonCodes}:{}),
+      ...(typeof toxicity==='number'?{toxicityProbability:toxicity}:{}),
+      liquidityCollapse:Number.isFinite(liquidityChange)&&liquidityChange<=-50,
+      ...(position.enteredAt&&Number.isFinite(Date.parse(position.enteredAt))?{positionAgeMinutes:Math.max(0,(Date.parse(input.observedAt)-Date.parse(position.enteredAt))/60000)}:{}),
+    });
     const decision = decideLivePositionManagement({
       policy,
       owned: position,
       ...(fact ? { position: fact } : {}),
       activeBinId,
+      exitDecision,
+    });
+    await input.store.upsertPositionExitState({
+      lpforgePositionId:position.lpforgePositionId,observedAt:input.observedAt,evidenceState:exitDecision.economics.evidenceState,
+      ...(exitDecision.economics.initialCapitalUsd!==undefined?{initialCapitalUsd:exitDecision.economics.initialCapitalUsd}:{}),
+      ...(exitDecision.economics.currentEconomicValueUsd!==undefined?{currentEconomicValueUsd:exitDecision.economics.currentEconomicValueUsd}:{}),
+      ...(exitDecision.economics.netPnlUsd!==undefined?{netPnlUsd:exitDecision.economics.netPnlUsd}:{}),
+      ...(exitDecision.economics.netReturnFraction!==undefined?{netReturnFraction:exitDecision.economics.netReturnFraction}:{}),
+      peakNetReturnFraction:exitDecision.highWater.peakNetReturnFraction,
+      ...(exitDecision.highWater.peakEconomicValueUsd!==undefined?{peakEconomicValueUsd:exitDecision.highWater.peakEconomicValueUsd}:{}),
+      peakObservedAt:exitDecision.highWater.peakObservedAt,lastAction:exitDecision.action,reasonCodes:exitDecision.reasonCodes,
+      payload:{peakGivebackFraction:exitDecision.peakGivebackFraction,reasonFamily:exitDecision.reasonFamily,urgency:exitDecision.urgency,forwardEv:currentForwardEv??null,regime:regime??null,toxicity:toxicity??null}
     });
     await input.store.insertPositionObservation({
       lpforgePositionId: position.lpforgePositionId,
@@ -162,7 +217,7 @@ async function observeAndPlanOwnedPositions(input: {
         : {}),
       walletTruth: { source: "NOT_REQUIRED_FOR_OBSERVATION" },
       positionTruth: fact ?? { missing: true },
-      managementContext: { decision, policy },
+      managementContext: { decision, policy, exitDecision, exitPolicy },
       reconciliationDebt: !fact,
       staleData: false,
       payload: { source: "LPFORGE_PRODUCTION_OWNED_POSITION_MONITOR" },
@@ -195,11 +250,13 @@ async function observeAndPlanOwnedPositions(input: {
             removeUpperBinId: position.upperBinId,
           }
         : {}),
+      ...(decision.action === "REDUCE" ? { reductionBps: Math.max(1,Math.min(9999,Math.round(exitDecision.reduceFraction*10000))) } : {}),
       metadata: {
         managementReasonCodes: decision.reasonCodes,
         sourcePositionAddress: position.positionAddress,
         orientation: position.orientation,
         entryFunding: { rebuildFromRemovedPosition: true },
+        exitGovernor: { reasonFamily: exitDecision.reasonFamily, reasonCodes: exitDecision.reasonCodes, economics: exitDecision.economics, highWater: exitDecision.highWater, peakGivebackFraction: exitDecision.peakGivebackFraction },
       },
     });
     await persistTransactionPlan(input.store, plan);
@@ -451,8 +508,10 @@ async function liveOnce() {
     const management = await observeAndPlanOwnedPositions({
       store,
       adapter,
+      api,
       ownerAddress: process.env.LPFORGE_OPERATOR_OWNER_ADDRESS,
       observedAt: decisionAt,
+      currentResult: result,
     });
     await store.upsertRuntimeHeartbeat({
       runtimeId: "lpforge-live-shadow",

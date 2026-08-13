@@ -78,7 +78,8 @@
     "verify:discovery": "node scripts/verify-discovery-boundary.mjs",
     "discovery:learn-once": "node --enable-source-maps .build/apps/discovery-learning/src/main.js once",
     "discovery:learn-start": "node --enable-source-maps .build/apps/discovery-learning/src/main.js start",
-    "test:discovery": "node --test tests/pool-discovery-d1d2.test.mjs tests/pool-discovery-d3d8.test.mjs"
+    "test:discovery": "node --test tests/pool-discovery-d1d2.test.mjs tests/pool-discovery-d3d8.test.mjs",
+    "test:exit": "node --test tests/live-exit-governor.test.mjs tests/live-position-management.test.mjs"
   },
   "dependencies": {
     "@meteora-ag/dlmm": "1.9.10",
