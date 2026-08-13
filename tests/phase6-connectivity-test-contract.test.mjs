@@ -1,0 +1,2 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {readFileSync} from 'node:fs';
+test('P6 connectivity test is opt-in, self-only, zero-lamport, and confirmed',()=>{const source=readFileSync('apps/execution/src/main.ts','utf8');for(const token of ['LPFORGE_P6_CONNECTIVITY_TEST_ALLOWED','fromPubkey:owner,toPubkey:owner,lamports:0','skipPreflight:false,maxRetries:0','confirmTransaction','MAINNET_SELF_CONNECTIVITY'])assert.ok(source.includes(token),token);});
