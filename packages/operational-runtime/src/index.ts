@@ -51,6 +51,7 @@ export interface OperationalCycleInput {
   replacementPositionAddress?:string;
   swapQuoteProvider?:{quote(input:{inputMint:string;outputMint:string;inputAmount:bigint;requiredOutputAmount:bigint}):Promise<SwapQuoteAssessment>};
   economicEvidence?:{fidelity:string;effectiveSampleCount:number;feeRatePerCapitalHour:number;uncertainty:number;evidenceAgeSeconds:number;rawObservationCount:number;independentEpisodeCount:number;feeObservationCount:number;eventPathObservationCount:number;sourceHashes?:Record<string,unknown>};
+  evidenceMaturity?:{state:string;historicalState?:string;liveConfirmationState?:string;reasonCodes?:string[]};
   policy?:OperationalRuntimePolicy;
 }
 export interface OperationalCycleResult {
@@ -122,6 +123,7 @@ export async function evaluateOperationalCycle(input:OperationalCycleInput):Prom
   const reasonCodes:string[]=[];
   const ready=input.history.marketObservations.length>=p.minMarketObservations&&input.history.activeBins.length>=p.minActiveBinObservations&&input.history.binFrames.length>=p.minBinFrames;
   const base={poolAddress:input.pool.address,observedAt:input.observedAt,poolAssessment,evidence:{history:{market:input.history.marketObservations.length,activeBins:input.history.activeBins.length,frames:input.history.binFrames.length,swaps:input.history.swapEvents.length},rateEvidence,valuation,policyId:p.id}};
+  if(input.evidenceMaturity?.state&&input.evidenceMaturity.state!=='MATURE'){reasonCodes.push('OPERATIONAL_EVIDENCE_MATURITY_PENDING',...(input.evidenceMaturity.reasonCodes??[]));const core={...base,phase3Status:'WARMING' as const,phase4Status:'WARMING' as const,phase5Status:'NOT_REACHED' as const,evidenceMaturity:input.evidenceMaturity,reasonCodes:[...new Set(reasonCodes)].sort()};return{cycleId:await sha256Hex(canonicalJson(core)),...core};}
   if(!ready){reasonCodes.push('OPERATIONAL_FORWARD_HISTORY_WARMING');const core={...base,phase3Status:'WARMING' as const,phase4Status:'WARMING' as const,phase5Status:'NOT_REACHED' as const,reasonCodes};return{cycleId:await sha256Hex(canonicalJson(core)),...core};}
   const market=[...input.history.marketObservations];const last=market.at(-1);if(!last||Date.parse(last.observedAt)<Date.parse(input.observedAt)){market.push({observedAt:input.observedAt,price:numeric(input.dataApiPool.current_price,1),activeBinId:input.pool.activeBinId,volume:numeric(input.dataApiPool.volume?.['5m']),feeValue:numeric(input.dataApiPool.fees?.['5m']),twoWayRatio:flow.twoWayRatio,localLiquidity:numeric(input.dataApiPool.tvl)});}
   const expiresAt=new Date(Date.parse(input.observedAt)+p.thesisTtlMinutes*60000).toISOString();

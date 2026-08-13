@@ -461,6 +461,17 @@ async function liveOnce() {
       2000,
     );
     const decisionAt = new Date().toISOString();
+    const maturityRow = await store.loadActiveCandidateHistoryMaturity(
+      cfg.smokePoolAddress,
+    );
+    const evidenceMaturity = maturityRow
+      ? {
+          state: String(maturityRow.state),
+          historicalState: String((maturityRow.payload as Record<string, unknown> | undefined)?.historicalMaturity ?? ''),
+          liveConfirmationState: String((maturityRow.payload as Record<string, unknown> | undefined)?.liveConfirmation ?? ''),
+          reasonCodes: (maturityRow.reason_codes ?? []) as string[],
+        }
+      : undefined;
     const economicRow = await store.loadLatestEconomicEstimate(
       cfg.smokePoolAddress,
       decisionAt,
@@ -512,6 +523,7 @@ async function liveOnce() {
       protocolCompatible: true,
       walletCapital,
       ...(economicEvidence ? { economicEvidence } : {}),
+      ...(evidenceMaturity ? { evidenceMaturity } : {}),
       ...(swapQuoteProvider ? { swapQuoteProvider } : {}),
       ...(process.env.LPFORGE_OPERATOR_OWNER_ADDRESS
         ? { ownerAddress: process.env.LPFORGE_OPERATOR_OWNER_ADDRESS }

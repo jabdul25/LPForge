@@ -8,6 +8,10 @@ export interface MarketObservation {
   observedAt:string;
   price:number;
   activeBinId:number;
+  /** Duration represented by this genuine source observation.  A 5m OHLCV
+   * candle covers five real market minutes; it is never expanded into five
+   * synthetic minute samples. */
+  resolutionMs?:number;
   volume?:number;
   feeValue?:number;
   twoWayRatio?:number;
@@ -56,8 +60,12 @@ function contextFor(horizon:MarketHorizon,decisionAt:string,rows:MarketObservati
   const netBins=s.at(-1)!.activeBinId-s[0]!.activeBinId;
   const duration=Math.max((Date.parse(s.at(-1)!.observedAt)-Date.parse(s[0]!.observedAt))/60000,1/60);
   const tw=s.map((x)=>x.twoWayRatio).filter(finite); const liq=s.map((x)=>x.localLiquidity).filter(finite);
-  const expectedSamples=Math.max(2,Math.floor(mins)+1);
-  return{horizon,samples:s.length,startAt:s[0]!.observedAt,endAt,returnPct:first>0?(last-first)/first*100:0,maxDrawdownPct:maxDd,realizedVolatility:Math.sqrt(Math.max(0,variance))*100,priceRangePct:prices.length&&Math.min(...prices)>0?(Math.max(...prices)-Math.min(...prices))/Math.min(...prices)*100:0,netBins,absoluteBins:absBins,binVelocityPerMinute:absBins/duration,directionalEfficiency:absBins?Math.abs(netBins)/absBins:0,volumeTotal:s.reduce((a,b)=>a+(finite(b.volume)?b.volume:0),0),feeTotal:s.reduce((a,b)=>a+(finite(b.feeValue)?b.feeValue:0),0),twoWayRatioMean:tw.length?mean(tw):null,localLiquidityChangePct:liq.length>=2&&liq[0]!>0?(liq.at(-1)!-liq[0]!)/liq[0]!*100:null,completeness:clamp(s.length/expectedSamples)};
+  // Completeness is market-time coverage, not ingestion-count.  This retains
+  // the existing .60 threshold while allowing a genuine 5m candle to cover its
+  // five-minute interval without manufacturing five minute observations.
+  const intervals=s.map(row=>{const bucketStart=Math.max(Date.parse(row.observedAt),start);const resolution=Math.max(1_000,Math.min(15*60_000,Number(row.resolutionMs??60_000)));return[bucketStart,Math.min(decision,bucketStart+resolution)] as const;}).filter(([a,b])=>b>a).sort((a,b)=>a[0]-b[0]);
+  let covered=0,coveredEnd=-Infinity;for(const [a,b] of intervals){const from=Math.max(a,coveredEnd);if(b>from){covered+=b-from;coveredEnd=Math.max(coveredEnd,b);}}
+  return{horizon,samples:s.length,startAt:s[0]!.observedAt,endAt,returnPct:first>0?(last-first)/first*100:0,maxDrawdownPct:maxDd,realizedVolatility:Math.sqrt(Math.max(0,variance))*100,priceRangePct:prices.length&&Math.min(...prices)>0?(Math.max(...prices)-Math.min(...prices))/Math.min(...prices)*100:0,netBins,absoluteBins:absBins,binVelocityPerMinute:absBins/duration,directionalEfficiency:absBins?Math.abs(netBins)/absBins:0,volumeTotal:s.reduce((a,b)=>a+(finite(b.volume)?b.volume:0),0),feeTotal:s.reduce((a,b)=>a+(finite(b.feeValue)?b.feeValue:0),0),twoWayRatioMean:tw.length?mean(tw):null,localLiquidityChangePct:liq.length>=2&&liq[0]!>0?(liq.at(-1)!-liq[0]!)/liq[0]!*100:null,completeness:clamp(covered/(mins*60_000))};
 }
 export async function buildMarketContext(pool:string,decisionAt:string,observations:MarketObservation[]):Promise<MarketContextSnapshot>{
   assertNoLookahead(decisionAt,observations);
