@@ -1,0 +1,3 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {routePhase6Inventory} from '../.build/packages/phase6-inventory-routing/src/index.js';
+test('P6 routes SOL-only inventory to autonomous one-sided BidAsk without an implicit swap',()=>{const r=routePhase6Inventory({tokenXRaw:0n,tokenYRaw:500_000_000n});assert.deepEqual(r.orientations,['ONE_SIDED_Y']);assert.deepEqual(r.strategies,['BID_ASK']);assert.equal(r.tradable,true);});
+test('P6 permits balanced strategy families only when both pool assets are present',()=>{const r=routePhase6Inventory({tokenXRaw:1n,tokenYRaw:1n});assert.ok(r.orientations.includes('BALANCED'));assert.ok(r.strategies.includes('CURVE'));assert.equal(routePhase6Inventory({tokenXRaw:0n,tokenYRaw:0n}).tradable,false);});
