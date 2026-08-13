@@ -46,8 +46,6 @@ importers:
 
   apps/paper: {}
 
-  apps/production: {}
-
   apps/replay: {}
 
   apps/shadow: {}
@@ -154,8 +152,6 @@ importers:
 
   packages/phase6-open-reconciliation: {}
 
-  packages/phase6-operational-gates: {}
-
   packages/phase6-pool-eligibility: {}
 
   packages/phase6-presign-revalidation: {}
@@ -165,56 +161,6 @@ importers:
   packages/phase6-simulation-validation: {}
 
   packages/phase6-wallet-truth: {}
-
-  packages/phase7-alerting: {}
-
-  packages/phase7-authority: {}
-
-  packages/phase7-contracts: {}
-
-  packages/phase7-daemon: {}
-
-  packages/phase7-disaster-recovery: {}
-
-  packages/phase7-drift: {}
-
-  packages/phase7-evaluation: {}
-
-  packages/phase7-evidence: {}
-
-  packages/phase7-health: {}
-
-  packages/phase7-incidents: {}
-
-  packages/phase7-learning: {}
-
-  packages/phase7-live-control: {}
-
-  packages/phase7-live-drift: {}
-
-  packages/phase7-live-evidence: {}
-
-  packages/phase7-live-health: {}
-
-  packages/phase7-live-runtime: {}
-
-  packages/phase7-operator-controls: {}
-
-  packages/phase7-policy-registry: {}
-
-  packages/phase7-portfolio-governor: {}
-
-  packages/phase7-production-service: {}
-
-  packages/phase7-promotion: {}
-
-  packages/phase7-release-evidence: {}
-
-  packages/phase7-rollback: {}
-
-  packages/phase7-runtime: {}
-
-  packages/phase7-scaling: {}
 
   packages/policy: {}
 
