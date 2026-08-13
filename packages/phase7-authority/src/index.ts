@@ -9,6 +9,22 @@ export interface Phase7ControlConfig {
   authorityTtlMs:number;
 }
 
+/**
+ * Loads the explicit owner approval envelope used when the runtime is allowed
+ * to request work from the separate execution service.  This is deliberately
+ * public operational metadata: it is not a signing credential.
+ */
+export function loadPhase7ManualApproval(env:NodeJS.ProcessEnv=process.env):Phase7ManualApproval|undefined{
+  const approvalId=env.LPFORGE_P7_APPROVAL_ID?.trim();
+  if(!approvalId)return undefined;
+  const action=(env.LPFORGE_P7_APPROVAL_ACTION??'PROMOTE_PRODUCTION').trim() as Phase7ManualApproval['action'];
+  const operatorId=env.LPFORGE_P7_APPROVED_BY?.trim()??'';
+  const issuedAt=env.LPFORGE_P7_APPROVAL_ISSUED_AT?.trim()??'';
+  const expiresAt=env.LPFORGE_P7_APPROVAL_EXPIRES_AT?.trim()??'';
+  const reason=env.LPFORGE_P7_APPROVAL_REASON?.trim()??'';
+  return {approvalId,action,operatorId,issuedAt,expiresAt,reason};
+}
+
 function bool(env:NodeJS.ProcessEnv,name:string,fallback=false):boolean{
   const raw=(env[name]??String(fallback)).trim().toLowerCase();
   if(raw==='true')return true;if(raw==='false')return false;throw new Error(`LPFORGE_P7_CONFIG_BOOLEAN:${name}`);

@@ -122,6 +122,7 @@ async function observeAndPlanOwnedPositions(input: {
   ownerAddress?: string | undefined;
   observedAt: string;
   currentResult?: OperationalCycleResult;
+  allowEconomicPlans: boolean;
 }) {
   if (!input.ownerAddress) return { observed: 0, planned: 0 };
   const policy = loadLivePositionManagementPolicy(
@@ -223,6 +224,7 @@ async function observeAndPlanOwnedPositions(input: {
       payload: { source: "LPFORGE_PRODUCTION_OWNED_POSITION_MONITOR" },
     });
     if (
+      !input.allowEconomicPlans ||
       decision.action === "HOLD" ||
       (await input.store.hasActiveAutonomousPlan(position.positionAddress))
     )
@@ -264,7 +266,11 @@ async function observeAndPlanOwnedPositions(input: {
   }
   return { observed: positions.length, planned };
 }
-async function persistResult(store: Phase1Store, r: OperationalCycleResult) {
+async function persistResult(
+  store: Phase1Store,
+  r: OperationalCycleResult,
+  allowEconomicPlans: boolean,
+) {
   await store.insertPoolAssessment({
     ...r.poolAssessment,
     poolAddress: r.poolAssessment.pool,
@@ -348,7 +354,7 @@ async function persistResult(store: Phase1Store, r: OperationalCycleResult) {
         payload: r.allocation as unknown as Record<string, unknown>,
       });
   }
-  if (r.plan) await persistTransactionPlan(store, r.plan);
+  if (r.plan && allowEconomicPlans) await persistTransactionPlan(store, r.plan);
   await store.insertOperationalCycle({
     cycleId: r.cycleId,
     poolAddress: r.poolAddress,
@@ -365,6 +371,10 @@ async function persistResult(store: Phase1Store, r: OperationalCycleResult) {
       evidence: r.evidence,
       liveSigning: false,
       submissionPerformed: false,
+      economicPlanDispatchAllowed: allowEconomicPlans,
+      ...(r.plan && !allowEconomicPlans
+        ? { planSuppressedReason: "P7_ECONOMIC_ACTION_NOT_ALLOWED" }
+        : {}),
     },
   });
 }
@@ -378,6 +388,14 @@ async function liveOnce() {
   const store = await createPostgresStore(cfg.databaseUrl);
   const cycleStartedAt = new Date().toISOString();
   try {
+    const runtimeId = (process.env.LPFORGE_P7_RUNTIME_ID ?? "lpforge-production").trim();
+    const planDispatchEnabled =
+      (process.env.LPFORGE_P7_PLAN_DISPATCH_ENABLED ?? "false").toLowerCase() === "true";
+    const control = await store.loadLatestPhase7ControlDecision(runtimeId);
+    const allowEconomicPlans =
+      planDispatchEnabled &&
+      control?.authority_mode !== "OBSERVE_ONLY" &&
+      Boolean(control?.new_economic_action_allowed);
     let eventDecodeWarnings = 0;
     const adapter = createMeteoraReadAdapter({
       rpcUrl: cfg.solanaRpcHttpUrl,
@@ -535,7 +553,7 @@ async function liveOnce() {
           }
         : {}),
     });
-    await persistResult(store, result);
+    await persistResult(store, result, allowEconomicPlans);
     const management = await observeAndPlanOwnedPositions({
       store,
       adapter,
@@ -543,6 +561,7 @@ async function liveOnce() {
       ownerAddress: process.env.LPFORGE_OPERATOR_OWNER_ADDRESS,
       observedAt: decisionAt,
       currentResult: result,
+      allowEconomicPlans,
     });
     await store.upsertRuntimeHeartbeat({
       runtimeId: "lpforge-live-shadow",
@@ -555,6 +574,7 @@ async function liveOnce() {
         phase3Status: result.phase3Status,
         phase4Status: result.phase4Status,
         phase5Status: result.phase5Status,
+        economicPlanDispatchAllowed: allowEconomicPlans,
         management,
       },
     });
