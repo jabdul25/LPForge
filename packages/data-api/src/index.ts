@@ -11,13 +11,13 @@ export interface DataApiPool {
   is_blacklisted?: boolean; tags?: string[]; launchpad?: string;
   [key:string]: unknown;
 }
-export interface PoolsPage { current_page: number; page_size: number; total?: number; total_pages?: number; data: DataApiPool[]; }
+export interface PoolsPage { current_page: number; page_size: number; total?: number; pages?: number; total_pages?: number; data: DataApiPool[]; }
 export interface OhlcvCandle { timestamp: number; timestamp_str?: string; open: number; high: number; low: number; close: number; volume: number; }
 export interface OhlcvResponse { data: OhlcvCandle[]; start_time: number; end_time: number; timeframe: string | null; }
 export interface HistoricalVolumePoint { timestamp:number; timestamp_str?:string; fees:number; protocol_fees:number; volume:number; }
 export interface HistoricalVolumeResponse { data:HistoricalVolumePoint[]; start_time:number; end_time:number; timeframe:string|null; }
 export interface MeteoraDataApi {
-  listPools(page?: number, pageSize?: number, query?: string): Promise<PoolsPage>;
+  listPools(page?: number, pageSize?: number, query?: string, options?: {sortBy?:string;filterBy?:string}): Promise<PoolsPage>;
   getPool(address: string): Promise<DataApiPool>;
   getOhlcv(address: string, params?: {timeframe?:MeteoraOhlcvTimeframe;startTime?:number;endTime?:number}): Promise<OhlcvResponse>;
   getHistoricalVolume(address:string,params?:{timeframe?:MeteoraOhlcvTimeframe;startTime?:number;endTime?:number}):Promise<HistoricalVolumeResponse>;
@@ -52,9 +52,9 @@ export function createMeteoraDataApi(opts: {baseUrl?:string;maxRps?:number;timeo
     finally { clearTimeout(timer); }
   }
   return {
-    async listPools(page=1,pageSize=100,query) {
+    async listPools(page=1,pageSize=100,query,options={}) {
       if (!Number.isInteger(page)||page<1) throw new Error('LPFORGE_DATA_API_PAGE'); if (!Number.isInteger(pageSize)||pageSize<1||pageSize>1000) throw new Error('LPFORGE_DATA_API_PAGE_SIZE');
-      const obj=assertObject(await get('/pools',{page,page_size:pageSize,query}),'LPFORGE_DATA_API_SCHEMA:POOLS'); if (!Array.isArray(obj.data)) throw new Error('LPFORGE_DATA_API_SCHEMA:POOLS_DATA');
+      const obj=assertObject(await get('/pools',{page,page_size:pageSize,query,sort_by:options.sortBy,filter_by:options.filterBy}),'LPFORGE_DATA_API_SCHEMA:POOLS'); if (!Array.isArray(obj.data)) throw new Error('LPFORGE_DATA_API_SCHEMA:POOLS_DATA');
       return obj as unknown as PoolsPage;
     },
     async getPool(address) { const obj=assertObject(await get(`/pools/${encodeURIComponent(address)}`),'LPFORGE_DATA_API_SCHEMA:POOL'); if (typeof obj.address!=='string') throw new Error('LPFORGE_DATA_API_SCHEMA:POOL_ADDRESS'); return obj as unknown as DataApiPool; },

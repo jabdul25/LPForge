@@ -113,6 +113,59 @@ export interface Phase1Store {
     evidence: Record<string, unknown>;
     assessedAt: string;
   }): Promise<void>;
+  upsertDiscoveryPool(value: {
+    poolAddress: string;
+    observedAt: string;
+    sourceManual: boolean;
+    sourceAuto: boolean;
+    tokenXMint?: string | undefined;
+    tokenYMint?: string | undefined;
+    pairedTokenMint?: string | undefined;
+    pairedTokenSymbol?: string | undefined;
+    marketCapCohort: string;
+    state: string;
+    tier: string;
+    priorityScore: number;
+    rank?: number | undefined;
+    universePercentile?: number | undefined;
+    reasonCodes: string[];
+    evidenceState: Record<string, unknown>;
+    payload: Record<string, unknown>;
+  }): Promise<void>;
+  insertDiscoveryObservation(value: {
+    poolAddress: string;
+    observedAt: string;
+    policyId: string;
+    source: string;
+    decision: string;
+    priorityScore: number;
+    metrics: Record<string, number | undefined>;
+    hardReasons: string[];
+    warnings: string[];
+    selectionReasons: string[];
+    evidenceState: Record<string, unknown>;
+    payload: Record<string, unknown>;
+  }): Promise<void>;
+  insertDiscoveryRanking(value: {
+    rankingCycleId: string;
+    poolAddress: string;
+    observedAt: string;
+    policyId: string;
+    rank: number;
+    universePercentile: number;
+    feePercentile?: number | undefined;
+    volumePercentile?: number | undefined;
+    liquidityPercentile?: number | undefined;
+    priorityScore: number;
+    state: string;
+    tier: string;
+    reasonCodes: string[];
+    payload: Record<string, unknown>;
+  }): Promise<void>;
+  listDiscoveryCandidates(tiers?: string[]): Promise<Array<{
+    poolAddress: string; state: string; tier: string; priorityScore: number; rank?: number | undefined; lastSeenAt: string; payload: Record<string, unknown>;
+  }>>;
+  markDiscoveryPoolsStale(cutoff: string, observedAt: string): Promise<number>;
   insertForensicEpisode(value: {
     poolAddress: string;
     episodeType: string;
@@ -1188,6 +1241,33 @@ export async function createPostgresStore(
           v.assessedAt,
         ],
       );
+    },
+    async upsertDiscoveryPool(v) {
+      await db.query(
+        `INSERT INTO market.pool_discovery_registry(pool_address,first_seen_at,last_seen_at,source_manual,source_auto,token_x_mint,token_y_mint,paired_token_mint,paired_token_symbol,market_cap_cohort,current_state,current_tier,last_priority_score,last_rank,last_universe_percentile,reason_codes,evidence_state,payload) VALUES($1,$2,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16::jsonb,$17::jsonb) ON CONFLICT(pool_address) DO UPDATE SET last_seen_at=EXCLUDED.last_seen_at,source_manual=market.pool_discovery_registry.source_manual OR EXCLUDED.source_manual,source_auto=market.pool_discovery_registry.source_auto OR EXCLUDED.source_auto,token_x_mint=COALESCE(EXCLUDED.token_x_mint,market.pool_discovery_registry.token_x_mint),token_y_mint=COALESCE(EXCLUDED.token_y_mint,market.pool_discovery_registry.token_y_mint),paired_token_mint=COALESCE(EXCLUDED.paired_token_mint,market.pool_discovery_registry.paired_token_mint),paired_token_symbol=COALESCE(EXCLUDED.paired_token_symbol,market.pool_discovery_registry.paired_token_symbol),market_cap_cohort=EXCLUDED.market_cap_cohort,current_state=EXCLUDED.current_state,current_tier=EXCLUDED.current_tier,last_priority_score=EXCLUDED.last_priority_score,last_rank=EXCLUDED.last_rank,last_universe_percentile=EXCLUDED.last_universe_percentile,reason_codes=EXCLUDED.reason_codes,evidence_state=EXCLUDED.evidence_state,payload=EXCLUDED.payload`,
+        [v.poolAddress,v.observedAt,v.sourceManual,v.sourceAuto,v.tokenXMint??null,v.tokenYMint??null,v.pairedTokenMint??null,v.pairedTokenSymbol??null,v.marketCapCohort,v.state,v.tier,v.priorityScore,v.rank??null,v.universePercentile??null,json(v.reasonCodes),json(v.evidenceState),json(v.payload)],
+      );
+    },
+    async insertDiscoveryObservation(v) {
+      const m=v.metrics;
+      await db.query(
+        `INSERT INTO market.pool_discovery_observations(pool_address,observed_at,policy_id,source,decision,priority_score,tvl_usd,volume_30m_usd,volume_1h_usd,volume_24h_usd,fees_30m_usd,fees_1h_usd,fees_24h_usd,fee_tvl_30m,fee_tvl_1h,fee_tvl_24h,market_cap_usd,liquidity_to_market_cap,volume_24h_to_market_cap,fees_24h_to_market_cap,holders,hard_reasons,warnings,selection_reasons,evidence_state,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22::jsonb,$23::jsonb,$24::jsonb,$25::jsonb,$26::jsonb) ON CONFLICT(pool_address,observed_at,policy_id) DO NOTHING`,
+        [v.poolAddress,v.observedAt,v.policyId,v.source,v.decision,v.priorityScore,m.tvlUsd??null,m.volume30mUsd??null,m.volume1hUsd??null,m.volume24hUsd??null,m.fees30mUsd??null,m.fees1hUsd??null,m.fees24hUsd??null,m.feeTvl30m??null,m.feeTvl1h??null,m.feeTvl24h??null,m.marketCapUsd??null,m.liquidityToMarketCap??null,m.volume24hToMarketCap??null,m.fees24hToMarketCap??null,m.holders??null,json(v.hardReasons),json(v.warnings),json(v.selectionReasons),json(v.evidenceState),json(v.payload)],
+      );
+    },
+    async insertDiscoveryRanking(v) {
+      await db.query(
+        `INSERT INTO market.pool_discovery_rankings(ranking_cycle_id,pool_address,observed_at,policy_id,rank,universe_percentile,fee_percentile,volume_percentile,liquidity_percentile,priority_score,state,tier,reason_codes,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb) ON CONFLICT(ranking_cycle_id,pool_address) DO UPDATE SET rank=EXCLUDED.rank,universe_percentile=EXCLUDED.universe_percentile,fee_percentile=EXCLUDED.fee_percentile,volume_percentile=EXCLUDED.volume_percentile,liquidity_percentile=EXCLUDED.liquidity_percentile,priority_score=EXCLUDED.priority_score,state=EXCLUDED.state,tier=EXCLUDED.tier,reason_codes=EXCLUDED.reason_codes,payload=EXCLUDED.payload`,
+        [v.rankingCycleId,v.poolAddress,v.observedAt,v.policyId,v.rank,v.universePercentile,v.feePercentile??null,v.volumePercentile??null,v.liquidityPercentile??null,v.priorityScore,v.state,v.tier,json(v.reasonCodes),json(v.payload)],
+      );
+    },
+    async listDiscoveryCandidates(tiers=['A']) {
+      const r=await db.query(`SELECT pool_address,current_state,current_tier,last_priority_score,last_rank,last_seen_at,payload FROM market.pool_discovery_registry WHERE current_tier=ANY($1::text[]) ORDER BY last_rank NULLS LAST,last_priority_score DESC,pool_address`,[tiers]);
+      return r.rows.map(row=>({poolAddress:String(row.pool_address),state:String(row.current_state),tier:String(row.current_tier),priorityScore:Number(row.last_priority_score),...(row.last_rank!==null?{rank:Number(row.last_rank)}:{}),lastSeenAt:new Date(String(row.last_seen_at)).toISOString(),payload:(row.payload??{}) as Record<string,unknown>}));
+    },
+    async markDiscoveryPoolsStale(cutoff, observedAt) {
+      const r=await db.query(`UPDATE market.pool_discovery_registry SET current_state='OBSERVING',current_tier='C',reason_codes=CASE WHEN reason_codes ? 'DISCOVERY_STALE' THEN reason_codes ELSE reason_codes || '["DISCOVERY_STALE"]'::jsonb END,evidence_state=jsonb_set(evidence_state,'{discoveryFreshness}','"STALE"'::jsonb,true),payload=jsonb_set(payload,'{staleMarkedAt}',to_jsonb($2::text),true) WHERE last_seen_at<$1::timestamptz AND current_state NOT IN ('REJECTED','QUARANTINED') RETURNING pool_address`,[cutoff,observedAt]);
+      return r.rows.length;
     },
     async insertForensicEpisode(v) {
       const r = await db.query(
@@ -2380,6 +2460,11 @@ export function createMemoryStore(): Phase1Store {
     async insertPositionValuation() {},
     async insertSimulationRun() {},
     async insertPoolAssessment() {},
+    async upsertDiscoveryPool() {},
+    async insertDiscoveryObservation() {},
+    async insertDiscoveryRanking() {},
+    async listDiscoveryCandidates() { return []; },
+    async markDiscoveryPoolsStale() { return 0; },
     async insertForensicEpisode() {
       return "memory-episode";
     },

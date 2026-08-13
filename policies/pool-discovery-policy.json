@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "policyId": "pool-discovery-v2.1.1-d1d2",
+  "sourceMode": "HYBRID",
+  "requireWsolForAuto": true,
+  "manualPools": [],
+  "maxUniverse": 250,
+  "pageSize": 250,
+  "maxDeepScreen": 40,
+  "maxActiveCandidates": 10,
+  "maxWatchlist": 30,
+  "minTvlUsd": 25000,
+  "minVolume30mUsd": 2500,
+  "minVolume1hUsd": 7500,
+  "minVolume24hUsd": 50000,
+  "minPoolAgeHours": 3,
+  "minKnownHolders": 250,
+  "activeMinPriority": 62,
+  "qualifiedMinPriority": 45,
+  "serverSideSortBy": "volume_24h:desc",
+  "useServerSidePrefilter": true,
+  "staleAfterMs": 900000
+}

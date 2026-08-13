@@ -70,7 +70,11 @@
     "pm2:stop": "bash scripts/pm2-stop.sh",
     "pm2:status": "bash scripts/pm2-status.sh",
     "canary:gate-status": "node --enable-source-maps .build/apps/canary/src/main.js gate-status",
-    "canary:assert-read-only": "node --enable-source-maps .build/apps/canary/src/main.js assert-read-only"
+    "canary:assert-read-only": "node --enable-source-maps .build/apps/canary/src/main.js assert-read-only",
+    "discovery:once": "node --enable-source-maps .build/apps/discovery/src/main.js once",
+    "discovery:start": "node --enable-source-maps .build/apps/discovery/src/main.js start",
+    "discovery:status": "node --enable-source-maps .build/apps/discovery/src/main.js status",
+    "verify:discovery": "node scripts/verify-discovery-boundary.mjs"
   },
   "dependencies": {
     "@meteora-ag/dlmm": "1.9.10",

@@ -1,0 +1,4 @@
+import {readdir,readFile} from 'node:fs/promises';import path from 'node:path';
+const roots=['packages/pool-discovery','apps/discovery'];const forbidden=['transaction-planner','phase6-live-worker','phase6-autonomous-dispatch','phase6-mainnet-signer','apps/execution','execution-runtime','canary'];let scanned=0;
+async function walk(dir){for(const e of await readdir(dir,{withFileTypes:true})){const p=path.join(dir,e.name);if(e.isDirectory())await walk(p);else if(/\.(ts|js|mjs)$/.test(e.name)){scanned++;const s=await readFile(p,'utf8');for(const f of forbidden)if(s.includes(f))throw new Error(`DISCOVERY_BOUNDARY_FORBIDDEN_IMPORT:${p}:${f}`);if(/insertExecutionIntent|insertTransactionPlan|claimNextAutonomousPlan|executeAutonomousPlan/.test(s))throw new Error(`DISCOVERY_BOUNDARY_EXECUTION_AUTHORITY:${p}`);}}}
+for(const r of roots)await walk(r);console.log(`DISCOVERY_BOUNDARY_OK scanned=${scanned}`);
