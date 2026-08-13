@@ -296,3 +296,19 @@ Recent commits that established this path:
 - The host filesystem was observed at roughly 94.6% utilization during the
   handover. This does not block the current processes, but it should be
   monitored before retaining large logs or adding build artifacts.
+
+## Addendum: two-pool production universe (2026-08-13)
+
+Production now evaluates both configured execution pools every cycle through
+the comma-separated `LPFORGE_PRODUCTION_POOL_ADDRESSES` setting. The primary
+health/drift pool is the first address in that universe. This replaced the
+unrelated former smoke pool for production decision-making.
+
+The first verified cycles for both pools are `WARMING` / `NOT_REACHED`, which
+is expected while each pool accumulates the required independent historical
+observations. No execution plan was created and no transaction was sent.
+
+The execution worker was deliberately stopped during this deployment and
+remains stopped. Before it is re-armed, it needs the independent enforcement
+patch identified above: validate plan provenance and validate the plan's
+pool/capital/position facts against the execution policy at claim time.
