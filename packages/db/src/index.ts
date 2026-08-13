@@ -20,6 +20,33 @@ export interface IngestionCheckpoint {
   lastFullyProcessedSlot?: bigint;
   state: Record<string, unknown>;
 }
+
+/**
+ * A 5-minute fee/volume value is only useful when it represents an actual
+ * measurement.  In particular, legacy rolling records with a zero/zero value
+ * and no evidence state are provider placeholders, not proof that the pool
+ * earned no fees in that interval.
+ */
+export type FeeVolumeEvidenceState = "MEASURED" | "PLACEHOLDER" | "PARTIAL";
+export interface FeeVolumeObservationCandidate {
+  source: string;
+  fees?: number | null;
+  protocolFees?: number | null;
+  volume?: number | null;
+  evidenceState?: string | null;
+}
+export function feeVolumeSelectionRank(row: FeeVolumeObservationCandidate): number {
+  const state = row.evidenceState?.trim().toUpperCase();
+  const fees = Number(row.fees ?? 0), protocolFees = Number(row.protocolFees ?? 0), volume = Number(row.volume ?? 0);
+  const populated = [fees, protocolFees, volume].some(value => Number.isFinite(value) && value > 0);
+  if (state === "MEASURED") return 0;
+  if (populated) return 1;
+  if (state === "PARTIAL") return 2;
+  // Existing rows predate evidenceState. A zero rolling row is a placeholder
+  // unless a producer explicitly attested it as MEASURED.
+  if (row.source === "METEORA_API_ROLLING_5M" && fees === 0 && protocolFees === 0 && volume === 0) return 4;
+  return 3;
+}
 export type AutonomousPlanAction =
   | "OPEN"
   | "ADD"
@@ -1300,7 +1327,7 @@ export async function createPostgresStore(
     async insertFeeVolumeObservations(v){
       for(const row of v.rows){const payload=row.payload??{};const sourceHash=await sha256Hex(canonicalJson({pool:v.poolAddress,bucketAt:row.bucketAt,source:v.source,fees:row.fees??null,protocolFees:row.protocolFees??null,volume:row.volume??null,payload}));await db.query(`INSERT INTO market.pool_fee_volume_observations(pool_address,bucket_at,source,fees,protocol_fees,volume,observed_at,source_hash,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) ON CONFLICT(pool_address,bucket_at,source) DO UPDATE SET fees=EXCLUDED.fees,protocol_fees=EXCLUDED.protocol_fees,volume=EXCLUDED.volume,observed_at=EXCLUDED.observed_at,source_hash=EXCLUDED.source_hash,payload=EXCLUDED.payload`,[v.poolAddress,row.bucketAt,v.source,row.fees??null,row.protocolFees??null,row.volume??null,v.observedAt,sourceHash,json(payload)]);}
     },
-    async loadFeeVolumeObservations(poolAddress,since,limit=1000){const r=await db.query(`SELECT DISTINCT ON(bucket_at) bucket_at,fees,protocol_fees,volume,source,source_hash FROM market.pool_fee_volume_observations WHERE pool_address=$1 AND bucket_at>=$2::timestamptz ORDER BY bucket_at ASC,CASE WHEN source='METEORA_API_ROLLING_5M' THEN 0 ELSE 1 END,observed_at DESC LIMIT $3`,[poolAddress,since,Math.max(1,Math.min(2000,limit))]);return r.rows.map(row=>({bucketAt:new Date(String(row.bucket_at)).toISOString(),fees:Number(row.fees??0),protocolFees:Number(row.protocol_fees??0),volume:Number(row.volume??0),source:String(row.source),sourceHash:String(row.source_hash)}));},
+    async loadFeeVolumeObservations(poolAddress,since,limit=1000){const r=await db.query(`SELECT DISTINCT ON(bucket_at) bucket_at,fees,protocol_fees,volume,source,source_hash FROM market.pool_fee_volume_observations WHERE pool_address=$1 AND bucket_at>=$2::timestamptz ORDER BY bucket_at ASC,CASE WHEN upper(COALESCE(payload->>'evidenceState',''))='MEASURED' THEN 0 WHEN COALESCE(fees,0)>0 OR COALESCE(protocol_fees,0)>0 OR COALESCE(volume,0)>0 THEN 1 WHEN upper(COALESCE(payload->>'evidenceState',''))='PARTIAL' THEN 2 WHEN source='METEORA_API_ROLLING_5M' AND COALESCE(fees,0)=0 AND COALESCE(protocol_fees,0)=0 AND COALESCE(volume,0)=0 THEN 4 ELSE 3 END,CASE WHEN source='METEORA_API_ROLLING_5M' THEN 0 ELSE 1 END,observed_at DESC LIMIT $3`,[poolAddress,since,Math.max(1,Math.min(2000,limit))]);return r.rows.map(row=>({bucketAt:new Date(String(row.bucket_at)).toISOString(),fees:Number(row.fees??0),protocolFees:Number(row.protocol_fees??0),volume:Number(row.volume??0),source:String(row.source),sourceHash:String(row.source_hash)}));},
     async insertCandidateMarketObservations(v){for(const row of v.rows){if(!(Number(row.price)>0)||!Number.isFinite(Date.parse(row.observedAt)))continue;const payload=row.payload??{},resolutionMs=Math.max(1_000,Math.min(15*60_000,Math.floor(row.resolutionMs??60_000)));const sourceHash=await sha256Hex(canonicalJson({pool:v.poolAddress,observedAt:row.observedAt,sourceType:row.sourceType,sourceProvider:row.sourceProvider,price:row.price,resolutionMs,activeBinId:row.activeBinId??null,volume:row.volume??null,feeValue:row.feeValue??null,localLiquidity:row.localLiquidity??null,payload}));await db.query(`INSERT INTO market.candidate_market_observations(pool_address,observed_at,ingested_at,source_type,source_provider,price,active_bin_id,resolution_ms,volume,fee_value,local_liquidity,source_hash,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb) ON CONFLICT(pool_address,observed_at,source_type) DO UPDATE SET ingested_at=EXCLUDED.ingested_at,source_provider=EXCLUDED.source_provider,price=EXCLUDED.price,active_bin_id=EXCLUDED.active_bin_id,resolution_ms=EXCLUDED.resolution_ms,volume=EXCLUDED.volume,fee_value=EXCLUDED.fee_value,local_liquidity=EXCLUDED.local_liquidity,source_hash=EXCLUDED.source_hash,payload=EXCLUDED.payload`,[v.poolAddress,row.observedAt,v.ingestedAt,row.sourceType,row.sourceProvider,row.price,row.activeBinId??null,resolutionMs,row.volume??null,row.feeValue??null,row.localLiquidity??null,sourceHash,json(payload)]);}},
     async loadCandidateMarketObservations(poolAddress,since,limit=2000){const r=await db.query(`SELECT observed_at,source_type,source_provider,price,resolution_ms,active_bin_id,volume,fee_value,local_liquidity FROM market.candidate_market_observations WHERE pool_address=$1 AND observed_at>=$2::timestamptz ORDER BY observed_at ASC,CASE source_type WHEN 'LIVE_OBSERVED' THEN 0 ELSE 1 END LIMIT $3`,[poolAddress,since,Math.max(1,Math.min(4000,limit))]);return r.rows.map(row=>({observedAt:new Date(String(row.observed_at)).toISOString(),sourceType:String(row.source_type),sourceProvider:String(row.source_provider),price:Number(row.price),resolutionMs:Number(row.resolution_ms),...(row.active_bin_id!==null?{activeBinId:Number(row.active_bin_id)}:{}),...(row.volume!==null?{volume:Number(row.volume)}:{}),...(row.fee_value!==null?{feeValue:Number(row.fee_value)}:{}),...(row.local_liquidity!==null?{localLiquidity:Number(row.local_liquidity)}:{})}));},
     async upsertActiveCandidateBackfill(v){await db.query(`INSERT INTO market.active_candidate_backfill(pool_address,last_attempt_at,last_successful_at,requested_minutes,covered_minutes,coverage_ratio,fee_bucket_count,ohlcv_bucket_count,swap_event_count,independent_15m_episodes,oldest_evidence_at,newest_evidence_at,quality,reason_codes,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15::jsonb) ON CONFLICT(pool_address) DO UPDATE SET last_attempt_at=EXCLUDED.last_attempt_at,last_successful_at=COALESCE(EXCLUDED.last_successful_at,market.active_candidate_backfill.last_successful_at),requested_minutes=EXCLUDED.requested_minutes,covered_minutes=EXCLUDED.covered_minutes,coverage_ratio=EXCLUDED.coverage_ratio,fee_bucket_count=EXCLUDED.fee_bucket_count,ohlcv_bucket_count=EXCLUDED.ohlcv_bucket_count,swap_event_count=EXCLUDED.swap_event_count,independent_15m_episodes=EXCLUDED.independent_15m_episodes,oldest_evidence_at=EXCLUDED.oldest_evidence_at,newest_evidence_at=EXCLUDED.newest_evidence_at,quality=EXCLUDED.quality,reason_codes=EXCLUDED.reason_codes,payload=EXCLUDED.payload`,[v.poolAddress,v.lastAttemptAt,v.lastSuccessfulAt??null,v.requestedMinutes,v.coveredMinutes,v.coverageRatio,v.feeBucketCount,v.ohlcvBucketCount,v.swapEventCount,v.independent15mEpisodes,v.oldestEvidenceAt??null,v.newestEvidenceAt??null,v.quality,json(v.reasonCodes),json(v.payload)]);},
