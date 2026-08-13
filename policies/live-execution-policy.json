@@ -5,6 +5,17 @@
   "approvalTtlMs": 15000,
   "minDevnetConfirmedRuns": 3,
   "maxActionsPerDay": 2,
-  "maxOpenPositions": 1,
-  "pools": []
+  "maxOpenPositions": 2,
+  "pools": [
+    {
+      "address": "Cfc6zeThDv58QEQqNYN2jfTVKoLhrEevNXesPTQk5yGW",
+      "maxCapitalSol": "0.5",
+      "maxOpenPositions": 1
+    },
+    {
+      "address": "CCHw81WFvz8SE4g9YSxRPs7ndZKhAsMsi2np2M2F6trW",
+      "maxCapitalSol": "0.5",
+      "maxOpenPositions": 1
+    }
+  ]
 }
