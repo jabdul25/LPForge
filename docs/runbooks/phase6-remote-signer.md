@@ -64,8 +64,8 @@ It must return exactly one 64-byte Ed25519 signature:
 
 The signer service must independently verify its configured owner public key, `mainnet-beta`, ticket expiry, and the allowed caller identity. It must retain its private key internally and must never return it through this API.
 
-`pnpm pm2:start-execution` first runs the Phase 6 launch assertion and only then starts the `lpforge-execution` PM2 service. The normal `pnpm pm2:start` starts only the read-only `lpforge-production` monitor.
+`pnpm pm2:start-execution` first runs the persistent Phase 6 authorization assertion and only then starts the `lpforge-execution` PM2 service. The normal `pnpm pm2:start` starts only the read-only `lpforge-production` monitor.
 
-## Manual plan inbox
+## Autonomous decision flow
 
-The execution worker reads the ignored file selected by `LPFORGE_P6_PLAN_INBOX_PATH` (default: `runtime/execution-plan.json`). Copy `runtime/execution-plan.example.json` to that ignored path and give it a unique plan ID. The source only validates and surfaces an operator-created request; it does not build, sign, or submit a transaction. A queued plan remains subject to build, simulation, fresh approval, and every Phase 6 control before any future execution implementation may act on it.
+The normal execution path does not accept a manual plan inbox or a one-shot approval. The enabled `live-execution-policy.json`, configured signer, private write RPC, and the three explicit live switches are the persistent authorization contract. The execution service is reserved for dispatching fresh decisions produced by `lpforge-production`; it still must build, simulate, sign, submit, and reconcile each concrete Meteora action before funds move.
