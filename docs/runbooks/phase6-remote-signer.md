@@ -64,4 +64,8 @@ It must return exactly one 64-byte Ed25519 signature:
 
 The signer service must independently verify its configured owner public key, `mainnet-beta`, ticket expiry, and the allowed caller identity. It must retain its private key internally and must never return it through this API.
 
-`pnpm pm2:start-execution` first runs the Phase 6 launch assertion and only then starts the `lpforge-execution` PM2 service. The normal `pnpm pm2:start` starts only the read-only `lpforge-production` monitor. The runner is intentionally no-plan-source until a separately reviewed plan-dispatch workflow is implemented; it cannot create an autonomous trade by itself.
+`pnpm pm2:start-execution` first runs the Phase 6 launch assertion and only then starts the `lpforge-execution` PM2 service. The normal `pnpm pm2:start` starts only the read-only `lpforge-production` monitor.
+
+## Manual plan inbox
+
+The execution worker reads the ignored file selected by `LPFORGE_P6_PLAN_INBOX_PATH` (default: `runtime/execution-plan.json`). Copy `runtime/execution-plan.example.json` to that ignored path and give it a unique plan ID. The source only validates and surfaces an operator-created request; it does not build, sign, or submit a transaction. A queued plan remains subject to build, simulation, fresh approval, and every Phase 6 control before any future execution implementation may act on it.

@@ -3,6 +3,7 @@ node_modules/
 dist/
 .env
 .env.execution
+runtime/execution-plan.json
 *.log
 coverage/
 .DS_Store
