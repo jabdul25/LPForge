@@ -129,8 +129,8 @@ async function loadSdk() {
   if(!DLMM||typeof DLMM.create!=='function')throw new Error('LPFORGE_METEORA_SDK_INCOMPATIBLE'); return {web3,DLMM};
 }
 
-export function createMeteoraReadAdapter(opts:{rpcUrl:string;cluster:'mainnet-beta'|'devnet';programId:string;expectedSdkVersion?:string;rpcTimeoutMs?:number;onEventDecodeWarning?:(warning:MeteoraEventDecodeWarning)=>void}):MeteoraReadAdapter {
-  const rpc=createSolanaRpcClient({url:opts.rpcUrl,...(opts.rpcTimeoutMs!==undefined?{timeoutMs:opts.rpcTimeoutMs}:{})});
+export function createMeteoraReadAdapter(opts:{rpcUrl:string;cluster:'mainnet-beta'|'devnet';programId:string;expectedSdkVersion?:string;rpcTimeoutMs?:number;rpcMinIntervalMs?:number;rpcMaxRetries?:number;retryBaseDelayMs?:number;retryMaxDelayMs?:number;onEventDecodeWarning?:(warning:MeteoraEventDecodeWarning)=>void}):MeteoraReadAdapter {
+  const rpc=createSolanaRpcClient({url:opts.rpcUrl,...(opts.rpcTimeoutMs!==undefined?{timeoutMs:opts.rpcTimeoutMs}:{}),...(opts.rpcMinIntervalMs!==undefined?{minIntervalMs:opts.rpcMinIntervalMs}:{}),...(opts.rpcMaxRetries!==undefined?{maxRetries:opts.rpcMaxRetries}:{}),...(opts.retryBaseDelayMs!==undefined?{retryBaseDelayMs:opts.retryBaseDelayMs}:{}),...(opts.retryMaxDelayMs!==undefined?{retryMaxDelayMs:opts.retryMaxDelayMs}:{})});
   const clientCache=new Map<string,Promise<Record<string,unknown>>>();
   async function client(address:string):Promise<Record<string,unknown>> { let pending=clientCache.get(address); if(!pending){ pending=(async()=>{const {web3,DLMM}=await loadSdk(); const connection=new web3.Connection(opts.rpcUrl,'confirmed'); const key=new web3.PublicKey(address); const programId=new web3.PublicKey(opts.programId); return DLMM.create(connection,key,{cluster:opts.cluster,programId});})(); clientCache.set(address,pending); } return pending; }
   return {

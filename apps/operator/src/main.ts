@@ -461,6 +461,24 @@ async function liveOnce() {
       2000,
     );
     const decisionAt = new Date().toISOString();
+    const economicRow = await store.loadLatestEconomicEstimate(
+      cfg.smokePoolAddress,
+      decisionAt,
+    );
+    const economicEvidence = economicRow && String(economicRow.fidelity) === "EVENT_PATH_ESTIMATE"
+      ? {
+          fidelity: String(economicRow.fidelity),
+          effectiveSampleCount: Number(economicRow.effective_sample_count),
+          feeRatePerCapitalHour: Number(economicRow.fee_rate_per_capital_hour),
+          uncertainty: Number(economicRow.uncertainty),
+          evidenceAgeSeconds: Number(economicRow.evidence_age_seconds),
+          rawObservationCount: Number(economicRow.raw_observation_count),
+          independentEpisodeCount: Number(economicRow.independent_episode_count),
+          feeObservationCount: Number(economicRow.fee_observation_count),
+          eventPathObservationCount: Number(economicRow.event_path_observation_count),
+          sourceHashes: (economicRow.source_hashes ?? {}) as Record<string, unknown>,
+        }
+      : undefined;
     const priorRegimeAssessments = await store.loadRegimeAssessmentHistory(
       cfg.smokePoolAddress,
       decisionAt,
@@ -493,6 +511,7 @@ async function liveOnce() {
       priorRegimeAssessments,
       protocolCompatible: true,
       walletCapital,
+      ...(economicEvidence ? { economicEvidence } : {}),
       ...(swapQuoteProvider ? { swapQuoteProvider } : {}),
       ...(process.env.LPFORGE_OPERATOR_OWNER_ADDRESS
         ? { ownerAddress: process.env.LPFORGE_OPERATOR_OWNER_ADDRESS }

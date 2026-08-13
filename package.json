@@ -73,6 +73,7 @@
     "canary:gate-status": "node --enable-source-maps .build/apps/canary/src/main.js gate-status",
     "canary:assert-read-only": "node --enable-source-maps .build/apps/canary/src/main.js assert-read-only",
     "discovery:once": "node --enable-source-maps .build/apps/discovery/src/main.js once",
+    "discovery:collect-once": "node --enable-source-maps .build/apps/discovery/src/main.js collect-once",
     "discovery:start": "node --enable-source-maps .build/apps/discovery/src/main.js start",
     "discovery:status": "node --enable-source-maps .build/apps/discovery/src/main.js status",
     "verify:discovery": "node scripts/verify-discovery-boundary.mjs",
