@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "enabled": true,
+  "outOfRangeAction": "RESHAPE",
+  "claimAccruedFees": true,
+  "missingPositionAction": "HOLD",
+  "replacementRange": "PRESERVE_WIDTH_CENTER_ACTIVE",
+  "planTtlMs": 300000
+}

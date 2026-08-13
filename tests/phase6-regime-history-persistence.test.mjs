@@ -40,8 +40,8 @@ test('v1.0.7 live operator loads only bounded strictly-prior regime history and 
   const operator=await readFile(new URL('../apps/operator/src/main.ts',import.meta.url),'utf8');
   const runtime=await readFile(new URL('../packages/operational-runtime/src/index.ts',import.meta.url),'utf8');
   assert.match(db,/decision_at<\$2 ORDER BY decision_at DESC LIMIT \$3/);
-  assert.match(db,/Math\.min\(500,limit\)/);
-  assert.match(operator,/loadRegimeAssessmentHistory\(cfg\.smokePoolAddress,decisionAt,120\)/);
-  assert.match(operator,/history,priorRegimeAssessments,protocolCompatible:true/);
+  assert.match(db,/Math\.min\(500,\s*limit\)/);
+  assert.match(operator,/loadRegimeAssessmentHistory\(\s*cfg\.smokePoolAddress,\s*decisionAt,\s*120,?\s*\)/);
+  assert.match(operator,/history,\s*priorRegimeAssessments,\s*protocolCompatible:\s*true/);
   assert.match(runtime,/priorRegimeAssessments:input\.priorRegimeAssessments\?\?\[\]/);
 });

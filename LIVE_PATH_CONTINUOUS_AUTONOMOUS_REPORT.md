@@ -2,7 +2,7 @@
 
 Generated: 2026-08-13T11:37:58Z  
 Repository: `/root/systems/LPForge`  
-Current implementation commit: `3b4f58e`
+Baseline implementation commit: `3b4f58e` (superseded by the lifecycle completion update below)
 
 ## Executive status
 
@@ -312,3 +312,81 @@ The execution worker was deliberately stopped during this deployment and
 remains stopped. Before it is re-armed, it needs the independent enforcement
 patch identified above: validate plan provenance and validate the plan's
 pool/capital/position facts against the execution policy at claim time.
+
+## Lifecycle completion update (2026-08-13T12:55:28Z)
+
+This update completes the implementation work that was previously listed as
+remaining in the live lifecycle handoff. It does not start the execution
+worker or send a transaction.
+
+### Owned-position production loop
+
+`lpforge-production` now loads the persisted LPForge-owned PositionV2 records
+for its public owner, reads each position and its pool's active bin from
+Meteora, and stores a `position_observations` record every cycle. The new
+versioned policy file `policies/live-position-management-policy.json` governs
+management behavior. It currently:
+
+- claims accrued fees for an in-range owned position;
+- creates a deduplicated `RESHAPE` plan when an owned position is out of
+  range, preserving its current strategy and width while re-centering on the
+  active bin; and
+- holds rather than guessing when chain position truth is missing.
+
+Production has no signer capability. It writes only PostgreSQL evidence and
+transaction plans. The execution worker remains the only process that can
+load the local owner signer.
+
+### Ordered reshape/rebalance lifecycle
+
+The execution worker now processes `RESHAPE` and `REBALANCE` as an enforced
+ordered lifecycle:
+
+1. Build, simulate, sign, submit, and confirm a full old-position removal.
+2. Read the old PositionV2 on-chain; it must be absent before proceeding.
+3. Refresh native and pool-token wallet facts.
+4. Mark the old LPForge owned-position record closed and persist the
+   reconciliation evidence.
+5. Generate a fresh in-memory replacement PositionV2 signer, rebuild the
+   Meteora open transaction from the reconciled removed liquidity, and then
+   follow the normal simulation/risk/sign/submit/reconcile path.
+
+The read-only producer never creates a replacement keypair. The executor
+creates it only after removal reconciliation and keeps its private component
+in memory for that transaction only.
+
+### Chain-aware recovery
+
+Execution now creates a durable journal before a plan is worked and records
+the submitted signature when one exists. Recovery obtains RPC signature
+status and Meteora position truth before it changes a pending plan. It keeps
+valid unknown submissions in a no-resend state, permits a rebuild only after
+expiry plus proven absence, and records reconciliation evidence when an
+economic effect is proven. A reshape/rebalance with only the old-position
+effect proven remains in reconciliation rather than being falsely completed.
+
+### Validation and current state
+
+`pnpm test:ci` passed after this update:
+
+- TypeScript typecheck and build: PASS
+- Test suite: PASS, 378 tests
+- Phase 1–7 boundary checks: PASS
+- Migration static validation: PASS, M0001–M0029
+- `git diff --check`: PASS
+
+Additional tests cover policy decisions for owned positions, duplicate journal
+ownership/version conflicts, no-resend recovery behavior, and the required
+remove → reconcile → wallet-refresh → replacement-open ordering.
+
+Current PM2 state at update time: `lpforge-production` is online and
+`lpforge-execution` is stopped. No transaction was signed or sent while
+implementing or validating this lifecycle update.
+
+### Execution-start recovery correction
+
+Before the execution worker was re-armed, its standalone recovery command was
+found to close its PostgreSQL client before the asynchronous recovery scan had
+finished. The command now awaits the scan before closing the client. A live
+`recover-once` check completed with an empty recovery queue, followed by a
+full passing `pnpm test:ci` run (378 tests and all Phase 1–7 boundaries).
