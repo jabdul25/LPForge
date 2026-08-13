@@ -6,6 +6,14 @@
   "minDevnetConfirmedRuns": 3,
   "maxActionsPerDay": 2,
   "maxOpenPositions": 2,
+  "productionAdmission": {
+    "enabled": true,
+    "eligibleTiers": ["A"],
+    "maxCandidates": 10,
+    "maxCandidateAgeMs": 900000,
+    "maxCapitalSol": "0.02",
+    "maxOpenPositions": 1
+  },
   "pools": [
     {
       "address": "Cfc6zeThDv58QEQqNYN2jfTVKoLhrEevNXesPTQk5yGW",

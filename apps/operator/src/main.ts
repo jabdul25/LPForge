@@ -71,6 +71,8 @@ async function persistTransactionPlan(
         producer: "LPFORGE_PRODUCTION",
         schemaVersion: 1,
         intentId: plan.intent.intentId,
+        poolAddress: plan.intent.poolAddress,
+        observedAt: plan.intent.observedAt,
       },
       intent: {
         capitalLamports: plan.intent.capitalLamports?.toString(),

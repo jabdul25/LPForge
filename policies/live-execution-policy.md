@@ -29,7 +29,26 @@ The only related environment entry is `LPFORGE_EXECUTION_POLICY_PATH`, which sel
 
 ## Discovery boundary
 
-Discovery D1–D8 can screen and rank pools in PostgreSQL, but it never changes
-this execution allowlist. A discovery result therefore cannot obtain signing,
-submission, capital, or executable-pool authority. Adding a pool here remains
-an explicit, reviewable policy change.
+Discovery D1–D8 can screen and rank pools in PostgreSQL, but discovery alone
+cannot obtain signing, submission, capital, or executable-pool authority.
+Production must first evaluate a candidate and emit an attributable plan. The
+execution worker then independently validates that the candidate is still
+fresh, `ACTIVE_CANDIDATE`, in an admitted tier, within the policy's candidate
+budget, capital and position limits, and that its plan provenance matches the
+pool and observation timestamp.
+
+```json
+{
+  "productionAdmission": {
+    "enabled": true,
+    "eligibleTiers": ["A"],
+    "maxCandidates": 10,
+    "maxCandidateAgeMs": 900000,
+    "maxCapitalSol": "0.02",
+    "maxOpenPositions": 1
+  }
+}
+```
+
+This is the configurable bridge from production evaluation to execution; the
+static `pools` list remains valid for deliberately pinned pools.

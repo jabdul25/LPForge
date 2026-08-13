@@ -127,7 +127,10 @@ async function dispatchOne() {
         process.env.LPFORGE_EXECUTION_POLICY_PATH?.trim() ||
           "policies/live-execution-policy.json",
       ),
-      owned = await store.loadOwnedPositions(plan.ownerAddress);
+      [owned,productionCandidates] = await Promise.all([
+        store.loadOwnedPositions(plan.ownerAddress),
+        store.listDiscoveryCandidates([...(staticPolicy.productionAdmission?.eligibleTiers??['A'])]),
+      ]);
     let positionTruth;
     if (plan.positionAddress) {
       try {
@@ -145,6 +148,8 @@ async function dispatchOne() {
       plan,
       policy: staticPolicy,
       ownedPositions: owned,
+      productionCandidates,
+      now: new Date().toISOString(),
       ...(positionTruth ? { positionTruth } : {}),
     });
     if (!guard.approved) {
