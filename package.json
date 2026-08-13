@@ -75,7 +75,10 @@
     "discovery:once": "node --enable-source-maps .build/apps/discovery/src/main.js once",
     "discovery:start": "node --enable-source-maps .build/apps/discovery/src/main.js start",
     "discovery:status": "node --enable-source-maps .build/apps/discovery/src/main.js status",
-    "verify:discovery": "node scripts/verify-discovery-boundary.mjs"
+    "verify:discovery": "node scripts/verify-discovery-boundary.mjs",
+    "discovery:learn-once": "node --enable-source-maps .build/apps/discovery-learning/src/main.js once",
+    "discovery:learn-start": "node --enable-source-maps .build/apps/discovery-learning/src/main.js start",
+    "test:discovery": "node --test tests/pool-discovery-d1d2.test.mjs tests/pool-discovery-d3d8.test.mjs"
   },
   "dependencies": {
     "@meteora-ag/dlmm": "1.9.10",

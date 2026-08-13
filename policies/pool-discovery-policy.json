@@ -6,7 +6,7 @@
   "manualPools": [],
   "maxUniverse": 250,
   "pageSize": 250,
-  "maxDeepScreen": 40,
+  "maxDeepScreen": 10,
   "maxActiveCandidates": 10,
   "maxWatchlist": 30,
   "minTvlUsd": 25000,

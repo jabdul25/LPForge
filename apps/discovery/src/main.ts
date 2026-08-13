@@ -2,6 +2,9 @@ import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { createMeteoraDataApi } from '../../../packages/data-api/src/index.js';
 import { createPostgresStore } from '../../../packages/db/src/index.js';
+import { loadPhase1Config } from '../../../packages/config/src/index.js';
+import { createMeteoraReadAdapter, createSolanaRpcClient } from '../../../packages/meteora/src/index.js';
+import { runDeepDiscoveryCycle } from '../../../packages/discovery-runtime/src/index.js';
 import { discoverUniverse, parseDiscoveryPolicy, type DiscoveryPolicy, type RankedDiscoveryPool } from '../../../packages/pool-discovery/src/index.js';
 
 function json(v:unknown){return JSON.stringify(v,(_,x)=>typeof x==='bigint'?x.toString():x,2)}
@@ -17,7 +20,7 @@ function cycleId(policyId:string,observedAt:string){return createHash('sha256').
 function reasonCodes(r:RankedDiscoveryPool){return [...new Set([...r.hardReasons,...r.warnings,...r.selectionReasons])].sort()}
 async function once(){
   const policy=await loadPolicy();
-  const api=createMeteoraDataApi({...((process.env.LPFORGE_METEORA_DATA_API_URL??'').trim()?{baseUrl:process.env.LPFORGE_METEORA_DATA_API_URL!}:{}),maxRps:Number(process.env.LPFORGE_DATA_API_MAX_RPS??25),timeoutMs:Number(process.env.LPFORGE_HTTP_TIMEOUT_MS??10000)});
+  const api=createMeteoraDataApi({...((process.env.LPFORGE_METEORA_DATA_API_URL??'').trim()?{baseUrl:process.env.LPFORGE_METEORA_DATA_API_URL!}:{}),maxRps:Number(process.env.LPFORGE_DATA_API_MAX_RPS??1),timeoutMs:Number(process.env.LPFORGE_HTTP_TIMEOUT_MS??10000)});
   const result=await discoverUniverse(api,policy);
   const databaseUrl=env('DATABASE_URL');const store=await createPostgresStore(databaseUrl);const rankingCycleId=cycleId(policy.policyId,result.observedAt);
   try{
@@ -29,7 +32,16 @@ async function once(){
     }
     for(const r of result.rankings)await store.insertDiscoveryRanking({rankingCycleId,poolAddress:r.pool.address,observedAt:result.observedAt,policyId:policy.policyId,rank:r.rank,universePercentile:r.universePercentile,feePercentile:r.feePercentile,volumePercentile:r.volumePercentile,liquidityPercentile:r.liquidityPercentile,priorityScore:r.priorityScore,state:r.state,tier:r.tier,reasonCodes:reasonCodes(r),payload:{marketCapCohort:r.features.marketCapCohort,source:r.source}});
     const staleCutoff=new Date(Date.parse(result.observedAt)-policy.staleAfterMs).toISOString();const staleMarked=await store.markDiscoveryPoolsStale(staleCutoff,result.observedAt);
-    const summary={status:'PASS',authority:'DISCOVERY_ONLY_NO_EXECUTION',observedAt:result.observedAt,policyId:policy.policyId,rankingCycleId,enumerated:result.enumeratedCount,deduplicated:result.deduplicatedCount,accepted:result.accepted.length,rejected:result.rejected.length,deepScreenQueue:result.deepScreenQueue.length,staleMarked,tierA:result.rankings.filter(x=>x.tier==='A').length,tierB:result.rankings.filter(x=>x.tier==='B').length,tierC:result.rankings.filter(x=>x.tier==='C').length,top:result.rankings.slice(0,10).map(x=>({rank:x.rank,pool:x.pool.address,name:x.features.name,score:x.priorityScore,state:x.state,tier:x.tier,marketCapCohort:x.features.marketCapCohort,feeTvl1h:x.features.feeTvl1h,volume1hUsd:x.features.volume1hUsd,tvlUsd:x.features.tvlUsd,reasons:reasonCodes(x)}))};console.log(json(summary));return summary;
+    let deep:Awaited<ReturnType<typeof runDeepDiscoveryCycle>>|undefined;
+    if((process.env.LPFORGE_DISCOVERY_DEEP_ENABLED??'true').toLowerCase()==='true'&&result.deepScreenQueue.length){
+      const cfg=loadPhase1Config();if(cfg.dataMode!=='LIVE_READ_ONLY')throw new Error('LPFORGE_DISCOVERY_DEEP_REQUIRES_LIVE_READ_ONLY');
+      const adapter=createMeteoraReadAdapter({rpcUrl:cfg.solanaRpcHttpUrl,cluster:cfg.cluster,programId:cfg.programId,expectedSdkVersion:cfg.expectedSdkVersion,rpcTimeoutMs:cfg.rpcTimeoutMs});
+      const rpc=createSolanaRpcClient({url:cfg.solanaRpcHttpUrl,timeoutMs:cfg.rpcTimeoutMs,minIntervalMs:cfg.rpcMinIntervalMs,maxRetries:cfg.rpcMaxRetries,retryBaseDelayMs:cfg.rpcRetryBaseDelayMs,retryMaxDelayMs:cfg.rpcRetryMaxDelayMs});
+      deep=await runDeepDiscoveryCycle({api,adapter,rpc,store,cheapQueue:result.deepScreenQueue,observedAt:result.observedAt});
+      const byPool=new Map(deep.assignments.map(x=>[x.poolAddress,x]));
+      for(const r of result.rankings){const a=byPool.get(r.pool.address);if(!a)continue;await store.upsertDiscoveryPool({poolAddress:r.pool.address,observedAt:result.observedAt,sourceManual:r.source==='MANUAL'||r.source==='BOTH',sourceAuto:r.source==='AUTO'||r.source==='BOTH',tokenXMint:r.features.tokenX,tokenYMint:r.features.tokenY,pairedTokenMint:r.features.pairedTokenMint,pairedTokenSymbol:r.features.pairedTokenSymbol,marketCapCohort:r.features.marketCapCohort,state:a.tier==='A'?'ACTIVE_CANDIDATE':a.tier==='B'?'WATCHLIST':a.tier==='REJECTED'?'REJECTED':a.tier==='QUARANTINED'?'QUARANTINED':'QUALIFIED',tier:a.tier,priorityScore:a.deepPriority,rank:a.rank??undefined,universePercentile:r.universePercentile,reasonCodes:a.selectionReason,evidenceState:r.features.evidence,payload:{policyId:policy.policyId,deepScreened:true,control:a.control,opportunityHalfLifeMinutes:a.opportunityHalfLifeMinutes}});}
+    }
+    const summary={status:'PASS',authority:'DISCOVERY_ONLY_NO_EXECUTION',observedAt:result.observedAt,policyId:policy.policyId,rankingCycleId,enumerated:result.enumeratedCount,deduplicated:result.deduplicatedCount,accepted:result.accepted.length,rejected:result.rejected.length,deepScreenQueue:result.deepScreenQueue.length,deepScreened:deep?.deep.length??0,predictions:deep?.predictions.length??0,baselines:deep?.baselines??{},staleMarked,tierA:deep?.assignments.filter(x=>x.tier==='A').length??0,tierB:deep?.assignments.filter(x=>x.tier==='B').length??0,tierControl:deep?.assignments.filter(x=>x.tier==='CONTROL').length??0,top:result.rankings.slice(0,10).map(x=>({rank:x.rank,pool:x.pool.address,name:x.features.name,score:x.priorityScore,marketCapCohort:x.features.marketCapCohort,feeTvl1h:x.features.feeTvl1h,volume1hUsd:x.features.volume1hUsd,tvlUsd:x.features.tvlUsd,reasons:reasonCodes(x)}))};console.log(json(summary));return summary;
   } finally {await store.close()}
 }
 async function status(){const store=await createPostgresStore(env('DATABASE_URL'));try{console.log(json({authority:'DISCOVERY_ONLY_NO_EXECUTION',candidates:await store.listDiscoveryCandidates(['A','B','C'])}))}finally{await store.close()}}

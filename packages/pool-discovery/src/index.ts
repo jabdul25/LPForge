@@ -79,7 +79,7 @@ export interface DiscoveryUniverseResult {
   deduplicatedCount: number;
   accepted: CheapScreenResult[];
   rejected: CheapScreenResult[];
-  deepScreenQueue: CheapScreenResult[];
+  deepScreenQueue: RankedDiscoveryPool[];
   rankings: RankedDiscoveryPool[];
 }
 
