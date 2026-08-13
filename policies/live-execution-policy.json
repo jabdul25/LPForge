@@ -14,6 +14,12 @@
     "maxCapitalSol": "0.5",
     "maxOpenPositions": 1
   },
+  "productionCapital": {
+    "reserveSol": "0.01",
+    "maxPortfolioCapitalSol": "0.5",
+    "maxTokenCapitalSol": "0.5",
+    "minAllocationSol": "0.01"
+  },
   "pools": [
     {
       "address": "Cfc6zeThDv58QEQqNYN2jfTVKoLhrEevNXesPTQk5yGW",

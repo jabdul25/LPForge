@@ -37,6 +37,7 @@ import {
   fixturePool,
   fixtureSwaps,
 } from "../../../packages/test-fixtures/src/index.js";
+import { loadMainnetCanaryDeploymentPolicyFile } from "../../../packages/canary/src/index.js";
 
 function json(v: unknown) {
   return JSON.stringify(
@@ -44,6 +45,32 @@ function json(v: unknown) {
     (_, x) => (typeof x === "bigint" ? x.toString() : x),
     2,
   );
+}
+const lamportsToSol = (value: bigint) => Number(value) / 1_000_000_000;
+function loadProductionCapitalEnvelope(poolAddress: string) {
+  const deployment = loadMainnetCanaryDeploymentPolicyFile(
+    process.env.LPFORGE_EXECUTION_POLICY_PATH ?? "policies/live-execution-policy.json",
+  );
+  if (deployment.status !== "ENABLED" || !deployment.productionCapital)
+    throw new Error("LPFORGE_PRODUCTION_CAPITAL_POLICY_REQUIRED");
+  const pool = deployment.pools.find((x) => x.address === poolAddress);
+  const admission = deployment.productionAdmission?.enabled
+    ? deployment.productionAdmission
+    : undefined;
+  const maxPoolLamports = pool?.maxCapitalLamports ?? admission?.maxCapitalLamports;
+  if (!maxPoolLamports)
+    throw new Error("LPFORGE_PRODUCTION_CAPITAL_POOL_LIMIT_REQUIRED");
+  const capital = deployment.productionCapital;
+  return {
+    productionCapitalPolicy: {
+      id: `${deployment.policyId}:production-capital-v1`,
+      reserveCapital: lamportsToSol(capital.reserveLamports),
+      maxPortfolioCapital: lamportsToSol(capital.maxPortfolioLamports),
+      maxTokenCapital: lamportsToSol(capital.maxTokenLamports),
+      minAllocation: lamportsToSol(capital.minAllocationLamports),
+    },
+    productionPoolCapital: lamportsToSol(maxPoolLamports),
+  };
 }
 async function persistTransactionPlan(
   store: Phase1Store,
@@ -522,6 +549,7 @@ async function liveOnce() {
       process.env.LPFORGE_AUTONOMOUS_ENTRY_POLICY_PATH ??
         "policies/autonomous-entry-policy.json",
     );
+    const productionCapital = loadProductionCapitalEnvelope(pool.address);
     const swapQuoteProvider =
       entryPolicy.status === "ENABLED"
         ? createJupiterSwapQuoteProvider({
@@ -540,6 +568,8 @@ async function liveOnce() {
       priorRegimeAssessments,
       protocolCompatible: true,
       walletCapital,
+      ...productionCapital,
+      planPreparationEnabled: allowEconomicPlans,
       ...(economicEvidence ? { economicEvidence } : {}),
       ...(evidenceMaturity ? { evidenceMaturity } : {}),
       ...(swapQuoteProvider ? { swapQuoteProvider } : {}),

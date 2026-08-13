@@ -5,6 +5,27 @@ export interface ExposureState {deployed:number;poolExposure:Record<string,numbe
 export interface CapitalAllocation {requestId:string;pool:string;token:string;allocated:number;requested:number;reasonCodes:string[];}
 export interface CapitalAllocationResult {policyId:string;walletCapital:number;feeAndSafetyReserve:number;deployableLimit:number;allocations:CapitalAllocation[];totalAllocated:number;remainingDeployable:number;}
 const clamp=(x:number,min=0,max=1)=>Math.max(min,Math.min(max,x));
+
+/**
+ * Production sizing deliberately does not repeat Phase-4 thesis scoring.
+ * Phase 4 decides whether an entry is worthwhile; this layer applies only
+ * configured capital envelopes, exposure facts, and minimum executable size.
+ */
+export interface ProductionCapitalPolicy {id:string;reserveCapital:number;maxPortfolioCapital:number;maxTokenCapital:number;minAllocation:number;}
+export interface ProductionCapitalRequest {id:string;pool:string;token:string;requested:number;maxPoolCapital:number;entryReady:boolean;expectedNetValue:number;}
+export function allocateProductionCapital(input:{walletCapital:number;requests:ProductionCapitalRequest[];exposure?:ExposureState;policy:ProductionCapitalPolicy}):CapitalAllocationResult{
+ const p=input.policy;if(!(input.walletCapital>0)||!(p.maxPortfolioCapital>0)||!(p.maxTokenCapital>0)||!(p.minAllocation>0)||p.reserveCapital<0)throw new Error('LPFORGE_PRODUCTION_CAPITAL_POLICY');
+ const ex=input.exposure??{deployed:0,poolExposure:{},tokenExposure:{},reserved:0},reserve=Math.max(p.reserveCapital,ex.reserved),deployableLimit=Math.max(0,Math.min(input.walletCapital-reserve,p.maxPortfolioCapital)-ex.deployed);let remaining=deployableLimit;const pool={...ex.poolExposure},token={...ex.tokenExposure},allocations:CapitalAllocation[]=[];
+ for(const r of [...input.requests].sort((a,b)=>a.id.localeCompare(b.id))){const reasons:string[]=[];const requested=Math.max(0,r.requested),poolCap=Math.max(0,r.maxPoolCapital-(pool[r.pool]??0)),tokenCap=Math.max(0,p.maxTokenCapital-(token[r.token]??0));let amount=Math.min(requested,poolCap,tokenCap,remaining);
+  if(!r.entryReady){amount=0;reasons.push('CAPITAL_ENTRY_NOT_READY');}
+  if(!(r.expectedNetValue>0)){amount=0;reasons.push('CAPITAL_EXPECTED_VALUE_NON_POSITIVE');}
+  if(amount<p.minAllocation){if(amount>0)reasons.push('CAPITAL_BELOW_MINIMUM');amount=0;}
+  if(poolCap<=0)reasons.push('CAPITAL_POOL_LIMIT');if(tokenCap<=0)reasons.push('CAPITAL_TOKEN_LIMIT');if(remaining<=0)reasons.push('CAPITAL_GLOBAL_LIMIT');
+  if(amount>0){pool[r.pool]=(pool[r.pool]??0)+amount;token[r.token]=(token[r.token]??0)+amount;remaining-=amount;reasons.push('CAPITAL_ALLOCATED');}
+  allocations.push({requestId:r.id,pool:r.pool,token:r.token,allocated:amount,requested,reasonCodes:reasons});
+ }
+ const totalAllocated=allocations.reduce((a,b)=>a+b.allocated,0);return{policyId:p.id,walletCapital:input.walletCapital,feeAndSafetyReserve:reserve,deployableLimit,allocations,totalAllocated,remainingDeployable:Math.max(0,remaining)};
+}
 export function allocateCapital(input:{walletCapital:number;requests:CapitalRequest[];exposure?:ExposureState;policy?:CapitalPolicy;}):CapitalAllocationResult{
  const p=input.policy??CAPITAL_RESEARCH_POLICY_V1;if(!(input.walletCapital>0))throw new Error('LPFORGE_CAPITAL_INVALID_WALLET');
  const ex=input.exposure??{deployed:0,poolExposure:{},tokenExposure:{},reserved:0};
