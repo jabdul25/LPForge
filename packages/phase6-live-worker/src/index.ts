@@ -147,7 +147,13 @@ function ledger(store: Phase1Store): SubmissionLedger {
       }),
   };
 }
-async function recordJournal(store: Phase1Store, plan: AutonomousPlan, state: string, payload: Record<string, unknown>, signature?: string) {
+async function recordJournal(
+  store: Phase1Store,
+  plan: AutonomousPlan,
+  state: string,
+  payload: Record<string, unknown>,
+  signature?: string,
+) {
   const existing = await store.getExecutionJournal(plan.idempotencyKey);
   if (!existing) {
     await store.createExecutionJournal({
@@ -651,7 +657,17 @@ export async function executeAutonomousOpen(input: {
       transport: createWeb3SubmissionTransport(connection),
       submittedAt: signedAt,
     });
-    await recordJournal(input.store, input.plan as unknown as AutonomousPlan, "SUBMITTED", { action: "OPEN", transactionId: input.plan.transactionId, positionAddress: prepared.positionSigner.publicKeyAddress }, submitted.signature);
+    await recordJournal(
+      input.store,
+      input.plan as unknown as AutonomousPlan,
+      "SUBMITTED",
+      {
+        action: "OPEN",
+        transactionId: input.plan.transactionId,
+        positionAddress: prepared.positionSigner.publicKeyAddress,
+      },
+      submitted.signature,
+    );
     await input.store.completeAutonomousPlan({
       planId: input.plan.planId,
       state: "SUBMITTED",
@@ -812,6 +828,396 @@ export async function executeAutonomousOpen(input: {
       transactionSubmitted: false,
     };
   }
+}
+
+async function unwindPartialEntry(input: {
+  store: Phase1Store;
+  plan: AutonomousPlan;
+  row: Record<string, unknown>;
+  signer: MainnetSignerBackend;
+  config: LiveWorkerConfig;
+}): Promise<{ ok: boolean; reasonCodes: string[] }> {
+  const amount = BigInt(String(input.row.paired_token_amount)),
+    connection = new Connection(input.config.rpcUrl, "confirmed"),
+    adapter = createMeteoraReadAdapter({
+      rpcUrl: input.config.rpcUrl,
+      cluster: "mainnet-beta",
+      programId: input.config.programId,
+    }),
+    pool = await adapter.getPool(input.plan.poolAddress),
+    policy = loadAutonomousEntryPolicy(),
+    quote = await readJupiterMetisQuote({
+      policy: policy.swapQuote,
+      inputMint: pool.tokenXMint,
+      outputMint: pool.tokenYMint,
+      amount,
+      ...(process.env.LPFORGE_JUPITER_API_KEY
+        ? { apiKey: process.env.LPFORGE_JUPITER_API_KEY }
+        : {}),
+    }),
+    assessment = assessSwapQuote({
+      quote,
+      policy: policy.swapQuote,
+      inputMint: pool.tokenXMint,
+      outputMint: pool.tokenYMint,
+      inputAmount: amount,
+      requiredOutputAmount: 1n,
+    });
+  if (assessment.status !== "APPROVED")
+    return { ok: false, reasonCodes: assessment.reasonCodes };
+  const bytes = await buildJupiterMetisSwapTransaction({
+      policy: policy.swapQuote,
+      quote,
+      userPublicKey: input.plan.ownerAddress,
+      ...(process.env.LPFORGE_JUPITER_API_KEY
+        ? { apiKey: process.env.LPFORGE_JUPITER_API_KEY }
+        : {}),
+    }),
+    transaction = VersionedTransaction.deserialize(bytes),
+    transactionId = `${input.plan.planId}:unwind`,
+    simulatedAt = new Date().toISOString(),
+    simulation = await simulateExecutionTransaction({
+      authority: authority(
+        "MAINNET_BUILD_SIMULATE",
+        simulatedAt,
+        input.config.riskPermitTtlMs,
+      ),
+      transactionId,
+      transaction,
+      transport: createWeb3SimulationTransport(connection),
+      simulatedAt,
+      freshnessMs: input.config.simulationFreshnessMs,
+    });
+  await input.store.insertExecutionSimulation({
+    transactionId,
+    simulatedAt: simulation.simulatedAt,
+    freshUntil: simulation.simulationFreshUntil,
+    ok: simulation.ok,
+    ...(simulation.unitsConsumed !== undefined
+      ? { unitsConsumed: simulation.unitsConsumed }
+      : {}),
+    logs: simulation.logs,
+    ...(simulation.error ? { error: simulation.error } : {}),
+    payload: { planId: input.plan.planId, stage: "PARTIAL_ENTRY_UNWIND" },
+  });
+  const fee = estimateExecutionFee({
+      signatureCount: 1,
+      computeUnitLimit: simulation.recommendedComputeUnitLimit ?? 0,
+      computeUnitPriceMicroLamports: 0n,
+    }),
+    cost = assessExecutionCost(fee, amount, {
+      maxAbsoluteFeeLamports: input.config.maxFeeLamports,
+      maxFeeFractionOfCapital: input.config.maxFeeFraction,
+    }),
+    risk = governExecutionRisk(
+      {
+        action: "CLOSE",
+        planId: transactionId,
+        now: simulatedAt,
+        thesisExpiresAt: input.plan.expiresAt,
+        planExpiresAt: new Date(
+          Date.now() + input.config.riskPermitTtlMs,
+        ).toISOString(),
+        simulationOk: simulation.ok,
+        simulationFreshUntil: simulation.simulationFreshUntil,
+        walletTruthConsistent: true,
+        protocolCompatible: true,
+        rpcHealthy: true,
+        referenceDivergenceBps: 0,
+        activeBinId: 0,
+        intendedCenterBinId: 0,
+        costApproved: cost.approved,
+        reconciliationRequired: false,
+        globalKillSwitch: false,
+        liquidityCollapse: false,
+      },
+      {
+        maxReferenceDivergenceBps: 100,
+        maxActiveBinDriftBins: 100000,
+        approvalTtlMs: input.config.riskPermitTtlMs,
+        allowEmergencyCostOverride: false,
+      },
+    );
+  if (risk.decision !== "APPROVE" || !risk.permitId || !risk.expiresAt)
+    return { ok: false, reasonCodes: risk.reasonCodes };
+  await input.store.insertExecutionRiskPermit({
+    permitId: risk.permitId,
+    planId: input.plan.planId,
+    decision: risk.decision,
+    issuedAt: risk.issuedAt,
+    expiresAt: risk.expiresAt,
+    reasonCodes: risk.reasonCodes,
+    payload: { stage: "PARTIAL_ENTRY_UNWIND" },
+  });
+  const signedAt = new Date().toISOString(),
+    closeTicket = ticket(
+      input.plan,
+      0n,
+      signedAt,
+      input.config.riskPermitTtlMs,
+      "CLOSE",
+    ),
+    closeAuthority = {
+      phase: "P6" as const,
+      cluster: "mainnet-beta" as const,
+      level: "MAINNET_CANARY_CLOSE" as const,
+      liveExecution: true as const,
+      canaryOnly: true as const,
+      issuedAt: signedAt,
+      expiresAt: closeTicket.expiresAt,
+      ticketId: closeTicket.ticketId,
+      reasonCodes: ["P6_PARTIAL_ENTRY_UNWIND"],
+    },
+    envelope = createVersionedMainnetEnvelope(transaction);
+  await signMainnetCanary({
+    authority: closeAuthority,
+    ticket: closeTicket,
+    transactionId,
+    requiredSignerAddresses: [input.plan.ownerAddress],
+    backend: input.signer,
+    envelope,
+    signedAt,
+  });
+  const record = await submitSignedTransaction({
+    authority: authority(
+      "MAINNET_CANARY",
+      signedAt,
+      input.config.riskPermitTtlMs,
+    ),
+    riskDecision: risk,
+    transactionId,
+    idempotencyKey: `${input.plan.idempotencyKey}:unwind`,
+    attempt: 1,
+    raw: envelope.serializeSigned(),
+    lease: {
+      blockhash: transaction.message.recentBlockhash,
+      lastValidBlockHeight: (await connection.getBlockHeight()) + 150,
+    },
+    ledger: ledger(input.store),
+    transport: createWeb3SubmissionTransport(connection),
+    submittedAt: signedAt,
+  });
+  if (
+    !(await awaitConfirmation({
+      connection,
+      store: input.store,
+      transactionId,
+      idempotencyKey: `${input.plan.idempotencyKey}:unwind`,
+      signature: record.signature,
+      lease: record,
+      pollMs: input.config.confirmPollMs,
+      attempts: input.config.confirmAttempts,
+    }))
+  )
+    return {
+      ok: false,
+      reasonCodes: ["P6_PARTIAL_UNWIND_CONFIRMATION_PENDING"],
+    };
+  return { ok: true, reasonCodes: ["P6_PARTIAL_UNWIND_RECONCILED"] };
+}
+
+/** Resumes a funded entry without ever repeating the already-confirmed Jupiter swap. */
+export async function recoverPartialEntryFunding(input: {
+  store: Phase1Store;
+  signer: MainnetSignerBackend;
+  config: LiveWorkerConfig;
+}): Promise<
+  Array<{
+    planId: string;
+    action: "RESUME_OPEN" | "UNWIND_REQUIRED" | "HOLD";
+    reasonCodes: string[];
+  }>
+> {
+  const rows = await input.store.loadPartialEntryRecoveries();
+  const results: Array<{
+    planId: string;
+    action: "RESUME_OPEN" | "UNWIND_REQUIRED" | "HOLD";
+    reasonCodes: string[];
+  }> = [];
+  for (const row of rows) {
+    const planId = String(row.plan_id),
+      state = String(row.state);
+    if (state !== "ENTRY_FUNDED_NOT_OPEN" && state !== "RESUME_OPEN") {
+      results.push({
+        planId,
+        action: "HOLD",
+        reasonCodes: [`P6_PARTIAL_${state}`],
+      });
+      continue;
+    }
+    const plan = await input.store.loadAutonomousPlan(planId);
+    if (!plan || plan.action !== "OPEN") {
+      await input.store.upsertPartialEntryRecovery({
+        planId,
+        poolAddress: String(row.pool_address),
+        ownerAddress: String(row.owner_address),
+        tokenMint: String(row.token_mint),
+        fundingTransactionId: String(row.funding_transaction_id),
+        fundingSignature: String(row.funding_signature),
+        fundedAt: new Date(String(row.funded_at)).toISOString(),
+        pairedTokenAmount: String(row.paired_token_amount),
+        intendedCapitalLamports: BigInt(String(row.intended_capital_lamports)),
+        intendedRange: (row.intended_range ?? {}) as Record<string, unknown>,
+        state: "UNWIND_REQUIRED",
+        walletTruth: { refreshRequired: true },
+        payload: { reasonCodes: ["P6_PARTIAL_PLAN_MISSING_OR_INVALID"] },
+        updatedAt: new Date().toISOString(),
+      });
+      results.push({
+        planId,
+        action: "UNWIND_REQUIRED",
+        reasonCodes: ["P6_PARTIAL_PLAN_MISSING_OR_INVALID"],
+      });
+      continue;
+    }
+    if (Date.parse(plan.expiresAt) <= Date.now()) {
+      await input.store.upsertPartialEntryRecovery({
+        planId,
+        poolAddress: plan.poolAddress,
+        ownerAddress: plan.ownerAddress,
+        tokenMint: String(row.token_mint),
+        fundingTransactionId: String(row.funding_transaction_id),
+        fundingSignature: String(row.funding_signature),
+        fundedAt: new Date(String(row.funded_at)).toISOString(),
+        pairedTokenAmount: String(row.paired_token_amount),
+        intendedCapitalLamports: BigInt(String(row.intended_capital_lamports)),
+        intendedRange: (row.intended_range ?? {}) as Record<string, unknown>,
+        state: "UNWIND_SUBMITTED",
+        walletTruth: { refreshRequired: true },
+        payload: { reasonCodes: ["P6_PARTIAL_THESIS_OR_PLAN_EXPIRED"] },
+        updatedAt: new Date().toISOString(),
+      });
+      const unwind = await unwindPartialEntry({
+        store: input.store,
+        plan,
+        row,
+        signer: input.signer,
+        config: input.config,
+      });
+      await input.store.upsertPartialEntryRecovery({
+        planId,
+        poolAddress: plan.poolAddress,
+        ownerAddress: plan.ownerAddress,
+        tokenMint: String(row.token_mint),
+        fundingTransactionId: String(row.funding_transaction_id),
+        fundingSignature: String(row.funding_signature),
+        fundedAt: new Date(String(row.funded_at)).toISOString(),
+        pairedTokenAmount: String(row.paired_token_amount),
+        intendedCapitalLamports: BigInt(String(row.intended_capital_lamports)),
+        intendedRange: (row.intended_range ?? {}) as Record<string, unknown>,
+        state: unwind.ok ? "RESOLVED" : "UNWIND_REQUIRED",
+        walletTruth: { refreshedAt: new Date().toISOString() },
+        payload: { reasonCodes: unwind.reasonCodes },
+        updatedAt: new Date().toISOString(),
+      });
+      results.push({
+        planId,
+        action: "UNWIND_REQUIRED",
+        reasonCodes: unwind.reasonCodes,
+      });
+      continue;
+    }
+    const funding = plan.intentPayload.entryFunding as
+      | Record<string, unknown>
+      | undefined;
+    if (!funding) {
+      results.push({
+        planId,
+        action: "HOLD",
+        reasonCodes: ["P6_PARTIAL_FUNDING_MISSING"],
+      });
+      continue;
+    }
+    const connection = new Connection(input.config.rpcUrl, "confirmed"),
+      adapter = createMeteoraReadAdapter({
+        rpcUrl: input.config.rpcUrl,
+        cluster: "mainnet-beta",
+        programId: input.config.programId,
+      }),
+      pool = await adapter.getPool(plan.poolAddress),
+      accounts = await connection.getParsedTokenAccountsByOwner(
+        new PublicKey(plan.ownerAddress),
+        { mint: new PublicKey(pool.tokenXMint) },
+        "confirmed",
+      ),
+      tokenBalance = accounts.value.reduce(
+        (sum, account) =>
+          sum +
+          BigInt(
+            String(
+              (
+                account.account.data as {
+                  parsed?: { info?: { tokenAmount?: { amount?: string } } };
+                }
+              ).parsed?.info?.tokenAmount?.amount ?? "0",
+            ),
+          ),
+        0n,
+      ),
+      required = BigInt(String(funding.totalPairedTokenRaw ?? "0"));
+    if (tokenBalance < required) {
+      results.push({
+        planId,
+        action: "HOLD",
+        reasonCodes: ["P6_PARTIAL_WALLET_TOKEN_TRUTH_INSUFFICIENT"],
+      });
+      continue;
+    }
+    const open = openPlan(plan);
+    delete open.swapTransactionId;
+    delete open.swapTransactionMetadata;
+    await input.store.upsertPartialEntryRecovery({
+      planId,
+      poolAddress: plan.poolAddress,
+      ownerAddress: plan.ownerAddress,
+      tokenMint: String(row.token_mint),
+      fundingTransactionId: String(row.funding_transaction_id),
+      fundingSignature: String(row.funding_signature),
+      fundedAt: new Date(String(row.funded_at)).toISOString(),
+      pairedTokenAmount: String(row.paired_token_amount),
+      intendedCapitalLamports: BigInt(String(row.intended_capital_lamports)),
+      intendedRange: (row.intended_range ?? {}) as Record<string, unknown>,
+      state: "RESUME_OPEN",
+      walletTruth: {
+        tokenBalance: tokenBalance.toString(),
+        refreshedAt: new Date().toISOString(),
+      },
+      payload: { reasonCodes: ["P6_PARTIAL_RESUME_WITHOUT_SECOND_SWAP"] },
+      updatedAt: new Date().toISOString(),
+    });
+    const result = await executeAutonomousOpen({
+      store: input.store,
+      plan: open,
+      signer: input.signer,
+      config: input.config,
+    });
+    if (result.status === "RECONCILED")
+      await input.store.upsertPartialEntryRecovery({
+        planId,
+        poolAddress: plan.poolAddress,
+        ownerAddress: plan.ownerAddress,
+        tokenMint: String(row.token_mint),
+        fundingTransactionId: String(row.funding_transaction_id),
+        fundingSignature: String(row.funding_signature),
+        fundedAt: new Date(String(row.funded_at)).toISOString(),
+        pairedTokenAmount: String(row.paired_token_amount),
+        intendedCapitalLamports: BigInt(String(row.intended_capital_lamports)),
+        intendedRange: (row.intended_range ?? {}) as Record<string, unknown>,
+        state: "RESOLVED",
+        walletTruth: {
+          tokenBalance: tokenBalance.toString(),
+          refreshedAt: new Date().toISOString(),
+        },
+        payload: { reasonCodes: ["P6_PARTIAL_RESUME_RECONCILED"] },
+        updatedAt: new Date().toISOString(),
+      });
+    results.push({
+      planId,
+      action: result.status === "RECONCILED" ? "RESUME_OPEN" : "HOLD",
+      reasonCodes: result.reasonCodes,
+    });
+  }
+  return results;
 }
 function mutationCapital(plan: AutonomousPlan) {
   const intent = plan.planPayload.intent as Record<string, unknown> | undefined;
@@ -1014,7 +1420,13 @@ async function executeMeteoraMutation(input: {
     const submitted = open
       ? await executeMainnetCanaryClose(submitInput)
       : await executeMainnetCanaryManage(submitInput);
-    await recordJournal(input.store, input.plan, "SUBMITTED", { action: input.action, transactionId }, submitted.signature);
+    await recordJournal(
+      input.store,
+      input.plan,
+      "SUBMITTED",
+      { action: input.action, transactionId },
+      submitted.signature,
+    );
     await input.store.transitionAutonomousPlan({
       planId: input.plan.planId,
       state: "SUBMITTED",
@@ -1053,7 +1465,10 @@ async function executeMeteoraMutation(input: {
       discrepancies: input.deferCompletion
         ? ["P6_SEQUENCE_CHAIN_TRUTH_PENDING"]
         : [],
-      payload: { autonomous: true, deferredCompletion: Boolean(input.deferCompletion) },
+      payload: {
+        autonomous: true,
+        deferredCompletion: Boolean(input.deferCompletion),
+      },
     });
     if (input.deferCompletion)
       return {
@@ -1107,20 +1522,31 @@ async function executeManagementReplacement(input: {
 }): Promise<LiveWorkerResult> {
   const remove = input.plan.steps.find((step) => step.kind === "METEORA_CLOSE");
   const open = input.plan.steps.find((step) => step.kind === "METEORA_OPEN");
-  if (!remove || !open) throw new Error("LPFORGE_P6_MANAGEMENT_SEQUENCE_MISSING");
+  if (!remove || !open)
+    throw new Error("LPFORGE_P6_MANAGEMENT_SEQUENCE_MISSING");
   const adapter = createMeteoraReadAdapter({
     rpcUrl: input.config.rpcUrl,
     cluster: "mainnet-beta",
     programId: input.config.programId,
   });
-  const old = await adapter.getPositionV2(input.plan.poolAddress, input.positionAddress);
-  if (old.owner !== input.plan.ownerAddress || old.pool !== input.plan.poolAddress)
+  const old = await adapter.getPositionV2(
+    input.plan.poolAddress,
+    input.positionAddress,
+  );
+  if (
+    old.owner !== input.plan.ownerAddress ||
+    old.pool !== input.plan.poolAddress
+  )
     throw new Error("LPFORGE_P6_MANAGEMENT_OLD_POSITION_IDENTITY_MISMATCH");
   const range = {
     lower: Number(remove.metadata.fromBinId ?? old.lowerBinId),
     upper: Number(remove.metadata.toBinId ?? old.upperBinId),
   };
-  if (!Number.isInteger(range.lower) || !Number.isInteger(range.upper) || range.lower > range.upper)
+  if (
+    !Number.isInteger(range.lower) ||
+    !Number.isInteger(range.upper) ||
+    range.lower > range.upper
+  )
     throw new Error("LPFORGE_P6_MANAGEMENT_REMOVE_RANGE_REQUIRED");
   await input.store.transitionAutonomousPlan({
     planId: input.plan.planId,
@@ -1137,7 +1563,9 @@ async function executeManagementReplacement(input: {
     claimAndClose: true,
   });
   if (built.length !== 1)
-    throw new Error("LPFORGE_P6_MANAGEMENT_MULTI_TRANSACTION_REMOVE_UNSUPPORTED");
+    throw new Error(
+      "LPFORGE_P6_MANAGEMENT_MULTI_TRANSACTION_REMOVE_UNSUPPORTED",
+    );
   built[0]!.metadata.transactionId = remove.transactionId;
   const closePlan: AutonomousPlan = {
     ...input.plan,
@@ -1167,7 +1595,10 @@ async function executeManagementReplacement(input: {
       reconciliationStatus: "MISMATCH",
       lastPlanId: input.plan.planId,
       at: new Date().toISOString(),
-      payload: { stage: "AWAIT_REMOVE_RECONCILIATION", oldPositionStillExists: true },
+      payload: {
+        stage: "AWAIT_REMOVE_RECONCILIATION",
+        oldPositionStillExists: true,
+      },
     });
     await input.store.transitionAutonomousPlan({
       planId: input.plan.planId,
@@ -1176,14 +1607,34 @@ async function executeManagementReplacement(input: {
       reasonCodes: ["P6_MANAGEMENT_OLD_POSITION_STILL_EXISTS"],
       payload: { stage: "AWAIT_REMOVE_RECONCILIATION" },
     });
-    return { status: "BLOCKED", planId: input.plan.planId, reasonCodes: ["P6_MANAGEMENT_OLD_POSITION_STILL_EXISTS"], transactionSubmitted: true };
+    return {
+      status: "BLOCKED",
+      planId: input.plan.planId,
+      reasonCodes: ["P6_MANAGEMENT_OLD_POSITION_STILL_EXISTS"],
+      transactionSubmitted: true,
+    };
   }
   const connection = new Connection(input.config.rpcUrl, "confirmed");
   const poolFact = await adapter.getPool(input.plan.poolAddress);
   const walletTruth = {
-    nativeLamports: await connection.getBalance(new PublicKey(input.plan.ownerAddress), "confirmed"),
-    tokenXAccounts: (await connection.getParsedTokenAccountsByOwner(new PublicKey(input.plan.ownerAddress), { mint: new PublicKey(poolFact.tokenXMint) }, "confirmed")).value.length,
-    tokenYAccounts: (await connection.getParsedTokenAccountsByOwner(new PublicKey(input.plan.ownerAddress), { mint: new PublicKey(poolFact.tokenYMint) }, "confirmed")).value.length,
+    nativeLamports: await connection.getBalance(
+      new PublicKey(input.plan.ownerAddress),
+      "confirmed",
+    ),
+    tokenXAccounts: (
+      await connection.getParsedTokenAccountsByOwner(
+        new PublicKey(input.plan.ownerAddress),
+        { mint: new PublicKey(poolFact.tokenXMint) },
+        "confirmed",
+      )
+    ).value.length,
+    tokenYAccounts: (
+      await connection.getParsedTokenAccountsByOwner(
+        new PublicKey(input.plan.ownerAddress),
+        { mint: new PublicKey(poolFact.tokenYMint) },
+        "confirmed",
+      )
+    ).value.length,
   };
   await input.store.markOwnedPositionLifecycle({
     positionAddress: input.positionAddress,
@@ -1197,7 +1648,11 @@ async function executeManagementReplacement(input: {
     planId: input.plan.planId,
     state: "RECONCILING",
     at: new Date().toISOString(),
-    payload: { stage: "BUILD_REPLACEMENT", walletTruth, oldPositionAddress: input.positionAddress },
+    payload: {
+      stage: "BUILD_REPLACEMENT",
+      walletTruth,
+      oldPositionAddress: input.positionAddress,
+    },
   });
   const intent = input.plan.planPayload.intent as Record<string, unknown>;
   const replacement: AutonomousOpenPlan = {
@@ -1214,7 +1669,9 @@ async function executeManagementReplacement(input: {
       entryFunding: {
         totalPairedTokenRaw: old.totalXAmount,
         solForLpLamports: old.totalYAmount,
-        orientation: String(input.plan.intentPayload.orientation ?? "REDEPLOYED"),
+        orientation: String(
+          input.plan.intentPayload.orientation ?? "REDEPLOYED",
+        ),
         rebuildFromRemovedPosition: true,
       },
     },
@@ -1237,7 +1694,9 @@ export async function executeAutonomousPlan(input: {
   signer: MainnetSignerBackend;
   config: LiveWorkerConfig;
 }): Promise<LiveWorkerResult> {
-  await recordJournal(input.store, input.plan, "PLAN_CREATED", { action: input.plan.action });
+  await recordJournal(input.store, input.plan, "PLAN_CREATED", {
+    action: input.plan.action,
+  });
   if (input.plan.action === "OPEN")
     return executeAutonomousOpen({
       store: input.store,
@@ -1334,8 +1793,17 @@ export async function recoverUnfinishedAutonomousPlans(input: {
 }): Promise<LiveRecoveryResult[]> {
   const plans = await input.store.loadUnresolvedAutonomousPlans(),
     results: LiveRecoveryResult[] = [];
-  const connection = input.rpcUrl ? new Connection(input.rpcUrl, "confirmed") : undefined;
-  const adapter = input.rpcUrl && input.programId ? createMeteoraReadAdapter({ rpcUrl: input.rpcUrl, cluster: "mainnet-beta", programId: input.programId }) : undefined;
+  const connection = input.rpcUrl
+    ? new Connection(input.rpcUrl, "confirmed")
+    : undefined;
+  const adapter =
+    input.rpcUrl && input.programId
+      ? createMeteoraReadAdapter({
+          rpcUrl: input.rpcUrl,
+          cluster: "mainnet-beta",
+          programId: input.programId,
+        })
+      : undefined;
   for (const plan of plans) {
     const raw = await input.store.getExecutionJournal(plan.idempotencyKey);
     if (!raw) {
@@ -1354,56 +1822,123 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       continue;
     }
     const journal = {
-        journalId: String(raw.journal_id),
-        idempotencyKey: String(raw.idempotency_key),
-        planId: String(raw.plan_id),
-        ...(raw.transaction_id
-          ? { transactionId: String(raw.transaction_id) }
-          : {}),
-        state: String(raw.state) as ExecutionJournal["state"],
-        ...(raw.signature ? { signature: String(raw.signature) } : {}),
-        ...(raw.blockhash ? { blockhash: String(raw.blockhash) } : {}),
-        ...(raw.last_valid_block_height !== null &&
-        raw.last_valid_block_height !== undefined
-          ? { lastValidBlockHeight: Number(raw.last_valid_block_height) }
-          : {}),
-        version: Number(raw.version),
-        updatedAt: new Date(String(raw.updated_at)).toISOString(),
-        payload: (raw.payload ?? {}) as Record<string, unknown>,
-      };
-    let confirmationStatus: "PROCESSED" | "CONFIRMED" | "FINALIZED" | "EXPIRED" | "FAILED" | "UNKNOWN" = "UNKNOWN";
+      journalId: String(raw.journal_id),
+      idempotencyKey: String(raw.idempotency_key),
+      planId: String(raw.plan_id),
+      ...(raw.transaction_id
+        ? { transactionId: String(raw.transaction_id) }
+        : {}),
+      state: String(raw.state) as ExecutionJournal["state"],
+      ...(raw.signature ? { signature: String(raw.signature) } : {}),
+      ...(raw.blockhash ? { blockhash: String(raw.blockhash) } : {}),
+      ...(raw.last_valid_block_height !== null &&
+      raw.last_valid_block_height !== undefined
+        ? { lastValidBlockHeight: Number(raw.last_valid_block_height) }
+        : {}),
+      version: Number(raw.version),
+      updatedAt: new Date(String(raw.updated_at)).toISOString(),
+      payload: (raw.payload ?? {}) as Record<string, unknown>,
+    };
+    let confirmationStatus:
+      | "PROCESSED"
+      | "CONFIRMED"
+      | "FINALIZED"
+      | "EXPIRED"
+      | "FAILED"
+      | "UNKNOWN" = "UNKNOWN";
     if (connection && journal.signature) {
-      const status = (await connection.getSignatureStatus(journal.signature, { searchTransactionHistory: true })).value;
+      const status = (
+        await connection.getSignatureStatus(journal.signature, {
+          searchTransactionHistory: true,
+        })
+      ).value;
       if (status?.err) confirmationStatus = "FAILED";
-      else if (status?.confirmationStatus === "processed") confirmationStatus = "PROCESSED";
-      else if (status?.confirmationStatus === "confirmed") confirmationStatus = "CONFIRMED";
-      else if (status?.confirmationStatus === "finalized") confirmationStatus = "FINALIZED";
-      else if (journal.lastValidBlockHeight !== undefined && input.currentBlockHeight > journal.lastValidBlockHeight) confirmationStatus = "EXPIRED";
+      else if (status?.confirmationStatus === "processed")
+        confirmationStatus = "PROCESSED";
+      else if (status?.confirmationStatus === "confirmed")
+        confirmationStatus = "CONFIRMED";
+      else if (status?.confirmationStatus === "finalized")
+        confirmationStatus = "FINALIZED";
+      else if (
+        journal.lastValidBlockHeight !== undefined &&
+        input.currentBlockHeight > journal.lastValidBlockHeight
+      )
+        confirmationStatus = "EXPIRED";
     }
     let economicEffect: "PRESENT" | "ABSENT" | "UNKNOWN" = "UNKNOWN";
     let positionTruth: Record<string, unknown> = { available: false };
     if (adapter && plan.positionAddress) {
       try {
-        const position = await adapter.getPositionV2(plan.poolAddress, plan.positionAddress);
-        positionTruth = { exists: true, owner: position.owner, pool: position.pool, lowerBinId: position.lowerBinId, upperBinId: position.upperBinId };
+        const position = await adapter.getPositionV2(
+          plan.poolAddress,
+          plan.positionAddress,
+        );
+        positionTruth = {
+          exists: true,
+          owner: position.owner,
+          pool: position.pool,
+          lowerBinId: position.lowerBinId,
+          upperBinId: position.upperBinId,
+        };
         if (plan.action === "OPEN") economicEffect = "PRESENT";
-        else if (["CLOSE", "EMERGENCY_CLOSE", "RESHAPE", "REBALANCE"].includes(plan.action)) economicEffect = "ABSENT";
+        else if (
+          ["CLOSE", "EMERGENCY_CLOSE", "RESHAPE", "REBALANCE"].includes(
+            plan.action,
+          )
+        )
+          economicEffect = "ABSENT";
       } catch {
         positionTruth = { exists: false };
-        if (["CLOSE", "EMERGENCY_CLOSE", "RESHAPE", "REBALANCE"].includes(plan.action)) economicEffect = "PRESENT";
+        if (
+          ["CLOSE", "EMERGENCY_CLOSE", "RESHAPE", "REBALANCE"].includes(
+            plan.action,
+          )
+        )
+          economicEffect = "PRESENT";
         else if (plan.action === "OPEN") economicEffect = "ABSENT";
       }
     }
     const action = determineRecoveryAction({
-        journal,
-        currentBlockHeight: input.currentBlockHeight,
-        confirmationStatus,
-        economicEffect,
+      journal,
+      currentBlockHeight: input.currentBlockHeight,
+      confirmationStatus,
+      economicEffect,
+    });
+    if (
+      action === "MARK_RECONCILED" &&
+      plan.action !== "RESHAPE" &&
+      plan.action !== "REBALANCE"
+    ) {
+      await input.store.insertExecutionReconciliation({
+        reconciliationId: `${plan.planId}:recovery`,
+        planId: plan.planId,
+        observedAt: input.now,
+        status: "MATCH",
+        expected: {
+          action: plan.action,
+          owner: plan.ownerAddress,
+          pool: plan.poolAddress,
+        },
+        actual: { confirmationStatus, economicEffect, positionTruth },
+        discrepancies: [],
+        payload: { recovered: true, journalId: journal.journalId },
       });
-    if (action === "MARK_RECONCILED" && plan.action !== "RESHAPE" && plan.action !== "REBALANCE") {
-      await input.store.insertExecutionReconciliation({ reconciliationId: `${plan.planId}:recovery`, planId: plan.planId, observedAt: input.now, status: "MATCH", expected: { action: plan.action, owner: plan.ownerAddress, pool: plan.poolAddress }, actual: { confirmationStatus, economicEffect, positionTruth }, discrepancies: [], payload: { recovered: true, journalId: journal.journalId } });
-      await input.store.completeAutonomousPlan({ planId: plan.planId, state: "RECONCILED", at: input.now, payload: { recovery: true, confirmationStatus, economicEffect, positionTruth } });
-      results.push({ planId: plan.planId, action, reasonCodes: ["P6_RECOVERY_CHAIN_TRUTH_RECONCILED"] });
+      await input.store.completeAutonomousPlan({
+        planId: plan.planId,
+        state: "RECONCILED",
+        at: input.now,
+        payload: {
+          recovery: true,
+          confirmationStatus,
+          economicEffect,
+          positionTruth,
+        },
+      });
+      results.push({
+        planId: plan.planId,
+        action,
+        reasonCodes: ["P6_RECOVERY_CHAIN_TRUTH_RECONCILED"],
+      });
       continue;
     }
     if (
@@ -1420,7 +1955,12 @@ export async function recoverUnfinishedAutonomousPlans(input: {
             : "RECOVERING",
         at: input.now,
         reasonCodes: [`P6_RECOVERY_${action}`],
-        payload: { journalId: journal.journalId, confirmationStatus, economicEffect, positionTruth },
+        payload: {
+          journalId: journal.journalId,
+          confirmationStatus,
+          economicEffect,
+          positionTruth,
+        },
       });
     results.push({
       planId: plan.planId,

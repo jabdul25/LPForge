@@ -277,9 +277,7 @@ export interface Phase1Store {
     }>;
   }): Promise<void>;
   claimNextAutonomousPlan(now: string): Promise<AutonomousPlan | undefined>;
-  claimNextAutonomousOpenPlan(
-    now: string,
-  ): Promise<
+  claimNextAutonomousOpenPlan(now: string): Promise<
     | {
         planId: string;
         intentId: string;
@@ -397,6 +395,8 @@ export interface Phase1Store {
     payload: Record<string, unknown>;
     updatedAt: string;
   }): Promise<void>;
+  loadPartialEntryRecoveries(): Promise<Record<string, unknown>[]>;
+  loadAutonomousPlan(planId: string): Promise<AutonomousPlan | undefined>;
   loadUnresolvedAutonomousPlans(): Promise<AutonomousPlan[]>;
   insertExecutionSimulation(value: {
     transactionId: string;
@@ -730,9 +730,7 @@ export interface Phase1Store {
     evidenceHash?: string;
     payload: Record<string, unknown>;
   }): Promise<void>;
-  loadPhase7HealthFacts(
-    poolAddress: string,
-  ): Promise<{
+  loadPhase7HealthFacts(poolAddress: string): Promise<{
     latestDecisionAt?: string;
     unknownSubmissionCount: number;
     unresolvedReconciliationDebt: number;
@@ -753,18 +751,14 @@ export interface Phase1Store {
     canaryExecutionCostLamports: number;
     featureMissingCount: number;
   }>;
-  loadPhase7RecoveryFacts(
-    runtimeId: string,
-  ): Promise<{
+  loadPhase7RecoveryFacts(runtimeId: string): Promise<{
     previousCompletedCycleKeys: string[];
     completedEconomicActionKeys: string[];
     recoveryQueueCount: number;
     unknownSubmissionCount: number;
     unresolvedReconciliationDebt: number;
   }>;
-  loadPhase7EvidenceFacts(
-    runtimeId: string,
-  ): Promise<{
+  loadPhase7EvidenceFacts(runtimeId: string): Promise<{
     latestHealthStatus?: string;
     latestDriftStatus?: string;
     latestSafetyMode?: string;
@@ -1605,6 +1599,19 @@ export async function createPostgresStore(
         ],
       );
     },
+    async loadPartialEntryRecoveries() {
+      const r = await db.query(
+        `SELECT * FROM execution.partial_entry_recovery WHERE state IN ('ENTRY_FUNDED_NOT_OPEN','RESUME_OPEN','UNWIND_REQUIRED','UNWIND_SUBMITTED','RECONCILIATION_REQUIRED') ORDER BY updated_at ASC`,
+      );
+      return r.rows;
+    },
+    async loadAutonomousPlan(planId) {
+      const r = await db.query(
+        `SELECT p.plan_id,p.intent_id,p.expires_at,p.payload AS plan_payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload AS intent_payload,COALESCE(json_agg(json_build_object('transactionId',s.transaction_id,'sequence',s.sequence,'kind',s.kind,'state',s.state,'requiredSignerAddresses',s.required_signers,'metadata',s.metadata) ORDER BY s.sequence) FILTER (WHERE s.transaction_id IS NOT NULL),'[]'::json) AS steps FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id LEFT JOIN execution.transaction_steps s ON s.plan_id=p.plan_id WHERE p.plan_id=$1 GROUP BY p.plan_id,p.intent_id,p.expires_at,p.payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload`,
+        [planId],
+      );
+      return r.rows[0] ? autonomousPlanFromRow(r.rows[0]) : undefined;
+    },
     async loadUnresolvedAutonomousPlans() {
       const r = await db.query(
         `SELECT p.plan_id,p.intent_id,p.expires_at,p.payload AS plan_payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload AS intent_payload,COALESCE(json_agg(json_build_object('transactionId',s.transaction_id,'sequence',s.sequence,'kind',s.kind,'state',s.state,'requiredSignerAddresses',s.required_signers,'metadata',s.metadata) ORDER BY s.sequence) FILTER (WHERE s.transaction_id IS NOT NULL),'[]'::json) AS steps FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id LEFT JOIN execution.transaction_steps s ON s.plan_id=p.plan_id WHERE p.cluster='mainnet-beta' AND p.state IN ('CLAIMED','DISPATCHING','BUILDING','BUILT','SIMULATING','SIMULATED','RISK_APPROVED','SIGNING','SIGNED','SUBMITTING','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILING') GROUP BY p.plan_id,p.intent_id,p.expires_at,p.payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload ORDER BY p.created_at ASC`,
@@ -2409,6 +2416,12 @@ export function createMemoryStore(): Phase1Store {
     },
     async markOwnedPositionLifecycle() {},
     async upsertPartialEntryRecovery() {},
+    async loadPartialEntryRecoveries() {
+      return [];
+    },
+    async loadAutonomousPlan() {
+      return undefined;
+    },
     async loadUnresolvedAutonomousPlans() {
       return [];
     },

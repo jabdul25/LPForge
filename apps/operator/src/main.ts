@@ -67,6 +67,11 @@ async function persistTransactionPlan(
     payload: {
       reasonCodes: plan.reasonCodes,
       authority: "AUTONOMOUS_DISPATCH",
+      provenance: {
+        producer: "LPFORGE_PRODUCTION",
+        schemaVersion: 1,
+        intentId: plan.intent.intentId,
+      },
       intent: {
         capitalLamports: plan.intent.capitalLamports?.toString(),
         lowerBinId: plan.intent.lowerBinId,

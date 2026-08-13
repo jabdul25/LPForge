@@ -390,3 +390,43 @@ found to close its PostgreSQL client before the asynchronous recovery scan had
 finished. The command now awaits the scan before closing the client. A live
 `recover-once` check completed with an empty recovery queue, followed by a
 full passing `pnpm test:ci` run (378 tests and all Phase 1–7 boundaries).
+
+## P0 execution-boundary and funded-entry recovery update
+
+Two later certification findings are closed by this update. The execution
+worker remains stopped while this code is committed and reviewed.
+
+### Claim-time trust boundary
+
+Immediately after the atomic PostgreSQL claim and before dispatch, the
+executor now independently validates the claimed record against the current
+versioned execution policy and live position truth. It rejects a plan unless:
+
+- its provenance identifies `LPFORGE_PRODUCTION`, schema version 1, and the
+  exact persisted intent ID;
+- its pool is allowlisted and its capital is within that pool's policy limit;
+- an OPEN would remain within global and per-pool owned-position limits; and
+- a management plan names a persisted LPForge-owned position whose owner and
+  pool match fresh Meteora PositionV2 truth.
+
+The producer now writes this provenance with every persisted plan, but the
+executor does not trust the producer or database merely because the plan was
+claimable. A failed check becomes a durable `BLOCKED` plan with claim-guard
+reason codes before the signing path is entered.
+
+### Funded-but-not-open recovery
+
+The recovery loop now reads unresolved `partial_entry_recovery` records.
+For a still-valid OPEN thesis, it refreshes the wallet's paired-token balance,
+marks `RESUME_OPEN`, and resumes the Meteora open using the original funding
+without issuing a second Jupiter swap. A reconciled replacement open marks
+the partial entry `RESOLVED`.
+
+For an expired plan, it marks `UNWIND_SUBMITTED`, obtains a fresh Jupiter
+paired-token-to-SOL quote and transaction, simulates and risk-checks it,
+signs/submits it once, waits for confirmation, and records either `RESOLVED`
+or `UNWIND_REQUIRED` with the exact failure reason. The current database has
+zero partial entries and zero unresolved plans.
+
+Validation after this update: `pnpm test:ci` passed with 380 tests, all Phase
+1–7 boundary checks, and M0001–M0029 static migration verification.
