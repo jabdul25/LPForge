@@ -69,7 +69,3 @@ The signer service must independently verify its configured owner public key, `m
 ## Manual plan inbox
 
 The execution worker reads the ignored file selected by `LPFORGE_P6_PLAN_INBOX_PATH` (default: `runtime/execution-plan.json`). Copy `runtime/execution-plan.example.json` to that ignored path and give it a unique plan ID. The source only validates and surfaces an operator-created request; it does not build, sign, or submit a transaction. A queued plan remains subject to build, simulation, fresh approval, and every Phase 6 control before any future execution implementation may act on it.
-
-## Mainnet signer/RPC connectivity test
-
-`execution connectivity-test` is a one-shot operator command, not a PM2 action. It requires all live gates, a ready signer, a private HTTPS write RPC, and `LPFORGE_P6_CONNECTIVITY_TEST_ALLOWED=true`. It signs, submits, and confirms a zero-lamport System Program transfer from the configured owner back to itself. The owner pays the normal network fee; no LP position is created or changed. Reset the explicit test flag to `false` immediately after confirmation.
