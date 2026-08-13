@@ -1,7 +1,7 @@
 import { asNumber, asString, nowIso, type Base58Address, type BinLiquidityFact, type CollectFeeMode, type FunctionType, type PoolStateFact, type PositionV2Fact, type ProtocolCompatibilityCheck, type SwapEventFact } from '../../domain/src/index.js';
 
 export const EXPECTED_DLMM_PROGRAM_ID = 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo';
-export const BASELINE_METEORA_SDK_VERSION = '1.9.8';
+export const BASELINE_METEORA_SDK_VERSION = '1.9.10';
 export const EVENT_DECODER_VERSION = 'lpforge-swap2evt-v2-cpi';
 
 export interface MeteoraReadAdapter {

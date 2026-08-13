@@ -73,7 +73,7 @@
     "canary:assert-read-only": "node --enable-source-maps .build/apps/canary/src/main.js assert-read-only"
   },
   "dependencies": {
-    "@meteora-ag/dlmm": "1.9.8",
+    "@meteora-ag/dlmm": "1.9.10",
     "@solana/web3.js": "1.98.4",
     "pg": "8.16.3"
   },

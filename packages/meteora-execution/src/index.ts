@@ -24,7 +24,7 @@ export async function loadMeteoraExecutionRuntime():Promise<RuntimeSdk>{
   const web3=rootRequire('@solana/web3.js') as {PublicKey:RuntimeSdk['PublicKey']};
   const BN=dlmmRequire('bn.js') as RuntimeSdk['BN'];
   // package.json is not exported; derive the installed production lock version explicitly from our compatibility baseline.
-  cached={PublicKey:web3.PublicKey,BN,StrategyType:dlmm.StrategyType,dlmmVersion:'1.9.8'}; return cached;
+  cached={PublicKey:web3.PublicKey,BN,StrategyType:dlmm.StrategyType,dlmmVersion:'1.9.10'}; return cached;
 }
 function strategyType(s:'SPOT'|'CURVE'|'BID_ASK',r:RuntimeSdk){return s==='SPOT'?r.StrategyType.Spot:s==='CURVE'?r.StrategyType.Curve:r.StrategyType.BidAsk;}
 function validateRange(lower:number,upper:number){if(!Number.isInteger(lower)||!Number.isInteger(upper)||lower>upper)throw new Error('LPFORGE_METEORA_BUILD_INVALID_RANGE');}

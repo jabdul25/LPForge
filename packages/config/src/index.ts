@@ -58,7 +58,7 @@ export function loadPhase1Config(env: NodeJS.ProcessEnv = process.env): Phase1Co
     meteoraDataApiUrl: urlValue(env.METEORA_DATA_API_URL ?? 'https://dlmm.datapi.meteora.ag', 'METEORA_DATA_API_URL'),
     cluster,
     programId: env.LPFORGE_PROGRAM_ID ?? 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo',
-    expectedSdkVersion: env.METEORA_SDK_VERSION_EXPECTED ?? '1.9.8',
+    expectedSdkVersion: env.METEORA_SDK_VERSION_EXPECTED ?? '1.9.10',
     dataMode,
     liveSigning: false,
     dataApiMaxRps: intValue(env, 'DATA_API_MAX_RPS', 25, 1, 30),
