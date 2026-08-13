@@ -65,6 +65,7 @@
     "production:status": "node --enable-source-maps .build/apps/production/src/main.js status",
     "production:register-release-evidence": "node --enable-source-maps .build/apps/production/src/main.js register-release-evidence",
     "pm2:start": "bash scripts/pm2-start.sh",
+    "pm2:start-execution": "bash scripts/pm2-start-execution.sh",
     "pm2:restart": "bash scripts/pm2-restart.sh",
     "pm2:stop": "bash scripts/pm2-stop.sh",
     "pm2:status": "bash scripts/pm2-status.sh",

@@ -12,4 +12,5 @@ phase1-runtime/
 # Production secrets and process logs
 .env
 .env.*.local
+*.swp
 logs/*.log

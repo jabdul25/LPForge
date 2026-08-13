@@ -36,6 +36,8 @@ importers:
 
   apps/devnet: {}
 
+  apps/execution: {}
+
   apps/executor: {}
 
   apps/lab: {}

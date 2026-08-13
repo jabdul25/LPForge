@@ -10,6 +10,20 @@ export interface MainnetSignerBackend {
   signMessage(message:Uint8Array,context:{ticketId:string;transactionId:string;cluster:'mainnet-beta'}):Promise<Uint8Array>;
 }
 
+export interface RemoteKmsHttpSignerConfig {backendId:string;publicKeyAddress:string;endpoint:string;authorizationToken:string;timeoutMs?:number;}
+export type RemoteKmsFetch=(input:string,init:{method:'POST';headers:Record<string,string>;body:string;signal:AbortSignal})=>Promise<{ok:boolean;status:number;json():Promise<unknown>}>;
+function requiredRemoteText(name:string,value:string){if(!value.trim())throw new Error(`LPFORGE_P6_REMOTE_SIGNER_${name}_REQUIRED`);return value.trim();}
+function base64(bytes:Uint8Array){let text='';for(const byte of bytes)text+=String.fromCharCode(byte);return btoa(text);}
+function fromBase64(value:string){const text=atob(value);return Uint8Array.from(text,char=>char.charCodeAt(0));}
+/**
+ * Adapter for an operator-managed remote Ed25519 signer/KMS service.
+ * The private key never enters LPForge. The remote endpoint must accept the
+ * documented request and return {"signatureBase64":"..."}; it must bind the
+ * request to the supplied mainnet ticket and transaction identifier.
+ */
+export function createRemoteKmsHttpSigner(config:RemoteKmsHttpSignerConfig,fetchFn:RemoteKmsFetch=fetch as unknown as RemoteKmsFetch):MainnetSignerBackend{
+  const backendId=requiredRemoteText('BACKEND_ID',config.backendId),publicKeyAddress=requiredRemoteText('PUBLIC_KEY',config.publicKeyAddress),authorizationToken=requiredRemoteText('AUTH_TOKEN',config.authorizationToken);let endpoint:URL;try{endpoint=new URL(requiredRemoteText('URL',config.endpoint));}catch{throw new Error('LPFORGE_P6_REMOTE_SIGNER_URL_INVALID');}if(endpoint.protocol!=='https:')throw new Error('LPFORGE_P6_REMOTE_SIGNER_HTTPS_REQUIRED');const timeoutMs=config.timeoutMs??5000;if(!Number.isInteger(timeoutMs)||timeoutMs<100||timeoutMs>30000)throw new Error('LPFORGE_P6_REMOTE_SIGNER_TIMEOUT');return{backendId,publicKeyAddress,clusterLock:'mainnet-beta',custodyMode:'REMOTE_KMS',secretExportable:false,async signMessage(message,context){const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),timeoutMs);try{const response=await fetchFn(endpoint.toString(),{method:'POST',headers:{'content-type':'application/json','authorization':`Bearer ${authorizationToken}`},body:JSON.stringify({version:1,algorithm:'ed25519',cluster:'mainnet-beta',publicKeyAddress,messageBase64:base64(message),ticketId:context.ticketId,transactionId:context.transactionId}),signal:controller.signal});if(!response.ok)throw new Error(`LPFORGE_P6_REMOTE_SIGNER_HTTP_${response.status}`);const value=await response.json();if(!value||typeof value!=='object'||typeof (value as {signatureBase64?:unknown}).signatureBase64!=='string')throw new Error('LPFORGE_P6_REMOTE_SIGNER_RESPONSE');const signature=fromBase64((value as {signatureBase64:string}).signatureBase64);if(signature.byteLength!==64)throw new Error('LPFORGE_P6_REMOTE_SIGNER_SIGNATURE_LENGTH');return signature;}finally{clearTimeout(timer);}}};}
+
 export interface AuxiliaryMainnetSignerBackend {
   backendId:string;
   publicKeyAddress:string;
