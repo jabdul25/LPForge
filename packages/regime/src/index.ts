@@ -10,19 +10,19 @@ const labels:Phase3RegimeLabel[]=['SIDEWAYS','CONSOLIDATION','CONTROLLED_PULLBAC
 function pos(x:number,scale:number){return clamp(x/scale);} function neg(x:number,scale:number){return clamp(-x/scale);} function closeness(x:number,target:number,width:number){return clamp(1-Math.abs(x-target)/width);}
 function softmax(scores:Record<Phase3RegimeLabel,number>):ProbabilityEntry[]{const temp=.42;const ex=labels.map((label)=>({label,v:Math.exp(scores[label]/temp)}));const d=ex.reduce((a,b)=>a+b.v,0);return ex.map((x)=>({label:x.label,probability:x.v/d})).sort((a,b)=>b.probability-a.probability);}
 export function classifyRegime(input:RegimeInput):RegimeAssessment{
- const {context:c,structure:s}=input,h5=c.horizons['5m'],h15=c.horizons['15m'],h30=c.horizons['30m'],h1=c.horizons['1h'];
- const completeness=Math.min(h15.completeness,h1.completeness);const up1=pos(h1.returnPct,8),dn1=neg(h1.returnPct,8),up15=pos(h15.returnPct,4),dn15=neg(h15.returnPct,4),up5=pos(h5.returnPct,2),dn5=neg(h5.returnPct,2);
+ const {context:c,structure:s}=input,h5=c.horizons['5m'],h15=c.horizons['15m'],h30=c.horizons['30m'],h1=c.horizons['1h'],h4=c.horizons['4h'];
+ const completeness=Math.min(h15.completeness,h1.completeness);const up1=pos(h1.returnPct,8),dn1=neg(h1.returnPct,8),up15=pos(h15.returnPct,4),dn15=neg(h15.returnPct,4),up5=pos(h5.returnPct,2),dn5=neg(h5.returnPct,2),up4=pos(h4.returnPct,18),dn4=neg(h4.returnPct,18);
  const scores={} as Record<Phase3RegimeLabel,number>;
  scores.SIDEWAYS=.30*closeness(h1.returnPct,0,3)+.25*(1-s.trendEfficiency)+.20*s.flowTwoWay+.15*(1-s.expansionScore)+.10*(1-s.liquidityGapRisk);
  scores.CONSOLIDATION=.38*s.compressionScore+.20*s.flowTwoWay+.15*(1-s.trendEfficiency)+.12*(1-s.downsideAcceleration)+.10*(1-s.upsideAcceleration)+.05*s.structureQuality;
- scores.CONTROLLED_PULLBACK=.25*up1+.15*dn15+.12*closeness(s.retracementDepth,.45,.5)+.15*(1-s.downsideAcceleration)+.12*s.supportIntegrity+.10*s.reclaimScore+.11*s.structureQuality;
+ scores.CONTROLLED_PULLBACK=.22*up1+.15*dn15+.11*up4-.20*dn4+.12*closeness(s.retracementDepth,.45,.5)+.12*(1-s.downsideAcceleration)+.10*s.supportIntegrity+.09*s.reclaimScore+.09*s.structureQuality;
  scores.BREAKOUT=.27*s.expansionScore+.22*up5+.14*up15+.15*s.upsideAcceleration+.12*s.trendEfficiency+.10*clamp(h5.netBins/15);
  scores.BREAKOUT_CONTROLLED_PULLBACK=.18*up1+.15*s.impulseStrength+.15*dn15+.12*closeness(s.retracementDepth,.35,.4)+.14*s.reclaimScore+.13*(1-s.downsideAcceleration)+.13*s.supportIntegrity;
  scores.TREND_UP=.30*up1+.20*up15+.20*s.trendEfficiency+.12*clamp(h1.netBins/30)+.10*(1-s.compressionScore)+.08*s.structureQuality;
- scores.TREND_DOWN=.30*dn1+.20*dn15+.20*s.trendEfficiency+.12*clamp(-h1.netBins/30)+.10*(1-s.compressionScore)+.08*(1-s.supportIntegrity);
- scores.DISTRIBUTION=.18*up1+.16*dn15+.16*dn5+.16*(1-s.flowTwoWay)+.12*clamp(-s.flowDirection)+.12*s.downsideAcceleration+.10*s.expansionScore;
+ scores.TREND_DOWN=.25*dn1+.18*dn15+.15*dn4+.16*s.trendEfficiency+.10*clamp(-h1.netBins/30)+.09*(1-s.compressionScore)+.07*(1-s.supportIntegrity);
+ scores.DISTRIBUTION=.15*up1+.15*dn15+.13*dn5+.12*dn4+.15*(1-s.flowTwoWay)+.11*clamp(-s.flowDirection)+.11*s.downsideAcceleration+.08*s.expansionScore;
  scores.EXHAUSTION=.16*Math.max(up1,dn1)+.18*s.trendEfficiency+.18*(h5.returnPct*h1.returnPct<0?1:0)+.14*s.expansionScore+.12*Math.max(s.downsideAcceleration,s.upsideAcceleration)+.12*(1-s.flowTwoWay)+.10*clamp(h15.realizedVolatility/1.5);
- scores.FREEFALL=.24*dn5+.22*dn15+.14*dn1+.16*s.downsideAcceleration+.10*clamp(-s.flowDirection)+.08*s.liquidityGapRisk+.06*s.trendEfficiency;
+ scores.FREEFALL=.24*dn5+.22*dn15+.12*dn1+.08*dn4+.16*s.downsideAcceleration+.10*clamp(-s.flowDirection)+.08*s.liquidityGapRisk;
  scores.RECOVERY=.22*dn1+.22*up5+.16*up15+.14*s.reclaimScore+.10*s.supportIntegrity+.08*s.flowTwoWay+.08*(1-s.downsideAcceleration);
  const mixed=(Math.sign(h5.returnPct)!==Math.sign(h15.returnPct)||Math.sign(h15.returnPct)!==Math.sign(h1.returnPct))?1:0;
  scores.TRANSITION=.28*mixed+.18*s.expansionScore+.14*(1-s.trendEfficiency)+.12*Math.abs(s.binVelocityAcceleration)/(Math.abs(s.binVelocityAcceleration)+5)+.14*(1-s.structureQuality)+.14*(1-s.flowTwoWay);
@@ -30,7 +30,7 @@ export function classifyRegime(input:RegimeInput):RegimeAssessment{
  const probabilities=softmax(scores),primary=probabilities[0]?.label??'UNKNOWN',confidence=probabilities[0]?.probability??0,second=probabilities[1]?.probability??0;
  const transitionRisk=clamp((probabilities.find((x)=>x.label==='TRANSITION')?.probability??0)+(1-confidence)*.35+(confidence-second<.08?.15:0));
  const reasonCodes=[...s.reasonCodes];if(completeness<.6)reasonCodes.push('REGIME_DATA_INCOMPLETE');if(confidence<.22)reasonCodes.push('REGIME_LOW_CONFIDENCE');if(primary==='FREEFALL')reasonCodes.push('REGIME_FREEFALL');if(primary==='CONTROLLED_PULLBACK')reasonCodes.push('REGIME_CONTROLLED_PULLBACK');
- return{primary,probabilities,confidence,stability:clamp(confidence-second),transitionRisk,observedAt:c.decisionAt,reasonCodes:[...new Set(reasonCodes)].sort(),rawScores:scores,evidence:{return5m:h5.returnPct,return15m:h15.returnPct,return1h:h1.returnPct,trendEfficiency:s.trendEfficiency,retracementDepth:s.retracementDepth,compressionScore:s.compressionScore,expansionScore:s.expansionScore,downsideAcceleration:s.downsideAcceleration,reclaimScore:s.reclaimScore,flowTwoWay:s.flowTwoWay,completeness}};
+ return{primary,probabilities,confidence,stability:clamp(confidence-second),transitionRisk,observedAt:c.decisionAt,reasonCodes:[...new Set(reasonCodes)].sort(),rawScores:scores,evidence:{return5m:h5.returnPct,return15m:h15.returnPct,return1h:h1.returnPct,return4h:h4.returnPct,trendEfficiency:s.trendEfficiency,retracementDepth:s.retracementDepth,compressionScore:s.compressionScore,expansionScore:s.expansionScore,downsideAcceleration:s.downsideAcceleration,reclaimScore:s.reclaimScore,flowTwoWay:s.flowTwoWay,completeness}};
 }
 
 export interface RegimeHistoryAnalysis {
