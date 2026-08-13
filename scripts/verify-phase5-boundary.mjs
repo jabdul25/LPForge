@@ -9,7 +9,8 @@ const files=roots.flatMap(walk).filter(f=>f.endsWith('.ts'));
 for(const file of files){const rel=file.replaceAll('\\','/');const text=fs.readFileSync(file,'utf8');
   if((/sendTransaction\s*\(/.test(text)||/sendRawTransaction\s*\(/.test(text))&&!allowedSendPrefixes.some(p=>rel.startsWith(p))){console.error('PHASE5_UNGUARDED_SEND_PATH',rel);process.exit(1);}
   if(/Keypair\.fromSecretKey\s*\(/.test(text)&&!rel.startsWith('packages/phase6-mainnet-signer/')){console.error('PHASE5_SECRET_KEY_LOADER_PROHIBITED',rel);process.exit(1);}
-  if(/Keypair\.generate\s*\(/.test(text)&&!rel.startsWith('packages/devnet-signing/')){console.error('PHASE5_KEYPAIR_GENERATION_OUTSIDE_DEVNET_HARNESS',rel);process.exit(1);}
+  if(/Keypair\.generate\s*\(/.test(text)&&!rel.startsWith('packages/devnet-signing/')&&!rel.startsWith('packages/phase6-mainnet-signer/')){console.error('PHASE5_KEYPAIR_GENERATION_OUTSIDE_DEVNET_HARNESS',rel);process.exit(1);}
+  if(rel.startsWith('packages/phase6-mainnet-signer/')&&/Keypair\.generate\s*\(/.test(text)&&!text.includes("purpose:'POSITION_ACCOUNT'")){console.error('PHASE5_MAINNET_KEYPAIR_NOT_POSITION_ACCOUNT',rel);process.exit(1);}
   if((/initializePositionAndAddLiquidityByStrategy\s*\(/.test(text)||/addLiquidityByStrategy\s*\(/.test(text)||/removeLiquidity\s*\(/.test(text)||/claimAllRewardsByPosition\s*\(/.test(text))&&!allowedMeteoraMutationPrefixes.some(p=>rel.startsWith(p))){console.error('PHASE5_METEORA_MUTATION_OUTSIDE_EXECUTION_ADAPTER',rel);process.exit(1);}
   if(/sendAndConfirmTransaction\s*\(/.test(text)){console.error('PHASE5_SEND_AND_CONFIRM_PROHIBITED',rel);process.exit(1);}
   if((/\bsignTransaction\s*\(/.test(text)||/\.partialSign\s*\(/.test(text))&&!allowedSignerPrefixes.some(p=>rel.startsWith(p))&&!rel.startsWith('packages/execution-submission/')){console.error('PHASE5_SIGNING_OUTSIDE_SIGNER_BOUNDARY',rel);process.exit(1);}

@@ -47,6 +47,13 @@ export interface AuxiliaryMainnetSignerBackend {
   signMessage(message:Uint8Array,context:{ticketId:string;transactionId:string;cluster:'mainnet-beta';purpose:'POSITION_ACCOUNT'}):Promise<Uint8Array>;
 }
 
+/** A fresh memory-only PositionV2 signer for one Meteora OPEN transaction. */
+export function createEphemeralPositionSigner():AuxiliaryMainnetSignerBackend{
+  const keypair=Keypair.generate();
+  const privateKey=ed25519PrivateKey(keypair.secretKey);
+  return{backendId:`lpforge-position-${keypair.publicKey.toBase58()}`,publicKeyAddress:keypair.publicKey.toBase58(),clusterLock:'mainnet-beta',custodyMode:'EPHEMERAL_MEMORY',purpose:'POSITION_ACCOUNT',secretExportable:false,async signMessage(message){return new Uint8Array(signEd25519(null,message,privateKey));}};
+}
+
 export interface MainnetSignableEnvelope {
   serializeMessage():Uint8Array;
   attachSignature(publicKeyAddress:string,signature:Uint8Array):void;

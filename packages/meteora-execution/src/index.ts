@@ -15,6 +15,8 @@ export function createFixtureMeteoraOpenAddPool():MeteoraOpenAddPoolLike{
 export interface BuiltMeteoraTransaction {transaction:OpaqueTransaction;requiredSignerAddresses:string[];builder:'initializePositionAndAddLiquidityByStrategy'|'addLiquidityByStrategy'|'removeLiquidity'|'claimAllRewardsByPosition';metadata:Record<string,unknown>;}
 interface RuntimeSdk {
   PublicKey:new(value:string)=>{toBase58():string};
+  Connection:new(url:string,commitment:'confirmed')=>unknown;
+  DLMM:{create(connection:unknown,pool:unknown,options:Record<string,unknown>):Promise<MeteoraOpenAddPoolLike>};
   BN:new(value:string|number|bigint)=>{toString(base?:number):string};
   StrategyType:{Spot:number;Curve:number;BidAsk:number};
   calculateSpotDistribution(activeBinId:number,binIds:number[]):Array<{binId:number;xAmountBpsOfTotal:{toString(base?:number):string};yAmountBpsOfTotal:{toString(base?:number):string}}>;
@@ -30,14 +32,20 @@ export async function loadMeteoraExecutionRuntime():Promise<RuntimeSdk>{
   const moduleName='node:module';
   const mod=await import(moduleName) as unknown as {createRequire:(url:string)=>((id:string)=>unknown)&{resolve:(id:string)=>string}};
   const rootRequire=mod.createRequire(import.meta.url); const dlmmEntry=rootRequire.resolve('@meteora-ag/dlmm'); const dlmmRequire=mod.createRequire(dlmmEntry);
-  const dlmm=dlmmRequire('@meteora-ag/dlmm') as Omit<RuntimeSdk,'PublicKey'|'BN'|'dlmmVersion'>;
-  const web3=rootRequire('@solana/web3.js') as {PublicKey:RuntimeSdk['PublicKey']};
+  const dlmm=dlmmRequire('@meteora-ag/dlmm') as Omit<RuntimeSdk,'PublicKey'|'Connection'|'BN'|'dlmmVersion'>;
+  const web3=rootRequire('@solana/web3.js') as {PublicKey:RuntimeSdk['PublicKey'];Connection:RuntimeSdk['Connection']};
   const BN=dlmmRequire('bn.js') as RuntimeSdk['BN'];
   // package.json is not exported; derive the installed production lock version explicitly from our compatibility baseline.
-  cached={PublicKey:web3.PublicKey,BN,StrategyType:dlmm.StrategyType,calculateSpotDistribution:dlmm.calculateSpotDistribution,calculateNormalDistribution:dlmm.calculateNormalDistribution,calculateBidAskDistribution:dlmm.calculateBidAskDistribution,autoFillXByStrategy:dlmm.autoFillXByStrategy,getPriceOfBinByBinId:dlmm.getPriceOfBinByBinId,dlmmVersion:'1.9.10'}; return cached;
+  cached={PublicKey:web3.PublicKey,Connection:web3.Connection,DLMM:dlmm as unknown as RuntimeSdk['DLMM'],BN,StrategyType:dlmm.StrategyType,calculateSpotDistribution:dlmm.calculateSpotDistribution,calculateNormalDistribution:dlmm.calculateNormalDistribution,calculateBidAskDistribution:dlmm.calculateBidAskDistribution,autoFillXByStrategy:dlmm.autoFillXByStrategy,getPriceOfBinByBinId:dlmm.getPriceOfBinByBinId,dlmmVersion:'1.9.10'}; return cached;
 }
 function strategyType(s:'SPOT'|'CURVE'|'BID_ASK',r:RuntimeSdk){return s==='SPOT'?r.StrategyType.Spot:s==='CURVE'?r.StrategyType.Curve:r.StrategyType.BidAsk;}
 function validateRange(lower:number,upper:number){if(!Number.isInteger(lower)||!Number.isInteger(upper)||lower>upper)throw new Error('LPFORGE_METEORA_BUILD_INVALID_RANGE');}
+/** Creates a live SDK pool adapter. Construction is read-only; it cannot sign or submit. */
+export async function createLiveMeteoraOpenPool(input:{rpcUrl:string;poolAddress:string;programId:string}):Promise<MeteoraOpenAddPoolLike>{
+  if(!input.rpcUrl.trim()||!input.poolAddress.trim()||!input.programId.trim())throw new Error('LPFORGE_METEORA_LIVE_POOL_CONFIG_REQUIRED');
+  const sdk=await loadMeteoraExecutionRuntime();
+  return sdk.DLMM.create(new sdk.Connection(input.rpcUrl.trim(),'confirmed'),new sdk.PublicKey(input.poolAddress.trim()),{cluster:'mainnet-beta',programId:new sdk.PublicKey(input.programId.trim())});
+}
 export interface MeteoraStrategyDistribution {strategy:'SPOT'|'CURVE'|'BID_ASK';activeBinId:number;lowerBinId:number;upperBinId:number;bins:Array<{binId:number;xAmountBps:number;yAmountBps:number}>;sdkVersion:string;}
 export async function calculateMeteoraStrategyDistribution(input:{strategy:'SPOT'|'CURVE'|'BID_ASK';activeBinId:number;lowerBinId:number;upperBinId:number}):Promise<MeteoraStrategyDistribution>{
   validateRange(input.lowerBinId,input.upperBinId);if(!Number.isInteger(input.activeBinId)||input.activeBinId<input.lowerBinId||input.activeBinId>input.upperBinId)throw new Error('LPFORGE_METEORA_DISTRIBUTION_ACTIVE_BIN_OUTSIDE_RANGE');const sdk=await loadMeteoraExecutionRuntime();const binIds=Array.from({length:input.upperBinId-input.lowerBinId+1},(_,index)=>input.lowerBinId+index);const calculate=input.strategy==='SPOT'?sdk.calculateSpotDistribution:input.strategy==='CURVE'?sdk.calculateNormalDistribution:sdk.calculateBidAskDistribution;return{strategy:input.strategy,activeBinId:input.activeBinId,lowerBinId:input.lowerBinId,upperBinId:input.upperBinId,bins:calculate(input.activeBinId,binIds).map(row=>({binId:row.binId,xAmountBps:Number(row.xAmountBpsOfTotal.toString()),yAmountBps:Number(row.yAmountBpsOfTotal.toString())})),sdkVersion:sdk.dlmmVersion};
