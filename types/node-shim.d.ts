@@ -18,6 +18,8 @@ declare module 'node:http' {
 declare module 'node:crypto' {
   export interface Hash { update(data:string|Uint8Array):Hash; digest(encoding:'hex'):string; }
   export function createHash(algorithm:string):Hash;
+  export function createPrivateKey(input:{key:Uint8Array;format:'der';type:'pkcs8'}):unknown;
+  export function sign(algorithm:null,data:Uint8Array,key:unknown):Uint8Array;
 }
 declare module 'node:child_process' {
   export interface ReadableLike { on(event:'data', listener:(chunk:unknown)=>void):ReadableLike; }
@@ -27,4 +29,7 @@ declare module 'node:child_process' {
 
 declare module 'node:fs' {
   export function readFileSync(path:string,encoding:'utf8'):string;
+  export interface Stats {mode:number;isFile():boolean;isSymbolicLink():boolean;}
+  export function lstatSync(path:string):Stats;
 }
+declare module 'node:path' { export function resolve(path:string):string; }

@@ -1,10 +1,26 @@
 # Phase 6 remote signer service contract
 
-`lpforge-execution` never holds an owner private key. It sends a ticket-bound Ed25519 message to an operator-managed HTTPS signer service only after the Phase 6 gate has authorized an action.
+`lpforge-execution` supports either a local owner-only JSON keypair file—matching the other LP repositories on this VPS—or an operator-managed HTTPS signer service. In both modes, Phase 6 gates must authorize an action before the signer can be used.
+
+## Local keypair-file mode
+
+This is the compatible local-repository setup. Store the wallet’s 64-byte Solana keypair JSON outside Git, with permissions `0600`; configure its path in the ignored `.env.execution` file:
+
+```dotenv
+LPFORGE_P6_SIGNER_MODE=LOCAL_KEYPAIR_FILE
+LPFORGE_P6_SIGNER_BACKEND_ID=lpforge-local-mainnet-owner
+LPFORGE_P6_SIGNER_PUBLIC_KEY=OWNER_PUBLIC_KEY
+LPFORGE_P6_KEYPAIR_PATH=/secure/path/lpforge-owner.json
+```
+
+LPForge rejects symbolic links, non-regular files, group/world-readable files, malformed keys, and keys whose public address does not match `LPFORGE_P6_SIGNER_PUBLIC_KEY`. Never place the key file in this repository or paste its contents into chat.
+
+## Remote signer mode
 
 Configure these secret/runtime settings only in the ignored VPS `.env` file:
 
 ```dotenv
+LPFORGE_P6_SIGNER_MODE=REMOTE_KMS
 LPFORGE_P6_SIGNER_BACKEND_ID=your-signer-id
 LPFORGE_P6_SIGNER_PUBLIC_KEY=your-owner-public-key
 LPFORGE_P6_REMOTE_SIGNER_URL=https://your-signer.example/v1/sign

@@ -1,20 +1,29 @@
 // LPFORGE_PHASE6_MAINNET_MODULE
+import {createPrivateKey,sign as signEd25519} from 'node:crypto';
+import {lstatSync,readFileSync} from 'node:fs';
+import {resolve} from 'node:path';
+import {Keypair} from '@solana/web3.js';
 import {assertPhase6Authority,type Phase6Authority,type Phase6CanaryTicket} from '../../phase6-contracts/src/index.js';
 
 export interface MainnetSignerBackend {
   backendId:string;
   publicKeyAddress:string;
   clusterLock:'mainnet-beta';
-  custodyMode:'HARDWARE'|'REMOTE_KMS'|'LOCAL_ENCRYPTED_KEYSTORE';
+  custodyMode:'HARDWARE'|'REMOTE_KMS'|'LOCAL_ENCRYPTED_KEYSTORE'|'LOCAL_KEYPAIR_FILE';
   secretExportable:false;
   signMessage(message:Uint8Array,context:{ticketId:string;transactionId:string;cluster:'mainnet-beta'}):Promise<Uint8Array>;
 }
 
 export interface RemoteKmsHttpSignerConfig {backendId:string;publicKeyAddress:string;endpoint:string;authorizationToken:string;timeoutMs?:number;}
+export interface LocalKeypairFileSignerConfig {backendId:string;publicKeyAddress:string;keypairPath:string;}
 export type RemoteKmsFetch=(input:string,init:{method:'POST';headers:Record<string,string>;body:string;signal:AbortSignal})=>Promise<{ok:boolean;status:number;json():Promise<unknown>}>;
 function requiredRemoteText(name:string,value:string){if(!value.trim())throw new Error(`LPFORGE_P6_REMOTE_SIGNER_${name}_REQUIRED`);return value.trim();}
 function base64(bytes:Uint8Array){let text='';for(const byte of bytes)text+=String.fromCharCode(byte);return btoa(text);}
 function fromBase64(value:string){const text=atob(value);return Uint8Array.from(text,char=>char.charCodeAt(0));}
+function localKeypairFile(config:LocalKeypairFileSignerConfig){if(!config.keypairPath.trim())throw new Error('LPFORGE_P6_LOCAL_SIGNER_KEYPAIR_PATH_REQUIRED');const keypairPath=resolve(config.keypairPath.trim());let stat;try{stat=lstatSync(keypairPath);}catch{throw new Error('LPFORGE_P6_LOCAL_SIGNER_KEYPAIR_FILE_UNREADABLE');}if(!stat.isFile()||stat.isSymbolicLink())throw new Error('LPFORGE_P6_LOCAL_SIGNER_KEYPAIR_FILE_INVALID');if((stat.mode&0o077)!==0)throw new Error('LPFORGE_P6_LOCAL_SIGNER_KEYPAIR_FILE_PERMISSIONS');let parsed:unknown;try{parsed=JSON.parse(readFileSync(keypairPath,'utf8'));}catch{throw new Error('LPFORGE_P6_LOCAL_SIGNER_KEYPAIR_FILE_INVALID');}if(!Array.isArray(parsed)||parsed.length!==64||parsed.some(value=>!Number.isInteger(value)||value<0||value>255))throw new Error('LPFORGE_P6_LOCAL_SIGNER_KEYPAIR_FORMAT');try{return Keypair.fromSecretKey(Uint8Array.from(parsed));}catch{throw new Error('LPFORGE_P6_LOCAL_SIGNER_KEYPAIR_INVALID');}}
+function ed25519PrivateKey(secretKey:Uint8Array){const seed=secretKey.slice(0,32);const der=Uint8Array.from([0x30,0x2e,0x02,0x01,0x00,0x30,0x05,0x06,0x03,0x2b,0x65,0x70,0x04,0x22,0x04,0x20,...seed]);return createPrivateKey({key:der,format:'der',type:'pkcs8'});}
+/** Local signer compatible with the existing LP repositories' KEYPAIR_PATH model. */
+export function createLocalKeypairFileSigner(config:LocalKeypairFileSignerConfig):MainnetSignerBackend{const backendId=requiredRemoteText('BACKEND_ID',config.backendId),publicKeyAddress=requiredRemoteText('PUBLIC_KEY',config.publicKeyAddress),keypair=localKeypairFile(config);if(keypair.publicKey.toBase58()!==publicKeyAddress)throw new Error('LPFORGE_P6_LOCAL_SIGNER_OWNER_MISMATCH');const privateKey=ed25519PrivateKey(keypair.secretKey);return{backendId,publicKeyAddress,clusterLock:'mainnet-beta',custodyMode:'LOCAL_KEYPAIR_FILE',secretExportable:false,async signMessage(message){return new Uint8Array(signEd25519(null,message,privateKey));}};}
 /**
  * Adapter for an operator-managed remote Ed25519 signer/KMS service.
  * The private key never enters LPForge. The remote endpoint must accept the
