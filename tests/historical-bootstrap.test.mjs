@@ -42,6 +42,18 @@ test('historical maturity is assessed at the historical high-water mark while fr
  assert.equal(maturity.historicalState,'MATURE');assert.equal(maturity.liveConfirmationState,'CONFIRMED');assert.equal(maturity.state,'MATURE');
 });
 
+test('live confirmation requires both observation density and bounded gaps, not wall-clock time alone',async()=>{
+ const historic=historicMarket();
+ const sparse=Array.from({length:3},(_,i)=>({observedAt:iso(ms-(10-i*5)*60_000),sourceType:'LIVE_OBSERVED',sourceProvider:'METEORA_API+RPC',price:1,activeBinId:110,resolutionMs:30_000}));
+ const tooFew=await assessHistoryMaturity({poolAddress:'P',assessedAt:at,history:history(),historicalMarket:historic,liveMarket:sparse,liveConfirmationMinutes:10,liveConfirmationMinObservations:4,liveConfirmationMaxGapMs:180_000});
+ assert.equal(tooFew.liveConfirmationState,'WARMING');assert.ok(tooFew.reasonCodes.includes('ENTRY_LIVE_CONFIRMATION_INSUFFICIENT_OBSERVATIONS'));
+ const gapped=[10,6,2,0].map(minutesAgo=>({observedAt:iso(ms-minutesAgo*60_000),sourceType:'LIVE_OBSERVED',sourceProvider:'METEORA_API+RPC',price:1,activeBinId:110,resolutionMs:30_000}));
+ const gap=await assessHistoryMaturity({poolAddress:'P',assessedAt:at,history:history(),historicalMarket:historic,liveMarket:gapped,liveConfirmationMinutes:10,liveConfirmationMinObservations:4,liveConfirmationMaxGapMs:180_000});
+ assert.equal(gap.liveConfirmationState,'WARMING');assert.ok(gap.reasonCodes.includes('ENTRY_LIVE_CONFIRMATION_GAP'));
+ const confirmed=await assessHistoryMaturity({poolAddress:'P',assessedAt:at,history:history(),historicalMarket:historic,liveMarket:liveMarket(10),liveConfirmationMinutes:10,liveConfirmationMinObservations:4,liveConfirmationMaxGapMs:180_000});
+ assert.equal(confirmed.liveConfirmationState,'CONFIRMED');
+});
+
 test('a timestamp-at-start five-minute historical bucket covers its genuine closing interval',async()=>{
  const historic=Array.from({length:13},(_,i)=>({observedAt:iso(ms-65*60_000+i*5*60_000),sourceType:'HISTORICAL_API_BACKFILL',sourceProvider:'METEORA_DATA_API',price:1+i*.01,resolutionMs:5*60_000}));
  const maturity=await assessHistoryMaturity({poolAddress:'P',assessedAt:at,history:history(),historicalMarket:historic,liveMarket:liveMarket(10),liveConfirmationMinutes:10});

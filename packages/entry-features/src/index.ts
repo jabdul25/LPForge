@@ -1,5 +1,5 @@
 import type { MarketContextSnapshot } from '../../market-context/src/index.js';
-import type { RegimeAssessment } from '../../regime/src/index.js';
+import { deriveTemporalRegimeStability, type RegimeAssessment, type RegimeHistoryAnalysis } from '../../regime/src/index.js';
 import type { StructureFeatureVector } from '../../structure-features/src/index.js';
 import type { PoolAssessment } from '../../pool-intelligence/src/index.js';
 import type { RangeStrategyCandidate } from '../../rangeforge/src/index.js';
@@ -25,7 +25,7 @@ export interface EntryTimingFeatureVector {
 }
 const clamp=(x:number,min=0,max=1)=>Math.max(min,Math.min(max,x));
 function prob(r:RegimeAssessment,label:string){return r.probabilities.find((x)=>x.label===label)?.probability??0;}
-export function computeEntryTimingFeatures(input:{context:MarketContextSnapshot;regime:RegimeAssessment;structure:StructureFeatureVector;pool:PoolAssessment;candidate:RangeStrategyCandidate;activeBinId:number;referenceDivergenceBps?:number;previousTwoWayRatio?:number;}):EntryTimingFeatureVector{
+export function computeEntryTimingFeatures(input:{context:MarketContextSnapshot;regime:RegimeAssessment;regimeHistory?:RegimeHistoryAnalysis;structure:StructureFeatureVector;pool:PoolAssessment;candidate:RangeStrategyCandidate;activeBinId:number;referenceDivergenceBps?:number;previousTwoWayRatio?:number;}):EntryTimingFeatureVector{
  const h5=input.context.horizons['5m'],h15=input.context.horizons['15m'];
  const downsidePressure=clamp(Math.max(0,-h5.returnPct)/3*.35+Math.max(0,-h5.netBins)/20*.35+input.structure.downsideAcceleration*.30);
  const downsideDeceleration=clamp(1-input.structure.downsideAcceleration);
@@ -35,7 +35,10 @@ export function computeEntryTimingFeatures(input:{context:MarketContextSnapshot;
  const twoWayFlowStrength=clamp(input.structure.flowTwoWay);
  const flowRecovery=clamp(input.previousTwoWayRatio===undefined?twoWayFlowStrength:(twoWayFlowStrength-input.previousTwoWayRatio+.5));
  const dangerousRegimeMass=clamp(prob(input.regime,'FREEFALL')+prob(input.regime,'TREND_DOWN')*.7+prob(input.regime,'DISTRIBUTION')*.45);
- const regimeStability=clamp(input.regime.stability*(1-input.regime.transitionRisk));
+ // Preserve the legacy one-snapshot fallback for old/offline callers.  The
+ // production path supplies persisted regime history and therefore uses the
+ // temporal-coherence measure rather than a softmax margin.
+ const regimeStability=input.regimeHistory?deriveTemporalRegimeStability(input.regimeHistory):clamp(input.regime.stability*(1-input.regime.transitionRisk));
  const poolToxicity=clamp(input.pool.toxicityProbability);
  const referenceDivergenceRisk=clamp(Math.abs(input.referenceDivergenceBps??0)/250);
  const width=Math.max(1,input.candidate.upperBinId-input.candidate.lowerBinId);

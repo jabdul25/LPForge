@@ -45,6 +45,20 @@ export interface RegimeHistoryAnalysis {
   recoveryLikelihood:number;
   transitionRisk:number;
 }
+/**
+ * Temporal coherence is intentionally distinct from a classifier's top-label
+ * margin.  Multi-class regime probabilities can remain ambiguous while their
+ * distribution and market structure are stable across time.
+ */
+export function deriveTemporalRegimeStability(history:RegimeHistoryAnalysis):number{
+ if(history.samples<3)return 0;
+ const persistence=clamp(history.stableDurationMinutes/30);
+ const driftCoherence=clamp(1-history.meanProbabilityDrift/.25);
+ const flapCoherence=clamp(1-history.flappingRate/.5);
+ const continuity=clamp(1-history.continuityBreaks/2);
+ const directionalSafety=clamp(1-history.downsideTransitionRisk);
+ return clamp(.30*persistence+.25*driftCoherence+.20*flapCoherence+.15*continuity+.10*directionalSafety);
+}
 function probabilityMap(a:RegimeHistorySample):Map<Phase3RegimeLabel,number>{return new Map(a.probabilities.map((p)=>[p.label,p.probability]));}
 function probabilityDrift(a:RegimeHistorySample,b:RegimeHistorySample):number{const am=probabilityMap(a),bm=probabilityMap(b);return labels.reduce((s,l)=>s+Math.abs((am.get(l)??0)-(bm.get(l)??0)),0)/2;}
 function quantizedFingerprint(a:RegimeHistorySample):string{return a.probabilities.slice(0,4).map((p)=>`${p.label}:${Math.round(p.probability*10)}`).sort().join('|');}
