@@ -11,7 +11,7 @@ export type ExecutionAuthorityLevel =
 
 export type ExecutionAction = 'OPEN'|'ADD'|'RESHAPE'|'REBALANCE'|'REDUCE'|'CLAIM'|'CLOSE'|'EMERGENCY_CLOSE';
 export type TransactionPlanState = 'PLANNED'|'BUILT'|'SIMULATED'|'APPROVED'|'SIGNED'|'SUBMITTED'|'CONFIRMED'|'EXPIRED'|'FAILED'|'RECONCILIATION_REQUIRED'|'RECONCILED';
-export type TransactionIntentKind = 'METEORA_OPEN'|'METEORA_ADD'|'METEORA_REMOVE'|'METEORA_CLAIM'|'METEORA_CLOSE';
+export type TransactionIntentKind = 'JUPITER_SWAP'|'METEORA_OPEN'|'METEORA_ADD'|'METEORA_REMOVE'|'METEORA_CLAIM'|'METEORA_CLOSE';
 
 export interface ExecutionAuthority {
   phase:'P5';

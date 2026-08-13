@@ -4,7 +4,7 @@ import {buildOpenPositionTransaction,type MeteoraOpenAddPoolLike} from '../../me
 import {createEphemeralPositionSigner,type AuxiliaryMainnetSignerBackend} from '../../phase6-mainnet-signer/src/index.js';
 import {createLegacyMainnetEnvelope} from '../../phase6-live-envelope/src/index.js';
 
-export interface AutonomousOpenPlan {planId:string;intentId:string;idempotencyKey:string;poolAddress:string;ownerAddress:string;thesisId:string;observedAt:string;expiresAt:string;intentPayload:Record<string,unknown>;planPayload:Record<string,unknown>;transactionId:string;transactionMetadata:Record<string,unknown>;}
+export interface AutonomousOpenPlan {planId:string;intentId:string;idempotencyKey:string;poolAddress:string;ownerAddress:string;thesisId:string;observedAt:string;expiresAt:string;intentPayload:Record<string,unknown>;planPayload:Record<string,unknown>;transactionId:string;transactionMetadata:Record<string,unknown>;swapTransactionId?:string;swapTransactionMetadata?:Record<string,unknown>;}
 export interface PreparedAutonomousOpen {plan:AutonomousOpenPlan;positionSigner:AuxiliaryMainnetSignerBackend;requiredSignerAddresses:string[];transaction:Transaction;envelope:ReturnType<typeof createLegacyMainnetEnvelope>;metadata:Record<string,unknown>;}
 function object(value:unknown,code:string){if(!value||typeof value!=='object'||Array.isArray(value))throw new Error(code);return value as Record<string,unknown>;}
 function integer(value:unknown,code:string){const n=Number(value);if(!Number.isInteger(n))throw new Error(code);return n;}
