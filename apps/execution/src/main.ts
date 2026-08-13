@@ -14,7 +14,7 @@ import {
   recoverPartialEntryFunding,
   recoverUnfinishedAutonomousPlans,
 } from "../../../packages/phase6-live-worker/src/index.js";
-import { Connection } from "@solana/web3.js";
+import { Connection, PublicKey } from "@solana/web3.js";
 import { EXPECTED_DLMM_PROGRAM_ID } from "../../../packages/meteora/src/index.js";
 import { loadMainnetCanaryDeploymentPolicyFile } from "../../../packages/canary/src/index.js";
 import { validateClaimedPlan } from "../../../packages/phase6-claim-guard/src/index.js";
@@ -135,6 +135,9 @@ async function dispatchOne() {
         store.loadOwnedPositions(plan.ownerAddress),
         store.listDiscoveryCandidates([...(staticPolicy.productionAdmission?.eligibleTiers??['A'])]),
       ]);
+    const now=new Date().toISOString(), dayStart=new Date(Date.UTC(new Date(now).getUTCFullYear(),new Date(now).getUTCMonth(),new Date(now).getUTCDate())).toISOString();
+    const [controlRow,actionsToday]=await Promise.all([store.loadLatestPhase7ControlDecision((process.env.LPFORGE_P7_RUNTIME_ID??'lpforge-production').trim()),store.countExecutionActionsSince(plan.ownerAddress,dayStart)]);
+    const phase7Control=controlRow?{authorityMode:String(controlRow.authority_mode),healthStatus:String(controlRow.health_status),driftStatus:String(controlRow.drift_status),safetyMode:String(controlRow.safety_mode),newEconomicActionAllowed:Boolean(controlRow.new_economic_action_allowed),observedAt:new Date(String(controlRow.observed_at)).toISOString()}:undefined;
     let positionTruth;
     if (plan.positionAddress) {
       try {
@@ -153,7 +156,9 @@ async function dispatchOne() {
       policy: staticPolicy,
       ownedPositions: owned,
       productionCandidates,
-      now: new Date().toISOString(),
+      ...(phase7Control?{phase7Control}:{}),
+      actionsToday,
+      now,
       ...(positionTruth ? { positionTruth } : {}),
     });
     if (!guard.approved) {
@@ -175,12 +180,24 @@ async function dispatchOne() {
         transactionSubmitted: false,
       };
     }
+    if(["OPEN","ADD"].includes(plan.action)){
+      const capital=guard.capitalLamports, deployment=staticPolicy.productionCapital;
+      if(!deployment){await store.transitionAutonomousPlan({planId:plan.planId,state:"BLOCKED",at:now,reasonCodes:['P6_CAPITAL_POLICY_MISSING'],payload:{stage:'CAPITAL_RESERVATION'}});return{service:'lpforge-execution',status:'BLOCKED',planId:plan.planId,reasonCodes:['P6_CAPITAL_POLICY_MISSING'],transactionSubmitted:false};}
+      const walletLamports=BigInt(await new Connection(config.rpcUrl,'confirmed').getBalance(new PublicKey(plan.ownerAddress),'confirmed'));
+      const pool=staticPolicy.pools.find(x=>x.address===plan.poolAddress),poolCap=pool?.maxCapitalLamports??staticPolicy.productionAdmission?.maxCapitalLamports;
+      if(!poolCap){await store.transitionAutonomousPlan({planId:plan.planId,state:"BLOCKED",at:now,reasonCodes:['P6_CAPITAL_POOL_POLICY_MISSING'],payload:{stage:'CAPITAL_RESERVATION'}});return{service:'lpforge-execution',status:'BLOCKED',planId:plan.planId,reasonCodes:['P6_CAPITAL_POOL_POLICY_MISSING'],transactionSubmitted:false};}
+      const reserved=await store.reserveExecutionCapital({planId:plan.planId,ownerAddress:plan.ownerAddress,poolAddress:plan.poolAddress,capitalLamports:capital,walletLamports,reserveLamports:deployment.reserveLamports,maxPortfolioLamports:deployment.maxPortfolioLamports,maxPoolLamports:poolCap,maxTokenLamports:deployment.maxTokenLamports,maxInitialPositionLamports:deployment.maxInitialPositionLamports,now});
+      if(!reserved.approved){await store.transitionAutonomousPlan({planId:plan.planId,state:"BLOCKED",at:now,reasonCodes:reserved.reasonCodes,payload:{stage:'CAPITAL_RESERVATION'}});return{service:'lpforge-execution',status:'BLOCKED',planId:plan.planId,reasonCodes:reserved.reasonCodes,transactionSubmitted:false};}
+    }
     const result = await executeAutonomousPlan({
       store,
       plan,
       signer: signerFromEnvironment(),
       config,
     });
+    if(result.transactionSubmitted)await store.markExecutionCapitalSubmitted(plan.planId,new Date().toISOString());
+    else if(result.status==='BLOCKED')await store.releaseExecutionCapital(plan.planId,new Date().toISOString(),result.reasonCodes);
+    await store.reconcileExecutionCapitalReservations(new Date().toISOString());
     return {
       service: "lpforge-execution",
       status: result.status,
@@ -201,6 +218,7 @@ async function recoverOnce() {
         config.rpcUrl,
         "confirmed",
       ).getBlockHeight("confirmed");
+    await store.reconcileExecutionCapitalReservations(new Date().toISOString());
     const partial = await recoverPartialEntryFunding({
       store,
       signer: signerFromEnvironment(),

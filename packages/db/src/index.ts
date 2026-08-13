@@ -79,6 +79,8 @@ export interface AutonomousPlan {
   planPayload: Record<string, unknown>;
   steps: AutonomousPlanStep[];
 }
+export interface ExecutionCapitalReservationRequest {planId:string;ownerAddress:string;poolAddress:string;capitalLamports:bigint;walletLamports:bigint;reserveLamports:bigint;maxPortfolioLamports:bigint;maxPoolLamports:bigint;maxTokenLamports:bigint;maxInitialPositionLamports:bigint;now:string;}
+export interface ExecutionCapitalReservationResult {approved:boolean;reasonCodes:string[];tokenMint?:string;deployedLamports:bigint;reservedLamports:bigint;availableLamports:bigint;}
 export interface Phase1Store {
   health(): Promise<boolean>;
   close(): Promise<void>;
@@ -378,6 +380,11 @@ export interface Phase1Store {
     }>;
   }): Promise<void>;
   claimNextAutonomousPlan(now: string): Promise<AutonomousPlan | undefined>;
+  reserveExecutionCapital(value:ExecutionCapitalReservationRequest):Promise<ExecutionCapitalReservationResult>;
+  releaseExecutionCapital(planId:string,at:string,reasonCodes:string[]):Promise<void>;
+  markExecutionCapitalSubmitted(planId:string,at:string):Promise<void>;
+  reconcileExecutionCapitalReservations(at:string):Promise<void>;
+  countExecutionActionsSince(ownerAddress:string,since:string):Promise<number>;
   claimNextAutonomousOpenPlan(now: string): Promise<
     | {
         planId: string;
@@ -1605,6 +1612,38 @@ export async function createPostgresStore(
       if (!row) throw new Error("LPFORGE_P6_AUTONOMOUS_PLAN_DETAIL_MISSING");
       return autonomousPlanFromRow(row);
     },
+    async reserveExecutionCapital(v) {
+      const tx=db;
+      try {
+        await tx.query('BEGIN');
+        await tx.query("SELECT pg_advisory_xact_lock(hashtext($1))",[v.ownerAddress]);
+        const existing=await tx.query("SELECT token_mint,state FROM execution.capital_reservations WHERE plan_id=$1 FOR UPDATE",[v.planId]);
+        if(existing.rows[0]&&String(existing.rows[0].state)!=='RELEASED'){
+          await tx.query('COMMIT');
+          return{approved:true,reasonCodes:['P6_CAPITAL_RESERVATION_ALREADY_HELD'],tokenMint:String(existing.rows[0].token_mint),deployedLamports:0n,reservedLamports:v.capitalLamports,availableLamports:0n};
+        }
+        const tokenRow=await tx.query("SELECT token_y_mint FROM protocol.pools WHERE address=$1",[v.poolAddress]);
+        const tokenMint=tokenRow.rows[0]?.token_y_mint?String(tokenRow.rows[0].token_y_mint):undefined;
+        const reasons:string[]=[]; if(!tokenMint) reasons.push('P6_CAPITAL_POOL_TOKEN_MISSING');
+        const positions=await tx.query("SELECT COALESCE(sum(initial_capital_lamports),0)::text AS deployed,COALESCE(sum(initial_capital_lamports) FILTER (WHERE pool_address=$2),0)::text AS pool_deployed,COALESCE(sum(initial_capital_lamports) FILTER (WHERE p.token_y_mint=$3),0)::text AS token_deployed FROM execution.owned_positions o JOIN protocol.pools p ON p.address=o.pool_address WHERE o.owner_address=$1 AND o.lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN')",[v.ownerAddress,v.poolAddress,tokenMint??'']);
+        const reservations=await tx.query("SELECT COALESCE(sum(capital_lamports),0)::text AS reserved,COALESCE(sum(capital_lamports) FILTER (WHERE pool_address=$2),0)::text AS pool_reserved,COALESCE(sum(capital_lamports) FILTER (WHERE token_mint=$3),0)::text AS token_reserved FROM execution.capital_reservations WHERE owner_address=$1 AND state IN ('RESERVED','SUBMITTED')",[v.ownerAddress,v.poolAddress,tokenMint??'']);
+        const q=(row:Record<string,unknown>,key:string)=>BigInt(String(row[key]??'0'));
+        const deployed=q(positions.rows[0]??{},'deployed'),poolDeployed=q(positions.rows[0]??{},'pool_deployed'),tokenDeployed=q(positions.rows[0]??{},'token_deployed'),reserved=q(reservations.rows[0]??{},'reserved'),poolReserved=q(reservations.rows[0]??{},'pool_reserved'),tokenReserved=q(reservations.rows[0]??{},'token_reserved');
+        const available=v.walletLamports-v.reserveLamports-deployed-reserved;
+        if(v.capitalLamports>v.maxInitialPositionLamports)reasons.push('P6_CAPITAL_MAX_INITIAL_POSITION');
+        if(v.capitalLamports>available)reasons.push('P6_CAPITAL_WALLET_OR_PORTFOLIO_LIMIT');
+        if(deployed+reserved+v.capitalLamports>v.maxPortfolioLamports)reasons.push('P6_CAPITAL_PORTFOLIO_LIMIT');
+        if(poolDeployed+poolReserved+v.capitalLamports>v.maxPoolLamports)reasons.push('P6_CAPITAL_POOL_LIMIT');
+        if(tokenDeployed+tokenReserved+v.capitalLamports>v.maxTokenLamports)reasons.push('P6_CAPITAL_TOKEN_LIMIT');
+        if(reasons.length){await tx.query('COMMIT');return{approved:false,reasonCodes:reasons.sort(),...(tokenMint?{tokenMint}:{}),deployedLamports:deployed,reservedLamports:reserved,availableLamports:available>0n?available:0n};}
+        await tx.query("INSERT INTO execution.capital_reservations(plan_id,owner_address,pool_address,token_mint,capital_lamports,state,reserved_at,updated_at,reason_codes,payload) VALUES($1,$2,$3,$4,$5,'RESERVED',$6,$6,'[]'::jsonb,'{}'::jsonb) ON CONFLICT(plan_id) DO UPDATE SET state='RESERVED',updated_at=EXCLUDED.updated_at,reason_codes='[]'::jsonb",[v.planId,v.ownerAddress,v.poolAddress,tokenMint,v.capitalLamports.toString(),v.now]);
+        await tx.query('COMMIT');return{approved:true,reasonCodes:['P6_CAPITAL_RESERVED'],...(tokenMint?{tokenMint}:{}),deployedLamports:deployed,reservedLamports:reserved+v.capitalLamports,availableLamports:available-v.capitalLamports};
+      } catch(error) {try{await tx.query('ROLLBACK');}catch{} throw error;}
+    },
+    async releaseExecutionCapital(planId,at,reasonCodes){await db.query("UPDATE execution.capital_reservations SET state='RELEASED',updated_at=$2,reason_codes=$3::jsonb WHERE plan_id=$1 AND state IN ('RESERVED','SUBMITTED')",[planId,at,json(reasonCodes)]);},
+    async markExecutionCapitalSubmitted(planId,at){await db.query("UPDATE execution.capital_reservations SET state='SUBMITTED',updated_at=$2 WHERE plan_id=$1 AND state='RESERVED'",[planId,at]);},
+    async reconcileExecutionCapitalReservations(at){await db.query("UPDATE execution.capital_reservations r SET state=CASE WHEN p.state IN ('BLOCKED','FAILED') THEN 'RELEASED' WHEN EXISTS(SELECT 1 FROM execution.owned_positions o WHERE o.entry_plan_id=r.plan_id AND o.lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN')) THEN 'DEPLOYED' ELSE r.state END,updated_at=$1 FROM execution.transaction_plans p WHERE p.plan_id=r.plan_id AND r.state IN ('RESERVED','SUBMITTED')",[at]);},
+    async countExecutionActionsSince(ownerAddress,since){const r=await db.query("SELECT count(DISTINCT p.plan_id)::int AS n FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id LEFT JOIN execution.transaction_steps s ON s.plan_id=p.plan_id LEFT JOIN execution.submission_attempts a ON a.transaction_id=s.transaction_id WHERE i.owner_address=$1 AND a.state IN ('SENT','UNKNOWN') AND a.submitted_at >= $2::timestamptz",[ownerAddress,since]);return Number(r.rows[0]?.n??0);},
     async claimNextAutonomousOpenPlan(now) {
       const claimed = await db.query(
         `WITH candidate AS (SELECT p.plan_id FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id WHERE p.cluster='mainnet-beta' AND p.state='PLANNED' AND i.action='OPEN' AND p.expires_at>$1::timestamptz ORDER BY p.created_at ASC FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE execution.transaction_plans p SET state='DISPATCHING',payload=p.payload||jsonb_build_object('autonomous_dispatch_claimed_at',$1::text) FROM candidate c WHERE p.plan_id=c.plan_id RETURNING p.plan_id,p.intent_id,p.expires_at,p.payload`,
@@ -2602,6 +2641,11 @@ export function createMemoryStore(): Phase1Store {
     async claimNextAutonomousPlan() {
       return undefined;
     },
+    async reserveExecutionCapital() { return {approved:true,reasonCodes:['P6_CAPITAL_RESERVED'],deployedLamports:0n,reservedLamports:0n,availableLamports:0n}; },
+    async releaseExecutionCapital() {},
+    async markExecutionCapitalSubmitted() {},
+    async reconcileExecutionCapitalReservations() {},
+    async countExecutionActionsSince() { return 0; },
     async claimNextAutonomousOpenPlan() {
       return undefined;
     },

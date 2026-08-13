@@ -7,6 +7,13 @@ export interface ClaimGuardResult {
   capitalLamports: bigint;
 }
 export interface ProductionAdmissionCandidate {poolAddress:string;state:string;tier:string;lastSeenAt:string;}
+export interface Phase7ExecutionControl {authorityMode:string;healthStatus:string;driftStatus:string;safetyMode:string;newEconomicActionAllowed:boolean;observedAt:string;}
+export function validateFreshPhase7ExecutionControl(control:Phase7ExecutionControl|undefined,now:string,maxAgeMs=60_000):string[]{
+ const reasons:string[]=[];const age=control?Date.parse(now)-Date.parse(control.observedAt):NaN;
+ if(!control)reasons.push('P6_CLAIM_P7_CONTROL_MISSING');
+ else {if(control.authorityMode!=='PRODUCTION')reasons.push('P6_CLAIM_P7_AUTHORITY_NOT_PRODUCTION');if(control.healthStatus!=='HEALTHY')reasons.push('P6_CLAIM_P7_HEALTH_NOT_HEALTHY');if(control.driftStatus==='BLOCK')reasons.push('P6_CLAIM_P7_DRIFT_BLOCK');if(control.safetyMode!=='NORMAL')reasons.push('P6_CLAIM_P7_SAFETY_NOT_NORMAL');if(!control.newEconomicActionAllowed)reasons.push('P6_CLAIM_P7_NEW_ACTION_BLOCKED');}
+ if(!Number.isFinite(age)||age<0||age>maxAgeMs)reasons.push('P6_CLAIM_P7_CONTROL_STALE');return reasons.sort();
+}
 function record(value: unknown) {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -40,6 +47,8 @@ export function validateClaimedPlan(input: {
   ownedPositions: Record<string, unknown>[];
   positionTruth?: { owner: string; pool: string };
   productionCandidates?: ProductionAdmissionCandidate[];
+  phase7Control?:Phase7ExecutionControl;
+  actionsToday?:number;
   now?: string;
 }): ClaimGuardResult {
   const reasons: string[] = [],
@@ -88,6 +97,8 @@ export function validateClaimedPlan(input: {
     )
       reasons.push("P6_CLAIM_POSITION_TRUTH_MISMATCH");
   }
+  if(input.phase7Control)reasons.push(...validateFreshPhase7ExecutionControl(input.phase7Control,input.now??new Date().toISOString()));
+  if(input.actionsToday!==undefined&&input.actionsToday>=input.policy.maxActionsPerDay)reasons.push('P6_CLAIM_DAILY_ACTION_LIMIT');
   return {
     approved: reasons.length === 0,
     reasonCodes: reasons.sort(),
