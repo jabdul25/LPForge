@@ -19,6 +19,22 @@ export interface DiscoveryRuntimePolicy {
   predictionCohorts:Array<'A'|'B'|'CONTROL'>;
 }
 export const DEFAULT_DISCOVERY_RUNTIME_POLICY:DiscoveryRuntimePolicy={id:'discovery-runtime-v2.1.1',deep:DEFAULT_DEEP_SCREEN_POLICY,universe:DEFAULT_UNIVERSE_POLICY,eventScanLimit:5,binRadius:35,capitalResearchSol:.1,predictionCohorts:['A','B','CONTROL']};
+export type DiscoveryLifecycleState='OBSERVING'|'QUALIFIED'|'WATCHLIST'|'ACTIVE_CANDIDATE'|'REJECTED'|'QUARANTINED';
+/**
+ * D3/D4 is the only authority allowed to promote a cheap-screened pool into
+ * execution eligibility.  D1/D2 priority alone must never produce an active
+ * candidate state.
+ */
+export function deriveDiscoveryLifecycleState(input:{deep:Pick<DeepScreenResult,'eligibility'|'reasonCodes'>;assignment:Pick<import('../../pool-universe/src/index.js').UniverseAssignment,'tier'>}):{state:DiscoveryLifecycleState;tier:string}{
+ const {eligibility}=input.deep,{tier}=input.assignment;
+ if(input.deep.reasonCodes.some(code=>code.startsWith('DEEP_READ_FAILED:')))return{state:'OBSERVING',tier:'C'};
+ if(eligibility==='QUARANTINED'||tier==='QUARANTINED')return{state:'QUARANTINED',tier:'QUARANTINED'};
+ if(eligibility==='BLOCK'||tier==='REJECTED')return{state:'REJECTED',tier:'REJECTED'};
+ if(eligibility!=='QUALIFIED')return{state:'OBSERVING',tier:'C'};
+ if(tier==='A')return{state:'ACTIVE_CANDIDATE',tier:'A'};
+ if(tier==='B')return{state:'WATCHLIST',tier:'B'};
+ return{state:'QUALIFIED',tier};
+}
 const hash=(x:string)=>createHash('sha256').update(x).digest('hex').slice(0,32);
 function movementHistory(events:Array<{startBinId?:number;endBinId?:number;blockTime?:string}>,activeBinId:number,observedAt:string){
  const rows:Array<{binId:number;observedAt:string}>=[];for(const e of events){if(e.blockTime&&e.endBinId!==undefined)rows.push({binId:e.endBinId,observedAt:e.blockTime});}
