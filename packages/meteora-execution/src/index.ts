@@ -5,6 +5,7 @@ export interface AddBuildRequest extends OpenBuildRequest {}
 export interface MeteoraOpenAddPoolLike {
   initializePositionAndAddLiquidityByStrategy(args:Record<string,unknown>):Promise<OpaqueTransaction>;
   addLiquidityByStrategy(args:Record<string,unknown>):Promise<OpaqueTransaction>;
+  getPosition?(position:unknown):Promise<unknown>;
 }
 export function createFixtureMeteoraOpenAddPool():MeteoraOpenAddPoolLike{
   return{
