@@ -1,6 +1,6 @@
 // LPFORGE_PHASE5_EXECUTION_MODULE
 import type { ExecutionAction, ExecutionAuthority } from '../../execution-contracts/src/index.js';
-export const MAINNET_CANARY_HARD_CAP_LAMPORTS=100_000_000n;
+export const MAINNET_CANARY_HARD_CAP_LAMPORTS=500_000_000n;
 export interface MainnetCanaryPolicy {maxLamports:bigint;allowedPools:string[];approvalTtlMs:number;minDevnetConfirmedRuns:number;maxActionsPerDay:number;rpcClass:'DEDICATED_PRIVATE';allowedActions:ReadonlyArray<'OPEN'|'CLOSE'|'EMERGENCY_CLOSE'>;}
 export interface MainnetCanaryReadiness {externalReadHealthy:boolean;databaseRuntimeVerified:boolean;phase5BoundaryPass:boolean;recoverySuitePass:boolean;emergencyStopTested:boolean;devnetConfirmedRuns:number;devnetReconciledRuns:number;unresolvedReconciliations:number;openMainnetCanaryPositions:number;actionsToday:number;globalKillSwitch:boolean;}
 export interface MainnetCanaryIntent {action:ExecutionAction;poolAddress:string;capitalLamports:bigint;now:string;}
