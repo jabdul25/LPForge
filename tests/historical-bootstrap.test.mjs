@@ -42,6 +42,12 @@ test('historical maturity is assessed at the historical high-water mark while fr
  assert.equal(maturity.historicalState,'MATURE');assert.equal(maturity.liveConfirmationState,'CONFIRMED');assert.equal(maturity.state,'MATURE');
 });
 
+test('a timestamp-at-start five-minute historical bucket covers its genuine closing interval',async()=>{
+ const historic=Array.from({length:13},(_,i)=>({observedAt:iso(ms-65*60_000+i*5*60_000),sourceType:'HISTORICAL_API_BACKFILL',sourceProvider:'METEORA_DATA_API',price:1+i*.01,resolutionMs:5*60_000}));
+ const maturity=await assessHistoryMaturity({poolAddress:'P',assessedAt:at,history:history(),historicalMarket:historic,liveMarket:liveMarket(10),liveConfirmationMinutes:10});
+ assert.equal(maturity.historicalState,'MATURE');assert.equal(maturity.state,'MATURE');
+});
+
 test('hybrid historical plus live economic evidence promotes only with non-overlapping market-time episodes',async()=>{
  const h=history(91),hybrid=[...Array.from({length:10},(_,i)=>({timestamp:Math.floor((ms-90*60_000+i*10*60_000)/1000),fees:5,protocol_fees:.5,volume:500})),...fees(2,ms-5*60_000)];
  const r=await deriveEventPathEconomicEstimate({poolAddress:'P',asOf:at,dataApiPool:{address:'P',tvl:100000},feeBuckets:hybrid,history:h});
