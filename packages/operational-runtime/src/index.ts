@@ -14,7 +14,6 @@ import { buildTransactionPlan } from '../../transaction-planner/src/index.js';
 import type { TransactionPlan } from '../../execution-contracts/src/index.js';
 import type { OpportunityRateEvidence } from '../../opportunity/src/index.js';
 import type { RegimeHistorySample } from '../../regime/src/index.js';
-import {routePhase6Inventory} from '../../phase6-inventory-routing/src/index.js';
 
 export interface OperationalHistory {
   marketObservations:MarketObservation[];
@@ -48,7 +47,6 @@ export interface OperationalCycleInput {
   walletCapital:number;
   ownerAddress?:string;
   replacementPositionAddress?:string;
-  executionInventory?:{tokenXRaw:bigint;tokenYRaw:bigint};
   policy?:OperationalRuntimePolicy;
 }
 export interface OperationalCycleResult {
@@ -118,8 +116,7 @@ export async function evaluateOperationalCycle(input:OperationalCycleInput):Prom
   if(!ready){reasonCodes.push('OPERATIONAL_FORWARD_HISTORY_WARMING');const core={...base,phase3Status:'WARMING' as const,phase4Status:'WARMING' as const,phase5Status:'NOT_REACHED' as const,reasonCodes};return{cycleId:await sha256Hex(canonicalJson(core)),...core};}
   const market=[...input.history.marketObservations];const last=market.at(-1);if(!last||Date.parse(last.observedAt)<Date.parse(input.observedAt)){market.push({observedAt:input.observedAt,price:numeric(input.dataApiPool.current_price,1),activeBinId:input.pool.activeBinId,volume:numeric(input.dataApiPool.volume?.['5m']),feeValue:numeric(input.dataApiPool.fees?.['5m']),twoWayRatio:flow.twoWayRatio,localLiquidity:numeric(input.dataApiPool.tvl)});}
   const expiresAt=new Date(Date.parse(input.observedAt)+p.thesisTtlMinutes*60000).toISOString();
-  const inventory=input.executionInventory?routePhase6Inventory(input.executionInventory):undefined;if(inventory)reasonCodes.push(...inventory.reasonCodes);if(inventory&&!inventory.tradable){const core={...base,phase3Status:'NO_TRADE' as const,phase4Status:'NO_TRADE' as const,phase5Status:'NOT_REACHED' as const,reasonCodes:[...new Set(reasonCodes)].sort()};return{cycleId:await sha256Hex(canonicalJson(core)),...core};}
-  const shadow=await buildShadowRecommendation({pool:input.pool.address,decisionAt:input.observedAt,expiresAt,activeBinId:input.pool.activeBinId,binStep:input.pool.binStep,horizonMinutes:p.horizonMinutes,capitalValue:input.walletCapital,currentObservations:market,historicalActiveBins:input.history.activeBins,historicalFrames:input.history.binFrames,historicalEvents:input.history.swapEvents,priorRegimeAssessments:input.priorRegimeAssessments??[],poolAssessment,rateEvidence,binFeatures:bin,flowFeatures:flow,totalPositionShareRaw:1000n,rawUnitValueX:valuation.rawUnitValueX,rawUnitValueY:valuation.rawUnitValueY,costs:{transactionFeeValue:String(p.executionCostFixed)},...(inventory?{orientations:inventory.orientations,strategies:inventory.strategies}:{orientations:['BALANCED']}),capitalFractions:[1]});
+  const shadow=await buildShadowRecommendation({pool:input.pool.address,decisionAt:input.observedAt,expiresAt,activeBinId:input.pool.activeBinId,binStep:input.pool.binStep,horizonMinutes:p.horizonMinutes,capitalValue:input.walletCapital,currentObservations:market,historicalActiveBins:input.history.activeBins,historicalFrames:input.history.binFrames,historicalEvents:input.history.swapEvents,priorRegimeAssessments:input.priorRegimeAssessments??[],poolAssessment,rateEvidence,binFeatures:bin,flowFeatures:flow,totalPositionShareRaw:1000n,rawUnitValueX:valuation.rawUnitValueX,rawUnitValueY:valuation.rawUnitValueY,costs:{transactionFeeValue:String(p.executionCostFixed)},orientations:['BALANCED','ONE_SIDED_Y'],capitalFractions:[1]});
   if(!shadow.thesis){reasonCodes.push(...shadow.reasonCodes,'OPERATIONAL_NO_TRADE');const core={...base,phase3Status:'NO_TRADE' as const,phase4Status:'NO_TRADE' as const,phase5Status:'NOT_REACHED' as const,shadow,reasonCodes:[...new Set(reasonCodes)].sort()};return{cycleId:await sha256Hex(canonicalJson(core)),...core};}
   const context=await buildMarketContext(input.pool.address,input.observedAt,market);const structure=computeStructureFeatures({context,observations:market,bin,flow});const candidate=candidateFromThesis(shadow.thesis);const entryFeatures=computeEntryTimingFeatures({context,regime:shadow.regime,structure,pool:poolAssessment,candidate,activeBinId:input.pool.activeBinId,...(market.slice(0,-1).at(-1)?.twoWayRatio!==undefined?{previousTwoWayRatio:market.slice(0,-1).at(-1)!.twoWayRatio}:{} )});const entry=evaluateEntry({features:entryFeatures,economics:shadow.economics,thesis:shadow.thesis,observedAt:input.observedAt,expiresAt});
   const risk=governRisk({now:input.observedAt,protocolCompatible:input.protocolCompatible,criticalDataObservedAt:input.pool.stamp.observedAt,dailyDrawdownFraction:0,rollingDrawdownFraction:0,tokenExposureFraction:0,poolExposureFraction:0,referenceDivergenceBps:0,liquidityChangeFraction:0,reconciliationRequired:false,signerHealthy:true});

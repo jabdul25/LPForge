@@ -1,13 +1,11 @@
 // LPFORGE_PHASE6_MAINNET_MODULE
 import type {Phase3Orientation,Phase3StrategyFamily} from '../../contracts/src/index.js';
 
-export interface Phase6InventoryRouting {orientations:Phase3Orientation[];strategies:Phase3StrategyFamily[];reasonCodes:string[];tradable:boolean;}
+export interface Phase6EntryFundingPlan {strategy:Phase3StrategyFamily;orientation:Phase3Orientation;solForLpLamports:bigint;solToPairedTokenLamports:bigint;lowerBinId:number;upperBinId:number;reasonCodes:string[];}
 
-/** Constrains autonomous range selection to assets the owner actually has; it never creates an implicit swap. */
-export function routePhase6Inventory(input:{tokenXRaw:bigint;tokenYRaw:bigint}):Phase6InventoryRouting{
-  if(input.tokenXRaw<0n||input.tokenYRaw<0n)throw new Error('LPFORGE_P6_INVENTORY_NEGATIVE');
-  if(input.tokenXRaw>0n&&input.tokenYRaw>0n)return{orientations:['BALANCED','SKEWED_X','SKEWED_Y'],strategies:['SPOT','CURVE','BID_ASK'],reasonCodes:['P6_INVENTORY_TWO_SIDED'],tradable:true};
-  if(input.tokenYRaw>0n)return{orientations:['ONE_SIDED_Y'],strategies:['BID_ASK'],reasonCodes:['P6_INVENTORY_SOL_SIDED_BID_ASK'],tradable:true};
-  if(input.tokenXRaw>0n)return{orientations:['ONE_SIDED_X'],strategies:['BID_ASK'],reasonCodes:['P6_INVENTORY_TOKEN_X_SIDED_BID_ASK'],tradable:true};
-  return{orientations:[],strategies:[],reasonCodes:['P6_INVENTORY_NO_POOL_ASSET'],tradable:false};
+/** Converts the autonomous strategy winner into its asset-funding sequence. SOL is token Y for the configured DLMM pools. */
+export function planPhase6SolEntryFunding(input:{strategy:Phase3StrategyFamily;capitalLamports:bigint;activeBinId:number;lowerBinId:number;upperBinId:number}):Phase6EntryFundingPlan{
+  if(input.capitalLamports<2n)throw new Error('LPFORGE_P6_ENTRY_CAPITAL_TOO_SMALL');if(!Number.isInteger(input.activeBinId)||!Number.isInteger(input.lowerBinId)||!Number.isInteger(input.upperBinId)||input.lowerBinId>input.upperBinId)throw new Error('LPFORGE_P6_ENTRY_RANGE_INVALID');
+  if(input.strategy==='BID_ASK'){const width=Math.max(1,input.upperBinId-input.lowerBinId+1);return{strategy:'BID_ASK',orientation:'ONE_SIDED_Y',solForLpLamports:input.capitalLamports,solToPairedTokenLamports:0n,lowerBinId:input.activeBinId-width,upperBinId:input.activeBinId,reasonCodes:['P6_SOL_SIDED_BID_ASK_NO_SWAP']};}
+  const solToPairedTokenLamports=input.capitalLamports/2n;return{strategy:input.strategy,orientation:'BALANCED',solForLpLamports:input.capitalLamports-solToPairedTokenLamports,solToPairedTokenLamports,lowerBinId:input.lowerBinId,upperBinId:input.upperBinId,reasonCodes:['P6_BALANCED_ENTRY_HALF_SOL_SWAP','P6_BALANCED_ENTRY_HALF_SOL_LP']};
 }
