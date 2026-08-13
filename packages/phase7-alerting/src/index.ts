@@ -41,3 +41,12 @@ export function alertsForPhase7ProductionResult(result:{runtimeId:string;instanc
   const productionStatus=result.evidence?.statuses?.PRODUCTION;if(productionStatus==='BLOCK')out.push({...common,severity:'CRITICAL',code:'P7_PRODUCTION_EVIDENCE_BLOCK',title:'Production evidence gate BLOCK',message:'The Phase 7 production evidence evaluator reports BLOCK.',reasonCodes:result.evidence?.reasonCodes??[]});
   return out;
 }
+/** Execution alerts are event-driven; the normal empty queue must never page Telegram. */
+export function alertsForExecutionResult(result:{status:string;observedAt:string;planId?:string|undefined;reasonCodes?:string[]|undefined;transactionSubmitted?:boolean|undefined;runtimeId?:string|undefined}):Phase7Alert[]{
+  const common={runtimeId:result.runtimeId??'lpforge-execution',observedAt:result.observedAt,reasonCodes:result.reasonCodes??[]};const plan=result.planId?` Plan: ${result.planId}.`:'';
+  if(result.status==='BLOCKED')return[{...common,severity:'CRITICAL',code:'P6_EXECUTION_PLAN_BLOCKED',title:'Execution plan blocked',message:`The execution claim guard or worker blocked a plan.${plan} No transaction was sent.`}];
+  if(result.status==='UNKNOWN')return[{...common,severity:'CRITICAL',code:'P6_EXECUTION_SUBMISSION_UNKNOWN',title:'Execution submission requires reconciliation',message:`A submitted execution has unknown chain outcome.${plan} LPForge will not resend blindly.`}];
+  if(result.status==='SUBMITTED')return[{...common,severity:'INFO',code:'P6_EXECUTION_SUBMITTED',title:'Execution transaction submitted',message:`LPForge submitted an execution transaction for chain confirmation.${plan}`}];
+  if(result.status==='RECONCILED')return[{...common,severity:'INFO',code:'P6_EXECUTION_RECONCILED',title:'Execution lifecycle reconciled',message:`LPForge reconciled the execution lifecycle against chain truth.${plan}`}];
+  return[];
+}

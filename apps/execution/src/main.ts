@@ -19,10 +19,14 @@ import { EXPECTED_DLMM_PROGRAM_ID } from "../../../packages/meteora/src/index.js
 import { loadMainnetCanaryDeploymentPolicyFile } from "../../../packages/canary/src/index.js";
 import { validateClaimedPlan } from "../../../packages/phase6-claim-guard/src/index.js";
 import { createMeteoraReadAdapter } from "../../../packages/meteora/src/index.js";
+import { Phase7TelegramAlerter,alertsForExecutionResult,loadPhase7TelegramConfig,type Phase7Alert } from "../../../packages/phase7-alerting/src/index.js";
 
 const json = (value: unknown) => JSON.stringify(value, null, 2);
 const yes = (value: string | undefined) =>
   String(value ?? "").toLowerCase() === "true";
+const executionTelegramAlerter=new Phase7TelegramAlerter(loadPhase7TelegramConfig({...process.env,LPFORGE_TELEGRAM_MIN_SEVERITY:process.env.LPFORGE_EXECUTION_TELEGRAM_MIN_SEVERITY??process.env.LPFORGE_TELEGRAM_MIN_SEVERITY??'INFO'}));
+async function safeExecutionTelegramAlert(alert:Phase7Alert){try{const r=await executionTelegramAlerter.send(alert);if(r.sent)console.log(json({event:'lpforge_telegram_alert_sent',runtime:'lpforge-execution',code:alert.code,severity:alert.severity}));}catch(error){console.error(json({event:'lpforge_telegram_alert_failed',runtime:'lpforge-execution',code:alert.code,error:error instanceof Error?error.message:String(error)}));}}
+async function alertExecutionResult(result:{status:string;planId?:string|undefined;reasonCodes?:string[]|undefined;transactionSubmitted?:boolean|undefined},observedAt:string){for(const alert of alertsForExecutionResult({...result,observedAt,runtimeId:'lpforge-execution'}))await safeExecutionTelegramAlert(alert);}
 /** The capital-owner signer is deliberately private-key-only in production. */
 function signerFromEnvironment(): MainnetSignerBackend {
   const common = {
@@ -215,13 +219,6 @@ async function recoverOnce() {
   }
 }
 async function start() {
-  console.log(
-    json({
-      ...assertLaunchable(),
-      status: "RECOVERY_BEFORE_AUTONOMOUS_DISPATCH",
-      recovery: await recoverOnce(),
-    }),
-  );
   const interval = Math.max(
     1000,
     Math.min(
@@ -229,21 +226,11 @@ async function start() {
       Number(process.env.LPFORGE_P6_EXECUTION_RUNNER_INTERVAL_MS ?? 5000),
     ),
   );
+  const startupAt=new Date().toISOString();
+  try{console.log(json({...assertLaunchable(),status:"RECOVERY_BEFORE_AUTONOMOUS_DISPATCH",recovery:await recoverOnce()}));if(executionTelegramAlerter.config.notifyStartup)await safeExecutionTelegramAlert({severity:'INFO',code:'P6_EXECUTION_DAEMON_START',title:'LPForge execution daemon started',message:'The execution worker is online and awaiting autonomous plans. Signing remains subject to its independent claim guard and live policy.',runtimeId:'lpforge-execution',observedAt:startupAt});}catch(error){await safeExecutionTelegramAlert({severity:'CRITICAL',code:'P6_EXECUTION_DAEMON_START_FAILURE',title:'LPForge execution daemon failed to start',message:'The execution worker could not complete its launch checks. No transaction was sent.',runtimeId:'lpforge-execution',observedAt:startupAt,reasonCodes:['P6_EXECUTION_START_FAILURE']});throw error;}
   for (;;) {
-    const recovery = await recoverOnce();
-    if (recovery.partial.length || recovery.plans.length)
-      console.log(
-        json({
-          service: "lpforge-execution",
-          status: "RECOVERY_PENDING",
-          recovery,
-          observedAt: new Date().toISOString(),
-        }),
-      );
-    else {
-      const result = await dispatchOne();
-      console.log(json({ ...result, observedAt: new Date().toISOString() }));
-    }
+    const observedAt=new Date().toISOString();
+    try{const recovery = await recoverOnce();if (recovery.partial.length || recovery.plans.length){const result={service:'lpforge-execution',status:'RECOVERY_PENDING',recovery,observedAt};console.log(json(result));await safeExecutionTelegramAlert({severity:'WARNING',code:'P6_EXECUTION_RECOVERY_PENDING',title:'Execution recovery is active',message:'LPForge is reconciling unfinished execution state before accepting a new plan.',runtimeId:'lpforge-execution',observedAt,reasonCodes:[...recovery.partial.flatMap(x=>x.reasonCodes),...recovery.plans.flatMap(x=>x.reasonCodes)].slice(0,12)});}else{const result=await dispatchOne();console.log(json({...result,observedAt}));await alertExecutionResult(result,observedAt);}}catch(error){console.error(error);await safeExecutionTelegramAlert({severity:'CRITICAL',code:'P6_EXECUTION_CYCLE_EXCEPTION',title:'Execution cycle exception',message:'The execution worker caught an exception and will retry. No blind resend is permitted.',runtimeId:'lpforge-execution',observedAt,reasonCodes:['P6_EXECUTION_CYCLE_EXCEPTION']});}
     await new Promise((resolve) => setTimeout(resolve, interval));
   }
 }
