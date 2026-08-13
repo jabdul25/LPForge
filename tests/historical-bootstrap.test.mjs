@@ -26,6 +26,15 @@ test('young pool cannot fabricate 90 minutes and backfill uses market time rathe
  assert.ok(context.horizons['1h'].completeness<.60,'two genuine 5m buckets are not expanded into 60 samples');
 });
 
+test('historical OHLCV contributes real price-time completeness without fabricating active-bin movement',async()=>{
+ const candles=Array.from({length:13},(_,i)=>({observedAt:iso(ms-60*60_000+i*5*60_000),price:1+i*.01,resolutionMs:5*60_000,volume:100}));
+ const context=await buildMarketContext('P',at,candles);
+ assert.ok(context.horizons['1h'].completeness>=.60,'genuine five-minute OHLCV covers its real market interval');
+ assert.equal(context.horizons['1h'].netBins,0,'price candles never invent active-bin movement');
+ const maturity=await assessHistoryMaturity({poolAddress:'P',assessedAt:at,history:history(),historicalMarket:candles.map(x=>({...x,sourceType:'HISTORICAL_API_BACKFILL',sourceProvider:'METEORA_DATA_API'})),liveMarket:liveMarket(10),liveConfirmationMinutes:10});
+ assert.equal(maturity.historicalState,'MATURE');
+});
+
 test('hybrid historical plus live economic evidence promotes only with non-overlapping market-time episodes',async()=>{
  const h=history(91),hybrid=[...Array.from({length:10},(_,i)=>({timestamp:Math.floor((ms-90*60_000+i*10*60_000)/1000),fees:5,protocol_fees:.5,volume:500})),...fees(2,ms-5*60_000)];
  const r=await deriveEventPathEconomicEstimate({poolAddress:'P',asOf:at,dataApiPool:{address:'P',tvl:100000},feeBuckets:hybrid,history:h});

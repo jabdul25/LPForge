@@ -7,7 +7,13 @@ export const MARKET_HORIZON_MINUTES:Record<MarketHorizon,number>={ '5m':5,'15m':
 export interface MarketObservation {
   observedAt:string;
   price:number;
-  activeBinId:number;
+  /**
+   * Price/volume candles from a historical provider do not always carry a
+   * direct active-bin observation.  They are still valid market-time evidence
+   * for price context and completeness; bin-motion metrics only use the rows
+   * that carry real or event-reconstructed bin evidence.
+   */
+  activeBinId?:number;
   /** Duration represented by this genuine source observation.  A 5m OHLCV
    * candle covers five real market minutes; it is never expanded into five
    * synthetic minute samples. */
@@ -56,8 +62,9 @@ function contextFor(horizon:MarketHorizon,decisionAt:string,rows:MarketObservati
   let peak=first,maxDd=0; for(const p of prices){peak=Math.max(peak,p);if(peak>0)maxDd=Math.min(maxDd,(p-peak)/peak*100);}
   const logReturns:number[]=[];for(let i=1;i<prices.length;i++){const a=prices[i-1]!,b=prices[i]!;if(a>0&&b>0)logReturns.push(Math.log(b/a));}
   const lrMean=mean(logReturns);const variance=mean(logReturns.map((r)=>(r-lrMean)**2));
-  let absBins=0;for(let i=1;i<s.length;i++)absBins+=Math.abs(s[i]!.activeBinId-s[i-1]!.activeBinId);
-  const netBins=s.at(-1)!.activeBinId-s[0]!.activeBinId;
+  const binRows=s.filter((row):row is MarketObservation & {activeBinId:number}=>Number.isFinite(row.activeBinId));
+  let absBins=0;for(let i=1;i<binRows.length;i++)absBins+=Math.abs(binRows[i]!.activeBinId-binRows[i-1]!.activeBinId);
+  const netBins=binRows.length>=2?binRows.at(-1)!.activeBinId-binRows[0]!.activeBinId:0;
   const duration=Math.max((Date.parse(s.at(-1)!.observedAt)-Date.parse(s[0]!.observedAt))/60000,1/60);
   const tw=s.map((x)=>x.twoWayRatio).filter(finite); const liq=s.map((x)=>x.localLiquidity).filter(finite);
   // Completeness is market-time coverage, not ingestion-count.  This retains

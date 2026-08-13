@@ -584,7 +584,8 @@ export interface Phase1Store {
     marketObservations: Array<{
       observedAt: string;
       price: number;
-      activeBinId: number;
+      activeBinId?: number;
+      resolutionMs?: number;
       volume?: number;
       feeValue?: number;
       localLiquidity?: number;
@@ -1888,9 +1889,10 @@ export async function createPostgresStore(
       const market = await db.query(
         `WITH candidate AS (
            SELECT observed_at,price::double precision AS price,local_liquidity::double precision AS tvl,active_bin_id,resolution_ms,
-             COALESCE(volume,0)::double precision AS volume_5m,COALESCE(fee_value,0)::double precision AS fee_5m,0 AS source_rank
+             COALESCE(volume,0)::double precision AS volume_5m,COALESCE(fee_value,0)::double precision AS fee_5m,
+             CASE source_type WHEN 'LIVE_OBSERVED' THEN 0 WHEN 'RECONSTRUCTED' THEN 1 ELSE 2 END AS source_rank
            FROM market.candidate_market_observations
-           WHERE pool_address=$1 AND observed_at>=$2 AND active_bin_id IS NOT NULL
+           WHERE pool_address=$1 AND observed_at>=$2
          ), snapshots AS (
            SELECT d.observed_at,(d.payload->>'current_price')::double precision AS price,(d.payload->>'tvl')::double precision AS tvl,
              (SELECT p.active_bin_id FROM protocol.pool_snapshots p WHERE p.pool_address=d.pool_address AND p.observed_at<=d.observed_at ORDER BY p.observed_at DESC LIMIT 1) AS active_bin_id,
@@ -1955,12 +1957,12 @@ export async function createPostgresStore(
         marketObservations: market.rows.flatMap((r) => {
           const price = Number(r.price),
             activeBinId = Number(r.active_bin_id);
-          if (!(price > 0) || !Number.isFinite(activeBinId)) return [];
+          if (!(price > 0)) return [];
           return [
             {
               observedAt: new Date(String(r.observed_at)).toISOString(),
               price,
-              activeBinId,
+              ...(Number.isFinite(activeBinId) ? { activeBinId } : {}),
               resolutionMs: Number(r.resolution_ms),
               ...(Number.isFinite(Number(r.volume_5m))
                 ? { volume: Number(r.volume_5m) }
