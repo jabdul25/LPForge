@@ -18,7 +18,9 @@
     "reserveSol": "0.01",
     "maxPortfolioCapitalSol": "0.5",
     "maxTokenCapitalSol": "0.5",
-    "minAllocationSol": "0.01"
+    "targetInitialPositionSol": "0.5",
+    "maxInitialPositionSol": "0.5",
+    "minInitialPositionSol": "0.01"
   },
   "pools": [
     {

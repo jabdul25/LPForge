@@ -11,15 +11,16 @@ const clamp=(x:number,min=0,max=1)=>Math.max(min,Math.min(max,x));
  * Phase 4 decides whether an entry is worthwhile; this layer applies only
  * configured capital envelopes, exposure facts, and minimum executable size.
  */
-export interface ProductionCapitalPolicy {id:string;reserveCapital:number;maxPortfolioCapital:number;maxTokenCapital:number;minAllocation:number;}
+export interface ProductionCapitalPolicy {id:string;reserveCapital:number;maxPortfolioCapital:number;maxTokenCapital:number;targetInitialPosition:number;maxInitialPosition:number;minInitialPosition:number;}
 export interface ProductionCapitalRequest {id:string;pool:string;token:string;requested:number;maxPoolCapital:number;entryReady:boolean;expectedNetValue:number;}
 export function allocateProductionCapital(input:{walletCapital:number;requests:ProductionCapitalRequest[];exposure?:ExposureState;policy:ProductionCapitalPolicy}):CapitalAllocationResult{
- const p=input.policy;if(!(input.walletCapital>0)||!(p.maxPortfolioCapital>0)||!(p.maxTokenCapital>0)||!(p.minAllocation>0)||p.reserveCapital<0)throw new Error('LPFORGE_PRODUCTION_CAPITAL_POLICY');
+ const p=input.policy;if(!(input.walletCapital>0)||!(p.maxPortfolioCapital>0)||!(p.maxTokenCapital>0)||!(p.targetInitialPosition>0)||!(p.maxInitialPosition>0)||!(p.minInitialPosition>0)||p.reserveCapital<0||p.minInitialPosition>p.targetInitialPosition||p.targetInitialPosition>p.maxInitialPosition)throw new Error('LPFORGE_PRODUCTION_CAPITAL_POLICY');
  const ex=input.exposure??{deployed:0,poolExposure:{},tokenExposure:{},reserved:0},reserve=Math.max(p.reserveCapital,ex.reserved),deployableLimit=Math.max(0,Math.min(input.walletCapital-reserve,p.maxPortfolioCapital)-ex.deployed);let remaining=deployableLimit;const pool={...ex.poolExposure},token={...ex.tokenExposure},allocations:CapitalAllocation[]=[];
- for(const r of [...input.requests].sort((a,b)=>a.id.localeCompare(b.id))){const reasons:string[]=[];const requested=Math.max(0,r.requested),poolCap=Math.max(0,r.maxPoolCapital-(pool[r.pool]??0)),tokenCap=Math.max(0,p.maxTokenCapital-(token[r.token]??0));let amount=Math.min(requested,poolCap,tokenCap,remaining);
+ for(const r of [...input.requests].sort((a,b)=>a.id.localeCompare(b.id))){const reasons:string[]=[];const requested=Math.max(0,r.requested),initialPositionCap=Math.max(0,p.maxInitialPosition),poolCap=Math.max(0,r.maxPoolCapital-(pool[r.pool]??0)),tokenCap=Math.max(0,p.maxTokenCapital-(token[r.token]??0));let amount=Math.min(requested,initialPositionCap,poolCap,tokenCap,remaining);
   if(!r.entryReady){amount=0;reasons.push('CAPITAL_ENTRY_NOT_READY');}
   if(!(r.expectedNetValue>0)){amount=0;reasons.push('CAPITAL_EXPECTED_VALUE_NON_POSITIVE');}
-  if(amount<p.minAllocation){if(amount>0)reasons.push('CAPITAL_BELOW_MINIMUM');amount=0;}
+  if(requested>initialPositionCap)reasons.push('CAPITAL_INITIAL_POSITION_LIMIT');
+  if(amount<p.minInitialPosition){if(amount>0)reasons.push('CAPITAL_BELOW_MINIMUM');amount=0;}
   if(poolCap<=0)reasons.push('CAPITAL_POOL_LIMIT');if(tokenCap<=0)reasons.push('CAPITAL_TOKEN_LIMIT');if(remaining<=0)reasons.push('CAPITAL_GLOBAL_LIMIT');
   if(amount>0){pool[r.pool]=(pool[r.pool]??0)+amount;token[r.token]=(token[r.token]??0)+amount;remaining-=amount;reasons.push('CAPITAL_ALLOCATED');}
   allocations.push({requestId:r.id,pool:r.pool,token:r.token,allocated:amount,requested,reasonCodes:reasons});

@@ -67,7 +67,9 @@ function loadProductionCapitalEnvelope(poolAddress: string) {
       reserveCapital: lamportsToSol(capital.reserveLamports),
       maxPortfolioCapital: lamportsToSol(capital.maxPortfolioLamports),
       maxTokenCapital: lamportsToSol(capital.maxTokenLamports),
-      minAllocation: lamportsToSol(capital.minAllocationLamports),
+      targetInitialPosition: lamportsToSol(capital.targetInitialPositionLamports),
+      maxInitialPosition: lamportsToSol(capital.maxInitialPositionLamports),
+      minInitialPosition: lamportsToSol(capital.minInitialPositionLamports),
     },
     productionPoolCapital: lamportsToSol(maxPoolLamports),
   };
