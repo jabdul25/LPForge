@@ -1,0 +1,40 @@
+import { canonicalJson, sha256Hex, type SwapEventFact } from '../../domain/src/index.js';
+import { assertNoLookahead } from '../../research/src/index.js';
+import { buildMarketContext, type MarketObservation } from '../../market-context/src/index.js';
+import { computeStructureFeatures } from '../../structure-features/src/index.js';
+import { classifyRegime, analyzeRegimeHistory, type RegimeAssessment, type RegimeHistorySample } from '../../regime/src/index.js';
+import { assessControlledPullback, assessBreakoutControlledPullback } from '../../setup-specialists/src/index.js';
+import { estimateOpportunityEconomics, deriveOpportunityProgress, type OpportunityRateEvidence } from '../../opportunity/src/index.js';
+import { generateRangeUniverse, generateStrategyCandidates, type RangeStrategyCandidate } from '../../rangeforge/src/index.js';
+import { fitRangeSurvivalModel, type ActiveBinObservation, type SurvivalForecast } from '../../range-survival/src/index.js';
+import { simulateCandidateSet, type CandidateEconomicSimulation } from '../../candidate-simulator/src/index.js';
+import { rankCandidates, type CandidateRankingResult } from '../../candidate-ranking/src/index.js';
+import { generateLpThesis, type MachineReadableLpThesis } from '../../thesis/src/index.js';
+import type { PoolAssessment } from '../../pool-intelligence/src/index.js';
+import type { BinWindowFeatures, SwapFlowFeatures } from '../../features/src/index.js';
+import type { BinFrame, SimulationCostModel } from '../../simulator/src/index.js';
+
+export interface ShadowRecommendationInput {
+  pool:string;decisionAt:string;expiresAt:string;activeBinId:number;binStep:number;horizonMinutes:number;capitalValue:number;
+  currentObservations:MarketObservation[];historicalActiveBins:ActiveBinObservation[];historicalFrames:BinFrame[];historicalEvents:SwapEventFact[];
+  poolAssessment:PoolAssessment;rateEvidence:OpportunityRateEvidence;binFeatures?:BinWindowFeatures;flowFeatures?:SwapFlowFeatures;
+  priorRegimeAssessments?:RegimeHistorySample[];totalPositionShareRaw:bigint;rawUnitValueX:number;rawUnitValueY:number;costs?:SimulationCostModel;
+  orientations?:RangeStrategyCandidate['orientation'][];capitalFractions?:number[];
+}
+export interface ShadowRecommendation {
+  recommendationId:string;phase:'P3';recommendationOnly:true;decisionAt:string;expiresAt:string;pool:string;state:string;noTrade:boolean;
+  marketContextHash:string;regime:RegimeAssessment;regimeHistory:ReturnType<typeof analyzeRegimeHistory>;pullback?:ReturnType<typeof assessControlledPullback>;breakoutPullback?:ReturnType<typeof assessBreakoutControlledPullback>;
+  economics:ReturnType<typeof estimateOpportunityEconomics>;candidateCount:number;simulations:CandidateEconomicSimulation[];ranking:CandidateRankingResult;thesis?:MachineReadableLpThesis;reasonCodes:string[];
+}
+function assertFramesHistorical(decisionAt:string,frames:BinFrame[],events:SwapEventFact[]){const t=Date.parse(decisionAt);for(const f of frames)if(Date.parse(f.observedAt)>t)throw new Error(`LPFORGE_SHADOW_LOOKAHEAD_FRAME:${f.observedAt}`);for(const e of events)if(Date.parse(e.stamp.observedAt)>t)throw new Error(`LPFORGE_SHADOW_LOOKAHEAD_EVENT:${e.stamp.observedAt}`);}
+function assertRegimeHistoryHistorical(decisionAt:string,history:RegimeHistorySample[]){const t=Date.parse(decisionAt);for(const r of history){const observed=Date.parse(r.observedAt);if(!Number.isFinite(observed))throw new Error(`LPFORGE_SHADOW_REGIME_HISTORY_TIME_INVALID:${r.observedAt}`);if(observed>t)throw new Error(`LPFORGE_SHADOW_LOOKAHEAD_REGIME:${r.observedAt}`);}}
+export async function buildShadowRecommendation(input:ShadowRecommendationInput):Promise<ShadowRecommendation>{
+ assertNoLookahead(input.decisionAt,input.currentObservations);if(input.historicalActiveBins.some(x=>Date.parse(x.observedAt)>Date.parse(input.decisionAt)))throw new Error('LPFORGE_SHADOW_LOOKAHEAD_SURVIVAL');assertFramesHistorical(input.decisionAt,input.historicalFrames,input.historicalEvents);assertRegimeHistoryHistorical(input.decisionAt,input.priorRegimeAssessments??[]);
+ const context=await buildMarketContext(input.pool,input.decisionAt,input.currentObservations);const structure=computeStructureFeatures({context,observations:input.currentObservations,...(input.binFeatures?{bin:input.binFeatures}:{}),...(input.flowFeatures?{flow:input.flowFeatures}:{})});const regime=classifyRegime({context,structure});const regimeHistory=analyzeRegimeHistory([...(input.priorRegimeAssessments??[]),regime]);
+ const pullback=assessControlledPullback({context,structure,regime,history:regimeHistory});const breakoutPullback=assessBreakoutControlledPullback({context,structure,regime,history:regimeHistory});const economics=estimateOpportunityEconomics({capitalValue:input.capitalValue,horizonMinutes:input.horizonMinutes,rates:input.rateEvidence,pool:input.poolAssessment,regime,structure});const progress=deriveOpportunityProgress({pool:input.poolAssessment,economics,regime,now:input.decisionAt,expiresAt:input.expiresAt});
+ const universe=generateRangeUniverse({activeBinId:input.activeBinId,binStep:input.binStep,horizonMinutes:input.horizonMinutes,context,structure,regime,maxWidthBins:Math.min(1400,Math.max(31,Math.floor(input.historicalFrames[0]?.bins.length??1400)))});const candidates=generateStrategyCandidates({universe,orientations:input.orientations??['BALANCED'],capitalFractions:input.capitalFractions??[1]});
+ const rangeShapes=universe.candidates.map(g=>({id:g.id,lowerOffsetBins:g.lowerOffsetBins,upperOffsetBins:g.upperOffsetBins}));const survivalModel=fitRangeSurvivalModel({history:input.historicalActiveBins,fitThrough:input.decisionAt,horizonsMinutes:[input.horizonMinutes],ranges:rangeShapes,anchorStride:5,minimumFutureSamples:3});const sfByGeometry=new Map(survivalModel.forecasts.map(f=>[f.rangeId,f] as const));const survivalForecasts:Record<string,SurvivalForecast|undefined>={};for(const c of candidates){const sf=sfByGeometry.get(c.id.split(`-${c.strategy.toLowerCase()}`)[0]??'');if(sf)survivalForecasts[c.id]={...sf,rangeId:c.id};}
+ const simulations=simulateCandidateSet({candidates,pool:input.pool,frames:input.historicalFrames,events:input.historicalEvents,totalPositionShareRaw:input.totalPositionShareRaw,rawUnitValueX:input.rawUnitValueX,rawUnitValueY:input.rawUnitValueY,capitalValue:input.capitalValue,...(input.costs?{costs:input.costs}:{})});const uncertainty=Object.fromEntries(candidates.map(c=>[c.id,economics.uncertainty]));const ranking=rankCandidates({candidates,simulations,survivalForecasts,uncertainty,globalActionable:economics.economicallyPositive});
+ let thesis:MachineReadableLpThesis|undefined;const winner=candidates.find(c=>c.id===ranking.winner);if(winner&&economics.economicallyPositive&&progress.state!=='REJECTED'&&progress.state!=='EXPIRED'&&progress.state!=='DATA_BLOCKED'){thesis=await generateLpThesis({pool:input.poolAssessment,regime,economics,candidate:winner,ranking,survival:Object.values(survivalForecasts).filter((x):x is SurvivalForecast=>Boolean(x)),observedAt:input.decisionAt,expiresAt:input.expiresAt,provenance:{marketContext:context.hash,rangeSurvival:survivalModel.version}});}
+ const noTrade=!thesis;const reasonCodes=[...new Set([...progress.reasonCodes,...ranking.reasonCodes,...(noTrade?['SHADOW_NO_TRADE']:['SHADOW_RECOMMENDATION'])])].sort();const core={phase:'P3' as const,recommendationOnly:true as const,decisionAt:input.decisionAt,expiresAt:input.expiresAt,pool:input.pool,state:noTrade?progress.state:'ENTRY_READY',noTrade,marketContextHash:context.hash,regime,regimeHistory,pullback,breakoutPullback,economics,candidateCount:candidates.length,simulations,ranking,...(thesis?{thesis}:{}),reasonCodes};return{recommendationId:await sha256Hex(canonicalJson(core)),...core};
+}

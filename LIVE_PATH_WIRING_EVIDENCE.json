@@ -1,0 +1,12 @@
+{
+  "schemaVersion": "lpforge-live-path-wiring-evidence-v2",
+  "sourceRevision": "2f9b6739d0a86d45a5d85e625ff1ff14d60539f0",
+  "release": "LPForge_Phase_1_to_7_Complete_Deployment_v1.0.4_Integrity_Corrected",
+  "phase6BoundaryPass": true,
+  "phase7BoundaryPass": true,
+  "newOperationalTests": {"passed": 3, "failed": 0},
+  "shellSyntaxPass": true,
+  "capitalDeploymentAuthorizedByDefault": false,
+  "fullRegressionRerunInPackagingSandbox": false,
+  "reason": "packaging sandbox lacks pinned workspace dependencies; Codex/VPS must run exact-lockfile full regression before soak"
+}

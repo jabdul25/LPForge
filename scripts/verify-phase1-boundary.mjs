@@ -1,0 +1,5 @@
+import { readdir, readFile } from 'node:fs/promises'; import path from 'node:path';
+const root=process.cwd(); const forbiddenEnv=['PRIVATE_KEY=','SEED_PHRASE=','WALLET_SECRET=','WALLET_PRIVATE_KEY=','SIGNER_KEYPAIR=']; const env=await readFile(path.join(root,'.env.example'),'utf8'); if(!/^LIVE_SIGNING=false$/m.test(env))throw new Error('LIVE_SIGNING must be false'); for(const f of forbiddenEnv)if(env.includes(f))throw new Error(`forbidden env key: ${f}`);
+async function files(dir){const out=[];for(const ent of await readdir(dir,{withFileTypes:true})){const p=path.join(dir,ent.name);if(ent.isDirectory())out.push(...await files(p));else out.push(p);}return out;}
+for(const file of await files(path.join(root,'apps'))){if(!file.endsWith('.ts'))continue;const src=await readFile(file,'utf8');for(const bad of ['sendAndConfirmTransaction(','sendRawTransaction(','Keypair.fromSecretKey(','initializePositionAndAddLiquidityByStrategy(','addLiquidityByStrategy('])if(src.includes(bad))throw new Error(`Phase1 prohibited execution primitive in ${file}: ${bad}`);}
+console.log('PHASE1_BOUNDARY_OK');

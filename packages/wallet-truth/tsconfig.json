@@ -1,0 +1,1 @@
+{"extends":"../../tsconfig.base.json","compilerOptions":{"outDir":"../../.build/packages/wallet-truth","rootDir":"../.."},"include":["src/**/*.ts"]}

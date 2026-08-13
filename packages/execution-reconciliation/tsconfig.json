@@ -1,0 +1,1 @@
+{"extends":"../../tsconfig.base.json","compilerOptions":{"outDir":"../../.build/packages/execution-reconciliation","rootDir":"../.."},"include":["src/**/*.ts"]}

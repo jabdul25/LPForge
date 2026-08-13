@@ -1,0 +1,3 @@
+NOT_A_GIT_WORKTREE
+
+This extracted deployment archive contains source revision metadata and SOURCE_GIT.bundle, but its working directory is not itself a Git worktree.

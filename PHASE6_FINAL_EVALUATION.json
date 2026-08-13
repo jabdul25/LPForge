@@ -1,0 +1,11 @@
+{
+  "implementationStatus": "PASS",
+  "operationalStatus": "HOLD",
+  "productionPromotion": "NOT_ELIGIBLE",
+  "reasonCodes": [
+    "P6_EXIT_REAL_MAINNET_CANARY_MISSING",
+    "P6_EXIT_RECONCILED_CANARIES_INSUFFICIENT"
+  ],
+  "autonomousScalingEnabled": false,
+  "productionAuthorityIssued": false
+}

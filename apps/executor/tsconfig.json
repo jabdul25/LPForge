@@ -1,0 +1,1 @@
+{"extends":"../../tsconfig.base.json","compilerOptions":{"outDir":"../../.build/apps/executor","rootDir":"../.."},"include":["src/**/*.ts"]}

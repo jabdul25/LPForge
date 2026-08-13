@@ -1,0 +1,4 @@
+import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';
+test('Phase6 live path is fully surfaced and default-deny',()=>{const s=fs.readFileSync('packages/phase6-operational-gates/src/index.ts','utf8');for(const x of ['READ_ONLY','BUILD','SIMULATE','PRESIGN','SIGN','SUBMIT','RECONCILE_OPEN','MONITOR','CLOSE','RECONCILE_CLOSE','RECOVERY'])assert.ok(s.includes(`'${x}'`));assert.ok(s.includes('LPFORGE_P6_CAPITAL_DEPLOYMENT_NOT_AUTHORIZED'));});
+test('production env remains read-only by default',()=>{const e=fs.readFileSync('.env.production.example','utf8');assert.match(e,/LIVE_SIGNING=false/);assert.match(e,/LPFORGE_LIVE_EXECUTION=false/);assert.match(e,/LPFORGE_MAINNET_CANARY=false/);assert.match(e,/LPFORGE_P6_CANARY_CAPITAL_LAMPORTS=0/);});
+test('PM2 start enforces Phase6 read-only assertion',()=>{const s=fs.readFileSync('scripts/pm2-start.sh','utf8');assert.match(s,/assert-read-only/);});

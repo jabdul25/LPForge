@@ -1,0 +1,16 @@
+{
+  "id": "research-pool-policy-v1",
+  "status": "RESEARCH_ONLY",
+  "not_live_trading_permission": true,
+  "blockBlacklisted": true,
+  "requireFreezeAuthorityDisabled": true,
+  "maxReferenceDivergenceBps": 250,
+  "maxDataAgeSeconds": 120,
+  "liquidityCollapsePct": -35,
+  "minHoldersForEligible": 250,
+  "minTwoWayFlowForEligible": 0.35,
+  "maxDirectionalMovementForEligible": 0.85,
+  "maxMeanBinsCrossedForEligible": 25,
+  "maxFeeBurstRatioForEligible": 8,
+  "note": "Baseline research heuristics only. Promotion requires chronological evidence and a later policy-review gate."
+}

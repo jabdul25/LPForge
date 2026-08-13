@@ -1,0 +1,11 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import {createRequire} from 'node:module';
+const root=new URL('../',import.meta.url);
+const read=(p)=>readFileSync(new URL(p,root),'utf8');
+test('Phase 7 operations packaging keeps PM2 single-instance and env-file based',()=>{const eco=read('ecosystem.config.cjs');assert.match(eco,/name:\s*'lpforge-production'/);assert.match(eco,/instances:\s*1/);assert.match(eco,/exec_mode:\s*'fork'/);assert.match(eco,/--env-file=\.env/);assert.match(eco,/autorestart:\s*true/);});
+test('Phase 7 production env template is fail-closed',()=>{const env=read('.env.production.example');assert.match(env,/LPFORGE_DATA_MODE=LIVE_READ_ONLY/);assert.match(env,/LIVE_SIGNING=false/);assert.match(env,/LPFORGE_LIVE_EXECUTION=false/);assert.match(env,/LPFORGE_MAINNET_CANARY=false/);assert.match(env,/LPFORGE_P7_AUTHORITY_MODE=OBSERVE_ONLY/);assert.match(env,/LPFORGE_TELEGRAM_ALERTS_ENABLED=false/);assert.doesNotMatch(env,/bot\d+:/i);});
+test('Telegram alerting never renders configured secrets',()=>{const source=read('packages/phase7-alerting/src/index.ts');assert.match(source,/LPFORGE_TELEGRAM_BOT_TOKEN/);assert.match(source,/LPFORGE_TELEGRAM_CHAT_ID/);assert.match(source,/disable_web_page_preview/);assert.doesNotMatch(source,/Bot token:/i);assert.doesNotMatch(source,/Chat id:/i);});
+test('Production app routes result and exception alerts through safe wrapper',()=>{const source=read('apps/production/src/main.ts');assert.match(source,/safeTelegramAlert/);assert.match(source,/alertProductionResult/);assert.match(source,/P7_DAEMON_CYCLE_EXCEPTION/);assert.match(source,/lpforge_telegram_alert_failed/);});
+test('PM2 helper validates required runtime variables before start',()=>{const source=read('scripts/pm2-start.sh');for(const key of ['DATABASE_URL','SOLANA_RPC_HTTP_URL','LPFORGE_SMOKE_POOL_ADDRESS','LPFORGE_P7_INSTANCE_ID','LPFORGE_P7_DRIFT_BASELINE_JSON'])assert.match(source,new RegExp(key));});

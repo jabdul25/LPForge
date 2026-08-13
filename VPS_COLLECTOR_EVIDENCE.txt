@@ -1,0 +1,11 @@
+Command class: one read-only live collector cycle with LPFORGE_DATA_MODE=LIVE_READ_ONLY and all execution flags false.
+Timestamp: 2026-08-12T15:46:40.822Z
+Result: live_read_cycle_complete
+Pool: 5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6
+Bins persisted: 73
+OHLCV candles persisted: 10
+Solana transactions sampled: 8
+Decoded swap events: 0
+liveSigning: false
+
+Database evidence captured before cleanup: one pool snapshot, 73 bin snapshots, and 10 OHLCV rows for this pool in the temporary PostgreSQL 17 validation database.

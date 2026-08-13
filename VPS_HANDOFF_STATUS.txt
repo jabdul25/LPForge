@@ -1,0 +1,15 @@
+UTC_TIMESTAMP=2026-08-12T16:53:11Z
+HOSTNAME=meridian-multiday
+NODE_VERSION=v24.19.0
+PNPM_VERSION=11.21.0
+POSTGRESQL_VERSION=psql (PostgreSQL) 17.10 (Ubuntu 17.10-1.pgdg24.04+1)
+DEPLOYED_RELEASE_SHA256=695b54e1cf03a29e8a73d6fefe3e2a968a8fc21bdaebfa3659041ebc1ef05fce
+DEPLOYED_RELEASE_ARTIFACT=LPForge_Phase_1_to_5_Complete_Deployment_v1.0.1.zip
+SOURCE_REVISION=88d1ffa155e6734e574658be928c2f77667e0627
+CURRENT_TEST_RESULT=PASS: node --test tests/*.test.mjs => 63 test files passed, 0 failed; repository manifest claims 159 passed tests, while archive contains 153 node:test registrations.
+CURRENT_MIGRATION_RESULT=PASS: M0001-M0015 applied to fresh PostgreSQL 17 validation database; 15 migration-ledger rows and 10 execution tables verified. Temporary database was dropped after evidence capture.
+PHASE5_OPERATIONAL_STATUS=HOLD
+REMAINING_HOLD_BLOCKERS=No operator-approved Devnet harness/non-real-asset configuration; no Devnet sign-submit-confirm-reconcile or recovery evidence; no supplied PositionV2 test address; repository exposes fixture-only P3/P4 commands rather than a long-running live P3->P4->P5 forward-flow runtime; manifest test-count claim (159) differs from observable archive count (153 node:test registrations).
+MAINNET_TRANSACTION_SENT=false
+DEVNET_TRANSACTION_SENT=false
+SOURCE_CODE_CHANGED_DURING_VPS_VALIDATION=false

@@ -1,0 +1,48 @@
+{
+  "status": "PASS",
+  "environment": "local-validator",
+  "programId": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+  "pair": "AuCG1cj9X2Tgd7B6cFNV4jAM5E4HivhYY1cvJrdPeWj7",
+  "position": "E1DpoMGgmicbmFQTxgFe48QTTqu5Z9UrHqzNnautJU4P",
+  "positionVersion": "V2",
+  "range": {
+    "lower": -10,
+    "upper": 10
+  },
+  "positionBefore": {
+    "x": "999999995",
+    "y": "999999990"
+  },
+  "swap": {
+    "inAmount": "50000000",
+    "outAmount": "49500000",
+    "fee": "400000",
+    "protocolFee": "100000",
+    "positionFeeX": "399999",
+    "positionFeeY": "0",
+    "activeBinBefore": 0,
+    "activeBinAfter": 0
+  },
+  "close": {
+    "transactionCount": 1,
+    "positionClosed": true
+  },
+  "signatures": [
+    {
+      "label": "OPEN",
+      "signature": "3ejoFGa2hbnZddSwVi5zgoCEjXZEUavUmwvyfyTiXsfkwEngfnR8MPDR9Rifuu2fPRj2vuWkZzJdVSsNLLFVs6Wn",
+      "unitsConsumed": 125490
+    },
+    {
+      "label": "SWAP",
+      "signature": "425fw9N7iyGZb8faBonyR6atTKL2FZwZuTkuaBpppang695LTeUp2AaTejvNpak25FSHVKFet3LeWT7QM5eKCZRS",
+      "unitsConsumed": 33521
+    },
+    {
+      "label": "CLOSE_0",
+      "signature": "4y9wudYdwZJe6zHUGWrpzTmqwred3AwQ8WkWBREm2DgZ2neeu23eVpuVnaZn4ukEL5ei83u1x5STnK2rndQLceB2",
+      "unitsConsumed": 157497
+    }
+  ],
+  "mainnetTransactionSent": false
+}

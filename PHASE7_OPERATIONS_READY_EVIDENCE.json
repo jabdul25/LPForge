@@ -1,0 +1,27 @@
+{
+  "schemaVersion": "lpforge-phase7-operations-ready-evidence-v2",
+  "sourceCommit": "2f9b6739d0a86d45a5d85e625ff1ff14d60539f0",
+  "baselineRuntimeIntegrationCommit": "46f2f36ceb5f716cffb60906d952e5222fcb3130",
+  "operationsPackaging": {
+    "telegramAlerting": true,
+    "pm2SingleInstance": true,
+    "productionEnvTemplate": true,
+    "pm2Preflight": true,
+    "phase6CanaryOperationalGate": true,
+    "readOnlySoakGuard": true
+  },
+  "fullRegression": {
+    "baselineCommitTestCount": 336,
+    "baselineCommitPassed": true,
+    "newCommitRerunComplete": false,
+    "reason": "Exact v1.0.4 full regression is a mandatory Codex/VPS verification gate before soak."
+  },
+  "safety": {
+    "liveSigningDefault": false,
+    "liveExecutionDefault": false,
+    "mainnetCanaryDefault": false,
+    "authorityDefault": "OBSERVE_ONLY",
+    "capitalDeploymentAuthorizedByDefault": false,
+    "pm2Instances": 1
+  }
+}

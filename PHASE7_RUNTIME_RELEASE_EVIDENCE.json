@@ -1,0 +1,56 @@
+{
+  "schemaVersion": "lpforge-phase7-runtime-release-evidence-v1",
+  "sourceCommit": "46f2f36ceb5f716cffb60906d952e5222fcb3130",
+  "generatedAt": "2026-08-13T01:42:46.183Z",
+  "fullRegression": {
+    "passed": true,
+    "testCount": 336
+  },
+  "phaseBoundaries": {
+    "P1": true,
+    "P2": true,
+    "P3": true,
+    "P4": true,
+    "P5": true,
+    "P6": true,
+    "P7": true
+  },
+  "migrations": {
+    "passed": true,
+    "count": 28,
+    "latest": "M0028_phase7_runtime_integration.sql",
+    "freshPostgres": true,
+    "upgradePostgres": true
+  },
+  "localMeteoraLifecycle": {
+    "passed": true,
+    "open": true,
+    "positionV2": true,
+    "swap": true,
+    "close": true,
+    "mainnetTransactionSent": false
+  },
+  "runtimeIntegration": {
+    "R01": true,
+    "R02": true,
+    "R03": true,
+    "R04": true,
+    "R05": true,
+    "R06": true,
+    "R07": true,
+    "R08": true,
+    "R09": true,
+    "soakCycles": 22,
+    "uniqueForwardCycles": true,
+    "uniqueRuntimeCycles": true,
+    "futureTimestampCount": 0,
+    "transactionPlanCount": 0,
+    "submissionAttemptCount": 0,
+    "confirmationCount": 0,
+    "canarySessionCount": 0,
+    "restartRecoveryPass": true,
+    "leaseExclusivityPass": true
+  },
+  "secretScanPass": true,
+  "evidenceHash": "03a5af8121cf046da5c5ef0b55c5c88a9694d5200f7f298dfcd5d0e6f4368b47"
+}

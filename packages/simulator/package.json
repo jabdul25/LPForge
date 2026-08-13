@@ -1,0 +1,7 @@
+{
+  "name": "@lpforge/simulator",
+  "version": "0.2.0-phase2",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts"
+}

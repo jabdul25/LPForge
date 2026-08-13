@@ -1,0 +1,27 @@
+{
+  "release": "LPForge_Phase_1_to_7_Complete_Deployment_v1.0.4.2_Operational_Script_Fixed",
+  "version": "1.0.4.2",
+  "sourceCommit": "dcd66a7c6f14c417e13f114a00788b82c86c56df",
+  "releaseParentCommit": "2f2021aad35d3183de0a96205506941de25ce490",
+  "baselineRuntimeIntegrationCommit": "46f2f36ceb5f716cffb60906d952e5222fcb3130",
+  "phase": "P1-P7 Live Path Wired + Integrity and Operational Script Fixes",
+  "migrationCount": 28,
+  "latestMigration": "M0028_phase7_runtime_integration.sql",
+  "productionAuthority": "HOLD",
+  "mainnetTransactionSent": false,
+  "livePathWired": true,
+  "capitalDeploymentAuthorizedByDefault": false,
+  "operationsReady": {
+    "telegramAlerting": true,
+    "pm2SingleInstance": true,
+    "productionEnvTemplate": true,
+    "phase6CanaryOperationalGate": true,
+    "readOnlySoakGuard": true
+  },
+  "verificationPolicy": {
+    "privateRpcRequiredForIntegrityVerification": false,
+    "fullRegressionRequiredBeforeSoak": true,
+    "readOnlySoakHours": 32,
+    "fullRegressionRerunInPackagingSandbox": false
+  }
+}

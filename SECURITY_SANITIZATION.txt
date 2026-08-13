@@ -1,0 +1,17 @@
+Sanitization result: PASS
+
+Excluded from the handoff archive:
+- .env and .env.* except .env.example
+- SOURCE_GIT.bundle, because it embeds the original .env.example and its non-production sample PostgreSQL password
+- node_modules and nested dependency directories
+- .pnpm-store and package-manager caches
+- PostgreSQL database/data directories, sockets, logs, and temporary validation databases
+- temporary files/directories and large raw logs
+- private-key, keypair, wallet, seed-phrase, API-key/token, RPC-credential, and PostgreSQL-password file patterns
+
+Included deliberately:
+- .env.example
+- a value-redacted .env.example: key names and safety defaults are retained, while all example values are blanked to ensure no .env values or password-like strings are distributed
+- package.json, pnpm-lock.yaml, pnpm-workspace.yaml, tsconfig files, source, scripts, migrations, tests, .build, release metadata, and this validation evidence
+
+Pre-package candidate scans found no included private keys, seed phrases, Solana keypair JSON files, wallet files, API secrets/tokens, RPC credentials, PostgreSQL passwords, or .env values. `SOURCE_REVISION.txt` provides source provenance; the credential-containing source bundle is deliberately excluded. The only network endpoints documented in evidence are public read-only URLs, with no embedded credentials.

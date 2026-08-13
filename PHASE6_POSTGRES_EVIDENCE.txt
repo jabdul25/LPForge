@@ -1,0 +1,10 @@
+PostgreSQL 17.10 runtime gate: PASS
+Fresh blank database: PASS
+M0001-M0018 applied in order: PASS
+operations.phase6_canary_sessions: PASS
+operations.phase6_canary_observations: PASS
+operations.phase6_stage_evidence: PASS
+session upsert: PASS
+observation persistence: PASS
+stage evidence idempotency: PASS
+inventory_risk_fraction database guard: PASS
