@@ -9,12 +9,12 @@
   "pools": [
     {
       "address": "Cfc6zeThDv58QEQqNYN2jfTVKoLhrEevNXesPTQk5yGW",
-      "maxCapitalSol": "0.5",
+      "maxCapitalSol": "0.02",
       "maxOpenPositions": 1
     },
     {
       "address": "CCHw81WFvz8SE4g9YSxRPs7ndZKhAsMsi2np2M2F6trW",
-      "maxCapitalSol": "0.5",
+      "maxCapitalSol": "0.02",
       "maxOpenPositions": 1
     }
   ]
