@@ -28,7 +28,7 @@ Tiering:
 - C — qualified reserve
 - CONTROL — deterministic random qualified control
 - REJECTED / QUARANTINED
-The Phase-7 production service can optionally include Tier-A discovered pools in its operator evaluation universe using `LPFORGE_DISCOVERY_OPERATOR_ENABLED=true`. Existing execution-policy pools remain included. Discovery itself does not write execution plans; the existing operator remains the downstream intelligence/plan source, and the execution worker retains its independent claim guard.
+The Phase-7 production service can optionally include Tier-A discovered pools in its operator evaluation universe using `LPFORGE_DISCOVERY_OPERATOR_ENABLED=true`. Existing execution-policy pools remain included. To keep the health probe within the RPC budget, discovery candidates are sampled in a bounded round-robin (`LPFORGE_DISCOVERY_OPERATOR_MAX_POOLS`, default `1`) and each probe uses the bounded `LPFORGE_P7_OPERATOR_EVENT_BACKFILL_LIMIT` (maximum `10`). Discovery itself does not write execution plans; the existing operator remains the downstream intelligence/plan source, and the execution worker retains its independent claim guard.
 PM2 entries added:
 - `lpforge-discovery`
 - `lpforge-discovery-learning`
