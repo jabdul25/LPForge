@@ -34,7 +34,10 @@ node -e 'const fs=require("fs");fs.writeFileSync(process.argv[1],JSON.stringify(
   find . -type f ! -name 'SHA256SUMS.txt' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
 )
 out="${1:-$root/LPForge_Production_${sha:0:12}.tar.gz}"
-tar -C "$stage" --exclude-vcs --exclude='node_modules' --exclude='.pnpm-store' --exclude='*.swp' -czf "$out" .
+# The staged tree comes from `git archive` and therefore contains no .git data.
+# Do not use --exclude-vcs here: it would remove tracked files such as
+# .gitignore after SHA256SUMS has already covered them.
+tar -C "$stage" --exclude='node_modules' --exclude='.pnpm-store' --exclude='*.swp' -czf "$out" .
 tar -tzf "$out" | grep -qx './RELEASE_MANIFEST.json'
 tar -tzf "$out" | grep -qx './SOURCE_REVISION.txt'
 tar -tzf "$out" | grep -qx './SHA256SUMS.txt'
