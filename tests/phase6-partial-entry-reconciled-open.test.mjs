@@ -17,5 +17,6 @@ test('a reconciled OPEN resolves a stale partial-entry recovery before any unwin
 test('autonomous plan mapping preserves the durable transaction-plan state', () => {
   const store = fs.readFileSync('packages/db/src/index.ts', 'utf8');
   assert.match(store, /state: String\(row\.state\)/);
-  assert.match(store, /SELECT p\.plan_id,p\.intent_id,p\.state,p\.expires_at/);
+  const planQueries = store.match(/SELECT p\.plan_id,p\.intent_id,p\.state,p\.expires_at/g) ?? [];
+  assert.ok(planQueries.length >= 3, 'claim, direct load, and recovery scans must all map plan state');
 });
