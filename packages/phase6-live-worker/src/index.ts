@@ -1903,10 +1903,27 @@ export async function executeAutonomousPlan(input: {
   const step = input.plan.steps[0];
   if (!step) throw new Error("LPFORGE_P6_MUTATION_STEP_REQUIRED");
   if (input.plan.action === "CLAIM") {
-    const built = await buildClaimTransactions(pool, {
-      userAddress: input.plan.ownerAddress,
-      positionAddress,
-    });
+    let built;
+    try {
+      built = await buildClaimTransactions(pool, {
+        userAddress: input.plan.ownerAddress,
+        positionAddress,
+      });
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== "LPFORGE_METEORA_CLAIM_NOTHING_TO_CLAIM") throw error;
+      await input.store.completeAutonomousPlan({
+        planId: input.plan.planId,
+        state: "RECONCILED",
+        at: new Date().toISOString(),
+        payload: { action: "CLAIM", positionAddress, noAccruedFees: true },
+      });
+      return {
+        status: "RECONCILED",
+        planId: input.plan.planId,
+        reasonCodes: ["P6_CLAIM_NOTHING_TO_CLAIM"],
+        transactionSubmitted: false,
+      };
+    }
     if (built.length !== 1)
       throw new Error("LPFORGE_P6_MULTI_TRANSACTION_CLAIM_UNSUPPORTED");
     built[0]!.metadata.transactionId = step.transactionId;

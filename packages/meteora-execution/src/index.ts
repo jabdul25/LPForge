@@ -101,6 +101,7 @@ export async function buildAddLiquidityTransaction(pool:MeteoraOpenAddPoolLike,r
 export interface MeteoraRemoveClaimPoolLike {
   removeLiquidity(args:Record<string,unknown>):Promise<OpaqueTransaction|OpaqueTransaction[]>;
   claimAllRewardsByPosition(args:Record<string,unknown>):Promise<OpaqueTransaction|OpaqueTransaction[]>;
+  getPosition?(position:unknown):Promise<unknown>;
 }
 export interface RemoveBuildRequest {userAddress:string;positionAddress:string;fromBinId:number;toBinId:number;bps:number;claimAndClose:boolean;}
 function many(value:OpaqueTransaction|OpaqueTransaction[]):OpaqueTransaction[]{return Array.isArray(value)?value:[value];}
@@ -110,6 +111,6 @@ export async function buildRemoveLiquidityTransactions(pool:MeteoraRemoveClaimPo
   return many(result).map((transaction,index)=>({transaction,requiredSignerAddresses:[r.userAddress],builder:'removeLiquidity' as const,metadata:{operation:r.claimAndClose?'CLOSE':'REMOVE',chunkIndex:index,chunkCount:many(result).length,bps:r.bps,fromBinId:r.fromBinId,toBinId:r.toBinId}}));
 }
 export async function buildClaimTransactions(pool:MeteoraRemoveClaimPoolLike,r:{userAddress:string;positionAddress:string}):Promise<BuiltMeteoraTransaction[]>{
-  const sdk=await loadMeteoraExecutionRuntime(); const result=await pool.claimAllRewardsByPosition({owner:new sdk.PublicKey(r.userAddress),position:new sdk.PublicKey(r.positionAddress)}); const list=many(result);
+  const sdk=await loadMeteoraExecutionRuntime(),positionKey=new sdk.PublicKey(r.positionAddress),position=await pool.getPosition?.(positionKey);if(!position)throw new Error('LPFORGE_METEORA_CLAIM_POSITION_UNAVAILABLE');let result:OpaqueTransaction|OpaqueTransaction[];try{result=await pool.claimAllRewardsByPosition({owner:new sdk.PublicKey(r.userAddress),position});}catch(error){if(error instanceof Error&&error.message==='No fee/reward to claim')throw new Error('LPFORGE_METEORA_CLAIM_NOTHING_TO_CLAIM');throw error;} const list=many(result);
   return list.map((transaction,index)=>({transaction,requiredSignerAddresses:[r.userAddress],builder:'claimAllRewardsByPosition' as const,metadata:{operation:'CLAIM',chunkIndex:index,chunkCount:list.length}}));
 }
