@@ -466,6 +466,9 @@ export interface Phase1Store {
     payload: Record<string, unknown>;
   }): Promise<void>;
   loadOwnedPositions(ownerAddress: string): Promise<Record<string, unknown>[]>;
+  loadPhase7PortfolioFacts(ownerAddress:string):Promise<{deployedLamports:bigint;pendingReservedLamports:bigint;openPositions:number;unresolvedReconciliationDebt:number;poolExposureLamports:Record<string,bigint>;poolPendingLamports:Record<string,bigint>;tokenExposureLamports:Record<string,bigint>;tokenPendingLamports:Record<string,bigint>}>;
+  loadPhase7PortfolioRiskState(ownerAddress:string):Promise<Record<string,unknown>|undefined>;
+  upsertPhase7PortfolioRiskState(value:{ownerAddress:string;dayStart:string;dailyStartEquityLamports:bigint;peakEquityLamports:bigint;currentEquityLamports:bigint;observedAt:string;valuationState:'RECONCILED'|'UNAVAILABLE';reasonCodes:string[];payload:Record<string,unknown>}):Promise<void>;
   loadPositionExitState(lpforgePositionId: string): Promise<Record<string, unknown> | null>;
   upsertPositionExitState(value: {
     lpforgePositionId:string; observedAt:string; evidenceState:string; initialCapitalUsd?:number; currentEconomicValueUsd?:number;
@@ -1766,6 +1769,9 @@ export async function createPostgresStore(
       );
       return r.rows;
     },
+    async loadPhase7PortfolioFacts(ownerAddress){const [positions,reservations,recon]=await Promise.all([db.query("SELECT COALESCE(sum(o.initial_capital_lamports),0)::text AS deployed,count(*)::int AS open_positions,COALESCE(jsonb_object_agg(o.pool_address,o.initial_capital_lamports) FILTER (WHERE o.pool_address IS NOT NULL),'{}'::jsonb) AS by_pool,COALESCE(jsonb_object_agg(p.token_x_mint,o.initial_capital_lamports) FILTER (WHERE p.token_x_mint IS NOT NULL),'{}'::jsonb) AS by_token FROM execution.owned_positions o JOIN protocol.pools p ON p.address=o.pool_address WHERE o.owner_address=$1 AND o.lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN')",[ownerAddress]),db.query("SELECT COALESCE(sum(capital_lamports),0)::text AS reserved,COALESCE(jsonb_object_agg(pool_address,capital_lamports) FILTER (WHERE pool_address IS NOT NULL),'{}'::jsonb) AS by_pool,COALESCE(jsonb_object_agg(token_mint,capital_lamports) FILTER (WHERE token_mint IS NOT NULL),'{}'::jsonb) AS by_token FROM execution.capital_reservations WHERE owner_address=$1 AND state IN ('RESERVED','SUBMITTED')",[ownerAddress]),db.query("SELECT count(*)::int AS n FROM execution.owned_positions WHERE owner_address=$1 AND lifecycle_state IN ('RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN')",[ownerAddress])]);const map=(v:unknown)=>Object.fromEntries(Object.entries((v??{}) as Record<string,unknown>).map(([k,x])=>[k,BigInt(String(x))]));return{deployedLamports:BigInt(String(positions.rows[0]?.deployed??'0')),pendingReservedLamports:BigInt(String(reservations.rows[0]?.reserved??'0')),openPositions:Number(positions.rows[0]?.open_positions??0),unresolvedReconciliationDebt:Number(recon.rows[0]?.n??0),poolExposureLamports:map(positions.rows[0]?.by_pool),poolPendingLamports:map(reservations.rows[0]?.by_pool),tokenExposureLamports:map(positions.rows[0]?.by_token),tokenPendingLamports:map(reservations.rows[0]?.by_token)};},
+    async loadPhase7PortfolioRiskState(ownerAddress){const r=await db.query("SELECT * FROM operations.phase7_live_portfolio_risk_state WHERE owner_address=$1",[ownerAddress]);return r.rows[0] as Record<string,unknown>|undefined;},
+    async upsertPhase7PortfolioRiskState(v){await db.query("INSERT INTO operations.phase7_live_portfolio_risk_state(owner_address,day_start,daily_start_equity_lamports,peak_equity_lamports,current_equity_lamports,observed_at,valuation_state,reason_codes,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb) ON CONFLICT(owner_address) DO UPDATE SET day_start=EXCLUDED.day_start,daily_start_equity_lamports=EXCLUDED.daily_start_equity_lamports,peak_equity_lamports=EXCLUDED.peak_equity_lamports,current_equity_lamports=EXCLUDED.current_equity_lamports,observed_at=EXCLUDED.observed_at,valuation_state=EXCLUDED.valuation_state,reason_codes=EXCLUDED.reason_codes,payload=EXCLUDED.payload",[v.ownerAddress,v.dayStart,v.dailyStartEquityLamports.toString(),v.peakEquityLamports.toString(),v.currentEquityLamports.toString(),v.observedAt,v.valuationState,json(v.reasonCodes),json(v.payload)]);},
     async loadPositionExitState(lpforgePositionId) {
       const r=await db.query(`SELECT * FROM execution.position_exit_state WHERE lpforge_position_id=$1`,[lpforgePositionId]);
       return (r.rows[0] as Record<string,unknown>|undefined)??null;
@@ -2668,6 +2674,9 @@ export function createMemoryStore(): Phase1Store {
     async loadOwnedPositions() {
       return [];
     },
+    async loadPhase7PortfolioFacts() { return {deployedLamports:0n,pendingReservedLamports:0n,openPositions:0,unresolvedReconciliationDebt:0,poolExposureLamports:{},poolPendingLamports:{},tokenExposureLamports:{},tokenPendingLamports:{}}; },
+    async loadPhase7PortfolioRiskState() { return undefined; },
+    async upsertPhase7PortfolioRiskState() {},
     async loadPositionExitState() { return null; },
     async upsertPositionExitState() {},
     async hasActiveAutonomousPlan() {
