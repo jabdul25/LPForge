@@ -873,7 +873,7 @@ async function unwindPartialEntry(input: {
   row: Record<string, unknown>;
   signer: MainnetSignerBackend;
   config: LiveWorkerConfig;
-}): Promise<{ ok: boolean; reasonCodes: string[] }> {
+}): Promise<{ ok: boolean; submitted: boolean; reasonCodes: string[] }> {
   const amount = BigInt(String(input.row.paired_token_amount)),
     connection = new Connection(input.config.rpcUrl, "confirmed"),
     adapter = createMeteoraReadAdapter({
@@ -901,7 +901,7 @@ async function unwindPartialEntry(input: {
       requiredOutputAmount: 1n,
     });
   if (assessment.status !== "APPROVED")
-    return { ok: false, reasonCodes: assessment.reasonCodes };
+    return { ok: false, submitted: false, reasonCodes: assessment.reasonCodes };
   const bytes = await buildJupiterMetisSwapTransaction({
       policy: policy.swapQuote,
       quote,
@@ -912,8 +912,22 @@ async function unwindPartialEntry(input: {
     }),
     transaction = VersionedTransaction.deserialize(bytes),
     transactionId = `${input.plan.planId}:unwind`,
-    simulatedAt = new Date().toISOString(),
-    simulation = await simulateExecutionTransaction({
+    simulatedAt = new Date().toISOString();
+  // Simulations and submission attempts are foreign-keyed to a durable plan
+  // step. A recovery unwind is a new transaction, not one of the original
+  // entry steps, so journal it before any simulation/signing work begins.
+  await input.store.ensureExecutionTransactionStep({
+    planId: input.plan.planId,
+    transactionId,
+    kind: "JUPITER_UNWIND",
+    state: "PLANNED",
+    requiredSignerAddresses: [input.plan.ownerAddress],
+    metadata: {
+      stage: "PARTIAL_ENTRY_UNWIND",
+      fundingTransactionId: String(input.row.funding_transaction_id),
+    },
+  });
+  const simulation = await simulateExecutionTransaction({
       authority: authority(
         "MAINNET_BUILD_SIMULATE",
         simulatedAt,
@@ -976,7 +990,7 @@ async function unwindPartialEntry(input: {
       },
     );
   if (risk.decision !== "APPROVE" || !risk.permitId || !risk.expiresAt)
-    return { ok: false, reasonCodes: risk.reasonCodes };
+    return { ok: false, submitted: false, reasonCodes: risk.reasonCodes };
   await input.store.insertExecutionRiskPermit({
     permitId: risk.permitId,
     planId: input.plan.planId,
@@ -1034,6 +1048,29 @@ async function unwindPartialEntry(input: {
     transport: createWeb3SubmissionTransport(connection),
     submittedAt: signedAt,
   });
+  // Persist submission identity before waiting for confirmation. If this
+  // process dies after send, recovery can check this exact signature and will
+  // never construct or send a duplicate unwind.
+  await input.store.upsertPartialEntryRecovery({
+    planId: input.plan.planId,
+    poolAddress: input.plan.poolAddress,
+    ownerAddress: input.plan.ownerAddress,
+    tokenMint: String(input.row.token_mint),
+    fundingTransactionId: String(input.row.funding_transaction_id),
+    fundingSignature: String(input.row.funding_signature),
+    fundedAt: new Date(String(input.row.funded_at)).toISOString(),
+    pairedTokenAmount: String(input.row.paired_token_amount),
+    intendedCapitalLamports: BigInt(String(input.row.intended_capital_lamports)),
+    intendedRange: (input.row.intended_range ?? {}) as Record<string, unknown>,
+    state: "UNWIND_SUBMITTED",
+    walletTruth: { refreshRequired: true },
+    payload: {
+      reasonCodes: ["P6_PARTIAL_UNWIND_SUBMITTED"],
+      unwindTransactionId: transactionId,
+      unwindSignature: record.signature,
+    },
+    updatedAt: new Date().toISOString(),
+  });
   if (
     !(await awaitConfirmation({
       connection,
@@ -1048,9 +1085,10 @@ async function unwindPartialEntry(input: {
   )
     return {
       ok: false,
+      submitted: true,
       reasonCodes: ["P6_PARTIAL_UNWIND_CONFIRMATION_PENDING"],
     };
-  return { ok: true, reasonCodes: ["P6_PARTIAL_UNWIND_RECONCILED"] };
+  return { ok: true, submitted: true, reasonCodes: ["P6_PARTIAL_UNWIND_RECONCILED"] };
 }
 
 /** Resumes a funded entry without ever repeating the already-confirmed Jupiter swap. */
@@ -1074,6 +1112,76 @@ export async function recoverPartialEntryFunding(input: {
   for (const row of rows) {
     const planId = String(row.plan_id),
       state = String(row.state);
+    if (state === "UNWIND_SUBMITTED") {
+      const payload = (row.payload ?? {}) as Record<string, unknown>;
+      const signature = typeof payload.unwindSignature === "string" ? payload.unwindSignature : "";
+      if (!signature) {
+        // Legacy interrupted rows can carry UNWIND_SUBMITTED before a send was
+        // actually journaled. Reset only this unproven state; the next cycle
+        // will rebuild the unwind through the durable step path.
+        await input.store.upsertPartialEntryRecovery({
+          planId,
+          poolAddress: String(row.pool_address),
+          ownerAddress: String(row.owner_address),
+          tokenMint: String(row.token_mint),
+          fundingTransactionId: String(row.funding_transaction_id),
+          fundingSignature: String(row.funding_signature),
+          fundedAt: new Date(String(row.funded_at)).toISOString(),
+          pairedTokenAmount: String(row.paired_token_amount),
+          intendedCapitalLamports: BigInt(String(row.intended_capital_lamports)),
+          intendedRange: (row.intended_range ?? {}) as Record<string, unknown>,
+          state: "ENTRY_FUNDED_NOT_OPEN",
+          walletTruth: { refreshRequired: true },
+          payload: { reasonCodes: ["P6_PARTIAL_UNWIND_SUBMISSION_UNPROVEN"] },
+          updatedAt: new Date().toISOString(),
+        });
+        results.push({ planId, action: "HOLD", reasonCodes: ["P6_PARTIAL_UNWIND_SUBMISSION_UNPROVEN"] });
+        continue;
+      }
+      const status = (await new Connection(input.config.rpcUrl, "confirmed").getSignatureStatuses([signature], { searchTransactionHistory: true })).value[0];
+      if (!status || !status.confirmationStatus) {
+        results.push({ planId, action: "HOLD", reasonCodes: ["P6_PARTIAL_UNWIND_CONFIRMATION_PENDING"] });
+        continue;
+      }
+      if (status.err) {
+        await input.store.upsertPartialEntryRecovery({
+          planId,
+          poolAddress: String(row.pool_address),
+          ownerAddress: String(row.owner_address),
+          tokenMint: String(row.token_mint),
+          fundingTransactionId: String(row.funding_transaction_id),
+          fundingSignature: String(row.funding_signature),
+          fundedAt: new Date(String(row.funded_at)).toISOString(),
+          pairedTokenAmount: String(row.paired_token_amount),
+          intendedCapitalLamports: BigInt(String(row.intended_capital_lamports)),
+          intendedRange: (row.intended_range ?? {}) as Record<string, unknown>,
+          state: "ENTRY_FUNDED_NOT_OPEN",
+          walletTruth: { refreshRequired: true },
+          payload: { reasonCodes: ["P6_PARTIAL_UNWIND_CHAIN_FAILED"] },
+          updatedAt: new Date().toISOString(),
+        });
+        results.push({ planId, action: "HOLD", reasonCodes: ["P6_PARTIAL_UNWIND_CHAIN_FAILED"] });
+        continue;
+      }
+      await input.store.upsertPartialEntryRecovery({
+        planId,
+        poolAddress: String(row.pool_address),
+        ownerAddress: String(row.owner_address),
+        tokenMint: String(row.token_mint),
+        fundingTransactionId: String(row.funding_transaction_id),
+        fundingSignature: String(row.funding_signature),
+        fundedAt: new Date(String(row.funded_at)).toISOString(),
+        pairedTokenAmount: String(row.paired_token_amount),
+        intendedCapitalLamports: BigInt(String(row.intended_capital_lamports)),
+        intendedRange: (row.intended_range ?? {}) as Record<string, unknown>,
+        state: "RESOLVED",
+        walletTruth: { unwindSignature: signature, confirmationStatus: status.confirmationStatus, refreshedAt: new Date().toISOString() },
+        payload: { reasonCodes: ["P6_PARTIAL_UNWIND_RECONCILED"] },
+        updatedAt: new Date().toISOString(),
+      });
+      results.push({ planId, action: "HOLD", reasonCodes: ["P6_PARTIAL_UNWIND_RECONCILED"] });
+      continue;
+    }
     if (state !== "ENTRY_FUNDED_NOT_OPEN" && state !== "RESUME_OPEN") {
       results.push({
         planId,
@@ -1119,7 +1227,10 @@ export async function recoverPartialEntryFunding(input: {
         pairedTokenAmount: String(row.paired_token_amount),
         intendedCapitalLamports: BigInt(String(row.intended_capital_lamports)),
         intendedRange: (row.intended_range ?? {}) as Record<string, unknown>,
-        state: "UNWIND_SUBMITTED",
+        // This is still only an unwind requirement.  It becomes submitted
+        // only after the durable unwind transaction step is simulated, signed,
+        // and handed to the submission ledger.
+        state: "UNWIND_REQUIRED",
         walletTruth: { refreshRequired: true },
         payload: { reasonCodes: ["P6_PARTIAL_THESIS_OR_PLAN_EXPIRED"] },
         updatedAt: new Date().toISOString(),
@@ -1142,7 +1253,7 @@ export async function recoverPartialEntryFunding(input: {
         pairedTokenAmount: String(row.paired_token_amount),
         intendedCapitalLamports: BigInt(String(row.intended_capital_lamports)),
         intendedRange: (row.intended_range ?? {}) as Record<string, unknown>,
-        state: unwind.ok ? "RESOLVED" : "UNWIND_REQUIRED",
+        state: unwind.ok ? "RESOLVED" : unwind.submitted ? "UNWIND_SUBMITTED" : "UNWIND_REQUIRED",
         walletTruth: { refreshedAt: new Date().toISOString() },
         payload: { reasonCodes: unwind.reasonCodes },
         updatedAt: new Date().toISOString(),
