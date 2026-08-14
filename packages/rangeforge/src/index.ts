@@ -7,11 +7,17 @@ export interface RangeGeometryCandidate {id:string;family:'NARROW'|'BASE'|'WIDE'
 export interface RangeUniverse {activeBinId:number;binStep:number;horizonMinutes:number;candidates:RangeGeometryCandidate[];movementBasisBins:number;volatilityMultiplier:number;}
 const clamp=(x:number,min:number,max:number)=>Math.max(min,Math.min(max,x));
 function pctForOffset(binStep:number,offset:number):number{return (Math.pow(1+binStep/10000,offset)-1)*100;}
-/** Meteora DLMM currently rejects InitializePosition ranges wider than 70 inclusive bins. */
-export const METEORA_MAX_POSITION_WIDTH_BINS=70;
+/**
+ * PositionV2 supports up to 1,400 bins.  The SDK's one-shot initializer only
+ * handles 70; wider positions use createExtendedEmptyPosition followed by
+ * addLiquidityByStrategyChunkable in the execution boundary.
+ */
+export const METEORA_PROTOCOL_MAX_POSITION_WIDTH_BINS=1400;
+/** LPForge's policy default. Production supplies its explicit policy cap. */
+export const DEFAULT_LPFORGE_MAX_POSITION_WIDTH_BINS=100;
 function boundedOddWidth(x:number,min:number,max:number){let n=clamp(Math.round(x),min,max);if(n%2===0)n=n===max?n-1:n+1;return Math.max(3,n);}
 export function generateRangeUniverse(input:{activeBinId:number;binStep:number;horizonMinutes:number;context:MarketContextSnapshot;structure:StructureFeatureVector;regime:RegimeAssessment;maxWidthBins?:number;minWidthBins?:number;}):RangeUniverse{
- const requestedMax=input.maxWidthBins??METEORA_MAX_POSITION_WIDTH_BINS;if(!Number.isInteger(requestedMax)||requestedMax<3)throw new Error('LPFORGE_RANGE_INVALID_MAX_WIDTH');const maxWidth=Math.min(METEORA_MAX_POSITION_WIDTH_BINS,requestedMax),requestedMin=input.minWidthBins??11;if(!Number.isInteger(requestedMin))throw new Error('LPFORGE_RANGE_INVALID_MIN_WIDTH');const minWidth=Math.min(maxWidth,Math.max(3,requestedMin));if(input.binStep<=0)throw new Error('LPFORGE_RANGE_INVALID_BIN_STEP');
+ const requestedMax=input.maxWidthBins??DEFAULT_LPFORGE_MAX_POSITION_WIDTH_BINS;if(!Number.isInteger(requestedMax)||requestedMax<3)throw new Error('LPFORGE_RANGE_INVALID_MAX_WIDTH');const maxWidth=Math.min(METEORA_PROTOCOL_MAX_POSITION_WIDTH_BINS,requestedMax),requestedMin=input.minWidthBins??11;if(!Number.isInteger(requestedMin))throw new Error('LPFORGE_RANGE_INVALID_MIN_WIDTH');const minWidth=Math.min(maxWidth,Math.max(3,requestedMin));if(input.binStep<=0)throw new Error('LPFORGE_RANGE_INVALID_BIN_STEP');
  const h15=input.context.horizons['15m'],h1=input.context.horizons['1h'];const horizonScale=Math.sqrt(Math.max(input.horizonMinutes,15)/60);const rawMove=Math.max(4,h15.absoluteBins*2,h1.absoluteBins*horizonScale*.75,h1.binVelocityPerMinute*input.horizonMinutes*.55);
  const volMult=input.structure.volatilityState==='EXTREME'?1.8:input.structure.volatilityState==='HIGH'?1.4:input.structure.volatilityState==='MODERATE'?1.15:.9;const transitionMult=1+input.regime.transitionRisk*.45;const movementBasis=Math.max(4,rawMove*volMult*transitionMult);
  const families=[['NARROW',.75],['BASE',1],['WIDE',1.4],['DEFENSIVE',1.9]] as const;const candidates:RangeGeometryCandidate[]=[];

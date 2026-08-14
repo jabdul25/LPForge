@@ -17,6 +17,7 @@ import {
 import {
   prepareAutonomousMeteoraOpen,
   type AutonomousOpenPlan,
+  type PreparedAutonomousOpen,
 } from "../../phase6-autonomous-dispatch/src/index.js";
 import {
   createWeb3SimulationTransport,
@@ -104,7 +105,7 @@ function planFields(plan: AutonomousOpenPlan) {
 function openPlan(plan: AutonomousPlan): AutonomousOpenPlan {
   if (plan.action !== "OPEN")
     throw new Error(`LPFORGE_P6_PLAN_ACTION_UNSUPPORTED:${plan.action}`);
-  const open = plan.steps.find((step) => step.kind === "METEORA_OPEN"),
+  const open = plan.steps.find((step) => step.kind === "METEORA_OPEN" || step.kind === "METEORA_POSITION_EXTEND"),
     swap = plan.steps.find((step) => step.kind === "JUPITER_SWAP");
   if (!open) throw new Error("LPFORGE_P6_AUTONOMOUS_PLAN_OPEN_STEP_MISSING");
   return {
@@ -120,6 +121,7 @@ function openPlan(plan: AutonomousPlan): AutonomousOpenPlan {
     planPayload: plan.planPayload,
     transactionId: open.transactionId,
     transactionMetadata: open.metadata,
+    steps: plan.steps.filter((step) => step.kind === "METEORA_OPEN" || step.kind === "METEORA_POSITION_EXTEND" || step.kind === "METEORA_OPEN_CHUNK").map((step) => ({transactionId:step.transactionId,kind:step.kind,metadata:step.metadata})),
     ...(swap
       ? {
           swapTransactionId: swap.transactionId,
@@ -449,6 +451,28 @@ async function executeRequiredJupiterSwap(input: {
     fundedAt: new Date().toISOString(),
   };
 }
+/**
+ * Executes an extended PositionV2 open as an ordered durable plan. Every SDK
+ * chunk is independently simulated and confirmed before the next one is sent.
+ * A post-extension interruption is never retried blindly: the plan remains in
+ * reconciliation-required state with its exact completed step/signature.
+ */
+async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:AutonomousOpenPlan;signer:MainnetSignerBackend;config:LiveWorkerConfig;connection:Connection;pool:MeteoraOpenAddPoolLike;prepared:PreparedAutonomousOpen;capital:bigint;lower:number;upper:number}):Promise<LiveWorkerResult>{
+  let submittedAny=false,lastSignature='';
+  try{
+    for(const step of input.prepared.steps){
+      const simulatedAt=new Date().toISOString(),simulation=await simulateExecutionTransaction({authority:authority('MAINNET_BUILD_SIMULATE',simulatedAt,input.config.riskPermitTtlMs),transactionId:step.transactionId,transaction:step.transaction,transport:createWeb3SimulationTransport(input.connection),simulatedAt,freshnessMs:input.config.simulationFreshnessMs});
+      await input.store.insertExecutionSimulation({transactionId:step.transactionId,simulatedAt:simulation.simulatedAt,freshUntil:simulation.simulationFreshUntil,ok:simulation.ok,...(simulation.unitsConsumed!==undefined?{unitsConsumed:simulation.unitsConsumed}:{}),logs:simulation.logs,...(simulation.error?{error:simulation.error}:{}),payload:{planId:input.plan.planId,positionAddress:input.prepared.positionSigner.publicKeyAddress,operation:step.kind,chunked:true}});
+      const fee=estimateExecutionFee({signatureCount:step.requiredSignerAddresses.length,computeUnitLimit:simulation.recommendedComputeUnitLimit??0,computeUnitPriceMicroLamports:0n}),cost=assessExecutionCost(fee,input.capital,{maxAbsoluteFeeLamports:input.config.maxFeeLamports,maxFeeFractionOfCapital:input.config.maxFeeFraction}),risk=governExecutionRisk({action:'OPEN',planId:input.plan.planId,now:new Date().toISOString(),thesisExpiresAt:input.plan.expiresAt,planExpiresAt:input.plan.expiresAt,simulationOk:simulation.ok,simulationFreshUntil:simulation.simulationFreshUntil,walletTruthConsistent:true,protocolCompatible:true,rpcHealthy:true,referenceDivergenceBps:0,activeBinId:input.lower,intendedCenterBinId:input.lower,costApproved:cost.approved,reconciliationRequired:false,globalKillSwitch:false,liquidityCollapse:false},{maxReferenceDivergenceBps:100,maxActiveBinDriftBins:100000,approvalTtlMs:input.config.riskPermitTtlMs,allowEmergencyCostOverride:false});
+      if(risk.decision!=='APPROVE'||!risk.permitId||!risk.expiresAt)throw new Error(`LPFORGE_P6_CHUNK_SIMULATE_RISK:${risk.reasonCodes.join(',')}`);
+      await input.store.insertExecutionRiskPermit({permitId:`${risk.permitId}:${step.transactionId}`,planId:input.plan.planId,decision:risk.decision,issuedAt:risk.issuedAt,expiresAt:risk.expiresAt,reasonCodes:risk.reasonCodes,payload:{autonomous:true,transactionId:step.transactionId,chunked:true,feeLamports:fee.totalFeeLamports.toString()}});
+      const latest=await input.connection.getLatestBlockhash('confirmed');step.transaction.recentBlockhash=latest.blockhash;step.transaction.lastValidBlockHeight=latest.lastValidBlockHeight;step.transaction.feePayer=new PublicKey(input.plan.ownerAddress);const submittedAt=new Date().toISOString(),openTicket=ticket(input.plan as unknown as AutonomousPlan,input.capital,submittedAt,input.config.riskPermitTtlMs),openAuthority={phase:'P6' as const,cluster:'mainnet-beta' as const,level:'MAINNET_CANARY_OPEN' as const,liveExecution:true,canaryOnly:true,issuedAt:submittedAt,expiresAt:openTicket.expiresAt,ticketId:openTicket.ticketId,reasonCodes:['P6_AUTONOMOUS_CHUNK_FINAL_REVALIDATION',step.kind]};
+      const submitted=await executeMainnetCanaryOpen({authority:openAuthority,ticket:openTicket,transactionId:step.transactionId,idempotencyKey:`${input.plan.idempotencyKey}:${step.transactionId}`,requiredSignerAddresses:step.requiredSignerAddresses,backend:input.signer,auxiliaryBackends:[input.prepared.positionSigner],envelope:step.envelope,phase5RiskDecision:risk,lease:latest,ledger:ledger(input.store),transport:createWeb3SubmissionTransport(input.connection),submittedAt});submittedAny=true;lastSignature=submitted.signature;await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SUBMITTED',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata},submitted.signature);
+      let confirmed=false;for(let attempt=0;attempt<input.config.confirmAttempts;attempt++){await new Promise(resolve=>setTimeout(resolve,input.config.confirmPollMs));const confirmation=await observeConfirmation({attemptId:`${step.transactionId}:attempt:1`,record:{transactionId:step.transactionId,signature:submitted.signature,submittedAt,blockhash:latest.blockhash,lastValidBlockHeight:latest.lastValidBlockHeight,attempt:1},transport:createWeb3SubmissionTransport(input.connection),ledger:ledger(input.store),observedAt:new Date().toISOString()});if(confirmation.status==='CONFIRMED'||confirmation.status==='FINALIZED'){confirmed=true;break;}if(confirmation.status==='FAILED'||confirmation.status==='EXPIRED')throw new Error(`LPFORGE_P6_CHUNK_CONFIRM_${confirmation.status}`);}if(!confirmed)throw new Error('LPFORGE_P6_CHUNK_CONFIRMATION_PENDING');
+    }
+    const position=await input.pool.getPosition?.(new PublicKey(input.prepared.positionSigner.publicKeyAddress));if(!position)throw new Error('LPFORGE_P6_POSITION_RECONCILIATION_MISSING');const intent=input.plan.planPayload.intent as Record<string,unknown>,funding=input.plan.intentPayload.entryFunding as Record<string,unknown>;await input.store.insertExecutionReconciliation({reconciliationId:`${input.plan.planId}:open`,planId:input.plan.planId,observedAt:new Date().toISOString(),status:'MATCH',expected:{owner:input.plan.ownerAddress,pool:input.plan.poolAddress,lowerBinId:input.lower,upperBinId:input.upper},actual:{positionAddress:input.prepared.positionSigner.publicKeyAddress},discrepancies:[],payload:{signature:lastSignature,autonomous:true,chunked:true}});await input.store.upsertOwnedPosition({lpforgePositionId:`position-${input.prepared.positionSigner.publicKeyAddress}`,poolAddress:input.plan.poolAddress,positionAddress:input.prepared.positionSigner.publicKeyAddress,ownerAddress:input.plan.ownerAddress,strategy:String(intent.strategy??'SPOT'),orientation:String(funding.orientation??'ONE_SIDED_Y'),lowerBinId:input.lower,upperBinId:input.upper,activeBinAtEntry:Number(intent.activeBinId??input.lower),initialCapitalLamports:input.capital,entryPlanId:input.plan.planId,entrySignature:lastSignature,enteredAt:new Date().toISOString(),lifecycleState:'OPEN',lastPlanId:input.plan.planId,reconciliationStatus:'MATCH',payload:{thesisId:input.plan.thesisId,entryFunding:funding,chunked:true}});await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'RECONCILED',at:new Date().toISOString(),payload:{signature:lastSignature,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true}});return{status:'RECONCILED',planId:input.plan.planId,reasonCodes:[],transactionSubmitted:true};
+  }catch(error){const reason=error instanceof Error?error.message:'LPFORGE_P6_CHUNKABLE_OPEN_UNKNOWN';if(submittedAny){await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECONCILIATION_REQUIRED',at:new Date().toISOString(),reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',reason],payload:{stage:'CHUNKABLE_OPEN',error:reason,positionAddress:input.prepared.positionSigner.publicKeyAddress,lastSignature}});return{status:'UNKNOWN',planId:input.plan.planId,reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',reason],transactionSubmitted:true};}await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'BLOCKED',at:new Date().toISOString(),payload:{stage:'CHUNKABLE_OPEN',error:reason}});return{status:'BLOCKED',planId:input.plan.planId,reasonCodes:[reason],transactionSubmitted:false};}
+}
 /** Executes one already-claimed plan. A caller must claim from storage before calling this function. */
 export async function executeAutonomousOpen(input: {
   store: Phase1Store;
@@ -524,6 +548,19 @@ export async function executeAutonomousOpen(input: {
       plan: input.plan,
       pool,
     });
+    if (prepared.steps.length > 1)
+      return executeChunkableAutonomousOpen({
+        store: input.store,
+        plan: input.plan,
+        signer: input.signer,
+        config: input.config,
+        connection,
+        pool,
+        prepared,
+        capital: fields.capital,
+        lower: fields.lower,
+        upper: fields.upper,
+      });
     const simAuthority = authority(
       "MAINNET_BUILD_SIMULATE",
       now,

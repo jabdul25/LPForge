@@ -23,6 +23,8 @@ export interface PlanRequest {
   lowerBinId?: number;
   upperBinId?: number;
   strategy?: "SPOT" | "CURVE" | "BID_ASK";
+  /** Per-release execution policy ceiling; never inferred from a range. */
+  maxPositionWidthBins?: number;
   reductionBps?: number;
   claimOnClose?: boolean;
   metadata?: Record<string, unknown>;
@@ -62,10 +64,7 @@ function tx(
     transactionId: `tx-${sequence}-${hash(`${kind}:${owner}:${position ?? ""}:${JSON.stringify(metadata)}`)}`,
     sequence,
     kind,
-    requiredSignerAddresses: [
-      owner,
-      ...(kind === "METEORA_OPEN" && position ? [position] : []),
-    ],
+    requiredSignerAddresses: [owner,...((kind === "METEORA_OPEN" || kind === "METEORA_POSITION_EXTEND") && position ? [position] : [])],
     writableAccounts: [...(position ? [position] : [])],
     state: "PLANNED",
     metadata,
@@ -98,6 +97,8 @@ export function buildTransactionPlan(r: PlanRequest): TransactionPlan {
     r.lowerBinId > r.upperBinId
   )
     throw new Error("LPFORGE_PLAN_INVALID_RANGE");
+  if(r.maxPositionWidthBins!==undefined&&(!Number.isInteger(r.maxPositionWidthBins)||r.maxPositionWidthBins<3||r.maxPositionWidthBins>1400))throw new Error('LPFORGE_PLAN_POSITION_WIDTH_POLICY_INVALID');
+  if(r.lowerBinId!==undefined&&r.upperBinId!==undefined&&r.maxPositionWidthBins!==undefined&&r.upperBinId-r.lowerBinId+1>r.maxPositionWidthBins)throw new Error('LPFORGE_PLAN_POSITION_WIDTH_POLICY_EXCEEDED');
   const key = stableKey(r);
   const intent: ExecutionIntent = {
     intentId: `intent-${key}`,
@@ -136,19 +137,14 @@ export function buildTransactionPlan(r: PlanRequest): TransactionPlan {
           provider: "JUPITER_METIS",
         }),
       );
-    transactions.push(
-      tx(
-        "METEORA_OPEN",
-        sequence,
-        r.ownerAddress,
-        r.replacementPositionAddress ?? r.positionAddress,
-        {
-          lowerBinId: r.lowerBinId,
-          upperBinId: r.upperBinId,
-          strategy: r.strategy,
-        },
-      ),
-    );
+    const width=(r.upperBinId??0)-(r.lowerBinId??0)+1;
+    const metadata={lowerBinId:r.lowerBinId,upperBinId:r.upperBinId,strategy:r.strategy,maxPositionWidthBins:r.maxPositionWidthBins??100};
+    if(width<=70)transactions.push(tx("METEORA_OPEN",sequence,r.ownerAddress,r.replacementPositionAddress??r.positionAddress,metadata));
+    else {
+      transactions.push(tx('METEORA_POSITION_EXTEND',sequence++,r.ownerAddress,r.replacementPositionAddress??r.positionAddress,{...metadata,positionWidthBins:width}));
+      const chunks=Math.ceil(width/70);
+      for(let index=0;index<chunks;index++)transactions.push(tx('METEORA_OPEN_CHUNK',sequence++,r.ownerAddress,r.replacementPositionAddress??r.positionAddress,{...metadata,chunkIndex:index,chunkCount:chunks}));
+    }
   } else if (r.action === "ADD")
     transactions.push(
       tx("METEORA_ADD", 1, r.ownerAddress, r.positionAddress, {

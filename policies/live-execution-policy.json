@@ -18,9 +18,14 @@
     "reserveSol": "0.01",
     "maxPortfolioCapitalSol": "0.5",
     "maxTokenCapitalSol": "0.5",
-    "targetInitialPositionSol": "0.05",
-    "maxInitialPositionSol": "0.05",
+    "targetInitialPositionSol": "0.03",
+    "maxInitialPositionSol": "0.03",
     "minInitialPositionSol": "0.01"
+  },
+  "positionConstruction": {
+    "maxInitialPositionWidthBins": 100,
+    "maxPositionAccountRentSol": "0.09",
+    "requirePreinitializedBinArrays": true
   },
   "pools": [
     {

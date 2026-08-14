@@ -19,6 +19,7 @@ import { EXPECTED_DLMM_PROGRAM_ID } from "../../../packages/meteora/src/index.js
 import { loadDeploymentPolicyFile } from "../../../packages/deployment-policy/src/index.js";
 import { validateClaimedPlan } from "../../../packages/phase6-claim-guard/src/index.js";
 import { createMeteoraReadAdapter } from "../../../packages/meteora/src/index.js";
+import { assertPreinitializedMeteoraBinArrays } from "../../../packages/meteora-execution/src/index.js";
 import { Phase7TelegramAlerter,alertsForExecutionResult,loadPhase7TelegramConfig,type Phase7Alert } from "../../../packages/phase7-alerting/src/index.js";
 
 const json = (value: unknown) => JSON.stringify(value, null, 2);
@@ -184,6 +185,14 @@ async function dispatchOne() {
       const capital=guard.capitalLamports, deployment=staticPolicy.productionCapital;
       if(!deployment){await store.transitionAutonomousPlan({planId:plan.planId,state:"BLOCKED",at:now,reasonCodes:['P6_CAPITAL_POLICY_MISSING'],payload:{stage:'CAPITAL_RESERVATION'}});return{service:'lpforge-execution',status:'BLOCKED',planId:plan.planId,reasonCodes:['P6_CAPITAL_POLICY_MISSING'],transactionSubmitted:false};}
       const walletLamports=BigInt(await new Connection(config.rpcUrl,'confirmed').getBalance(new PublicKey(plan.ownerAddress),'confirmed'));
+      if(plan.action==='OPEN'){
+        const construction=staticPolicy.positionConstruction,intent=(plan.planPayload.intent??{}) as Record<string,unknown>,lower=Number(intent.lowerBinId),upper=Number(intent.upperBinId),width=upper-lower+1;
+        if(!construction||!Number.isInteger(lower)||!Number.isInteger(upper)||width<3||width>construction.maxInitialPositionWidthBins){await store.transitionAutonomousPlan({planId:plan.planId,state:'BLOCKED',at:now,reasonCodes:['P6_POSITION_CONSTRUCTION_POLICY_BLOCK'],payload:{stage:'POSITION_CONSTRUCTION',widthBins:width}});return{service:'lpforge-execution',status:'BLOCKED',planId:plan.planId,reasonCodes:['P6_POSITION_CONSTRUCTION_POLICY_BLOCK'],transactionSubmitted:false};}
+        // This is a balance-availability preflight only. The refundable
+        // PositionV2 deposit is intentionally excluded from LP EV/PnL.
+        if(walletLamports<capital+deployment.reserveLamports+construction.maxPositionAccountRentLamports){await store.transitionAutonomousPlan({planId:plan.planId,state:'BLOCKED',at:now,reasonCodes:['P6_POSITION_ACCOUNT_RENT_WALLET_INSUFFICIENT'],payload:{stage:'POSITION_CONSTRUCTION',capitalLamports:capital.toString(),refundablePositionRentLamports:construction.maxPositionAccountRentLamports.toString()}});return{service:'lpforge-execution',status:'BLOCKED',planId:plan.planId,reasonCodes:['P6_POSITION_ACCOUNT_RENT_WALLET_INSUFFICIENT'],transactionSubmitted:false};}
+        if(construction.requirePreinitializedBinArrays)try{await assertPreinitializedMeteoraBinArrays({rpcUrl:config.rpcUrl,poolAddress:plan.poolAddress,programId:config.programId,lowerBinId:lower,upperBinId:upper});}catch(error){const reason=error instanceof Error?error.message:'P6_BIN_ARRAY_COVERAGE_UNAVAILABLE';await store.transitionAutonomousPlan({planId:plan.planId,state:'BLOCKED',at:now,reasonCodes:[reason],payload:{stage:'BIN_ARRAY_COVERAGE',widthBins:width}});return{service:'lpforge-execution',status:'BLOCKED',planId:plan.planId,reasonCodes:[reason],transactionSubmitted:false};}
+      }
       const pool=staticPolicy.pools.find(x=>x.address===plan.poolAddress),poolCap=pool?.maxCapitalLamports??staticPolicy.productionAdmission?.maxCapitalLamports;
       if(!poolCap){await store.transitionAutonomousPlan({planId:plan.planId,state:"BLOCKED",at:now,reasonCodes:['P6_CAPITAL_POOL_POLICY_MISSING'],payload:{stage:'CAPITAL_RESERVATION'}});return{service:'lpforge-execution',status:'BLOCKED',planId:plan.planId,reasonCodes:['P6_CAPITAL_POOL_POLICY_MISSING'],transactionSubmitted:false};}
       const reserved=await store.reserveExecutionCapital({planId:plan.planId,ownerAddress:plan.ownerAddress,poolAddress:plan.poolAddress,capitalLamports:capital,walletLamports,reserveLamports:deployment.reserveLamports,maxPortfolioLamports:deployment.maxPortfolioLamports,maxPoolLamports:poolCap,maxTokenLamports:deployment.maxTokenLamports,maxInitialPositionLamports:deployment.maxInitialPositionLamports,now});

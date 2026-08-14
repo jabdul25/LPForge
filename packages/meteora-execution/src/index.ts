@@ -1,9 +1,11 @@
 // LPFORGE_PHASE5_EXECUTION_MODULE
 export type OpaqueTransaction = object;
-export interface OpenBuildRequest {userAddress:string;positionAddress:string;totalXAmount:string|bigint;totalYAmount:string|bigint;lowerBinId:number;upperBinId:number;strategy:'SPOT'|'CURVE'|'BID_ASK';}
+export interface OpenBuildRequest {userAddress:string;positionAddress:string;totalXAmount:string|bigint;totalYAmount:string|bigint;lowerBinId:number;upperBinId:number;strategy:'SPOT'|'CURVE'|'BID_ASK';maxPositionWidthBins?:number;}
 export interface AddBuildRequest extends OpenBuildRequest {}
 export interface MeteoraOpenAddPoolLike {
   initializePositionAndAddLiquidityByStrategy(args:Record<string,unknown>):Promise<OpaqueTransaction>;
+  createExtendedEmptyPosition?(lowerBinId:number,upperBinId:number,position:unknown,owner:unknown):Promise<OpaqueTransaction>;
+  addLiquidityByStrategyChunkable?(args:Record<string,unknown>):Promise<OpaqueTransaction[]>;
   addLiquidityByStrategy(args:Record<string,unknown>):Promise<OpaqueTransaction>;
   getPosition?(position:unknown):Promise<unknown>;
 }
@@ -13,7 +15,7 @@ export function createFixtureMeteoraOpenAddPool():MeteoraOpenAddPoolLike{
     async addLiquidityByStrategy(){return{fixtureUnsignedAdd:true};}
   };
 }
-export interface BuiltMeteoraTransaction {transaction:OpaqueTransaction;requiredSignerAddresses:string[];builder:'initializePositionAndAddLiquidityByStrategy'|'addLiquidityByStrategy'|'removeLiquidity'|'claimAllRewardsByPosition';metadata:Record<string,unknown>;}
+export interface BuiltMeteoraTransaction {transaction:OpaqueTransaction;requiredSignerAddresses:string[];builder:'initializePositionAndAddLiquidityByStrategy'|'createExtendedEmptyPosition'|'addLiquidityByStrategyChunkable'|'addLiquidityByStrategy'|'removeLiquidity'|'claimAllRewardsByPosition';metadata:Record<string,unknown>;}
 interface RuntimeSdk {
   PublicKey:new(value:string)=>{toBase58():string};
   Connection:new(url:string,commitment:'confirmed')=>unknown;
@@ -25,6 +27,7 @@ interface RuntimeSdk {
   calculateBidAskDistribution(activeBinId:number,binIds:number[]):Array<{binId:number;xAmountBpsOfTotal:{toString(base?:number):string};yAmountBpsOfTotal:{toString(base?:number):string}}>;
   autoFillXByStrategy(activeBinId:number,binStep:number,amountY:{toString(base?:number):string},amountXInActiveBin:{toString(base?:number):string},amountYInActiveBin:{toString(base?:number):string},lowerBinId:number,upperBinId:number,strategyType:number):{toString(base?:number):string};
   getPriceOfBinByBinId(binId:number,binStep:number):{toFixed(decimalPlaces?:number):string};
+  getBinArrayKeysCoverage(lowerBinId:{toString(base?:number):string},upperBinId:{toString(base?:number):string},lbPair:unknown,programId:unknown):Array<{toBase58():string}>;
   dlmmVersion:string;
 }
 let cached:RuntimeSdk|undefined;
@@ -37,17 +40,24 @@ export async function loadMeteoraExecutionRuntime():Promise<RuntimeSdk>{
   const web3=rootRequire('@solana/web3.js') as {PublicKey:RuntimeSdk['PublicKey'];Connection:RuntimeSdk['Connection']};
   const BN=dlmmRequire('bn.js') as RuntimeSdk['BN'];
   // package.json is not exported; derive the installed production lock version explicitly from our compatibility baseline.
-  cached={PublicKey:web3.PublicKey,Connection:web3.Connection,DLMM:dlmm as unknown as RuntimeSdk['DLMM'],BN,StrategyType:dlmm.StrategyType,calculateSpotDistribution:dlmm.calculateSpotDistribution,calculateNormalDistribution:dlmm.calculateNormalDistribution,calculateBidAskDistribution:dlmm.calculateBidAskDistribution,autoFillXByStrategy:dlmm.autoFillXByStrategy,getPriceOfBinByBinId:dlmm.getPriceOfBinByBinId,dlmmVersion:'1.9.10'}; return cached;
+  cached={PublicKey:web3.PublicKey,Connection:web3.Connection,DLMM:dlmm as unknown as RuntimeSdk['DLMM'],BN,StrategyType:dlmm.StrategyType,calculateSpotDistribution:dlmm.calculateSpotDistribution,calculateNormalDistribution:dlmm.calculateNormalDistribution,calculateBidAskDistribution:dlmm.calculateBidAskDistribution,autoFillXByStrategy:dlmm.autoFillXByStrategy,getPriceOfBinByBinId:dlmm.getPriceOfBinByBinId,getBinArrayKeysCoverage:dlmm.getBinArrayKeysCoverage,dlmmVersion:'1.9.10'}; return cached;
 }
 function strategyType(s:'SPOT'|'CURVE'|'BID_ASK',r:RuntimeSdk){return s==='SPOT'?r.StrategyType.Spot:s==='CURVE'?r.StrategyType.Curve:r.StrategyType.BidAsk;}
-/** Meteora DLMM rejects InitializePosition ranges wider than 70 inclusive bins. Keep this execution-boundary guard independent of RangeForge. */
-export const METEORA_MAX_POSITION_WIDTH_BINS=70;
-function validateRange(lower:number,upper:number){if(!Number.isInteger(lower)||!Number.isInteger(upper)||lower>upper)throw new Error('LPFORGE_METEORA_BUILD_INVALID_RANGE');if(upper-lower+1>METEORA_MAX_POSITION_WIDTH_BINS)throw new Error('LPFORGE_METEORA_BUILD_POSITION_WIDTH');}
+/** The SDK one-shot initializer is 70 bins; extended PositionV2 is 1,400. */
+export const METEORA_ONE_SHOT_POSITION_WIDTH_BINS=70;
+export const METEORA_PROTOCOL_MAX_POSITION_WIDTH_BINS=1400;
+function validateRange(lower:number,upper:number,maxWidthBins=100){if(!Number.isInteger(lower)||!Number.isInteger(upper)||lower>upper)throw new Error('LPFORGE_METEORA_BUILD_INVALID_RANGE');if(!Number.isInteger(maxWidthBins)||maxWidthBins<3||maxWidthBins>METEORA_PROTOCOL_MAX_POSITION_WIDTH_BINS)throw new Error('LPFORGE_METEORA_BUILD_POSITION_WIDTH_POLICY');if(upper-lower+1>maxWidthBins)throw new Error('LPFORGE_METEORA_BUILD_POSITION_WIDTH_POLICY_EXCEEDED');}
 /** Creates a live SDK pool adapter. Construction is read-only; it cannot sign or submit. */
 export async function createLiveMeteoraOpenPool(input:{rpcUrl:string;poolAddress:string;programId:string}):Promise<MeteoraOpenAddPoolLike>{
   if(!input.rpcUrl.trim()||!input.poolAddress.trim()||!input.programId.trim())throw new Error('LPFORGE_METEORA_LIVE_POOL_CONFIG_REQUIRED');
   const sdk=await loadMeteoraExecutionRuntime();
   return sdk.DLMM.create(new sdk.Connection(input.rpcUrl.trim(),'confirmed'),new sdk.PublicKey(input.poolAddress.trim()),{cluster:'mainnet-beta',programId:new sdk.PublicKey(input.programId.trim())});
+}
+/** Refuses an open before the SDK can create any missing bin-array account.
+ * PositionV2 rent remains a refundable wallet requirement and is handled by
+ * the execution preflight, never by opportunity economics. */
+export async function assertPreinitializedMeteoraBinArrays(input:{rpcUrl:string;poolAddress:string;programId:string;lowerBinId:number;upperBinId:number}):Promise<{binArrayAddresses:string[]}>{
+  validateRange(input.lowerBinId,input.upperBinId,METEORA_PROTOCOL_MAX_POSITION_WIDTH_BINS);const sdk=await loadMeteoraExecutionRuntime(),connection=new sdk.Connection(input.rpcUrl.trim(),'confirmed') as unknown as {getMultipleAccountsInfo(keys:unknown[],commitment:'confirmed'):Promise<Array<unknown|null>>},keys=sdk.getBinArrayKeysCoverage(new sdk.BN(input.lowerBinId),new sdk.BN(input.upperBinId),new sdk.PublicKey(input.poolAddress),new sdk.PublicKey(input.programId)),accounts=await connection.getMultipleAccountsInfo(keys,'confirmed'),missing=keys.filter((_,index)=>!accounts[index]);if(missing.length)throw new Error(`LPFORGE_METEORA_BIN_ARRAY_INITIALIZATION_RENT_REQUIRED:${missing.map(key=>key.toBase58()).join(',')}`);return{binArrayAddresses:keys.map(key=>key.toBase58())};
 }
 export interface MeteoraStrategyDistribution {strategy:'SPOT'|'CURVE'|'BID_ASK';activeBinId:number;lowerBinId:number;upperBinId:number;bins:Array<{binId:number;xAmountBps:number;yAmountBps:number}>;sdkVersion:string;}
 export async function calculateMeteoraStrategyDistribution(input:{strategy:'SPOT'|'CURVE'|'BID_ASK';activeBinId:number;lowerBinId:number;upperBinId:number}):Promise<MeteoraStrategyDistribution>{
@@ -66,10 +76,19 @@ export async function quoteMeteoraFundingFromSolCapital(input:{strategy:'SPOT'|'
   const xValue=(bestX*priceScaled)/scale;return{strategy:input.strategy,orientation:input.orientation,totalXAmount:bestX.toString(),totalYAmount:bestY.toString(),pairedTokenCostInYRaw:xValue.toString(),capitalUsedYRaw:(bestY+xValue).toString(),activeBinPriceYPerXRaw:priceScaled.toString(),sdkVersion:sdk.dlmmVersion};
 }
 export async function buildOpenPositionTransaction(pool:MeteoraOpenAddPoolLike,r:OpenBuildRequest):Promise<BuiltMeteoraTransaction>{
-  validateRange(r.lowerBinId,r.upperBinId);const sdk=await loadMeteoraExecutionRuntime();
+  validateRange(r.lowerBinId,r.upperBinId,r.maxPositionWidthBins);if(r.upperBinId-r.lowerBinId+1>METEORA_ONE_SHOT_POSITION_WIDTH_BINS)throw new Error('LPFORGE_METEORA_BUILD_EXTENDED_POSITION_REQUIRED');const sdk=await loadMeteoraExecutionRuntime();
   const args={positionPubKey:new sdk.PublicKey(r.positionAddress),user:new sdk.PublicKey(r.userAddress),totalXAmount:new sdk.BN(r.totalXAmount),totalYAmount:new sdk.BN(r.totalYAmount),strategy:{minBinId:r.lowerBinId,maxBinId:r.upperBinId,strategyType:strategyType(r.strategy,sdk)}};
   const transaction=await pool.initializePositionAndAddLiquidityByStrategy(args);
   return{transaction,requiredSignerAddresses:[r.userAddress,r.positionAddress],builder:'initializePositionAndAddLiquidityByStrategy',metadata:{strategy:r.strategy,lowerBinId:r.lowerBinId,upperBinId:r.upperBinId,totalXAmount:String(r.totalXAmount),totalYAmount:String(r.totalYAmount)}};
+}
+/**
+ * Creates the refundable extended PositionV2 account first, then lets the
+ * SDK split liquidity over its safe 70-bin instruction chunks. This builder
+ * is transaction construction only: callers must simulate, submit, confirm
+ * and persist every returned step in order.
+ */
+export async function buildExtendedChunkableOpenTransactions(pool:MeteoraOpenAddPoolLike,r:OpenBuildRequest):Promise<BuiltMeteoraTransaction[]>{
+  validateRange(r.lowerBinId,r.upperBinId,r.maxPositionWidthBins);const width=r.upperBinId-r.lowerBinId+1;if(width<=METEORA_ONE_SHOT_POSITION_WIDTH_BINS)return[await buildOpenPositionTransaction(pool,r)];if(!pool.createExtendedEmptyPosition||!pool.addLiquidityByStrategyChunkable)throw new Error('LPFORGE_METEORA_EXTENDED_CHUNKABLE_SDK_REQUIRED');const sdk=await loadMeteoraExecutionRuntime(),position=new sdk.PublicKey(r.positionAddress),owner=new sdk.PublicKey(r.userAddress),strategy={minBinId:r.lowerBinId,maxBinId:r.upperBinId,strategyType:strategyType(r.strategy,sdk)},extension=await pool.createExtendedEmptyPosition(r.lowerBinId,r.upperBinId,position,owner),chunks=await pool.addLiquidityByStrategyChunkable({positionPubKey:position,user:owner,totalXAmount:new sdk.BN(r.totalXAmount),totalYAmount:new sdk.BN(r.totalYAmount),strategy});if(!chunks.length)throw new Error('LPFORGE_METEORA_CHUNKABLE_EMPTY');const shared={strategy:r.strategy,lowerBinId:r.lowerBinId,upperBinId:r.upperBinId,totalXAmount:String(r.totalXAmount),totalYAmount:String(r.totalYAmount),positionWidthBins:width};return[{transaction:extension,requiredSignerAddresses:[r.userAddress,r.positionAddress],builder:'createExtendedEmptyPosition',metadata:{...shared,operation:'POSITION_EXTEND'}},...chunks.map((transaction,chunkIndex)=>({transaction,requiredSignerAddresses:[r.userAddress],builder:'addLiquidityByStrategyChunkable' as const,metadata:{...shared,operation:'OPEN_CHUNK',chunkIndex,chunkCount:chunks.length}}))];
 }
 export async function buildAddLiquidityTransaction(pool:MeteoraOpenAddPoolLike,r:AddBuildRequest):Promise<BuiltMeteoraTransaction>{
   validateRange(r.lowerBinId,r.upperBinId);const sdk=await loadMeteoraExecutionRuntime();

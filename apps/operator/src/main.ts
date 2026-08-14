@@ -61,6 +61,7 @@ function loadProductionCapitalEnvelope(poolAddress: string) {
   if (!maxPoolLamports)
     throw new Error("LPFORGE_PRODUCTION_CAPITAL_POOL_LIMIT_REQUIRED");
   const capital = deployment.productionCapital;
+  const construction = deployment.positionConstruction;
   return {
     productionCapitalPolicy: {
       id: `${deployment.policyId}:production-capital-v1`,
@@ -72,6 +73,7 @@ function loadProductionCapitalEnvelope(poolAddress: string) {
       minInitialPosition: lamportsToSol(capital.minInitialPositionLamports),
     },
     productionPoolCapital: lamportsToSol(maxPoolLamports),
+    ...(construction ? { maxRangeWidthBins: construction.maxInitialPositionWidthBins } : {}),
   };
 }
 async function persistTransactionPlan(
@@ -114,6 +116,7 @@ async function persistTransactionPlan(
         lowerBinId: plan.intent.lowerBinId,
         upperBinId: plan.intent.upperBinId,
         strategy: plan.intent.strategy,
+        maxPositionWidthBins: plan.transactions.find((step) => step.kind === "METEORA_OPEN" || step.kind === "METEORA_POSITION_EXTEND")?.metadata.maxPositionWidthBins,
       },
     },
     steps: plan.transactions.map((t) => ({
