@@ -33,6 +33,7 @@ node -e 'const fs=require("fs");fs.writeFileSync(process.argv[1],JSON.stringify(
   cd "$stage"
   find . -type f ! -name 'SHA256SUMS.txt' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
 )
+"$stage/scripts/verify-release-integrity.sh" "$stage"
 out="${1:-$root/LPForge_Production_${sha:0:12}.tar.gz}"
 # The staged tree comes from `git archive` and therefore contains no .git data.
 # Do not use --exclude-vcs here: it would remove tracked files such as
