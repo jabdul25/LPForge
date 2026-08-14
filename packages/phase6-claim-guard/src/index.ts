@@ -6,7 +6,8 @@ export interface ClaimGuardResult {
   reasonCodes: string[];
   capitalLamports: bigint;
 }
-export interface ProductionAdmissionCandidate {poolAddress:string;state:string;tier:string;lastSeenAt:string;}
+export interface ProductionAdmissionCandidate {poolAddress:string;state:string;tier:string;lastSeenAt:string;tokenYMint?:string|undefined;pairedTokenMint?:string|undefined;}
+const WSOL_MINT='So11111111111111111111111111111111111111112';
 export interface Phase7ExecutionControl {authorityMode:string;healthStatus:string;driftStatus:string;safetyMode:string;newEconomicActionAllowed:boolean;observedAt:string;}
 export function validateFreshPhase7ExecutionControl(control:Phase7ExecutionControl|undefined,now:string,maxAgeMs=60_000):string[]{
  if(!control)return ['P6_CLAIM_P7_CONTROL_MISSING'];
@@ -38,6 +39,7 @@ function policyPoolForPlan(input:{plan:AutonomousPlan;policy:MainnetCanaryDeploy
  if(!admission?.enabled){reasons.push('P6_CLAIM_POOL_NOT_ALLOWLISTED');return undefined;}
  const candidate=input.productionCandidates.find(x=>x.poolAddress===input.plan.poolAddress),age=candidate?Date.parse(input.now)-Date.parse(candidate.lastSeenAt):NaN;
  if(!candidate||candidate.state!=='ACTIVE_CANDIDATE'||!admission.eligibleTiers.includes(candidate.tier as 'A'|'B'|'C')||!Number.isFinite(age)||age<0||age>admission.maxCandidateAgeMs||input.productionCandidates.indexOf(candidate)>=admission.maxCandidates){reasons.push('P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return undefined;}
+ if(candidate.tokenYMint!==WSOL_MINT){reasons.push('P6_PRODUCTION_REQUIRES_WSOL_TOKEN_Y');return undefined;}
  return{address:candidate.poolAddress,maxCapitalLamports:admission.maxCapitalLamports,maxOpenPositions:admission.maxOpenPositions};
 }
 /** Signing-boundary validation. A PostgreSQL plan is untrusted until this passes. */

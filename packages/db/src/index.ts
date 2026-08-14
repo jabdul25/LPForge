@@ -193,7 +193,7 @@ export interface Phase1Store {
     payload: Record<string, unknown>;
   }): Promise<void>;
   listDiscoveryCandidates(tiers?: string[]): Promise<Array<{
-    poolAddress: string; state: string; tier: string; priorityScore: number; rank?: number | undefined; lastSeenAt: string; payload: Record<string, unknown>;
+    poolAddress: string; state: string; tier: string; priorityScore: number; rank?: number | undefined; lastSeenAt: string; tokenXMint?:string|undefined;tokenYMint?:string|undefined;pairedTokenMint?:string|undefined; payload: Record<string, unknown>;
   }>>;
   markDiscoveryPoolsStale(cutoff: string, observedAt: string): Promise<number>;
   insertFeeVolumeObservations(value:{poolAddress:string; observedAt:string; source:string; rows:Array<{bucketAt:string;fees?:number;protocolFees?:number;volume?:number;payload?:Record<string,unknown>}>;}):Promise<void>;
@@ -1334,8 +1334,8 @@ export async function createPostgresStore(
       );
     },
     async listDiscoveryCandidates(tiers=['A']) {
-      const r=await db.query(`SELECT pool_address,current_state,current_tier,last_priority_score,last_rank,last_seen_at,COALESCE(NULLIF(payload->>'deepScreenedAt','')::timestamptz,last_seen_at) AS admission_seen_at,payload FROM market.pool_discovery_registry WHERE current_tier=ANY($1::text[]) ORDER BY last_rank NULLS LAST,last_priority_score DESC,pool_address`,[tiers]);
-      return r.rows.map(row=>({poolAddress:String(row.pool_address),state:String(row.current_state),tier:String(row.current_tier),priorityScore:Number(row.last_priority_score),...(row.last_rank!==null?{rank:Number(row.last_rank)}:{}),lastSeenAt:new Date(String(row.admission_seen_at)).toISOString(),payload:(row.payload??{}) as Record<string,unknown>}));
+      const r=await db.query(`SELECT pool_address,current_state,current_tier,last_priority_score,last_rank,last_seen_at,token_x_mint,token_y_mint,paired_token_mint,COALESCE(NULLIF(payload->>'deepScreenedAt','')::timestamptz,last_seen_at) AS admission_seen_at,payload FROM market.pool_discovery_registry WHERE current_tier=ANY($1::text[]) ORDER BY last_rank NULLS LAST,last_priority_score DESC,pool_address`,[tiers]);
+      return r.rows.map(row=>({poolAddress:String(row.pool_address),state:String(row.current_state),tier:String(row.current_tier),priorityScore:Number(row.last_priority_score),...(row.last_rank!==null?{rank:Number(row.last_rank)}:{}),lastSeenAt:new Date(String(row.admission_seen_at)).toISOString(),...(row.token_x_mint?{tokenXMint:String(row.token_x_mint)}:{}),...(row.token_y_mint?{tokenYMint:String(row.token_y_mint)}:{}),...(row.paired_token_mint?{pairedTokenMint:String(row.paired_token_mint)}:{}),payload:(row.payload??{}) as Record<string,unknown>}));
     },
     async markDiscoveryPoolsStale(cutoff, observedAt) {
       const r=await db.query(`UPDATE market.pool_discovery_registry SET current_state='OBSERVING',current_tier='C',reason_codes=CASE WHEN reason_codes ? 'DISCOVERY_STALE' THEN reason_codes ELSE reason_codes || '["DISCOVERY_STALE"]'::jsonb END,evidence_state=jsonb_set(evidence_state,'{discoveryFreshness}','"STALE"'::jsonb,true),payload=jsonb_set(payload,'{staleMarkedAt}',to_jsonb($2::text),true) WHERE last_seen_at<$1::timestamptz AND current_state NOT IN ('REJECTED','QUARANTINED') RETURNING pool_address`,[cutoff,observedAt]);
@@ -1632,10 +1632,12 @@ export async function createPostgresStore(
           await tx.query('COMMIT');
           return{approved:true,reasonCodes:['P6_CAPITAL_RESERVATION_ALREADY_HELD'],tokenMint:String(existing.rows[0].token_mint),deployedLamports:0n,reservedLamports:v.capitalLamports,availableLamports:0n};
         }
-        const tokenRow=await tx.query("SELECT token_y_mint FROM protocol.pools WHERE address=$1",[v.poolAddress]);
-        const tokenMint=tokenRow.rows[0]?.token_y_mint?String(tokenRow.rows[0].token_y_mint):undefined;
+        // Execution is currently canonicalized to WSOL as token Y.  Therefore
+        // token X is the paired/risky asset used for concentration accounting.
+        const tokenRow=await tx.query("SELECT token_x_mint FROM protocol.pools WHERE address=$1",[v.poolAddress]);
+        const tokenMint=tokenRow.rows[0]?.token_x_mint?String(tokenRow.rows[0].token_x_mint):undefined;
         const reasons:string[]=[]; if(!tokenMint) reasons.push('P6_CAPITAL_POOL_TOKEN_MISSING');
-        const positions=await tx.query("SELECT COALESCE(sum(initial_capital_lamports),0)::text AS deployed,COALESCE(sum(initial_capital_lamports) FILTER (WHERE pool_address=$2),0)::text AS pool_deployed,COALESCE(sum(initial_capital_lamports) FILTER (WHERE p.token_y_mint=$3),0)::text AS token_deployed FROM execution.owned_positions o JOIN protocol.pools p ON p.address=o.pool_address WHERE o.owner_address=$1 AND o.lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN')",[v.ownerAddress,v.poolAddress,tokenMint??'']);
+        const positions=await tx.query("SELECT COALESCE(sum(initial_capital_lamports),0)::text AS deployed,COALESCE(sum(initial_capital_lamports) FILTER (WHERE pool_address=$2),0)::text AS pool_deployed,COALESCE(sum(initial_capital_lamports) FILTER (WHERE p.token_x_mint=$3),0)::text AS token_deployed FROM execution.owned_positions o JOIN protocol.pools p ON p.address=o.pool_address WHERE o.owner_address=$1 AND o.lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN')",[v.ownerAddress,v.poolAddress,tokenMint??'']);
         const reservations=await tx.query("SELECT COALESCE(sum(capital_lamports),0)::text AS reserved,COALESCE(sum(capital_lamports) FILTER (WHERE pool_address=$2),0)::text AS pool_reserved,COALESCE(sum(capital_lamports) FILTER (WHERE token_mint=$3),0)::text AS token_reserved FROM execution.capital_reservations WHERE owner_address=$1 AND state IN ('RESERVED','SUBMITTED')",[v.ownerAddress,v.poolAddress,tokenMint??'']);
         const q=(row:Record<string,unknown>,key:string)=>BigInt(String(row[key]??'0'));
         const deployed=q(positions.rows[0]??{},'deployed'),poolDeployed=q(positions.rows[0]??{},'pool_deployed'),tokenDeployed=q(positions.rows[0]??{},'token_deployed'),reserved=q(reservations.rows[0]??{},'reserved'),poolReserved=q(reservations.rows[0]??{},'pool_reserved'),tokenReserved=q(reservations.rows[0]??{},'token_reserved');

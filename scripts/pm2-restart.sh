@@ -2,6 +2,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 [[ -f .env ]] || { echo 'ERROR: .env missing.' >&2; exit 1; }
+pm2 stop lpforge-execution
 pm2 restart ecosystem.config.cjs --only lpforge-production --update-env
+pm2 restart ecosystem.config.cjs --only lpforge-execution --update-env
 pm2 save
-pm2 status lpforge-production
+pm2 status lpforge-production lpforge-execution
