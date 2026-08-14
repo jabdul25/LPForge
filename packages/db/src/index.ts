@@ -1632,6 +1632,27 @@ export async function createPostgresStore(
       );
     },
     async claimNextAutonomousPlan(now) {
+      // An expired recommendation is no longer a valid expression of the market
+      // thesis that created it.  Finalize it before looking for work so it cannot
+      // remain an apparently queued plan (or be confused with a retryable plan)
+      // after its execution window has elapsed.
+      await db.query(
+        `WITH expired AS (
+           UPDATE execution.transaction_plans
+           SET state='EXPIRED',
+               payload=payload||jsonb_build_object(
+                 'autonomous_dispatch_expired_at',$1::text,
+                 'autonomous_dispatch',jsonb_build_object('reason','P6_PLAN_EXPIRED_BEFORE_CLAIM')
+               )
+           WHERE state='PLANNED' AND expires_at<=$1::timestamptz
+           RETURNING plan_id
+         )
+         INSERT INTO execution.plan_state_events(plan_id,prior_state,next_state,observed_at,reason_codes,payload)
+         SELECT plan_id,'PLANNED','EXPIRED',$1,'["P6_PLAN_EXPIRED_BEFORE_CLAIM"]'::jsonb,
+                jsonb_build_object('recovery',false)
+         FROM expired`,
+        [now],
+      );
       const claimed = await db.query(
         `WITH candidate AS (SELECT p.plan_id FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id WHERE p.cluster='mainnet-beta' AND p.state='PLANNED' AND p.expires_at>$1::timestamptz AND i.action IN ('OPEN','ADD','CLAIM','REDUCE','RESHAPE','REBALANCE','CLOSE','EMERGENCY_CLOSE') AND NOT EXISTS (SELECT 1 FROM execution.transaction_plans pending JOIN execution.intents pi ON pi.intent_id=pending.intent_id WHERE pending.plan_id<>p.plan_id AND pending.cluster='mainnet-beta' AND pending.state IN ('CLAIMED','DISPATCHING','BUILDING','BUILT','SIMULATING','SIMULATED','RISK_APPROVED','SIGNING','SIGNED','SUBMITTING','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILING') AND ((i.position_address IS NOT NULL AND pi.position_address=i.position_address) OR (i.action='OPEN' AND pi.action='OPEN' AND pi.pool_address=i.pool_address AND pi.owner_address=i.owner_address))) ORDER BY CASE i.action WHEN 'EMERGENCY_CLOSE' THEN 1 WHEN 'CLOSE' THEN 2 WHEN 'REDUCE' THEN 3 WHEN 'RESHAPE' THEN 4 WHEN 'REBALANCE' THEN 5 WHEN 'CLAIM' THEN 6 WHEN 'ADD' THEN 7 ELSE 8 END,p.created_at FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE execution.transaction_plans p SET state='CLAIMED',payload=p.payload||jsonb_build_object('autonomous_dispatch_claimed_at',$1::text) FROM candidate c WHERE p.plan_id=c.plan_id RETURNING p.plan_id,p.intent_id,p.expires_at,p.payload`,
         [now],
