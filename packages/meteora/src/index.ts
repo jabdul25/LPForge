@@ -80,7 +80,17 @@ export function createSolanaRpcClient(opts:SolanaRpcClientOptions):SolanaRpcClie
           throw new Error(`LPFORGE_RPC_HTTP:${r.status}`);
         }
         const body=await r.json() as {result?:T;error?:{code:number;message:string}};
-        if(body.error)throw new Error(`LPFORGE_RPC:${method}:${body.error.code}:${body.error.message}`);
+        if(body.error){
+          // A provider can intermittently fail one historical transaction
+          // lookup. Retry transient JSON-RPC errors inside the configured RPC
+          // budget before scanner-level quarantine is considered.
+          const transient=body.error.code===-32603||body.error.code===-32005||body.error.code===-32004;
+          if(transient&&attempt<maxRetries){
+            await sleepImpl(Math.min(retryMaxDelayMs,retryBaseDelayMs*(2**attempt)));
+            continue;
+          }
+          throw new Error(`LPFORGE_RPC:${method}:${body.error.code}:${body.error.message}`);
+        }
         return body.result as T;
       } finally {clearTimeout(timer);}
     }
@@ -236,9 +246,23 @@ export function extractInnerInstructionDataForProgram(tx:Record<string,unknown>,
   return out;
 }
 export interface ScannedAddressTransaction {signature:string;slot:bigint;blockTime?:string;logs:string[];cpiInstructionData:string[];}
-export async function scanAddressTransactions(opts:{rpc:SolanaRpcClient;address:string;limit:number;before?:string;programId?:string}):Promise<ScannedAddressTransaction[]> {
+export interface ScanTransactionFailure {signature:string;message:string;}
+export async function scanAddressTransactions(opts:{rpc:SolanaRpcClient;address:string;limit:number;before?:string;programId?:string;maxTransactionFailures?:number;onTransactionFailure?:(failure:ScanTransactionFailure)=>void}):Promise<ScannedAddressTransaction[]> {
   const sigs=await opts.rpc.getSignaturesForAddress(opts.address,opts.limit,opts.before); const out:ScannedAddressTransaction[]=[];
-  for(const s of [...sigs].reverse()){ if(s.err)continue; const tx=await opts.rpc.getTransaction(s.signature); if(!tx)continue; const meta=(tx.meta??{}) as Record<string,unknown>; const logs=Array.isArray(meta.logMessages)?meta.logMessages.filter((x):x is string=>typeof x==='string'):[]; out.push({signature:s.signature,slot:BigInt(s.slot),...(typeof s.blockTime==='number'?{blockTime:new Date(s.blockTime*1000).toISOString()}:{}),logs,cpiInstructionData:extractInnerInstructionDataForProgram(tx,opts.programId??EXPECTED_DLMM_PROGRAM_ID)}); }
+  const maxFailures=Math.max(0,Math.floor(opts.maxTransactionFailures??3));let failures=0;
+  for(const s of [...sigs].reverse()){
+    if(s.err)continue;
+    let tx:Record<string,unknown>|null;
+    try{tx=await opts.rpc.getTransaction(s.signature);}catch(error){
+      failures++;
+      const message=error instanceof Error?error.message:String(error);
+      opts.onTransactionFailure?.({signature:s.signature,message});
+      if(failures>maxFailures)throw new Error(`LPFORGE_RPC_SCAN_TRANSACTION_FAILURE_THRESHOLD:${failures}/${maxFailures}:${message}`);
+      continue;
+    }
+    if(!tx)continue;
+    const meta=(tx.meta??{}) as Record<string,unknown>; const logs=Array.isArray(meta.logMessages)?meta.logMessages.filter((x):x is string=>typeof x==='string'):[]; out.push({signature:s.signature,slot:BigInt(s.slot),...(typeof s.blockTime==='number'?{blockTime:new Date(s.blockTime*1000).toISOString()}:{}),logs,cpiInstructionData:extractInnerInstructionDataForProgram(tx,opts.programId??EXPECTED_DLMM_PROGRAM_ID)});
+  }
   return out;
 }
 

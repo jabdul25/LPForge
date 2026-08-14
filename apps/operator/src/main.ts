@@ -481,6 +481,11 @@ async function liveOnce() {
       address: cfg.smokePoolAddress,
       limit: cfg.eventBackfillLimit,
       programId: cfg.programId,
+      onTransactionFailure: ({ signature, message }) =>
+        log.warn("meteora_transaction_fetch_quarantined", {
+          signature,
+          reason: message,
+        }),
     });
     let decodedSwapEvents = 0;
     for (const tx of transactions)
