@@ -25,7 +25,8 @@
   "positionConstruction": {
     "maxInitialPositionWidthBins": 100,
     "maxPositionAccountRentSol": "0.09",
-    "requirePreinitializedBinArrays": true
+    "requirePreinitializedBinArrays": true,
+    "liquiditySlippageBps": 100
   },
   "pools": [
     {

@@ -36,7 +36,7 @@ async function simulateAndSend(tx,signers,label){
  const signature=await sendAndConfirmTransaction(connection,tx,signers,{commitment:'confirmed'});signatures.push({label,signature,unitsConsumed:sim.value.unitsConsumed??null});return sim;
 }
 try{
- const openBuilt=await buildOpenPositionTransaction(pool,{userAddress:payer.publicKey.toBase58(),positionAddress:position.publicKey.toBase58(),totalXAmount:'1000000000',totalYAmount:'1000000000',lowerBinId:-10,upperBinId:10,strategy:'SPOT'});
+ const openBuilt=await buildOpenPositionTransaction(pool,{userAddress:payer.publicKey.toBase58(),positionAddress:position.publicKey.toBase58(),totalXAmount:'1000000000',totalYAmount:'1000000000',lowerBinId:-10,upperBinId:10,strategy:'SPOT',liquiditySlippageBps:100});
  await simulateAndSend(openBuilt.transaction,[payer,position],'OPEN');opened=true;
  let before=await pool.getPosition(position.publicKey);
  if(before.version!==1)throw new Error(`LPFORGE_LOCAL_METEORA_POSITION_NOT_V2:${before.version}`);

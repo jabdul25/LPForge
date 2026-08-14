@@ -94,17 +94,27 @@ function workerConfig() {
   const maxFeeLamports = BigInt(
       process.env.LPFORGE_P6_MAX_FEE_LAMPORTS ?? "100000",
     ),
-    maxFeeFraction = Number(process.env.LPFORGE_P6_MAX_FEE_FRACTION ?? "0.02");
+    maxFeeFraction = Number(process.env.LPFORGE_P6_MAX_FEE_FRACTION ?? "0.02"),
+    construction = loadDeploymentPolicyFile(
+      process.env.LPFORGE_EXECUTION_POLICY_PATH?.trim() ||
+        "policies/live-execution-policy.json",
+    ).positionConstruction,
+    configuredLiquiditySlippageBps = construction?.liquiditySlippageBps,
+    liquiditySlippageBps = Number(configuredLiquiditySlippageBps);
   if (
     maxFeeLamports < 0n ||
     !Number.isFinite(maxFeeFraction) ||
     maxFeeFraction <= 0 ||
-    maxFeeFraction > 1
+    maxFeeFraction > 1 ||
+    !Number.isInteger(configuredLiquiditySlippageBps) ||
+    liquiditySlippageBps < 1 ||
+    liquiditySlippageBps > 10_000
   )
     throw new Error("LPFORGE_P6_EXECUTION_COST_CONFIG_INVALID");
   return {
     rpcUrl: process.env.LPFORGE_P6_PRIVATE_WRITE_RPC_URL ?? "",
     programId: process.env.LPFORGE_P6_PROGRAM_ID ?? EXPECTED_DLMM_PROGRAM_ID,
+    liquiditySlippageBps,
     maxFeeLamports,
     maxFeeFraction,
     simulationFreshnessMs: Number(
@@ -127,7 +137,7 @@ async function dispatchOne() {
         status: "AWAITING_AUTONOMOUS_DECISION",
         transactionSubmitted: false,
       };
-    const config = workerConfig(),
+    const baseConfig = workerConfig(),
       staticPolicy = loadDeploymentPolicyFile(
         process.env.LPFORGE_EXECUTION_POLICY_PATH?.trim() ||
           "policies/live-execution-policy.json",
@@ -135,7 +145,12 @@ async function dispatchOne() {
       [owned,productionCandidates] = await Promise.all([
         store.loadOwnedPositions(plan.ownerAddress),
         store.listDiscoveryCandidates([...(staticPolicy.productionAdmission?.eligibleTiers??['A'])]),
-      ]);
+      ]),
+      config = {
+        ...baseConfig,
+        liquiditySlippageBps:
+          staticPolicy.positionConstruction?.liquiditySlippageBps ?? 0,
+      };
     const now=new Date().toISOString(), dayStart=new Date(Date.UTC(new Date(now).getUTCFullYear(),new Date(now).getUTCMonth(),new Date(now).getUTCDate())).toISOString();
     const [controlRow,actionsToday]=await Promise.all([store.loadLatestPhase7ControlDecision((process.env.LPFORGE_P7_RUNTIME_ID??'lpforge-production').trim()),store.countExecutionActionsSince(plan.ownerAddress,dayStart)]);
     const phase7Control=controlRow?{authorityMode:String(controlRow.authority_mode),healthStatus:String(controlRow.health_status),driftStatus:String(controlRow.drift_status),safetyMode:String(controlRow.safety_mode),newEconomicActionAllowed:Boolean(controlRow.new_economic_action_allowed),observedAt:new Date(String(controlRow.observed_at)).toISOString()}:undefined;

@@ -67,6 +67,8 @@ import {
 export interface LiveWorkerConfig {
   rpcUrl: string;
   programId: string;
+  /** Explicit deployment-policy cap; the SDK must never receive undefined slippage. */
+  liquiditySlippageBps: number;
   maxFeeLamports: bigint;
   maxFeeFraction: number;
   simulationFreshnessMs: number;
@@ -486,6 +488,18 @@ export async function executeAutonomousOpen(input: {
     if (input.signer.publicKeyAddress !== input.plan.ownerAddress)
       throw new Error("LPFORGE_P6_OWNER_SIGNER_PLAN_MISMATCH");
     const connection = new Connection(input.config.rpcUrl, "confirmed");
+    // Build the entire Meteora route before swapping into the paired asset.
+    // This construction-only preflight never signs or submits a transaction.
+    const pool = await createLiveMeteoraOpenPool({
+      rpcUrl: input.config.rpcUrl,
+      poolAddress: input.plan.poolAddress,
+      programId: input.config.programId,
+    });
+    await prepareAutonomousMeteoraOpen({
+      plan: input.plan,
+      pool,
+      liquiditySlippageBps: input.config.liquiditySlippageBps,
+    });
     if (input.plan.swapTransactionId) {
       const swapSignedAt = new Date().toISOString(),
         swapTicket = ticket(
@@ -539,14 +553,10 @@ export async function executeAutonomousOpen(input: {
         updatedAt: funded.fundedAt,
       });
     }
-    const pool = await createLiveMeteoraOpenPool({
-      rpcUrl: input.config.rpcUrl,
-      poolAddress: input.plan.poolAddress,
-      programId: input.config.programId,
-    });
     const prepared = await prepareAutonomousMeteoraOpen({
       plan: input.plan,
       pool,
+      liquiditySlippageBps: input.config.liquiditySlippageBps,
     });
     if (prepared.steps.length > 1)
       return executeChunkableAutonomousOpen({
