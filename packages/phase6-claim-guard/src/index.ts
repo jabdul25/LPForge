@@ -1,4 +1,4 @@
-import type { MainnetCanaryDeploymentPolicy } from "../../canary/src/index.js";
+import type { MainnetCanaryDeploymentPolicy } from "../../deployment-policy/src/index.js";
 import type { AutonomousPlan } from "../../db/src/index.js";
 
 export interface ClaimGuardResult {
@@ -9,9 +9,9 @@ export interface ClaimGuardResult {
 export interface ProductionAdmissionCandidate {poolAddress:string;state:string;tier:string;lastSeenAt:string;}
 export interface Phase7ExecutionControl {authorityMode:string;healthStatus:string;driftStatus:string;safetyMode:string;newEconomicActionAllowed:boolean;observedAt:string;}
 export function validateFreshPhase7ExecutionControl(control:Phase7ExecutionControl|undefined,now:string,maxAgeMs=60_000):string[]{
- const reasons:string[]=[];const age=control?Date.parse(now)-Date.parse(control.observedAt):NaN;
- if(!control)reasons.push('P6_CLAIM_P7_CONTROL_MISSING');
- else {if(control.authorityMode!=='PRODUCTION')reasons.push('P6_CLAIM_P7_AUTHORITY_NOT_PRODUCTION');if(control.healthStatus!=='HEALTHY')reasons.push('P6_CLAIM_P7_HEALTH_NOT_HEALTHY');if(control.driftStatus==='BLOCK')reasons.push('P6_CLAIM_P7_DRIFT_BLOCK');if(control.safetyMode!=='NORMAL')reasons.push('P6_CLAIM_P7_SAFETY_NOT_NORMAL');if(!control.newEconomicActionAllowed)reasons.push('P6_CLAIM_P7_NEW_ACTION_BLOCKED');}
+ if(!control)return ['P6_CLAIM_P7_CONTROL_MISSING'];
+ const reasons:string[]=[];const age=Date.parse(now)-Date.parse(control.observedAt);
+ if(control.authorityMode!=='PRODUCTION')reasons.push('P6_CLAIM_P7_AUTHORITY_NOT_PRODUCTION');if(control.healthStatus!=='HEALTHY')reasons.push('P6_CLAIM_P7_HEALTH_NOT_HEALTHY');if(control.driftStatus==='BLOCK')reasons.push('P6_CLAIM_P7_DRIFT_BLOCK');if(control.safetyMode!=='NORMAL')reasons.push('P6_CLAIM_P7_SAFETY_NOT_NORMAL');if(!control.newEconomicActionAllowed)reasons.push('P6_CLAIM_P7_NEW_ACTION_BLOCKED');
  if(!Number.isFinite(age)||age<0||age>maxAgeMs)reasons.push('P6_CLAIM_P7_CONTROL_STALE');return reasons.sort();
 }
 function record(value: unknown) {
@@ -97,7 +97,9 @@ export function validateClaimedPlan(input: {
     )
       reasons.push("P6_CLAIM_POSITION_TRUTH_MISMATCH");
   }
-  if(input.phase7Control)reasons.push(...validateFreshPhase7ExecutionControl(input.phase7Control,input.now??new Date().toISOString()));
+  // Risk-increasing mutations are fail-closed when P7 authority is unavailable.
+  // Protective actions retain their dedicated degraded-control authorization path.
+  if(["OPEN","ADD","RESHAPE","REBALANCE"].includes(p.action))reasons.push(...validateFreshPhase7ExecutionControl(input.phase7Control,input.now??new Date().toISOString()));
   if(input.actionsToday!==undefined&&input.actionsToday>=input.policy.maxActionsPerDay)reasons.push('P6_CLAIM_DAILY_ACTION_LIMIT');
   return {
     approved: reasons.length === 0,

@@ -37,7 +37,7 @@ import {
   fixturePool,
   fixtureSwaps,
 } from "../../../packages/test-fixtures/src/index.js";
-import { loadMainnetCanaryDeploymentPolicyFile } from "../../../packages/canary/src/index.js";
+import { loadDeploymentPolicyFile } from "../../../packages/deployment-policy/src/index.js";
 
 function json(v: unknown) {
   return JSON.stringify(
@@ -48,7 +48,7 @@ function json(v: unknown) {
 }
 const lamportsToSol = (value: bigint) => Number(value) / 1_000_000_000;
 function loadProductionCapitalEnvelope(poolAddress: string) {
-  const deployment = loadMainnetCanaryDeploymentPolicyFile(
+  const deployment = loadDeploymentPolicyFile(
     process.env.LPFORGE_EXECUTION_POLICY_PATH ?? "policies/live-execution-policy.json",
   );
   if (deployment.status !== "ENABLED" || !deployment.productionCapital)

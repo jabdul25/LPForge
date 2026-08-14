@@ -4,7 +4,7 @@ import { createMeteoraDataApi } from '../../../packages/data-api/src/index.js';
 import { createPostgresStore } from '../../../packages/db/src/index.js';
 import { loadPhase1Config } from '../../../packages/config/src/index.js';
 import { createMeteoraReadAdapter, createSolanaRpcClient } from '../../../packages/meteora/src/index.js';
-import { loadMainnetCanaryDeploymentPolicyFile } from '../../../packages/canary/src/index.js';
+import { loadDeploymentPolicyFile } from '../../../packages/deployment-policy/src/index.js';
 import { deriveDiscoveryLifecycleState, runDeepDiscoveryCycle } from '../../../packages/discovery-runtime/src/index.js';
 import { collectActiveCandidateEvidence } from '../../../packages/active-candidate-evidence/src/index.js';
 import { discoverUniverse, parseDiscoveryPolicy, type DiscoveryPolicy, type RankedDiscoveryPool } from '../../../packages/pool-discovery/src/index.js';
@@ -20,7 +20,7 @@ async function loadPolicy():Promise<DiscoveryPolicy>{
 }
 function cycleId(policyId:string,observedAt:string){return createHash('sha256').update(`${policyId}:${observedAt}`).digest('hex').slice(0,32)}
 function reasonCodes(r:RankedDiscoveryPool){return [...new Set([...r.hardReasons,...r.warnings,...r.selectionReasons])].sort()}
-function productionEvidencePools(){const path=process.env.LPFORGE_EXECUTION_POLICY_PATH?.trim()||'policies/live-execution-policy.json';return loadMainnetCanaryDeploymentPolicyFile(path).pools.map(pool=>pool.address)}
+function productionEvidencePools(){const path=process.env.LPFORGE_EXECUTION_POLICY_PATH?.trim()||'policies/live-execution-policy.json';return loadDeploymentPolicyFile(path).pools.map(pool=>pool.address)}
 async function once(){
   const policy=await loadPolicy();
   const api=createMeteoraDataApi({...((process.env.LPFORGE_METEORA_DATA_API_URL??'').trim()?{baseUrl:process.env.LPFORGE_METEORA_DATA_API_URL!}:{}),maxRps:Number(process.env.LPFORGE_DATA_API_MAX_RPS??1),timeoutMs:Number(process.env.LPFORGE_HTTP_TIMEOUT_MS??10000)});

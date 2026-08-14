@@ -29,7 +29,8 @@ declare module 'node:child_process' {
 
 declare module 'node:fs' {
   export function readFileSync(path:string,encoding:'utf8'):string;
+  export function readdirSync(path:string):string[];
   export interface Stats {mode:number;isFile():boolean;isSymbolicLink():boolean;}
   export function lstatSync(path:string):Stats;
 }
-declare module 'node:path' { export function resolve(path:string):string; }
+declare module 'node:path' { export function resolve(...path:string[]):string; }
