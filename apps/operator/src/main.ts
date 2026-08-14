@@ -38,6 +38,8 @@ import {
   fixtureSwaps,
 } from "../../../packages/test-fixtures/src/index.js";
 import { loadDeploymentPolicyFile } from "../../../packages/deployment-policy/src/index.js";
+import { assessProductionOpenPlanCapacity } from "../../../packages/production-entry-capacity/src/index.js";
+import { Connection, PublicKey } from "@solana/web3.js";
 
 function json(v: unknown) {
   return JSON.stringify(
@@ -75,6 +77,64 @@ function loadProductionCapitalEnvelope(poolAddress: string) {
     productionPoolCapital: lamportsToSol(maxPoolLamports),
     ...(construction ? { maxRangeWidthBins: construction.maxInitialPositionWidthBins } : {}),
   };
+}
+async function loadLiveOpenPlanCapacity(input: {
+  store: Phase1Store;
+  rpcUrl: string;
+  ownerAddress?: string | undefined;
+}) {
+  if (!input.ownerAddress)
+    return {
+      approved: false,
+      walletLamports: 0n,
+      availableWalletLamports: 0n,
+      reasonCodes: ["P7_PLAN_OWNER_ADDRESS_MISSING"],
+    };
+  const deployment = loadDeploymentPolicyFile(
+    process.env.LPFORGE_EXECUTION_POLICY_PATH ??
+      "policies/live-execution-policy.json",
+  );
+  const capital = deployment.productionCapital;
+  if (!capital)
+    return {
+      approved: false,
+      walletLamports: 0n,
+      availableWalletLamports: 0n,
+      reasonCodes: ["P7_PLAN_CAPITAL_POLICY_MISSING"],
+    };
+  const [facts, priorRisk] = await Promise.all([
+    input.store.loadPhase7PortfolioFacts(input.ownerAddress),
+    input.store.loadPhase7PortfolioRiskState(input.ownerAddress),
+  ]);
+  const priorObservedAt = priorRisk
+    ? Date.parse(String(priorRisk.observed_at))
+    : Number.NaN;
+  const priorWallet = (priorRisk?.payload as Record<string, unknown> | undefined)
+    ?.walletLamports;
+  const currentEnough =
+    Number.isFinite(priorObservedAt) &&
+    Date.now() - priorObservedAt <= 60_000 &&
+    typeof priorWallet === "string" &&
+    /^\d+$/.test(priorWallet);
+  const walletLamports = currentEnough
+    ? BigInt(priorWallet)
+    : BigInt(
+        await new Connection(input.rpcUrl, "confirmed").getBalance(
+          new PublicKey(input.ownerAddress),
+          "confirmed",
+        ),
+      );
+  const capacity = assessProductionOpenPlanCapacity({
+    walletLamports,
+    reserveLamports: capital.reserveLamports,
+    minInitialPositionLamports: capital.minInitialPositionLamports,
+    maxPortfolioLamports: capital.maxPortfolioLamports,
+    maxOpenPositions: deployment.maxOpenPositions,
+    openPositions: facts.openPositions,
+    deployedLamports: facts.deployedLamports,
+    pendingReservedLamports: facts.pendingReservedLamports,
+  });
+  return { ...capacity, walletLamports };
 }
 async function persistTransactionPlan(
   store: Phase1Store,
@@ -550,11 +610,14 @@ async function liveOnce() {
       decisionAt,
       120,
     );
-    const walletCapital = Number(
-      process.env.LPFORGE_SHADOW_WALLET_CAPITAL ?? "1",
-    );
+    const openPlanCapacity = await loadLiveOpenPlanCapacity({
+      store,
+      rpcUrl: cfg.solanaRpcHttpUrl,
+      ownerAddress: process.env.LPFORGE_OPERATOR_OWNER_ADDRESS,
+    });
+    const walletCapital = lamportsToSol(openPlanCapacity.walletLamports);
     if (!(walletCapital > 0))
-      throw new Error("LPFORGE_OPERATOR_INVALID_SHADOW_CAPITAL");
+      throw new Error("LPFORGE_OPERATOR_WALLET_BALANCE_UNAVAILABLE");
     const entryPolicy = loadAutonomousEntryPolicy(
       process.env.LPFORGE_AUTONOMOUS_ENTRY_POLICY_PATH ??
         "policies/autonomous-entry-policy.json",
@@ -579,7 +642,10 @@ async function liveOnce() {
       protocolCompatible: true,
       walletCapital,
       ...productionCapital,
-      planPreparationEnabled: allowEconomicPlans,
+      planPreparationEnabled: allowEconomicPlans && openPlanCapacity.approved,
+      ...(!openPlanCapacity.approved
+        ? { planPreparationBlockReasonCodes: openPlanCapacity.reasonCodes }
+        : {}),
       ...(economicEvidence ? { economicEvidence } : {}),
       ...(evidenceMaturity ? { evidenceMaturity } : {}),
       ...(swapQuoteProvider ? { swapQuoteProvider } : {}),
@@ -615,6 +681,11 @@ async function liveOnce() {
         phase4Status: result.phase4Status,
         phase5Status: result.phase5Status,
         economicPlanDispatchAllowed: allowEconomicPlans,
+        openPlanCapacity: {
+          approved: openPlanCapacity.approved,
+          availableWalletLamports: openPlanCapacity.availableWalletLamports?.toString(),
+          reasonCodes: openPlanCapacity.reasonCodes,
+        },
         management,
       },
     });

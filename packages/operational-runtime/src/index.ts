@@ -60,6 +60,9 @@ export interface OperationalCycleInput {
   maxRangeWidthBins?:number;
   /** False means observe/shadow: do not quote, fund, or construct a plan. */
   planPreparationEnabled?:boolean;
+  /** Explicit upstream reasons that prevent a new plan without changing the
+   * market decision itself (for example, no free wallet capital or no slot). */
+  planPreparationBlockReasonCodes?:readonly string[];
   policy?:OperationalRuntimePolicy;
 }
 export interface OperationalCycleResult {
@@ -155,7 +158,7 @@ export async function evaluateOperationalCycle(input:OperationalCycleInput):Prom
     :allocateCapital({walletCapital:input.walletCapital,requests:[{id:`alloc-${shadow.thesis.thesisId}`,pool:input.pool.address,token:input.dataApiPool.token_x?.address??input.pool.tokenXMint,requested:input.walletCapital*shadow.thesis.selectedCandidate.capitalFraction,confidence:entry.confidence,expectedNetValueRate:shadow.economics.expectedNetLpValue/Math.max(input.walletCapital,Number.EPSILON),downsideRisk:clamp(entryFeatures.dangerousRegimeMass)}]});
   const entryPrerequisitesMet=entry.decision==='ENTRY_READY'&&risk.decision==='APPROVE'&&allocation.totalAllocated>0;
   if(!entryPrerequisitesMet){if(entry.decision!=='ENTRY_READY')reasonCodes.push('OPERATIONAL_ENTRY_NOT_READY');if(risk.decision!=='APPROVE')reasonCodes.push('OPERATIONAL_RISK_NOT_APPROVED');if(!(allocation.totalAllocated>0))reasonCodes.push('OPERATIONAL_CAPITAL_ALLOCATION_ZERO');const core={...base,phase3Status:'ENTRY_READY' as const,phase4Status:entry.decision==='ENTRY_READY'?'WAIT' as const:entry.decision,phase5Status:'NOT_REACHED' as const,shadow,entry,risk,allocation,reasonCodes:[...new Set(reasonCodes)].sort()};return{cycleId:await sha256Hex(canonicalJson(core)),...core};}
-  if(input.planPreparationEnabled===false){reasonCodes.push('OPERATIONAL_PLAN_DISPATCH_DISABLED');const core={...base,phase3Status:'ENTRY_READY' as const,phase4Status:'ENTRY_READY' as const,phase5Status:'NOT_REACHED' as const,shadow,entry,risk,allocation,reasonCodes:[...new Set(reasonCodes)].sort()};return{cycleId:await sha256Hex(canonicalJson(core)),...core};}
+  if(input.planPreparationEnabled===false){reasonCodes.push(...(input.planPreparationBlockReasonCodes?.length?input.planPreparationBlockReasonCodes:['OPERATIONAL_PLAN_DISPATCH_DISABLED']));const core={...base,phase3Status:'ENTRY_READY' as const,phase4Status:'ENTRY_READY' as const,phase5Status:'NOT_REACHED' as const,shadow,entry,risk,allocation,reasonCodes:[...new Set(reasonCodes)].sort()};return{cycleId:await sha256Hex(canonicalJson(core)),...core};}
   const capitalLamports=BigInt(Math.floor(allocation.totalAllocated*1_000_000_000)),activeBin=input.bins.find(binFact=>binFact.binId===input.pool.activeBinId);if(!activeBin)throw new Error('LPFORGE_OPERATIONAL_ACTIVE_BIN_LIQUIDITY_MISSING');
   const entryFunding=await quotePhase6ExactSolEntryFunding({strategy:candidate.strategy,orientation:candidate.orientation,capitalLamports,activeBinId:input.pool.activeBinId,binStep:input.pool.binStep,lowerBinId:candidate.lowerBinId,upperBinId:candidate.upperBinId,activeBinXAmount:activeBin.amountX,activeBinYAmount:activeBin.amountY,perBinWeights:candidate.perBinWeights});
   const requiresSwap=entryFunding.solToPairedTokenLamports>0n;let swapQuote:SwapQuoteAssessment|undefined;if(requiresSwap){if(input.swapQuoteProvider)swapQuote=await input.swapQuoteProvider.quote({inputMint:input.pool.tokenYMint,outputMint:input.pool.tokenXMint,inputAmount:entryFunding.solToPairedTokenLamports,requiredOutputAmount:entryFunding.totalPairedTokenRaw});else swapQuote={status:'UNAVAILABLE',reasonCodes:['P6_SWAP_QUOTE_PROVIDER_REQUIRED']};}
