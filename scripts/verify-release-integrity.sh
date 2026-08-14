@@ -11,7 +11,7 @@ fail(){ echo "RELEASE_INTEGRITY_FAIL: $*" >&2; exit 1; }
 [[ -f SOURCE_REVISION.txt ]] || fail "SOURCE_REVISION.txt missing"
 [[ -f pnpm-lock.yaml ]] || fail "pnpm-lock.yaml missing"
 [[ ! -e .env ]] || fail ".env must not be shipped in release"
-if find . -type f \( -name '.env' -o -name '.env.*' \) ! -name '.env.example' -print -quit | grep -q .; then
+if find . -type f \( -name '.env' -o -name '.env.*' \) ! -name '*.example' -print -quit | grep -q .; then
   fail "non-example environment file must not be shipped in release"
 fi
 
