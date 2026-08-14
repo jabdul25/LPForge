@@ -4,7 +4,7 @@
   "status": "ENABLED",
   "approvalTtlMs": 15000,
   "minDevnetConfirmedRuns": 3,
-  "maxActionsPerDay": 2,
+  "maxActionsPerDay": 30,
   "maxOpenPositions": 2,
   "productionAdmission": {
     "enabled": true,
