@@ -11,6 +11,12 @@ test('production suppresses new plans when every open-position slot is occupied'
   assert.deepEqual(result.reasonCodes,['P7_PLAN_OPEN_POSITION_LIMIT']);
 });
 
+test('a stricter one-slot admission policy suppresses a second open even if a broader policy permits two',()=>{
+  const result=assessProductionOpenPlanCapacity({...base,maxOpenPositions:1,openPositions:1});
+  assert.equal(result.approved,false);
+  assert.deepEqual(result.reasonCodes,['P7_PLAN_OPEN_POSITION_LIMIT']);
+});
+
 test('production suppresses new plans when wallet funds cannot cover reserve plus minimum position',()=>{
   const result=assessProductionOpenPlanCapacity({...base,walletLamports:29_999_999n});
   assert.equal(result.approved,false);

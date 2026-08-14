@@ -129,7 +129,15 @@ async function loadLiveOpenPlanCapacity(input: {
     reserveLamports: capital.reserveLamports,
     minInitialPositionLamports: capital.minInitialPositionLamports,
     maxPortfolioLamports: capital.maxPortfolioLamports,
-    maxOpenPositions: deployment.maxOpenPositions,
+    // Discovery admission is an additional production constraint, not merely
+    // a screening hint.  A discovered candidate therefore uses the stricter
+    // of the global and discovery-admission position limits.
+    maxOpenPositions: Math.min(
+      deployment.maxOpenPositions,
+      deployment.productionAdmission?.enabled
+        ? deployment.productionAdmission.maxOpenPositions
+        : deployment.maxOpenPositions,
+    ),
     openPositions: facts.openPositions,
     deployedLamports: facts.deployedLamports,
     pendingReservedLamports: facts.pendingReservedLamports,
