@@ -195,6 +195,15 @@ export function buildTransactionPlan(r: PlanRequest): TransactionPlan {
       }),
     );
   }
+  // Transaction-step IDs are globally unique in PostgreSQL. A management
+  // action can legitimately recur for the same owner/position with identical
+  // metadata, so the plan's idempotency key is part of every persisted step
+  // identity. This keeps retries of one plan deterministic while preventing
+  // a later plan from silently losing its steps to an earlier plan.
+  const planTransactions = transactions.map((transaction) => ({
+    ...transaction,
+    transactionId: `${transaction.transactionId}-${key}`,
+  }));
   return {
     planId: `plan-${key}`,
     intent,
@@ -202,8 +211,8 @@ export function buildTransactionPlan(r: PlanRequest): TransactionPlan {
     createdAt: r.observedAt,
     expiresAt: r.expiresAt,
     state: "PLANNED",
-    transactions,
+    transactions: planTransactions,
     reasonCodes:
-      transactions.length > 1 ? ["EXECUTION_MULTI_TRANSACTION_PLAN"] : [],
+      planTransactions.length > 1 ? ["EXECUTION_MULTI_TRANSACTION_PLAN"] : [],
   };
 }

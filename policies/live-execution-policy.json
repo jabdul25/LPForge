@@ -9,7 +9,7 @@
   "productionAdmission": {
     "enabled": true,
     "eligibleTiers": ["A"],
-    "maxCandidates": 10,
+    "maxCandidates": 20,
     "maxCandidateAgeMs": 900000,
     "maxCapitalSol": "0.5",
     "maxOpenPositions": 1

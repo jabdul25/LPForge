@@ -2092,6 +2092,56 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       confirmationStatus,
       economicEffect,
     });
+    // RETURN_EXISTING_PLAN means no transaction was submitted. Leaving a
+    // claimed pre-submission plan unresolved would indefinitely block the
+    // worker and invite a stale trade to be resumed later. Finalize it
+    // instead; a fresh production decision must create any replacement.
+    if (action === "RETURN_EXISTING_PLAN") {
+      const expired = Date.parse(plan.expiresAt) <= Date.parse(input.now);
+      await input.store.updateExecutionJournal({
+        idempotencyKey: plan.idempotencyKey,
+        expectedVersion: journal.version,
+        state: expired ? "EXPIRED" : "FAILED",
+        updatedAt: input.now,
+        payload: {
+          ...journal.payload,
+          recovery: "PRE_SUBMISSION_ABORTED",
+          confirmationStatus,
+          economicEffect,
+          positionTruth,
+        },
+      });
+      if (expired)
+        await input.store.transitionAutonomousPlan({
+          planId: plan.planId,
+          state: "EXPIRED",
+          at: input.now,
+          reasonCodes: ["P6_RECOVERY_PRE_SUBMISSION_PLAN_EXPIRED"],
+          payload: { journalId: journal.journalId, recovery: true },
+        });
+      else
+        await input.store.completeAutonomousPlan({
+          planId: plan.planId,
+          state: "FAILED",
+          at: input.now,
+          payload: { journalId: journal.journalId, recovery: true },
+        });
+      await input.store.releaseExecutionCapital(plan.planId, input.now, [
+        expired
+          ? "P6_RECOVERY_PRE_SUBMISSION_PLAN_EXPIRED"
+          : "P6_RECOVERY_PRE_SUBMISSION_ABORTED",
+      ]);
+      results.push({
+        planId: plan.planId,
+        action,
+        reasonCodes: [
+          expired
+            ? "P6_RECOVERY_PRE_SUBMISSION_PLAN_EXPIRED"
+            : "P6_RECOVERY_PRE_SUBMISSION_ABORTED",
+        ],
+      });
+      continue;
+    }
     if (
       action === "MARK_RECONCILED" &&
       plan.action !== "RESHAPE" &&
