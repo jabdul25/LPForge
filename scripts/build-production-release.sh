@@ -38,8 +38,12 @@ out="${1:-$root/LPForge_Production_${sha:0:12}.tar.gz}"
 # Do not use --exclude-vcs here: it would remove tracked files such as
 # .gitignore after SHA256SUMS has already covered them.
 tar -C "$stage" --exclude='node_modules' --exclude='.pnpm-store' --exclude='*.swp' -czf "$out" .
-tar -tzf "$out" | grep -qx './RELEASE_MANIFEST.json'
-tar -tzf "$out" | grep -qx './SOURCE_REVISION.txt'
-tar -tzf "$out" | grep -qx './SHA256SUMS.txt'
-tar -tzf "$out" | grep -qx './SECURITY_SANITIZATION.json'
+# Do not pipe `tar` directly to `grep` under `pipefail`: grep may stop after a
+# match and make tar exit with SIGPIPE even though the artifact is valid.
+archive_listing="$stage/archive-file-list.txt"
+tar -tzf "$out" > "$archive_listing"
+grep -qx './RELEASE_MANIFEST.json' "$archive_listing"
+grep -qx './SOURCE_REVISION.txt' "$archive_listing"
+grep -qx './SHA256SUMS.txt' "$archive_listing"
+grep -qx './SECURITY_SANITIZATION.json' "$archive_listing"
 sha256sum "$out"
