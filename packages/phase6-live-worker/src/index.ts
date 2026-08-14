@@ -2012,17 +2012,38 @@ export async function recoverUnfinishedAutonomousPlans(input: {
   for (const plan of plans) {
     const raw = await input.store.getExecutionJournal(plan.idempotencyKey);
     if (!raw) {
-      await input.store.transitionAutonomousPlan({
-        planId: plan.planId,
-        state: "RECONCILIATION_REQUIRED",
-        at: input.now,
-        reasonCodes: ["P6_RECOVERY_JOURNAL_MISSING"],
-        payload: { action: plan.action },
-      });
+      // The journal is written before any build/sign/send path. A claimed
+      // plan without one therefore has not crossed a network boundary and
+      // must not hold the queue or be resumed after its thesis has aged.
+      const expired = Date.parse(plan.expiresAt) <= Date.parse(input.now);
+      if (expired)
+        await input.store.transitionAutonomousPlan({
+          planId: plan.planId,
+          state: "EXPIRED",
+          at: input.now,
+          reasonCodes: ["P6_RECOVERY_JOURNAL_MISSING_PRE_SUBMISSION_EXPIRED"],
+          payload: { action: plan.action, recovery: "PRE_SUBMISSION_ABORTED" },
+        });
+      else
+        await input.store.completeAutonomousPlan({
+          planId: plan.planId,
+          state: "FAILED",
+          at: input.now,
+          payload: { action: plan.action, recovery: "PRE_SUBMISSION_ABORTED" },
+        });
+      await input.store.releaseExecutionCapital(plan.planId, input.now, [
+        expired
+          ? "P6_RECOVERY_JOURNAL_MISSING_PRE_SUBMISSION_EXPIRED"
+          : "P6_RECOVERY_JOURNAL_MISSING_PRE_SUBMISSION_ABORTED",
+      ]);
       results.push({
         planId: plan.planId,
-        action: "HOLD_FOR_OPERATOR",
-        reasonCodes: ["P6_RECOVERY_JOURNAL_MISSING"],
+        action: "RETURN_EXISTING_PLAN",
+        reasonCodes: [
+          expired
+            ? "P6_RECOVERY_JOURNAL_MISSING_PRE_SUBMISSION_EXPIRED"
+            : "P6_RECOVERY_JOURNAL_MISSING_PRE_SUBMISSION_ABORTED",
+        ],
       });
       continue;
     }
