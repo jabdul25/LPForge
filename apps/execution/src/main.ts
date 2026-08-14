@@ -13,6 +13,7 @@ import {
   executeAutonomousPlan,
   recoverPartialEntryFunding,
   recoverUnfinishedAutonomousPlans,
+  reconcileOrphanedPositions,
 } from "../../../packages/phase6-live-worker/src/index.js";
 import { Connection, PublicKey } from "@solana/web3.js";
 import { EXPECTED_DLMM_PROGRAM_ID } from "../../../packages/meteora/src/index.js";
@@ -154,6 +155,7 @@ async function dispatchOne() {
     const now=new Date().toISOString(), dayStart=new Date(Date.UTC(new Date(now).getUTCFullYear(),new Date(now).getUTCMonth(),new Date(now).getUTCDate())).toISOString();
     const [controlRow,actionsToday]=await Promise.all([store.loadLatestPhase7ControlDecision((process.env.LPFORGE_P7_RUNTIME_ID??'lpforge-production').trim()),store.countExecutionActionsSince(plan.ownerAddress,dayStart)]);
     const phase7Control=controlRow?{authorityMode:String(controlRow.authority_mode),healthStatus:String(controlRow.health_status),driftStatus:String(controlRow.drift_status),safetyMode:String(controlRow.safety_mode),newEconomicActionAllowed:Boolean(controlRow.new_economic_action_allowed),observedAt:new Date(String(controlRow.observed_at)).toISOString()}:undefined;
+    const provenanceSecret=(process.env.LPFORGE_PLAN_PROVENANCE_SECRET??'').trim();
     let positionTruth;
     if (plan.positionAddress) {
       try {
@@ -174,6 +176,7 @@ async function dispatchOne() {
       productionCandidates,
       ...(phase7Control?{phase7Control}:{}),
       actionsToday,
+      ...(provenanceSecret?{provenanceSecret}:{}),
       now,
       ...(positionTruth ? { positionTruth } : {}),
     });
@@ -255,7 +258,17 @@ async function recoverOnce() {
       rpcUrl: config.rpcUrl,
       programId: config.programId,
     });
-    return { partial, plans };
+    const orphans = await reconcileOrphanedPositions({
+      store,
+      rpcUrl: config.rpcUrl,
+      programId: config.programId,
+      ownerAddress: process.env.LPFORGE_OPERATOR_OWNER_ADDRESS ?? "",
+      poolAddresses: loadDeploymentPolicyFile(
+        process.env.LPFORGE_EXECUTION_POLICY_PATH?.trim() ||
+          "policies/live-execution-policy.json",
+      ).pools.map((pool) => pool.address),
+    });
+    return { partial, plans, orphans };
   } finally {
     await store.close();
   }
@@ -272,7 +285,7 @@ async function start() {
   try{console.log(json({...assertLaunchable(),status:"RECOVERY_BEFORE_AUTONOMOUS_DISPATCH",recovery:await recoverOnce()}));if(executionTelegramAlerter.config.notifyStartup)await safeExecutionTelegramAlert({severity:'INFO',code:'P6_EXECUTION_DAEMON_START',title:'LPForge execution daemon started',message:'The execution worker is online and awaiting autonomous plans. Signing remains subject to its independent claim guard and live policy.',runtimeId:'lpforge-execution',observedAt:startupAt});}catch(error){await safeExecutionTelegramAlert({severity:'CRITICAL',code:'P6_EXECUTION_DAEMON_START_FAILURE',title:'LPForge execution daemon failed to start',message:'The execution worker could not complete its launch checks. No transaction was sent.',runtimeId:'lpforge-execution',observedAt:startupAt,reasonCodes:['P6_EXECUTION_START_FAILURE']});throw error;}
   for (;;) {
     const observedAt=new Date().toISOString();
-    try{const recovery = await recoverOnce();if (recovery.partial.length || recovery.plans.length){const result={service:'lpforge-execution',status:'RECOVERY_PENDING',recovery,observedAt};console.log(json(result));await safeExecutionTelegramAlert({severity:'WARNING',code:'P6_EXECUTION_RECOVERY_PENDING',title:'Execution recovery is active',message:'LPForge is reconciling unfinished execution state before accepting a new plan.',runtimeId:'lpforge-execution',observedAt,reasonCodes:[...recovery.partial.flatMap(x=>x.reasonCodes),...recovery.plans.flatMap(x=>x.reasonCodes)].slice(0,12)});}else{const result=await dispatchOne();console.log(json({...result,observedAt}));await alertExecutionResult(result,observedAt);}}catch(error){console.error(error);await safeExecutionTelegramAlert({severity:'CRITICAL',code:'P6_EXECUTION_CYCLE_EXCEPTION',title:'Execution cycle exception',message:'The execution worker caught an exception and will retry. No blind resend is permitted.',runtimeId:'lpforge-execution',observedAt,reasonCodes:['P6_EXECUTION_CYCLE_EXCEPTION']});}
+    try{const recovery = await recoverOnce();if (recovery.partial.length || recovery.plans.length || recovery.orphans?.adopted){const result={service:'lpforge-execution',status:'RECOVERY_PENDING',recovery,observedAt};console.log(json(result));await safeExecutionTelegramAlert({severity:'WARNING',code:'P6_EXECUTION_RECOVERY_PENDING',title:'Execution recovery is active',message:'LPForge is reconciling unfinished execution state before accepting a new plan.',runtimeId:'lpforge-execution',observedAt,reasonCodes:[...recovery.partial.flatMap(x=>x.reasonCodes),...recovery.plans.flatMap(x=>x.reasonCodes),...(recovery.orphans?.reasonCodes??[])].slice(0,12)});}else{const result=await dispatchOne();console.log(json({...result,observedAt}));await alertExecutionResult(result,observedAt);}}catch(error){console.error(error);await safeExecutionTelegramAlert({severity:'CRITICAL',code:'P6_EXECUTION_CYCLE_EXCEPTION',title:'Execution cycle exception',message:'The execution worker caught an exception and will retry. No blind resend is permitted.',runtimeId:'lpforge-execution',observedAt,reasonCodes:['P6_EXECUTION_CYCLE_EXCEPTION']});}
     await new Promise((resolve) => setTimeout(resolve, interval));
   }
 }

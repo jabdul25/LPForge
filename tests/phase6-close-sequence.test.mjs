@@ -1,0 +1,79 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import test from 'node:test';
+import {buildTransactionPlan} from '../.build/packages/transaction-planner/src/index.js';
+
+const owner='11111111111111111111111111111111',position='Vote111111111111111111111111111111111111',now='2026-08-13T12:00:00.000Z',expires='2026-08-13T12:05:00.000Z';
+function plan(action){return buildTransactionPlan({action,cluster:'mainnet-beta',ownerAddress:owner,poolAddress:'POOL_FIXTURE',positionAddress:position,thesisId:'thesis',observedAt:now,expiresAt:expires});}
+
+test('close plans are a drain → unwind → close sequence with one durable step per phase',()=>{
+  for(const action of ['CLOSE','EMERGENCY_CLOSE']){
+    const p=plan(action);
+    assert.deepEqual(p.transactions.map(x=>x.kind),['METEORA_REMOVE','JUPITER_UNWIND','METEORA_CLOSE'],`${action} step kinds`);
+    const [remove,unwind,close]=p.transactions;
+    assert.equal(remove.metadata.bps,10_000);
+    assert.equal(remove.metadata.claimAndClose,false,'the drain must not claim-and-close');
+    assert.equal(remove.metadata.unwindStage,'CLOSE_TOKEN_X_UNWIND');
+    assert.equal(remove.metadata.emergency,action==='EMERGENCY_CLOSE');
+    assert.equal(unwind.metadata.unwindStage,'CLOSE_TOKEN_X_UNWIND');
+    assert.equal(unwind.metadata.provider,'JUPITER_METIS');
+    assert.deepEqual(unwind.writableAccounts,[]);
+    assert.equal(close.metadata.bps,10_000);
+    assert.equal(close.metadata.claimAndClose,true);
+    assert.equal(close.metadata.emergency,action==='EMERGENCY_CLOSE');
+    assert.deepEqual(remove.requiredSignerAddresses,[owner]);
+    // The unwind step is a fresh wallet swap, not a position mutation.
+    assert.deepEqual(remove.writableAccounts,[position]);
+    assert.deepEqual(close.writableAccounts,[position]);
+    assert.ok(p.reasonCodes.includes('EXECUTION_MULTI_TRANSACTION_PLAN'));
+    for(const [index,tx] of p.transactions.entries())assert.equal(tx.sequence,index+1);
+  }
+});
+
+test('worker close sequence drains, unwinds wallet token-X, claims residual fees, then closes the drained account',()=>{
+  const worker=fs.readFileSync('packages/phase6-live-worker/src/index.ts','utf8');
+  const closeAt=worker.indexOf('input.plan.action === "CLOSE" ||');
+  const drainAt=worker.indexOf('deferCompletion: true,',closeAt);
+  const unwindAt=worker.indexOf('executeJupiterUnwindStep({',drainAt);
+  const claimAt=worker.indexOf('buildClaimTransactions(pool, {',unwindAt);
+  const claimStepAt=worker.indexOf('CLOSE_CLAIM_RESIDUAL',claimAt);
+  const closeBuilderAt=worker.indexOf('buildClosePositionTransaction(pool, {',claimStepAt);
+  assert.ok(closeAt>=0&&drainAt>closeAt&&unwindAt>drainAt&&claimAt>unwindAt&&claimStepAt>claimAt&&closeBuilderAt>claimStepAt,'close phases must run drain → unwind → claim → close in order');
+  assert.match(worker,/stage:\s*"CLOSE_TOKEN_X_UNWIND"/);
+  assert.match(worker,/reasonPrefix:\s*"P6_CLOSE_UNWIND"/);
+  assert.match(worker,/LPFORGE_METEORA_CLAIM_NOTHING_TO_CLAIM/);
+  assert.match(worker,/idempotencyKey:\s*`\$\{input\.plan\.idempotencyKey\}:\$\{unwindStep\.transactionId\}`/);
+  // The drain and claim phases must defer completion: a death between phases
+  // leaves the journal action as the plan action so recovery HOLDs instead
+  // of marking a half-executed close reconciled.
+  const drainDefer=worker.slice(closeAt,closeBuilderAt).match(/deferCompletion:\s*true/g);
+  assert.ok(drainDefer&&drainDefer.length>=2,'drain and claim phases both defer completion');
+  // The final close verifies chain truth before completing the plan.
+  const verifyAt=worker.indexOf('CLOSE_CHAIN_VERIFIED');
+  const stillPresentAt=worker.indexOf('P6_CLOSE_POSITION_STILL_PRESENT');
+  assert.ok(verifyAt>=0&&stillPresentAt>verifyAt,'confirmed close must verify the position vanished');
+});
+
+test('a confirmed REDUCE rebases the owned cost basis with an audit trail',()=>{
+  const worker=fs.readFileSync('packages/phase6-live-worker/src/index.ts','utf8');
+  assert.match(worker,/const remainingCapitalLamports =\s*\n?\s*\(capital \* BigInt\(10_000 - reductionBps\)\) \/ 10_000n;/);
+  assert.match(worker,/adjustOwnedPositionCapital\(\{/);
+  assert.match(worker,/priorCapitalLamports:\s*capital\.toString\(\)/);
+  assert.match(worker,/remainingCapitalLamports:\s*remainingCapitalLamports\.toString\(\)/);
+  const db=fs.readFileSync('packages/db/src/index.ts','utf8');
+  assert.match(db,/capital_adjustments/,'postgres store keeps the adjustment audit trail');
+  assert.match(db,/adjustOwnedPositionCapital/);
+});
+
+test('close and reduce derive their remove range from chain truth when the intent carries none',()=>{
+  const worker=fs.readFileSync('packages/phase6-live-worker/src/index.ts','utf8');
+  assert.match(worker,/async function chainMutationRange/);
+  assert.match(worker,/getPositionV2\(input\.plan\.poolAddress,\s*\n?\s*input\.positionAddress/);
+  const operator=fs.readFileSync('apps/operator/src/main.ts','utf8');
+  assert.match(operator,/capitalLamports:\s*position\.initialCapitalLamports/,'REDUCE intent must declare the capital it rebases');
+});
+
+test('execution contracts enumerate the close unwind step kind',()=>{
+  const contracts=fs.readFileSync('packages/execution-contracts/src/index.ts','utf8');
+  assert.match(contracts,/'JUPITER_UNWIND'/);
+});

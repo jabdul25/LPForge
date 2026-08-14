@@ -19,6 +19,7 @@ import {
   loadAutonomousEntryPolicy,
 } from "../../../packages/phase6-swap-quote/src/index.js";
 import { buildTransactionPlan } from "../../../packages/transaction-planner/src/index.js";
+import { computePlanProvenanceHmac } from "../../../packages/execution-contracts/src/index.js";
 import type { TransactionPlan } from "../../../packages/execution-contracts/src/index.js";
 import {
   decideLivePositionManagement,
@@ -148,6 +149,7 @@ async function persistTransactionPlan(
   store: Phase1Store,
   plan: TransactionPlan,
 ) {
+  const provenanceSecret=(process.env.LPFORGE_PLAN_PROVENANCE_SECRET??'').trim();
   await store.insertExecutionIntent({
     intentId: plan.intent.intentId,
     idempotencyKey: plan.intent.idempotencyKey,
@@ -178,6 +180,26 @@ async function persistTransactionPlan(
         intentId: plan.intent.intentId,
         poolAddress: plan.intent.poolAddress,
         observedAt: plan.intent.observedAt,
+        // Stamped only when the provenance secret is configured; the claim
+        // guard verifies it fail-closed from that moment on.
+        ...(provenanceSecret
+          ? {
+              hmac: computePlanProvenanceHmac(
+                {
+                  producer: "LPFORGE_PRODUCTION",
+                  schemaVersion: 1,
+                  intentId: plan.intent.intentId,
+                  poolAddress: plan.intent.poolAddress,
+                  observedAt: plan.intent.observedAt,
+                  action: plan.intent.action,
+                  ownerAddress: plan.intent.ownerAddress,
+                  positionAddress: plan.intent.positionAddress ?? null,
+                  expiresAt: plan.expiresAt,
+                },
+                provenanceSecret,
+              ),
+            }
+          : {}),
       },
       intent: {
         capitalLamports: plan.intent.capitalLamports?.toString(),
@@ -352,7 +374,15 @@ async function observeAndPlanOwnedPositions(input: {
             removeUpperBinId: position.upperBinId,
           }
         : {}),
-      ...(decision.action === "REDUCE" ? { reductionBps: Math.max(1,Math.min(9999,Math.round(exitDecision.reduceFraction*10000))) } : {}),
+      ...(decision.action === "REDUCE"
+        ? {
+            capitalLamports: position.initialCapitalLamports,
+            reductionBps: Math.max(
+              1,
+              Math.min(9999, Math.round(exitDecision.reduceFraction * 10000)),
+            ),
+          }
+        : {}),
       metadata: {
         managementReasonCodes: decision.reasonCodes,
         sourcePositionAddress: position.positionAddress,

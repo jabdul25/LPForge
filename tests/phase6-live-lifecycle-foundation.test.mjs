@@ -11,8 +11,13 @@ test('P6 lifecycle planner has executable transaction kinds for every managed ac
   assert.equal(plan('ADD').transactions[0].kind,'METEORA_ADD');
   assert.equal(plan('CLAIM').transactions[0].kind,'METEORA_CLAIM');
   assert.equal(plan('REDUCE').transactions[0].kind,'METEORA_REMOVE');
-  assert.equal(plan('CLOSE').transactions[0].kind,'METEORA_CLOSE');
-  assert.equal(plan('EMERGENCY_CLOSE').transactions[0].kind,'METEORA_CLOSE');
+  // A close is a drain → unwind → close sequence: liquidity out, token-X
+  // proceeds swapped into the SOL-side token, then the empty account closed.
+  assert.deepEqual(plan('CLOSE').transactions.map(x=>x.kind),['METEORA_REMOVE','JUPITER_UNWIND','METEORA_CLOSE']);
+  assert.deepEqual(plan('EMERGENCY_CLOSE').transactions.map(x=>x.kind),['METEORA_REMOVE','JUPITER_UNWIND','METEORA_CLOSE']);
+  assert.equal(plan('CLOSE').transactions[0].metadata.claimAndClose,false);
+  assert.equal(plan('CLOSE').transactions[0].metadata.bps,10_000);
+  assert.equal(plan('CLOSE').transactions.at(-1).metadata.claimAndClose,true);
   assert.deepEqual(plan('RESHAPE').transactions.map(x=>x.kind),['METEORA_CLOSE','METEORA_OPEN']);
   assert.deepEqual(plan('REBALANCE').transactions.map(x=>x.kind),['METEORA_CLOSE','METEORA_OPEN']);
 });

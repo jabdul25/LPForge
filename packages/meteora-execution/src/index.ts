@@ -15,11 +15,11 @@ export function createFixtureMeteoraOpenAddPool():MeteoraOpenAddPoolLike{
     async addLiquidityByStrategy(){return{fixtureUnsignedAdd:true};}
   };
 }
-export interface BuiltMeteoraTransaction {transaction:OpaqueTransaction;requiredSignerAddresses:string[];builder:'initializePositionAndAddLiquidityByStrategy'|'createExtendedEmptyPosition'|'addLiquidityByStrategyChunkable'|'addLiquidityByStrategy'|'removeLiquidity'|'claimAllRewardsByPosition';metadata:Record<string,unknown>;}
+export interface BuiltMeteoraTransaction {transaction:OpaqueTransaction;requiredSignerAddresses:string[];builder:'initializePositionAndAddLiquidityByStrategy'|'createExtendedEmptyPosition'|'addLiquidityByStrategyChunkable'|'addLiquidityByStrategy'|'removeLiquidity'|'claimAllRewardsByPosition'|'closePositionIfEmpty';metadata:Record<string,unknown>;}
 interface RuntimeSdk {
   PublicKey:new(value:string)=>{toBase58():string};
   Connection:new(url:string,commitment:'confirmed')=>unknown;
-  DLMM:{create(connection:unknown,pool:unknown,options:Record<string,unknown>):Promise<MeteoraOpenAddPoolLike>};
+  DLMM:{create(connection:unknown,pool:unknown,options:Record<string,unknown>):Promise<MeteoraOpenAddPoolLike>;getPositionsByUserAndLbPair?(user:unknown,lbPair:unknown):Promise<{userPositions:Array<{publicKey:{toBase58():string}}>}>};
   BN:new(value:string|number|bigint)=>{toString(base?:number):string};
   StrategyType:{Spot:number;Curve:number;BidAsk:number};
   calculateSpotDistribution(activeBinId:number,binIds:number[]):Array<{binId:number;xAmountBpsOfTotal:{toString(base?:number):string};yAmountBpsOfTotal:{toString(base?:number):string}}>;
@@ -101,6 +101,7 @@ export async function buildAddLiquidityTransaction(pool:MeteoraOpenAddPoolLike,r
 export interface MeteoraRemoveClaimPoolLike {
   removeLiquidity(args:Record<string,unknown>):Promise<OpaqueTransaction|OpaqueTransaction[]>;
   claimAllRewardsByPosition(args:Record<string,unknown>):Promise<OpaqueTransaction|OpaqueTransaction[]>;
+  closePositionIfEmpty?(args:Record<string,unknown>):Promise<OpaqueTransaction>;
   getPosition?(position:unknown):Promise<unknown>;
 }
 export interface RemoveBuildRequest {userAddress:string;positionAddress:string;fromBinId:number;toBinId:number;bps:number;claimAndClose:boolean;}
@@ -113,4 +114,12 @@ export async function buildRemoveLiquidityTransactions(pool:MeteoraRemoveClaimPo
 export async function buildClaimTransactions(pool:MeteoraRemoveClaimPoolLike,r:{userAddress:string;positionAddress:string}):Promise<BuiltMeteoraTransaction[]>{
   const sdk=await loadMeteoraExecutionRuntime(),positionKey=new sdk.PublicKey(r.positionAddress),position=await pool.getPosition?.(positionKey);if(!position)throw new Error('LPFORGE_METEORA_CLAIM_POSITION_UNAVAILABLE');let result:OpaqueTransaction|OpaqueTransaction[];try{result=await pool.claimAllRewardsByPosition({owner:new sdk.PublicKey(r.userAddress),position});}catch(error){if(error instanceof Error&&error.message==='No fee/reward to claim')throw new Error('LPFORGE_METEORA_CLAIM_NOTHING_TO_CLAIM');throw error;} const list=many(result);
   return list.map((transaction,index)=>({transaction,requiredSignerAddresses:[r.userAddress],builder:'claimAllRewardsByPosition' as const,metadata:{operation:'CLAIM',chunkIndex:index,chunkCount:list.length}}));
+}
+/** Closes a fully drained PositionV2. The instruction is a no-op unless the
+ * position is empty, so a range with residual liquidity stays open and is
+ * caught by the post-close chain verification instead of being lost. */
+export async function buildClosePositionTransaction(pool:MeteoraRemoveClaimPoolLike,r:{userAddress:string;positionAddress:string}):Promise<BuiltMeteoraTransaction>{
+  const sdk=await loadMeteoraExecutionRuntime(),positionKey=new sdk.PublicKey(r.positionAddress),position=await pool.getPosition?.(positionKey);if(!position)throw new Error('LPFORGE_METEORA_CLOSE_POSITION_UNAVAILABLE');if(typeof pool.closePositionIfEmpty!=='function')throw new Error('LPFORGE_METEORA_CLOSE_UNSUPPORTED');
+  const transaction=await pool.closePositionIfEmpty({owner:new sdk.PublicKey(r.userAddress),position});
+  return{transaction,requiredSignerAddresses:[r.userAddress],builder:'closePositionIfEmpty' as const,metadata:{operation:'CLOSE_EMPTY'}};
 }

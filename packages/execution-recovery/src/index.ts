@@ -4,7 +4,14 @@ export interface ExecutionJournal {journalId:string;idempotencyKey:string;planId
 export type RecoveryAction='RETURN_EXISTING_PLAN'|'WAIT_DO_NOT_RESUBMIT'|'RECONCILE_FIRST'|'REBUILD_WITH_NEW_BLOCKHASH'|'MARK_RECONCILED'|'HOLD_FOR_OPERATOR'|'NO_ACTION_COMPLETE';
 export interface RecoveryFacts {journal:ExecutionJournal;currentBlockHeight:number;confirmationStatus:'PROCESSED'|'CONFIRMED'|'FINALIZED'|'EXPIRED'|'FAILED'|'UNKNOWN';economicEffect:'PRESENT'|'ABSENT'|'UNKNOWN';}
 export function determineRecoveryAction(f:RecoveryFacts):RecoveryAction{
-  const j=f.journal;if(j.state==='RECONCILED')return'NO_ACTION_COMPLETE';if(f.economicEffect==='PRESENT')return f.confirmationStatus==='CONFIRMED'||f.confirmationStatus==='FINALIZED'?'RECONCILE_FIRST':'MARK_RECONCILED';
+  const j=f.journal,action=String(j.payload?.action??'');
+  if(j.state==='RECONCILED')return'NO_ACTION_COMPLETE';
+  // A close-family plan may only auto-complete when the position is verifiably
+  // gone. Recovery maps "position gone" to economicEffect PRESENT for
+  // close-family (the close's effect is on chain), so ABSENT — position still
+  // readable — is operator attention, never a silent completion or resend.
+  if(action==='CLOSE'||action==='EMERGENCY_CLOSE')return f.economicEffect==='PRESENT'&&(f.confirmationStatus==='CONFIRMED'||f.confirmationStatus==='FINALIZED')?'MARK_RECONCILED':'HOLD_FOR_OPERATOR';
+  if(f.economicEffect==='PRESENT')return f.confirmationStatus==='CONFIRMED'||f.confirmationStatus==='FINALIZED'?'RECONCILE_FIRST':'MARK_RECONCILED';
   if(j.state==='SUBMITTED'||j.state==='UNKNOWN_SUBMISSION'){
     if(f.confirmationStatus==='PROCESSED'||f.confirmationStatus==='CONFIRMED'||f.confirmationStatus==='FINALIZED')return'RECONCILE_FIRST';
     const expired=j.lastValidBlockHeight!==undefined&&f.currentBlockHeight>j.lastValidBlockHeight;

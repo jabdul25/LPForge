@@ -8,8 +8,10 @@ import {
 import {
   buildAddLiquidityTransaction,
   buildClaimTransactions,
+  buildClosePositionTransaction,
   buildRemoveLiquidityTransactions,
   createLiveMeteoraOpenPool,
+  loadMeteoraExecutionRuntime,
   type BuiltMeteoraTransaction,
   type MeteoraOpenAddPoolLike,
   type MeteoraRemoveClaimPoolLike,
@@ -485,6 +487,11 @@ export async function executeAutonomousOpen(input: {
 }): Promise<LiveWorkerResult> {
   const now = new Date().toISOString(),
     fields = planFields(input.plan);
+  // A signature that has left the wallet means the position may exist on-chain
+  // even if post-submit bookkeeping fails; recovery must adopt, never resend.
+  let submittedAny = false,
+    lastSignature = "",
+    openPositionAddress = "";
   try {
     if (input.signer.publicKeyAddress !== input.plan.ownerAddress)
       throw new Error("LPFORGE_P6_OWNER_SIGNER_PLAN_MISMATCH");
@@ -705,6 +712,9 @@ export async function executeAutonomousOpen(input: {
       transport: createWeb3SubmissionTransport(connection),
       submittedAt: signedAt,
     });
+    submittedAny = true;
+    lastSignature = submitted.signature;
+    openPositionAddress = prepared.positionSigner.publicKeyAddress;
     await recordJournal(
       input.store,
       input.plan as unknown as AutonomousPlan,
@@ -860,6 +870,28 @@ export async function executeAutonomousOpen(input: {
   } catch (error) {
     const reason =
       error instanceof Error ? error.message : "LPFORGE_P6_AUTONOMOUS_UNKNOWN";
+    if (submittedAny) {
+      // One-shot opens get the same post-submit parity as the chunkable path:
+      // never FAILED after a signature left the wallet, never resent blindly.
+      await input.store.transitionAutonomousPlan({
+        planId: input.plan.planId,
+        state: "RECONCILIATION_REQUIRED",
+        at: new Date().toISOString(),
+        reasonCodes: ["P6_AUTONOMOUS_OPEN_RECONCILIATION_REQUIRED", reason],
+        payload: {
+          stage: "AUTONOMOUS_OPEN",
+          error: reason,
+          positionAddress: openPositionAddress,
+          lastSignature,
+        },
+      });
+      return {
+        status: "UNKNOWN",
+        planId: input.plan.planId,
+        reasonCodes: ["P6_AUTONOMOUS_OPEN_RECONCILIATION_REQUIRED", reason],
+        transactionSubmitted: true,
+      };
+    }
     if (!reason.includes("LPFORGE_SUBMISSION_STATUS_UNKNOWN"))
       await input.store.completeAutonomousPlan({
         planId: input.plan.planId,
@@ -878,15 +910,51 @@ export async function executeAutonomousOpen(input: {
   }
 }
 
-async function unwindPartialEntry(input: {
+/** Reads the owner's raw token balance for a mint across all accounts. */
+async function readWalletTokenBalance(input: {
+  connection: Connection;
+  ownerAddress: string;
+  mint: string;
+}): Promise<bigint> {
+  const accounts = await input.connection.getParsedTokenAccountsByOwner(
+    new PublicKey(input.ownerAddress),
+    { mint: new PublicKey(input.mint) },
+    "confirmed",
+  );
+  let total = 0n;
+  for (const account of accounts.value) {
+    const parsed = account.account.data.parsed as {
+      info?: { tokenAmount?: { amount?: string } };
+    };
+    const amount = parsed.info?.tokenAmount?.amount;
+    try {
+      if (amount) total += BigInt(amount);
+    } catch {
+      // Ignore unparsable account data; the swap simply covers what is known.
+    }
+  }
+  return total;
+}
+
+/**
+ * Executes one Jupiter token-X→token-Y swap with the full simulation, cost,
+ * risk, signing and confirmation chain. Shared by partial-entry recovery and
+ * the close sequence so both record the identical durable audit trail.
+ */
+async function executeJupiterUnwindStep(input: {
   store: Phase1Store;
   plan: AutonomousPlan;
-  row: Record<string, unknown>;
   signer: MainnetSignerBackend;
   config: LiveWorkerConfig;
+  amount: bigint;
+  transactionId: string;
+  idempotencyKey: string;
+  stage: "PARTIAL_ENTRY_UNWIND" | "CLOSE_TOKEN_X_UNWIND";
+  reasonPrefix: "P6_PARTIAL_UNWIND" | "P6_CLOSE_UNWIND";
+  fundingTransactionId?: string;
+  afterSubmit?: (submitted: { signature: string }) => Promise<void>;
 }): Promise<{ ok: boolean; submitted: boolean; reasonCodes: string[] }> {
-  const amount = BigInt(String(input.row.paired_token_amount)),
-    connection = new Connection(input.config.rpcUrl, "confirmed"),
+  const connection = new Connection(input.config.rpcUrl, "confirmed"),
     adapter = createMeteoraReadAdapter({
       rpcUrl: input.config.rpcUrl,
       cluster: "mainnet-beta",
@@ -898,7 +966,7 @@ async function unwindPartialEntry(input: {
       policy: policy.swapQuote,
       inputMint: pool.tokenXMint,
       outputMint: pool.tokenYMint,
-      amount,
+      amount: input.amount,
       ...(process.env.LPFORGE_JUPITER_API_KEY
         ? { apiKey: process.env.LPFORGE_JUPITER_API_KEY }
         : {}),
@@ -908,7 +976,7 @@ async function unwindPartialEntry(input: {
       policy: policy.swapQuote,
       inputMint: pool.tokenXMint,
       outputMint: pool.tokenYMint,
-      inputAmount: amount,
+      inputAmount: input.amount,
       requiredOutputAmount: 1n,
     });
   if (assessment.status !== "APPROVED")
@@ -922,20 +990,21 @@ async function unwindPartialEntry(input: {
         : {}),
     }),
     transaction = VersionedTransaction.deserialize(bytes),
-    transactionId = `${input.plan.planId}:unwind`,
     simulatedAt = new Date().toISOString();
   // Simulations and submission attempts are foreign-keyed to a durable plan
   // step. A recovery unwind is a new transaction, not one of the original
   // entry steps, so journal it before any simulation/signing work begins.
   await input.store.ensureExecutionTransactionStep({
     planId: input.plan.planId,
-    transactionId,
+    transactionId: input.transactionId,
     kind: "JUPITER_UNWIND",
     state: "PLANNED",
     requiredSignerAddresses: [input.plan.ownerAddress],
     metadata: {
-      stage: "PARTIAL_ENTRY_UNWIND",
-      fundingTransactionId: String(input.row.funding_transaction_id),
+      stage: input.stage,
+      ...(input.fundingTransactionId
+        ? { fundingTransactionId: input.fundingTransactionId }
+        : {}),
     },
   });
   const simulation = await simulateExecutionTransaction({
@@ -944,14 +1013,14 @@ async function unwindPartialEntry(input: {
         simulatedAt,
         input.config.riskPermitTtlMs,
       ),
-      transactionId,
+      transactionId: input.transactionId,
       transaction,
       transport: createWeb3SimulationTransport(connection),
       simulatedAt,
       freshnessMs: input.config.simulationFreshnessMs,
     });
   await input.store.insertExecutionSimulation({
-    transactionId,
+    transactionId: input.transactionId,
     simulatedAt: simulation.simulatedAt,
     freshUntil: simulation.simulationFreshUntil,
     ok: simulation.ok,
@@ -960,21 +1029,21 @@ async function unwindPartialEntry(input: {
       : {}),
     logs: simulation.logs,
     ...(simulation.error ? { error: simulation.error } : {}),
-    payload: { planId: input.plan.planId, stage: "PARTIAL_ENTRY_UNWIND" },
+    payload: { planId: input.plan.planId, stage: input.stage },
   });
   const fee = estimateExecutionFee({
       signatureCount: 1,
       computeUnitLimit: simulation.recommendedComputeUnitLimit ?? 0,
       computeUnitPriceMicroLamports: 0n,
     }),
-    cost = assessExecutionCost(fee, amount, {
+    cost = assessExecutionCost(fee, input.amount, {
       maxAbsoluteFeeLamports: input.config.maxFeeLamports,
       maxFeeFractionOfCapital: input.config.maxFeeFraction,
     }),
     risk = governExecutionRisk(
       {
         action: "CLOSE",
-        planId: transactionId,
+        planId: input.transactionId,
         now: simulatedAt,
         thesisExpiresAt: input.plan.expiresAt,
         planExpiresAt: new Date(
@@ -1009,7 +1078,7 @@ async function unwindPartialEntry(input: {
     issuedAt: risk.issuedAt,
     expiresAt: risk.expiresAt,
     reasonCodes: risk.reasonCodes,
-    payload: { stage: "PARTIAL_ENTRY_UNWIND" },
+    payload: { stage: input.stage },
   });
   const signedAt = new Date().toISOString(),
     closeTicket = ticket(
@@ -1028,13 +1097,13 @@ async function unwindPartialEntry(input: {
       issuedAt: signedAt,
       expiresAt: closeTicket.expiresAt,
       ticketId: closeTicket.ticketId,
-      reasonCodes: ["P6_PARTIAL_ENTRY_UNWIND"],
+      reasonCodes: [input.stage],
     },
     envelope = createVersionedMainnetEnvelope(transaction);
   await signMainnetCanary({
     authority: closeAuthority,
     ticket: closeTicket,
-    transactionId,
+    transactionId: input.transactionId,
     requiredSignerAddresses: [input.plan.ownerAddress],
     backend: input.signer,
     envelope,
@@ -1047,8 +1116,8 @@ async function unwindPartialEntry(input: {
       input.config.riskPermitTtlMs,
     ),
     riskDecision: risk,
-    transactionId,
-    idempotencyKey: `${input.plan.idempotencyKey}:unwind`,
+    transactionId: input.transactionId,
+    idempotencyKey: input.idempotencyKey,
     attempt: 1,
     raw: envelope.serializeSigned(),
     lease: {
@@ -1062,32 +1131,14 @@ async function unwindPartialEntry(input: {
   // Persist submission identity before waiting for confirmation. If this
   // process dies after send, recovery can check this exact signature and will
   // never construct or send a duplicate unwind.
-  await input.store.upsertPartialEntryRecovery({
-    planId: input.plan.planId,
-    poolAddress: input.plan.poolAddress,
-    ownerAddress: input.plan.ownerAddress,
-    tokenMint: String(input.row.token_mint),
-    fundingTransactionId: String(input.row.funding_transaction_id),
-    fundingSignature: String(input.row.funding_signature),
-    fundedAt: new Date(String(input.row.funded_at)).toISOString(),
-    pairedTokenAmount: String(input.row.paired_token_amount),
-    intendedCapitalLamports: BigInt(String(input.row.intended_capital_lamports)),
-    intendedRange: (input.row.intended_range ?? {}) as Record<string, unknown>,
-    state: "UNWIND_SUBMITTED",
-    walletTruth: { refreshRequired: true },
-    payload: {
-      reasonCodes: ["P6_PARTIAL_UNWIND_SUBMITTED"],
-      unwindTransactionId: transactionId,
-      unwindSignature: record.signature,
-    },
-    updatedAt: new Date().toISOString(),
-  });
+  if (input.afterSubmit)
+    await input.afterSubmit({ signature: record.signature });
   if (
     !(await awaitConfirmation({
       connection,
       store: input.store,
-      transactionId,
-      idempotencyKey: `${input.plan.idempotencyKey}:unwind`,
+      transactionId: input.transactionId,
+      idempotencyKey: input.idempotencyKey,
       signature: record.signature,
       lease: record,
       pollMs: input.config.confirmPollMs,
@@ -1097,9 +1148,63 @@ async function unwindPartialEntry(input: {
     return {
       ok: false,
       submitted: true,
-      reasonCodes: ["P6_PARTIAL_UNWIND_CONFIRMATION_PENDING"],
+      reasonCodes: [`${input.reasonPrefix}_CONFIRMATION_PENDING`],
     };
-  return { ok: true, submitted: true, reasonCodes: ["P6_PARTIAL_UNWIND_RECONCILED"] };
+  return {
+    ok: true,
+    submitted: true,
+    reasonCodes: [`${input.reasonPrefix}_RECONCILED`],
+  };
+}
+
+async function unwindPartialEntry(input: {
+  store: Phase1Store;
+  plan: AutonomousPlan;
+  row: Record<string, unknown>;
+  signer: MainnetSignerBackend;
+  config: LiveWorkerConfig;
+}): Promise<{ ok: boolean; submitted: boolean; reasonCodes: string[] }> {
+  const amount = BigInt(String(input.row.paired_token_amount)),
+    transactionId = `${input.plan.planId}:unwind`;
+  return executeJupiterUnwindStep({
+    store: input.store,
+    plan: input.plan,
+    signer: input.signer,
+    config: input.config,
+    amount,
+    transactionId,
+    idempotencyKey: `${input.plan.idempotencyKey}:unwind`,
+    stage: "PARTIAL_ENTRY_UNWIND",
+    reasonPrefix: "P6_PARTIAL_UNWIND",
+    fundingTransactionId: String(input.row.funding_transaction_id),
+    afterSubmit: async (submitted) => {
+      await input.store.upsertPartialEntryRecovery({
+        planId: input.plan.planId,
+        poolAddress: input.plan.poolAddress,
+        ownerAddress: input.plan.ownerAddress,
+        tokenMint: String(input.row.token_mint),
+        fundingTransactionId: String(input.row.funding_transaction_id),
+        fundingSignature: String(input.row.funding_signature),
+        fundedAt: new Date(String(input.row.funded_at)).toISOString(),
+        pairedTokenAmount: String(input.row.paired_token_amount),
+        intendedCapitalLamports: BigInt(
+          String(input.row.intended_capital_lamports),
+        ),
+        intendedRange: (input.row.intended_range ?? {}) as Record<
+          string,
+          unknown
+        >,
+        state: "UNWIND_SUBMITTED",
+        walletTruth: { refreshRequired: true },
+        payload: {
+          reasonCodes: ["P6_PARTIAL_UNWIND_SUBMITTED"],
+          unwindTransactionId: transactionId,
+          unwindSignature: submitted.signature,
+        },
+        updatedAt: new Date().toISOString(),
+      });
+    },
+  });
 }
 
 /** Resumes a funded entry without ever repeating the already-confirmed Jupiter swap. */
@@ -1427,6 +1532,41 @@ function mutationRange(
     throw new Error("LPFORGE_P6_MUTATION_RANGE_REQUIRED");
   return { lower, upper };
 }
+/**
+ * Close and reduce intents carry no range: the operator dispatches them with
+ * a position address only. When the intent/step carries a valid range it
+ * wins; otherwise the position's own chain range is the single source of
+ * truth for a drain.
+ */
+async function chainMutationRange(input: {
+  plan: AutonomousPlan;
+  stepMetadata?: Record<string, unknown>;
+  rpcUrl: string;
+  programId: string;
+  positionAddress: string;
+}): Promise<{ lower: number; upper: number }> {
+  const intent = input.plan.planPayload.intent as
+      | Record<string, unknown>
+      | undefined,
+    lower = Number(intent?.lowerBinId ?? input.stepMetadata?.fromBinId),
+    upper = Number(intent?.upperBinId ?? input.stepMetadata?.toBinId);
+  if (Number.isInteger(lower) && Number.isInteger(upper) && lower <= upper)
+    return { lower, upper };
+  const truth = await createMeteoraReadAdapter({
+    rpcUrl: input.rpcUrl,
+    cluster: "mainnet-beta",
+    programId: input.programId,
+  }).getPositionV2(input.plan.poolAddress, input.positionAddress);
+  const chainLower = Number(truth.lowerBinId),
+    chainUpper = Number(truth.upperBinId);
+  if (
+    !Number.isInteger(chainLower) ||
+    !Number.isInteger(chainUpper) ||
+    chainLower > chainUpper
+  )
+    throw new Error("LPFORGE_P6_MUTATION_RANGE_REQUIRED");
+  return { lower: chainLower, upper: chainUpper };
+}
 function legacyBuilt(value: BuiltMeteoraTransaction) {
   if (!(value.transaction instanceof Transaction))
     throw new Error("LPFORGE_P6_MUTATION_TRANSACTION_UNSUPPORTED");
@@ -1665,6 +1805,84 @@ async function executeMeteoraMutation(input: {
         reasonCodes: ["P6_SEQUENCE_CHAIN_TRUTH_PENDING"],
         transactionSubmitted: true,
       };
+    // A confirmed close verifies the position actually vanished before the
+    // plan completes. A still-present position is reconciliation debt the
+    // operator must see, never a silent COMPLETED.
+    if (
+      (input.action === "CLOSE" || input.action === "EMERGENCY_CLOSE") &&
+      input.plan.positionAddress
+    ) {
+      let positionGone = false;
+      try {
+        await createMeteoraReadAdapter({
+          rpcUrl: input.config.rpcUrl,
+          cluster: "mainnet-beta",
+          programId: input.config.programId,
+        }).getPositionV2(input.plan.poolAddress, input.plan.positionAddress);
+      } catch {
+        positionGone = true;
+      }
+      await input.store.markOwnedPositionLifecycle({
+        positionAddress: input.plan.positionAddress,
+        lifecycleState: positionGone ? "CLOSED" : "RECONCILIATION_REQUIRED",
+        reconciliationStatus: positionGone ? "MATCH" : "MISMATCH",
+        lastPlanId: input.plan.planId,
+        at: new Date().toISOString(),
+        payload: {
+          stage: "CLOSE_CHAIN_VERIFIED",
+          signature: submitted.signature,
+          positionGone,
+        },
+      });
+      if (!positionGone) {
+        await input.store.transitionAutonomousPlan({
+          planId: input.plan.planId,
+          state: "RECONCILIATION_REQUIRED",
+          at: new Date().toISOString(),
+          reasonCodes: ["P6_CLOSE_POSITION_STILL_PRESENT"],
+          payload: { signature: submitted.signature },
+        });
+        return {
+          status: "UNKNOWN",
+          planId: input.plan.planId,
+          reasonCodes: ["P6_CLOSE_POSITION_STILL_PRESENT"],
+          transactionSubmitted: true,
+        };
+      }
+    }
+    // A confirmed REDUCE rebases the owned cost basis so NAV and exit
+    // economics track the position's real remaining capital.
+    if (
+      input.action === "REDUCE" &&
+      input.plan.positionAddress &&
+      capital > 0n
+    ) {
+      const reductionBps = Number(
+        input.plan.intentPayload.reductionBps ??
+          input.plan.steps[0]?.metadata?.bps ??
+          0,
+      );
+      if (
+        Number.isInteger(reductionBps) &&
+        reductionBps >= 1 &&
+        reductionBps <= 9999
+      ) {
+        const remainingCapitalLamports =
+          (capital * BigInt(10_000 - reductionBps)) / 10_000n;
+        await input.store.adjustOwnedPositionCapital({
+          positionAddress: input.plan.positionAddress,
+          capitalLamports: remainingCapitalLamports,
+          at: new Date().toISOString(),
+          payload: {
+            planId: input.plan.planId,
+            reductionBps,
+            priorCapitalLamports: capital.toString(),
+            remainingCapitalLamports: remainingCapitalLamports.toString(),
+            signature: submitted.signature,
+          },
+        });
+      }
+    }
     await input.store.completeAutonomousPlan({
       planId: input.plan.planId,
       state: "COMPLETED",
@@ -1933,25 +2151,24 @@ export async function executeAutonomousPlan(input: {
       action: "CLAIM",
     });
   }
-  if (
-    input.plan.action === "REDUCE" ||
-    input.plan.action === "CLOSE" ||
-    input.plan.action === "EMERGENCY_CLOSE"
-  ) {
-    const range = mutationRange(input.plan, step.metadata),
-      bps =
-        input.plan.action === "REDUCE"
-          ? Number(
-              input.plan.intentPayload.reductionBps ?? step.metadata.bps ?? 0,
-            )
-          : 10_000,
+  if (input.plan.action === "REDUCE") {
+    const range = await chainMutationRange({
+        plan: input.plan,
+        stepMetadata: step.metadata,
+        rpcUrl: input.config.rpcUrl,
+        programId: input.config.programId,
+        positionAddress,
+      }),
+      bps = Number(
+        input.plan.intentPayload.reductionBps ?? step.metadata.bps ?? 0,
+      ),
       built = await buildRemoveLiquidityTransactions(pool, {
         userAddress: input.plan.ownerAddress,
         positionAddress,
         fromBinId: range.lower,
         toBinId: range.upper,
         bps,
-        claimAndClose: input.plan.action !== "REDUCE",
+        claimAndClose: false,
       });
     if (built.length !== 1)
       throw new Error("LPFORGE_P6_MULTI_TRANSACTION_REMOVE_UNSUPPORTED");
@@ -1959,6 +2176,132 @@ export async function executeAutonomousPlan(input: {
     return executeMeteoraMutation({
       ...input,
       built: built[0]!,
+      action: "REDUCE",
+    });
+  }
+  if (
+    input.plan.action === "CLOSE" ||
+    input.plan.action === "EMERGENCY_CLOSE"
+  ) {
+    // A close drains liquidity, unwinds the token-X proceeds into the
+    // SOL-side token, then closes the drained account. Every phase journals
+    // the plan action, so a death between phases surfaces as a recovery HOLD
+    // instead of a blind resubmit that could double-spend or strand tokens.
+    const removeStep =
+        input.plan.steps.find(
+          (candidate) => candidate.kind === "METEORA_REMOVE",
+        ) ?? step,
+      unwindStep = input.plan.steps.find(
+        (candidate) => candidate.kind === "JUPITER_UNWIND",
+      ),
+      closeStep = input.plan.steps.find(
+        (candidate) => candidate.kind === "METEORA_CLOSE",
+      );
+    if (!unwindStep || !closeStep)
+      throw new Error("LPFORGE_P6_CLOSE_SEQUENCE_MISSING");
+    const range = await chainMutationRange({
+        plan: input.plan,
+        stepMetadata: removeStep.metadata,
+        rpcUrl: input.config.rpcUrl,
+        programId: input.config.programId,
+        positionAddress,
+      }),
+      built = await buildRemoveLiquidityTransactions(pool, {
+        userAddress: input.plan.ownerAddress,
+        positionAddress,
+        fromBinId: range.lower,
+        toBinId: range.upper,
+        bps: 10_000,
+        claimAndClose: false,
+      });
+    if (built.length !== 1)
+      throw new Error("LPFORGE_P6_MULTI_TRANSACTION_REMOVE_UNSUPPORTED");
+    built[0]!.metadata.transactionId = removeStep.transactionId;
+    const drained = await executeMeteoraMutation({
+      ...input,
+      built: built[0]!,
+      action: input.plan.action,
+      deferCompletion: true,
+    });
+    if (drained.status !== "RECONCILED") return drained;
+    const poolFact = await createMeteoraReadAdapter({
+        rpcUrl: input.config.rpcUrl,
+        cluster: "mainnet-beta",
+        programId: input.config.programId,
+      }).getPool(input.plan.poolAddress),
+      tokenXBalance = await readWalletTokenBalance({
+        connection: new Connection(input.config.rpcUrl, "confirmed"),
+        ownerAddress: input.plan.ownerAddress,
+        mint: poolFact.tokenXMint,
+      });
+    if (tokenXBalance > 0n) {
+      const unwind = await executeJupiterUnwindStep({
+        store: input.store,
+        plan: input.plan,
+        signer: input.signer,
+        config: input.config,
+        amount: tokenXBalance,
+        transactionId: unwindStep.transactionId,
+        idempotencyKey: `${input.plan.idempotencyKey}:${unwindStep.transactionId}`,
+        stage: "CLOSE_TOKEN_X_UNWIND",
+        reasonPrefix: "P6_CLOSE_UNWIND",
+      });
+      if (!unwind.ok)
+        return {
+          status: unwind.submitted ? "SUBMITTED" : "BLOCKED",
+          planId: input.plan.planId,
+          reasonCodes: unwind.reasonCodes,
+          transactionSubmitted: unwind.submitted,
+        };
+    }
+    // Residual fees must be claimed before the account can be closed; only
+    // an empty PositionV2 is closable. Nothing to claim is a clean skip.
+    let claimBuilt;
+    try {
+      claimBuilt = await buildClaimTransactions(pool, {
+        userAddress: input.plan.ownerAddress,
+        positionAddress,
+      });
+    } catch (error) {
+      if (
+        !(error instanceof Error) ||
+        error.message !== "LPFORGE_METEORA_CLAIM_NOTHING_TO_CLAIM"
+      )
+        throw error;
+      claimBuilt = undefined;
+    }
+    if (claimBuilt) {
+      if (claimBuilt.length !== 1)
+        throw new Error("LPFORGE_P6_MULTI_TRANSACTION_CLAIM_UNSUPPORTED");
+      const claimTransactionId = `${closeStep.transactionId}:claim`;
+      await input.store.ensureExecutionTransactionStep({
+        planId: input.plan.planId,
+        transactionId: claimTransactionId,
+        kind: "METEORA_CLAIM",
+        state: "PLANNED",
+        requiredSignerAddresses: [input.plan.ownerAddress],
+        metadata: {
+          stage: "CLOSE_CLAIM_RESIDUAL",
+          parentTransactionId: closeStep.transactionId,
+        },
+      });
+      claimBuilt[0]!.metadata.transactionId = claimTransactionId;
+      const claimed = await executeMeteoraMutation({
+        ...input,
+        built: claimBuilt[0]!,
+        action: input.plan.action,
+        deferCompletion: true,
+      });
+      if (claimed.status !== "RECONCILED") return claimed;
+    }
+    const closedBuilt = await buildClosePositionTransaction(pool, {
+      userAddress: input.plan.ownerAddress,
+      positionAddress,
+    });
+    closedBuilt.metadata.transactionId = closeStep.transactionId;
+    return executeMeteoraMutation({
+      ...input,
+      built: closedBuilt,
       action: input.plan.action,
     });
   }
@@ -2130,6 +2473,86 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       confirmationStatus,
       economicEffect,
     });
+    // A verified on-chain OPEN position must be adopted into the owned
+    // registry even when its plan's post-submit bookkeeping died. Adoption
+    // never fabricates data: identity and capital come from chain truth and
+    // the intent itself, and any missing input fails closed to HOLD.
+    const adoptOpenPosition = async (): Promise<boolean> => {
+      if (plan.action !== "OPEN" || economicEffect !== "PRESENT") return false;
+      const address =
+        plan.positionAddress ??
+        String(
+          (plan.planPayload as Record<string, unknown>).positionAddress ?? "",
+        );
+      const intent = (plan.planPayload.intent ?? {}) as Record<
+        string,
+        unknown
+      >;
+      let capital = 0n;
+      try {
+        capital = BigInt(String(intent.capitalLamports ?? "0"));
+      } catch {
+        capital = 0n;
+      }
+      if (
+        address === "" ||
+        capital <= 0n ||
+        positionTruth.exists !== true ||
+        String(positionTruth.owner) !== plan.ownerAddress ||
+        String(positionTruth.pool) !== plan.poolAddress
+      )
+        return false;
+      const funding = (plan.intentPayload.entryFunding ?? {}) as Record<
+        string,
+        unknown
+      >;
+      await input.store.upsertOwnedPosition({
+        lpforgePositionId: `position-${address}`,
+        poolAddress: plan.poolAddress,
+        positionAddress: address,
+        ownerAddress: plan.ownerAddress,
+        strategy: String(intent.strategy ?? "SPOT"),
+        orientation: String(funding.orientation ?? "ONE_SIDED_Y"),
+        lowerBinId: Number(positionTruth.lowerBinId),
+        upperBinId: Number(positionTruth.upperBinId),
+        activeBinAtEntry: Number(
+          intent.activeBinId ?? positionTruth.lowerBinId,
+        ),
+        initialCapitalLamports: capital,
+        entryPlanId: plan.planId,
+        ...(journal.signature ? { entrySignature: journal.signature } : {}),
+        enteredAt: input.now,
+        lifecycleState: "OPEN",
+        lastPlanId: plan.planId,
+        reconciliationStatus: "MATCH",
+        payload: {
+          thesisId: plan.thesisId,
+          entryFunding: funding,
+          recovery: true,
+          journalId: journal.journalId,
+        },
+      });
+      return true;
+    };
+    const holdOpenAdoption = async (): Promise<void> => {
+      await input.store.transitionAutonomousPlan({
+        planId: plan.planId,
+        state: "RECONCILIATION_REQUIRED",
+        at: input.now,
+        reasonCodes: ["P6_RECOVERY_OPEN_POSITION_ADOPTION_BLOCKED"],
+        payload: {
+          journalId: journal.journalId,
+          confirmationStatus,
+          economicEffect,
+          positionTruth,
+        },
+      });
+      results.push({
+        planId: plan.planId,
+        action: "HOLD_FOR_OPERATOR",
+        reasonCodes: ["P6_RECOVERY_OPEN_POSITION_ADOPTION_BLOCKED"],
+      });
+    };
     // RETURN_EXISTING_PLAN means no transaction was submitted. Leaving a
     // claimed pre-submission plan unresolved would indefinitely block the
     // worker and invite a stale trade to be resumed later. Finalize it
@@ -2185,6 +2608,28 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       plan.action !== "RESHAPE" &&
       plan.action !== "REBALANCE"
     ) {
+      if (plan.action === "OPEN") {
+        if (!(await adoptOpenPosition())) {
+          await holdOpenAdoption();
+          continue;
+        }
+      } else if (plan.action === "CLOSE" || plan.action === "EMERGENCY_CLOSE") {
+        // The position is verifiably gone and the close confirmed: retire
+        // the owned row so capital accounting and capacity reflect reality.
+        await input.store.markOwnedPositionLifecycle({
+          positionAddress: plan.positionAddress ?? "",
+          lifecycleState: "CLOSED",
+          reconciliationStatus: "MATCH",
+          lastPlanId: plan.planId,
+          at: input.now,
+          payload: {
+            stage: "RECOVERY_CLOSE_VERIFIED",
+            journalId: journal.journalId,
+            confirmationStatus,
+            economicEffect,
+          },
+        });
+      }
       await input.store.insertExecutionReconciliation({
         reconciliationId: `${plan.planId}:recovery`,
         planId: plan.planId,
@@ -2217,6 +2662,45 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       });
       continue;
     }
+    if (action === "RECONCILE_FIRST" && plan.action === "OPEN") {
+      // A confirmed OPEN whose bookkeeping never recorded the position:
+      // adopt it and complete the plan instead of looping in RECOVERING.
+      if (await adoptOpenPosition()) {
+        await input.store.insertExecutionReconciliation({
+          reconciliationId: `${plan.planId}:recovery`,
+          planId: plan.planId,
+          observedAt: input.now,
+          status: "MATCH",
+          expected: {
+            action: plan.action,
+            owner: plan.ownerAddress,
+            pool: plan.poolAddress,
+          },
+          actual: { confirmationStatus, economicEffect, positionTruth },
+          discrepancies: [],
+          payload: { recovered: true, journalId: journal.journalId },
+        });
+        await input.store.completeAutonomousPlan({
+          planId: plan.planId,
+          state: "RECONCILED",
+          at: input.now,
+          payload: {
+            recovery: true,
+            confirmationStatus,
+            economicEffect,
+            positionTruth,
+          },
+        });
+        results.push({
+          planId: plan.planId,
+          action,
+          reasonCodes: ["P6_RECOVERY_OPEN_POSITION_ADOPTED"],
+        });
+        continue;
+      }
+      await holdOpenAdoption();
+      continue;
+    }
     if (
       action === "WAIT_DO_NOT_RESUBMIT" ||
       action === "RECONCILE_FIRST" ||
@@ -2245,4 +2729,123 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     });
   }
   return results;
+}
+/**
+ * Adopts on-chain positions the owner wallet holds that are absent from the
+ * owned-positions registry. Read-only: never signs or submits anything.
+ * Adopted rows are created RECONCILIATION_REQUIRED with zero known capital so
+ * the standard management loop and production evidence surface them instead of
+ * silently ignoring them; the exit governor treats zero-capital rows as
+ * UNAVAILABLE and holds.
+ */
+export async function reconcileOrphanedPositions(input: {
+  store: Phase1Store;
+  rpcUrl: string;
+  programId: string;
+  ownerAddress?: string;
+  poolAddresses: string[];
+  now?: string;
+  /** Test seam for on-chain reads. Defaults to the DLMM SDK + Meteora read adapter. */
+  positionsProvider?: (
+    poolAddress: string,
+  ) => Promise<
+    Array<{
+      positionAddress: string;
+      owner: string;
+      pool: string;
+      lowerBinId: number;
+      upperBinId: number;
+    }>
+  >;
+}): Promise<{ adopted: number; reasonCodes: string[] }> {
+  const at = input.now ?? new Date().toISOString();
+  if (!input.ownerAddress?.trim() || input.poolAddresses.length === 0)
+    return { adopted: 0, reasonCodes: [] };
+  const ownerAddress = input.ownerAddress.trim();
+  const owned = await input.store.loadOwnedPositions(ownerAddress);
+  const known = new Set(owned.map((row) => String(row.position_address)));
+  const reasonCodes = new Set<string>();
+  let adopted = 0;
+  const defaultProvider = async (poolAddress: string) => {
+    const runtime = await loadMeteoraExecutionRuntime();
+    if (typeof runtime.DLMM.getPositionsByUserAndLbPair !== "function")
+      throw new Error("LPFORGE_ORPHAN_SWEEP_RUNTIME_UNAVAILABLE");
+    const adapter = createMeteoraReadAdapter({
+      rpcUrl: input.rpcUrl,
+      cluster: "mainnet-beta",
+      programId: input.programId,
+    });
+    const result = await runtime.DLMM.getPositionsByUserAndLbPair(
+      new runtime.PublicKey(ownerAddress),
+      new runtime.PublicKey(poolAddress),
+    );
+    const facts: Array<{
+      positionAddress: string;
+      owner: string;
+      pool: string;
+      lowerBinId: number;
+      upperBinId: number;
+    }> = [];
+    for (const position of result.userPositions) {
+      try {
+        const fact = await adapter.getPositionV2(
+          poolAddress,
+          position.publicKey.toBase58(),
+        );
+        facts.push({
+          positionAddress: position.publicKey.toBase58(),
+          owner: fact.owner,
+          pool: fact.pool,
+          lowerBinId: fact.lowerBinId,
+          upperBinId: fact.upperBinId,
+        });
+      } catch {
+        // Unreadable position: leave it unknown rather than guess identity.
+      }
+    }
+    return facts;
+  };
+  const readPoolPositions = input.positionsProvider ?? defaultProvider;
+  for (const poolAddress of input.poolAddresses) {
+    try {
+      for (const fact of await readPoolPositions(poolAddress)) {
+        if (known.has(fact.positionAddress)) continue;
+        if (fact.owner !== ownerAddress || fact.pool !== poolAddress)
+          continue;
+        await input.store.upsertOwnedPosition({
+          lpforgePositionId: `position-${fact.positionAddress}`,
+          poolAddress,
+          positionAddress: fact.positionAddress,
+          ownerAddress,
+          strategy: "SPOT",
+          orientation: "UNKNOWN",
+          lowerBinId: fact.lowerBinId,
+          upperBinId: fact.upperBinId,
+          activeBinAtEntry: fact.lowerBinId,
+          initialCapitalLamports: 0n,
+          enteredAt: at,
+          lifecycleState: "RECONCILIATION_REQUIRED",
+          reconciliationStatus: "MISMATCH",
+          payload: {
+            orphanDetected: true,
+            reasonCodes: ["P6_ORPHAN_POSITION_DETECTED"],
+            lowerBinId: fact.lowerBinId,
+            upperBinId: fact.upperBinId,
+          },
+        });
+        known.add(fact.positionAddress);
+        adopted++;
+        reasonCodes.add("P6_ORPHAN_POSITION_DETECTED");
+      }
+    } catch (error) {
+      // A single pool sweep failure must not disrupt the recovery cycle.
+      reasonCodes.add(
+        error instanceof Error &&
+          error.message === "LPFORGE_ORPHAN_SWEEP_RUNTIME_UNAVAILABLE"
+          ? "P6_ORPHAN_SWEEP_RUNTIME_UNAVAILABLE"
+          : "P6_ORPHAN_SWEEP_POOL_READ_FAILED",
+      );
+    }
+  }
+  return { adopted, reasonCodes: [...reasonCodes] };
 }

@@ -499,6 +499,12 @@ export interface Phase1Store {
     at: string;
     payload: Record<string, unknown>;
   }): Promise<void>;
+  adjustOwnedPositionCapital(value: {
+    positionAddress: string;
+    capitalLamports: bigint;
+    at: string;
+    payload: Record<string, unknown>;
+  }): Promise<void>;
   upsertPartialEntryRecovery(value: {
     planId: string;
     poolAddress: string;
@@ -884,6 +890,7 @@ export interface Phase1Store {
     recoveryQueueCount: number;
     unknownSubmissionCount: number;
     unresolvedReconciliationDebt: number;
+    partialEntryRecoveryCount: number;
   }>;
   loadPhase7EvidenceFacts(runtimeId: string): Promise<{
     latestHealthStatus?: string;
@@ -1815,7 +1822,7 @@ export async function createPostgresStore(
       );
       return r.rows;
     },
-    async loadPhase7PortfolioFacts(ownerAddress){const [positions,reservations,recon]=await Promise.all([db.query("SELECT COALESCE(sum(o.initial_capital_lamports),0)::text AS deployed,count(*)::int AS open_positions,COALESCE(jsonb_object_agg(o.pool_address,o.initial_capital_lamports) FILTER (WHERE o.pool_address IS NOT NULL),'{}'::jsonb) AS by_pool,COALESCE(jsonb_object_agg(p.token_x_mint,o.initial_capital_lamports) FILTER (WHERE p.token_x_mint IS NOT NULL),'{}'::jsonb) AS by_token FROM execution.owned_positions o JOIN protocol.pools p ON p.address=o.pool_address WHERE o.owner_address=$1 AND o.lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN')",[ownerAddress]),db.query("SELECT COALESCE(sum(capital_lamports),0)::text AS reserved,COALESCE(jsonb_object_agg(pool_address,capital_lamports) FILTER (WHERE pool_address IS NOT NULL),'{}'::jsonb) AS by_pool,COALESCE(jsonb_object_agg(token_mint,capital_lamports) FILTER (WHERE token_mint IS NOT NULL),'{}'::jsonb) AS by_token FROM execution.capital_reservations WHERE owner_address=$1 AND state IN ('RESERVED','SUBMITTED')",[ownerAddress]),db.query("SELECT count(*)::int AS n FROM execution.owned_positions WHERE owner_address=$1 AND lifecycle_state IN ('RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN')",[ownerAddress])]);const map=(v:unknown)=>Object.fromEntries(Object.entries((v??{}) as Record<string,unknown>).map(([k,x])=>[k,BigInt(String(x))]));return{deployedLamports:BigInt(String(positions.rows[0]?.deployed??'0')),pendingReservedLamports:BigInt(String(reservations.rows[0]?.reserved??'0')),openPositions:Number(positions.rows[0]?.open_positions??0),unresolvedReconciliationDebt:Number(recon.rows[0]?.n??0),poolExposureLamports:map(positions.rows[0]?.by_pool),poolPendingLamports:map(reservations.rows[0]?.by_pool),tokenExposureLamports:map(positions.rows[0]?.by_token),tokenPendingLamports:map(reservations.rows[0]?.by_token)};},
+    async loadPhase7PortfolioFacts(ownerAddress){const [positions,reservations,recon]=await Promise.all([db.query("SELECT COALESCE(sum(o.initial_capital_lamports),0)::text AS deployed,count(*)::int AS open_positions,COALESCE((SELECT jsonb_object_agg(g.pool_address,g.deployed) FROM (SELECT p.address AS pool_address,COALESCE(sum(o2.initial_capital_lamports),0) AS deployed FROM execution.owned_positions o2 JOIN protocol.pools p ON p.address=o2.pool_address WHERE o2.owner_address=$1 AND o2.lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN') GROUP BY p.address) g),'{}'::jsonb) AS by_pool,COALESCE((SELECT jsonb_object_agg(g.token_x_mint,g.deployed) FROM (SELECT p.token_x_mint,COALESCE(sum(o3.initial_capital_lamports),0) AS deployed FROM execution.owned_positions o3 JOIN protocol.pools p ON p.address=o3.pool_address WHERE o3.owner_address=$1 AND o3.lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN') AND p.token_x_mint IS NOT NULL GROUP BY p.token_x_mint) g),'{}'::jsonb) AS by_token FROM execution.owned_positions o WHERE o.owner_address=$1 AND o.lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN')",[ownerAddress]),db.query("SELECT COALESCE(sum(capital_lamports),0)::text AS reserved,COALESCE((SELECT jsonb_object_agg(g.pool_address,g.reserved) FROM (SELECT pool_address,COALESCE(sum(capital_lamports),0) AS reserved FROM execution.capital_reservations WHERE owner_address=$1 AND state IN ('RESERVED','SUBMITTED') AND pool_address IS NOT NULL GROUP BY pool_address) g),'{}'::jsonb) AS by_pool,COALESCE((SELECT jsonb_object_agg(g.token_mint,g.reserved) FROM (SELECT token_mint,COALESCE(sum(capital_lamports),0) AS reserved FROM execution.capital_reservations WHERE owner_address=$1 AND state IN ('RESERVED','SUBMITTED') AND token_mint IS NOT NULL GROUP BY token_mint) g),'{}'::jsonb) AS by_token FROM execution.capital_reservations WHERE owner_address=$1 AND state IN ('RESERVED','SUBMITTED')",[ownerAddress]),db.query("SELECT count(*)::int AS n FROM execution.owned_positions WHERE owner_address=$1 AND lifecycle_state IN ('RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN')",[ownerAddress])]);const map=(v:unknown)=>Object.fromEntries(Object.entries((v??{}) as Record<string,unknown>).map(([k,x])=>[k,BigInt(String(x))]));return{deployedLamports:BigInt(String(positions.rows[0]?.deployed??'0')),pendingReservedLamports:BigInt(String(reservations.rows[0]?.reserved??'0')),openPositions:Number(positions.rows[0]?.open_positions??0),unresolvedReconciliationDebt:Number(recon.rows[0]?.n??0),poolExposureLamports:map(positions.rows[0]?.by_pool),poolPendingLamports:map(reservations.rows[0]?.by_pool),tokenExposureLamports:map(positions.rows[0]?.by_token),tokenPendingLamports:map(reservations.rows[0]?.by_token)};},
     async loadPhase7PortfolioRiskState(ownerAddress){const r=await db.query("SELECT * FROM operations.phase7_live_portfolio_risk_state WHERE owner_address=$1",[ownerAddress]);return r.rows[0] as Record<string,unknown>|undefined;},
     async upsertPhase7PortfolioRiskState(v){await db.query("INSERT INTO operations.phase7_live_portfolio_risk_state(owner_address,day_start,daily_start_equity_lamports,peak_equity_lamports,current_equity_lamports,observed_at,valuation_state,reason_codes,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb) ON CONFLICT(owner_address) DO UPDATE SET day_start=EXCLUDED.day_start,daily_start_equity_lamports=EXCLUDED.daily_start_equity_lamports,peak_equity_lamports=EXCLUDED.peak_equity_lamports,current_equity_lamports=EXCLUDED.current_equity_lamports,observed_at=EXCLUDED.observed_at,valuation_state=EXCLUDED.valuation_state,reason_codes=EXCLUDED.reason_codes,payload=EXCLUDED.payload",[v.ownerAddress,v.dayStart,v.dailyStartEquityLamports.toString(),v.peakEquityLamports.toString(),v.currentEquityLamports.toString(),v.observedAt,v.valuationState,json(v.reasonCodes),json(v.payload)]);},
     async loadPositionExitState(lpforgePositionId) {
@@ -1846,6 +1853,12 @@ export async function createPostgresStore(
           v.at,
           json(v.payload),
         ],
+      );
+    },
+    async adjustOwnedPositionCapital(v) {
+      await db.query(
+        `UPDATE execution.owned_positions SET initial_capital_lamports=$2,payload=payload||jsonb_build_object('capital_adjustments',COALESCE(payload->'capital_adjustments','[]'::jsonb)||jsonb_build_array(jsonb_build_object('capitalLamports',$2::text,'at',$3::text,'detail',$4::jsonb))) WHERE position_address=$1`,
+        [v.positionAddress, v.capitalLamports.toString(), v.at, json(v.payload)],
       );
     },
     async upsertPartialEntryRecovery(v) {
@@ -1884,7 +1897,7 @@ export async function createPostgresStore(
     },
     async loadUnresolvedAutonomousPlans() {
       const r = await db.query(
-        `SELECT p.plan_id,p.intent_id,p.state,p.expires_at,p.payload AS plan_payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload AS intent_payload,COALESCE(json_agg(json_build_object('transactionId',s.transaction_id,'sequence',s.sequence,'kind',s.kind,'state',s.state,'requiredSignerAddresses',s.required_signers,'metadata',s.metadata) ORDER BY s.sequence) FILTER (WHERE s.transaction_id IS NOT NULL),'[]'::json) AS steps FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id LEFT JOIN execution.transaction_steps s ON s.plan_id=p.plan_id WHERE p.cluster='mainnet-beta' AND p.state IN ('CLAIMED','DISPATCHING','BUILDING','BUILT','SIMULATING','SIMULATED','RISK_APPROVED','SIGNING','SIGNED','SUBMITTING','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILING') GROUP BY p.plan_id,p.intent_id,p.state,p.expires_at,p.payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload ORDER BY p.created_at ASC`,
+        `SELECT p.plan_id,p.intent_id,p.state,p.expires_at,p.payload AS plan_payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload AS intent_payload,COALESCE(json_agg(json_build_object('transactionId',s.transaction_id,'sequence',s.sequence,'kind',s.kind,'state',s.state,'requiredSignerAddresses',s.required_signers,'metadata',s.metadata) ORDER BY s.sequence) FILTER (WHERE s.transaction_id IS NOT NULL),'[]'::json) AS steps FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id LEFT JOIN execution.transaction_steps s ON s.plan_id=p.plan_id WHERE p.cluster='mainnet-beta' AND p.state IN ('CLAIMED','DISPATCHING','BUILDING','BUILT','SIMULATING','SIMULATED','RISK_APPROVED','SIGNING','SIGNED','SUBMITTING','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILING','RECOVERING','RECONCILIATION_REQUIRED') OR (p.state='FAILED' AND EXISTS(SELECT 1 FROM execution.transaction_steps s JOIN execution.submission_attempts a ON a.transaction_id=s.transaction_id WHERE s.plan_id=p.plan_id AND a.state IN ('SENT','UNKNOWN'))) GROUP BY p.plan_id,p.intent_id,p.state,p.expires_at,p.payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload ORDER BY p.created_at ASC`,
       );
       return r.rows.map(autonomousPlanFromRow);
     },
@@ -2503,24 +2516,28 @@ export async function createPostgresStore(
       };
     },
     async loadPhase7RecoveryFacts(runtimeId) {
-      const [cycles, actions, queue, unknown, recon] = await Promise.all([
-        db.query(
-          `SELECT cycle_key FROM operations.phase7_runtime_cycles WHERE runtime_id=$1 ORDER BY observed_at DESC LIMIT 500`,
-          [runtimeId],
-        ),
-        db.query(
-          `SELECT idempotency_key FROM execution.execution_journal WHERE state='RECONCILED' ORDER BY updated_at DESC LIMIT 500`,
-        ),
-        db.query(
-          `SELECT count(*)::int AS n FROM execution.execution_journal WHERE state IN ('SIGNED','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED')`,
-        ),
-        db.query(
-          `SELECT count(*)::int AS n FROM execution.submission_attempts WHERE state='UNKNOWN'`,
-        ),
-        db.query(
-          `WITH latest AS (SELECT DISTINCT ON (plan_id) plan_id,status FROM execution.reconciliations ORDER BY plan_id,observed_at DESC) SELECT count(*)::int AS n FROM latest WHERE status<>'MATCH'`,
-        ),
-      ]);
+      const [cycles, actions, queue, unknown, recon, partial] =
+        await Promise.all([
+          db.query(
+            `SELECT cycle_key FROM operations.phase7_runtime_cycles WHERE runtime_id=$1 ORDER BY observed_at DESC LIMIT 500`,
+            [runtimeId],
+          ),
+          db.query(
+            `SELECT idempotency_key FROM execution.execution_journal WHERE state='RECONCILED' ORDER BY updated_at DESC LIMIT 500`,
+          ),
+          db.query(
+            `SELECT count(*)::int AS n FROM execution.execution_journal WHERE state IN ('SIGNED','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED')`,
+          ),
+          db.query(
+            `SELECT count(*)::int AS n FROM execution.submission_attempts WHERE state='UNKNOWN'`,
+          ),
+          db.query(
+            `WITH latest AS (SELECT DISTINCT ON (plan_id) plan_id,status FROM execution.reconciliations ORDER BY plan_id,observed_at DESC) SELECT count(*)::int AS n FROM latest WHERE status<>'MATCH'`,
+          ),
+          db.query(
+            `SELECT count(*)::int AS n FROM execution.partial_entry_recovery WHERE state<>'RESOLVED'`,
+          ),
+        ]);
       return {
         previousCompletedCycleKeys: cycles.rows.map((r) => String(r.cycle_key)),
         completedEconomicActionKeys: actions.rows.map((r) =>
@@ -2529,6 +2546,7 @@ export async function createPostgresStore(
         recoveryQueueCount: Number(queue.rows[0]?.n ?? 0),
         unknownSubmissionCount: Number(unknown.rows[0]?.n ?? 0),
         unresolvedReconciliationDebt: Number(recon.rows[0]?.n ?? 0),
+        partialEntryRecoveryCount: Number(partial.rows[0]?.n ?? 0),
       };
     },
     async loadPhase7EvidenceFacts(runtimeId) {
@@ -2733,6 +2751,7 @@ export function createMemoryStore(): Phase1Store {
       return false;
     },
     async markOwnedPositionLifecycle() {},
+    async adjustOwnedPositionCapital() {},
     async upsertPartialEntryRecovery() {},
     async loadPartialEntryRecoveries() {
       return [];
@@ -2845,6 +2864,7 @@ export function createMemoryStore(): Phase1Store {
         recoveryQueueCount: 0,
         unknownSubmissionCount: 0,
         unresolvedReconciliationDebt: 0,
+        partialEntryRecoveryCount: 0,
       };
     },
     async loadPhase7EvidenceFacts() {

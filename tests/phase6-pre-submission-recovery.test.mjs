@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {recoverUnfinishedAutonomousPlans} from '../.build/packages/phase6-live-worker/src/index.js';
+import {recoverUnfinishedAutonomousPlans,reconcileOrphanedPositions} from '../.build/packages/phase6-live-worker/src/index.js';
 
 test('P6 recovery terminalizes an unsubmitted claimed plan and releases any reservation',async()=>{
   const calls=[];
@@ -33,4 +33,46 @@ test('P6 recovery terminalizes a claimed plan that never reached durable journal
   assert.deepEqual(result[0].reasonCodes,['P6_RECOVERY_JOURNAL_MISSING_PRE_SUBMISSION_ABORTED']);
   assert.equal(calls.find(([kind])=>kind==='complete')[1].state,'FAILED');
   assert.deepEqual(calls.find(([kind])=>kind==='release')[1],['plan-no-journal','2026-08-14T00:01:00.000Z',['P6_RECOVERY_JOURNAL_MISSING_PRE_SUBMISSION_ABORTED']]);
+});
+
+test('orphan sweep is a no-op without an owner or pool set',async()=>{
+  const upserts=[];
+  const store={async loadOwnedPositions(){return[];},async upsertOwnedPosition(v){upserts.push(v);}};
+  const result=await reconcileOrphanedPositions({store,rpcUrl:'http://rpc',programId:'program',ownerAddress:'',poolAddresses:['pool'],positionsProvider:async()=>[]});
+  assert.deepEqual(result,{adopted:0,reasonCodes:[]});
+  assert.equal(upserts.length,0);
+});
+
+test('orphan sweep adopts unknown owned-identity positions and skips known or foreign rows',async()=>{
+  const upserts=[];
+  const store={
+    async loadOwnedPositions(){return[{position_address:'KNOWN'}];},
+    async upsertOwnedPosition(v){upserts.push(v);},
+  };
+  const facts={
+    pool:async()=>[
+      {positionAddress:'KNOWN',owner:'OWNER',pool:'pool',lowerBinId:10,upperBinId:20},
+      {positionAddress:'FOREIGN',owner:'OTHER',pool:'pool',lowerBinId:10,upperBinId:20},
+      {positionAddress:'WRONG_POOL',owner:'OWNER',pool:'other',lowerBinId:10,upperBinId:20},
+      {positionAddress:'ORPHAN',owner:'OWNER',pool:'pool',lowerBinId:30,upperBinId:40},
+    ],
+    other:async()=>[],
+  };
+  const result=await reconcileOrphanedPositions({store,rpcUrl:'http://rpc',programId:'program',ownerAddress:'OWNER',poolAddresses:['pool','other'],now:'2026-08-14T00:00:00.000Z',positionsProvider:async(pool)=>facts[pool]()});
+  assert.equal(result.adopted,1);
+  assert.deepEqual(result.reasonCodes,['P6_ORPHAN_POSITION_DETECTED']);
+  assert.equal(upserts.length,1);
+  assert.equal(upserts[0].positionAddress,'ORPHAN');
+  assert.equal(upserts[0].initialCapitalLamports,0n);
+  assert.equal(upserts[0].lifecycleState,'RECONCILIATION_REQUIRED');
+  assert.equal(upserts[0].reconciliationStatus,'MISMATCH');
+  assert.equal(upserts[0].payload.orphanDetected,true);
+});
+
+test('orphan sweep reports a pool read failure without disrupting other pools',async()=>{
+  const upserts=[];
+  const store={async loadOwnedPositions(){return[];},async upsertOwnedPosition(v){upserts.push(v);}};
+  const result=await reconcileOrphanedPositions({store,rpcUrl:'http://rpc',programId:'program',ownerAddress:'OWNER',poolAddresses:['broken','ok'],positionsProvider:async(pool)=>{if(pool==='broken')throw new Error('rpc down');return[{positionAddress:'ORPHAN',owner:'OWNER',pool:'ok',lowerBinId:1,upperBinId:2}];}});
+  assert.equal(result.adopted,1);
+  assert.deepEqual(result.reasonCodes,['P6_ORPHAN_SWEEP_POOL_READ_FAILED','P6_ORPHAN_POSITION_DETECTED']);
 });

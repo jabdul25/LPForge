@@ -20,6 +20,9 @@ declare module 'node:crypto' {
   export function createHash(algorithm:string):Hash;
   export function createPrivateKey(input:{key:Uint8Array;format:'der';type:'pkcs8'}):unknown;
   export function sign(algorithm:null,data:Uint8Array,key:unknown):Uint8Array;
+  export interface Hmac { update(data:string|Uint8Array):Hmac; digest():Uint8Array; digest(encoding:'hex'):string; }
+  export function createHmac(algorithm:string,key:string|Uint8Array):Hmac;
+  export function timingSafeEqual(a:Uint8Array,b:Uint8Array):boolean;
 }
 declare module 'node:child_process' {
   export interface ReadableLike { on(event:'data', listener:(chunk:unknown)=>void):ReadableLike; }

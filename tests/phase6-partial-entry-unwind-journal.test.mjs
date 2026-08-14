@@ -13,11 +13,17 @@ test('partial-entry unwind is durably journaled before simulation', () => {
 
 test('partial-entry unwind persists its signature before confirmation and never treats an unproven legacy send as submitted', () => {
   const worker = fs.readFileSync('packages/phase6-live-worker/src/index.ts', 'utf8');
-  const unwindAt = worker.indexOf('async function unwindPartialEntry');
-  const submitAt = worker.indexOf('const record = await submitSignedTransaction({', unwindAt);
-  const persistAt = worker.indexOf('unwindSignature: record.signature', submitAt);
+  // The unwind chain is a shared step: submit, then run the caller's durable
+  // persistence hook, and only then wait for confirmation. The partial-entry
+  // wrapper passes its UNWIND_SUBMITTED upsert as that hook.
+  const stepAt = worker.indexOf('async function executeJupiterUnwindStep');
+  const submitAt = worker.indexOf('const record = await submitSignedTransaction({', stepAt);
+  const persistHookAt = worker.indexOf('input.afterSubmit', submitAt);
   const confirmAt = worker.indexOf('awaitConfirmation({', submitAt);
-  assert.ok(persistAt > submitAt && confirmAt > persistAt, 'submission identity must be persisted before confirmation wait');
+  const persistAt = worker.indexOf('unwindSignature: submitted.signature', submitAt);
+  assert.ok(stepAt >= 0, 'missing shared unwind step');
+  assert.ok(persistHookAt > submitAt && confirmAt > persistHookAt, 'submission identity must be persisted before confirmation wait');
+  assert.ok(persistAt > confirmAt, 'the wrapper persists the signature before the shared step confirms');
   assert.match(worker, /P6_PARTIAL_UNWIND_SUBMISSION_UNPROVEN/);
   assert.match(worker, /P6_PARTIAL_UNWIND_CONFIRMATION_PENDING/);
 });
