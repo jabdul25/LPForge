@@ -40,7 +40,9 @@ export async function loadMeteoraExecutionRuntime():Promise<RuntimeSdk>{
   cached={PublicKey:web3.PublicKey,Connection:web3.Connection,DLMM:dlmm as unknown as RuntimeSdk['DLMM'],BN,StrategyType:dlmm.StrategyType,calculateSpotDistribution:dlmm.calculateSpotDistribution,calculateNormalDistribution:dlmm.calculateNormalDistribution,calculateBidAskDistribution:dlmm.calculateBidAskDistribution,autoFillXByStrategy:dlmm.autoFillXByStrategy,getPriceOfBinByBinId:dlmm.getPriceOfBinByBinId,dlmmVersion:'1.9.10'}; return cached;
 }
 function strategyType(s:'SPOT'|'CURVE'|'BID_ASK',r:RuntimeSdk){return s==='SPOT'?r.StrategyType.Spot:s==='CURVE'?r.StrategyType.Curve:r.StrategyType.BidAsk;}
-function validateRange(lower:number,upper:number){if(!Number.isInteger(lower)||!Number.isInteger(upper)||lower>upper)throw new Error('LPFORGE_METEORA_BUILD_INVALID_RANGE');}
+/** Meteora DLMM rejects InitializePosition ranges wider than 70 inclusive bins. Keep this execution-boundary guard independent of RangeForge. */
+export const METEORA_MAX_POSITION_WIDTH_BINS=70;
+function validateRange(lower:number,upper:number){if(!Number.isInteger(lower)||!Number.isInteger(upper)||lower>upper)throw new Error('LPFORGE_METEORA_BUILD_INVALID_RANGE');if(upper-lower+1>METEORA_MAX_POSITION_WIDTH_BINS)throw new Error('LPFORGE_METEORA_BUILD_POSITION_WIDTH');}
 /** Creates a live SDK pool adapter. Construction is read-only; it cannot sign or submit. */
 export async function createLiveMeteoraOpenPool(input:{rpcUrl:string;poolAddress:string;programId:string}):Promise<MeteoraOpenAddPoolLike>{
   if(!input.rpcUrl.trim()||!input.poolAddress.trim()||!input.programId.trim())throw new Error('LPFORGE_METEORA_LIVE_POOL_CONFIG_REQUIRED');
