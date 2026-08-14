@@ -67,6 +67,7 @@ export interface AutonomousPlanStep {
 export interface AutonomousPlan {
   planId: string;
   intentId: string;
+  state: string;
   idempotencyKey: string;
   action: AutonomousPlanAction;
   poolAddress: string;
@@ -950,6 +951,7 @@ function autonomousPlanFromRow(row: Record<string, unknown>): AutonomousPlan {
   return {
     planId: String(row.plan_id),
     intentId: String(row.intent_id),
+    state: String(row.state),
     idempotencyKey: String(row.idempotency_key),
     action: String(row.action) as AutonomousPlanAction,
     poolAddress: String(row.pool_address),
@@ -1641,7 +1643,7 @@ export async function createPostgresStore(
         [String(plan.plan_id), now],
       );
       const detail = await db.query(
-        `SELECT p.plan_id,p.intent_id,p.expires_at,p.payload AS plan_payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload AS intent_payload,COALESCE(json_agg(json_build_object('transactionId',s.transaction_id,'sequence',s.sequence,'kind',s.kind,'state',s.state,'requiredSignerAddresses',s.required_signers,'metadata',s.metadata) ORDER BY s.sequence) FILTER (WHERE s.transaction_id IS NOT NULL),'[]'::json) AS steps FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id LEFT JOIN execution.transaction_steps s ON s.plan_id=p.plan_id WHERE p.plan_id=$1 GROUP BY p.plan_id,p.intent_id,p.expires_at,p.payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload`,
+        `SELECT p.plan_id,p.intent_id,p.state,p.expires_at,p.payload AS plan_payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload AS intent_payload,COALESCE(json_agg(json_build_object('transactionId',s.transaction_id,'sequence',s.sequence,'kind',s.kind,'state',s.state,'requiredSignerAddresses',s.required_signers,'metadata',s.metadata) ORDER BY s.sequence) FILTER (WHERE s.transaction_id IS NOT NULL),'[]'::json) AS steps FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id LEFT JOIN execution.transaction_steps s ON s.plan_id=p.plan_id WHERE p.plan_id=$1 GROUP BY p.plan_id,p.intent_id,p.state,p.expires_at,p.payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload`,
         [String(plan.plan_id)],
       );
       const row = detail.rows[0];
@@ -1861,7 +1863,7 @@ export async function createPostgresStore(
     },
     async loadUnresolvedAutonomousPlans() {
       const r = await db.query(
-        `SELECT p.plan_id,p.intent_id,p.expires_at,p.payload AS plan_payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload AS intent_payload,COALESCE(json_agg(json_build_object('transactionId',s.transaction_id,'sequence',s.sequence,'kind',s.kind,'state',s.state,'requiredSignerAddresses',s.required_signers,'metadata',s.metadata) ORDER BY s.sequence) FILTER (WHERE s.transaction_id IS NOT NULL),'[]'::json) AS steps FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id LEFT JOIN execution.transaction_steps s ON s.plan_id=p.plan_id WHERE p.cluster='mainnet-beta' AND p.state IN ('CLAIMED','DISPATCHING','BUILDING','BUILT','SIMULATING','SIMULATED','RISK_APPROVED','SIGNING','SIGNED','SUBMITTING','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILING') GROUP BY p.plan_id,p.intent_id,p.expires_at,p.payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload ORDER BY p.created_at ASC`,
+        `SELECT p.plan_id,p.intent_id,p.state,p.expires_at,p.payload AS plan_payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload AS intent_payload,COALESCE(json_agg(json_build_object('transactionId',s.transaction_id,'sequence',s.sequence,'kind',s.kind,'state',s.state,'requiredSignerAddresses',s.required_signers,'metadata',s.metadata) ORDER BY s.sequence) FILTER (WHERE s.transaction_id IS NOT NULL),'[]'::json) AS steps FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id LEFT JOIN execution.transaction_steps s ON s.plan_id=p.plan_id WHERE p.cluster='mainnet-beta' AND p.state IN ('CLAIMED','DISPATCHING','BUILDING','BUILT','SIMULATING','SIMULATED','RISK_APPROVED','SIGNING','SIGNED','SUBMITTING','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILING') GROUP BY p.plan_id,p.intent_id,p.state,p.expires_at,p.payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload ORDER BY p.created_at ASC`,
       );
       return r.rows.map(autonomousPlanFromRow);
     },

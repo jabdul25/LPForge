@@ -1123,6 +1123,36 @@ export async function recoverPartialEntryFunding(input: {
   for (const row of rows) {
     const planId = String(row.plan_id),
       state = String(row.state);
+    // A funded OPEN can finish reconciliation after an earlier failure wrote a
+    // recovery row.  Reconciled chain truth wins: retaining UNWIND_REQUIRED in
+    // that case would incorrectly strand the worker (or later unwind a live
+    // LP position).  This is deliberately limited to a reconciled OPEN plan.
+    const plan = await input.store.loadAutonomousPlan(planId);
+    if (plan?.action === "OPEN" && plan.state === "RECONCILED") {
+      await input.store.upsertPartialEntryRecovery({
+        planId,
+        poolAddress: String(row.pool_address),
+        ownerAddress: String(row.owner_address),
+        tokenMint: String(row.token_mint),
+        fundingTransactionId: String(row.funding_transaction_id),
+        fundingSignature: String(row.funding_signature),
+        fundedAt: new Date(String(row.funded_at)).toISOString(),
+        pairedTokenAmount: String(row.paired_token_amount),
+        intendedCapitalLamports: BigInt(String(row.intended_capital_lamports)),
+        intendedRange: (row.intended_range ?? {}) as Record<string, unknown>,
+        state: "RESOLVED",
+        walletTruth: {
+          ...(row.wallet_truth ?? {}),
+          reconciledPlanId: plan.planId,
+          reconciledPositionAddress: plan.positionAddress ?? null,
+          refreshedAt: new Date().toISOString(),
+        },
+        payload: { reasonCodes: ["P6_PARTIAL_OPEN_RECONCILED_AFTER_RECOVERY"] },
+        updatedAt: new Date().toISOString(),
+      });
+      results.push({ planId, action: "HOLD", reasonCodes: ["P6_PARTIAL_OPEN_RECONCILED_AFTER_RECOVERY"] });
+      continue;
+    }
     if (state === "UNWIND_SUBMITTED") {
       const payload = (row.payload ?? {}) as Record<string, unknown>;
       const signature = typeof payload.unwindSignature === "string" ? payload.unwindSignature : "";
@@ -1201,7 +1231,6 @@ export async function recoverPartialEntryFunding(input: {
       });
       continue;
     }
-    const plan = await input.store.loadAutonomousPlan(planId);
     if (!plan || plan.action !== "OPEN") {
       await input.store.upsertPartialEntryRecovery({
         planId,
