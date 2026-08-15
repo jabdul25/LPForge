@@ -283,8 +283,8 @@ async function observeAndPlanOwnedPositions(input: {
     let economics = { evidenceState: "UNAVAILABLE" as const, observedAt: input.observedAt, reasonCodes: ["EXIT_VALUATION_POOL_DATA_UNAVAILABLE"] };
     if (fact) {
       try {
-        const apiPool = await input.api.getPool(position.poolAddress);
-        economics = derivePositionEconomics({position: fact, pool: apiPool, initialCapitalLamports: position.initialCapitalLamports, observedAt: input.observedAt}) as typeof economics;
+        const [apiPool,cashflows] = await Promise.all([input.api.getPool(position.poolAddress),input.store.loadPositionCashflows(position.positionAddress)]);
+        economics = derivePositionEconomics({position: fact, pool: apiPool, initialCapitalLamports: position.initialCapitalLamports, observedAt: input.observedAt,realizedFeeCashflows:cashflows}) as typeof economics;
       } catch {}
     }
     const priorExitRow=await input.store.loadPositionExitState(position.lpforgePositionId);

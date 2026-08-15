@@ -29,6 +29,8 @@ export interface PositionEconomicsSnapshot {
   netPnlUsd?:number;
   netReturnFraction?:number;
   feesValueUsd?:number;
+  /** Fees/rewards already moved out of PositionV2 and recorded durably. */
+  realizedFeeValueUsd?:number;
   reasonCodes:string[];
 }
 export interface ExitHighWaterState {peakNetReturnFraction:number;peakEconomicValueUsd?:number;peakObservedAt:string;}
@@ -72,18 +74,42 @@ function tokenUsd(raw:string|undefined,decimals:number|undefined,price:number|un
   if(raw===undefined||!Number.isInteger(decimals)||decimals!<0||!finite(price)||price!<0)return undefined;
   let n:number;try{n=Number(BigInt(raw))/10**decimals!;}catch{return undefined;}return Number.isFinite(n)?n*price!:undefined;
 }
+export interface RealizedPositionCashflow {flowType:string;lamports?:bigint;tokenMint?:string;tokenAmountRaw?:string;}
+/**
+ * Values only fee/reward cashflows that have left PositionV2.  The caller
+ * supplies the contemporaneous pool price/decimals; unknown token prices are
+ * reported rather than guessed.  Principal withdrawals/additions remain
+ * capital-basis events and are intentionally not mixed into fee PnL here.
+ */
+export function valueRealizedFeeCashflows(input:{cashflows:readonly RealizedPositionCashflow[];pool:DataApiPool}):{valueUsd:number;complete:boolean;reasonCodes:string[]}{
+  const tokens=[input.pool.token_x,input.pool.token_y].filter((x):x is NonNullable<typeof x>=>Boolean(x));
+  let valueUsd=0,complete=true;const reasons:string[]=[];
+  for(const flow of input.cashflows){
+    if(flow.flowType!=="FEE_CLAIM"&&flow.flowType!=="REWARD_CLAIM")continue;
+    const token=tokens.find(candidate=>candidate.address===flow.tokenMint);
+    const value=tokenUsd(flow.tokenAmountRaw,token?.decimals,token?.price);
+    if(value===undefined){complete=false;reasons.push('EXIT_CASHFLOW_FEE_VALUE_UNAVAILABLE');continue;}
+    valueUsd+=value;
+  }
+  return{valueUsd,complete,reasonCodes:[...new Set(reasons)].sort()};
+}
 /** Capital-normalized economic valuation. No value is fabricated when token price/decimals are unavailable. */
-export function derivePositionEconomics(input:{position:PositionV2Fact;pool:DataApiPool;initialCapitalLamports:bigint;observedAt:string}):PositionEconomicsSnapshot{
+export function derivePositionEconomics(input:{position:PositionV2Fact;pool:DataApiPool;initialCapitalLamports:bigint;observedAt:string;realizedFeeCashflows?:readonly RealizedPositionCashflow[]}):PositionEconomicsSnapshot{
   const {position,pool,initialCapitalLamports,observedAt}=input,x=pool.token_x,y=pool.token_y;
   const sol=x?.address==='So11111111111111111111111111111111111111112'?x:y?.address==='So11111111111111111111111111111111111111112'?y:undefined;
   const initial=finite(sol?.price)&&sol!.price!>0?Number(initialCapitalLamports)/1e9*sol!.price!:undefined;
   const xv=tokenUsd(position.totalXAmount,x?.decimals,x?.price),yv=tokenUsd(position.totalYAmount,y?.decimals,y?.price);
   const fux=tokenUsd(position.feeX,x?.decimals,x?.price)??0,fuy=tokenUsd(position.feeY,y?.decimals,y?.price)??0;
-  const fcx=tokenUsd(position.claimedFeeX,x?.decimals,x?.price)??0,fcy=tokenUsd(position.claimedFeeY,y?.decimals,y?.price)??0;
+  const onPositionClaimedX=tokenUsd(position.claimedFeeX,x?.decimals,x?.price)??0,onPositionClaimedY=tokenUsd(position.claimedFeeY,y?.decimals,y?.price)??0,
+    ledger=input.realizedFeeCashflows&&input.realizedFeeCashflows.length>0?valueRealizedFeeCashflows({cashflows:input.realizedFeeCashflows,pool}):undefined;
   const reasons:string[]=[];if(initial===undefined||!(initial>0))reasons.push('EXIT_VALUATION_INITIAL_CAPITAL_UNAVAILABLE');if(xv===undefined)reasons.push('EXIT_VALUATION_TOKEN_X_UNAVAILABLE');if(yv===undefined)reasons.push('EXIT_VALUATION_TOKEN_Y_UNAVAILABLE');
-  if(reasons.length)return{evidenceState:'UNAVAILABLE',observedAt,reasonCodes:reasons};
-  const fees=fux+fuy+fcx+fcy,current=xv!+yv!+fees,net=current-initial!,fraction=net/initial!;
-  return{evidenceState:'AVAILABLE',observedAt,initialCapitalUsd:initial!,currentEconomicValueUsd:current,netPnlUsd:net,netReturnFraction:fraction,feesValueUsd:fees,reasonCodes:['EXIT_VALUATION_CAPITAL_NORMALIZED']};
+  if(ledger&&!ledger.complete)reasons.push(...ledger.reasonCodes);
+  if(reasons.length)return{evidenceState:'UNAVAILABLE',observedAt,reasonCodes:[...new Set(reasons)].sort()};
+  // Once the durable ledger is present it is the authority for fees already
+  // withdrawn to the wallet. This prevents a CLAIM from looking like a loss
+  // and avoids double counting an SDK cumulative claimed-fee field.
+  const realized=ledger?.valueUsd??(onPositionClaimedX+onPositionClaimedY),fees=fux+fuy+realized,current=xv!+yv!+fees,net=current-initial!,fraction=net/initial!;
+  return{evidenceState:'AVAILABLE',observedAt,initialCapitalUsd:initial!,currentEconomicValueUsd:current,netPnlUsd:net,netReturnFraction:fraction,feesValueUsd:fees,realizedFeeValueUsd:realized,reasonCodes:['EXIT_VALUATION_CAPITAL_NORMALIZED',...(ledger?['EXIT_VALUATION_REALIZED_CASHFLOWS']:[])]};
 }
 function nextHighWater(e:PositionEconomicsSnapshot,prior?:ExitHighWaterState):ExitHighWaterState{
   const current=e.netReturnFraction??Number.NEGATIVE_INFINITY;
