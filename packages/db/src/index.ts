@@ -1751,7 +1751,7 @@ export async function createPostgresStore(
     },
     async transitionAutonomousPlan(v) {
       const prior = await db.query(
-        `WITH current AS (SELECT state FROM execution.transaction_plans WHERE plan_id=$1),updated AS (UPDATE execution.transaction_plans SET state=$2,payload=payload||jsonb_build_object('autonomous_dispatch_updated_at',$3::text,'autonomous_dispatch',$4::jsonb) WHERE plan_id=$1 RETURNING plan_id) SELECT state FROM current JOIN updated ON true`,
+        `WITH current AS (SELECT state FROM execution.transaction_plans WHERE plan_id=$1),updated AS (UPDATE execution.transaction_plans SET state=$2,payload=payload||jsonb_build_object('autonomous_dispatch_updated_at',$3::text,'autonomous_dispatch',COALESCE(payload->'autonomous_dispatch','{}'::jsonb)||$4::jsonb) WHERE plan_id=$1 RETURNING plan_id) SELECT state FROM current JOIN updated ON true`,
         [v.planId, v.state, v.at, json(v.payload)],
       );
       await db.query(
@@ -1768,7 +1768,7 @@ export async function createPostgresStore(
     },
     async completeAutonomousPlan(v) {
       await db.query(
-        `UPDATE execution.transaction_plans SET state=$2,payload=payload||jsonb_build_object('autonomous_dispatch_completed_at',$3::text,'autonomous_dispatch',$4::jsonb) WHERE plan_id=$1`,
+        `UPDATE execution.transaction_plans SET state=$2,payload=payload||jsonb_build_object('autonomous_dispatch_completed_at',$3::text,'autonomous_dispatch',COALESCE(payload->'autonomous_dispatch','{}'::jsonb)||$4::jsonb) WHERE plan_id=$1`,
         [v.planId, v.state, v.at, json(v.payload)],
       );
     },

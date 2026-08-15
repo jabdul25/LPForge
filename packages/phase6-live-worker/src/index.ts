@@ -92,6 +92,7 @@ export interface LiveRecoveryResult {
     | "RECONCILE_FIRST"
     | "MARK_RECONCILED"
     | "REBUILD_WITH_NEW_BLOCKHASH"
+    | "RESUME_CLOSE_SETTLEMENT"
     | "HOLD_FOR_OPERATOR"
     | "RETURN_EXISTING_PLAN"
     | "NO_ACTION_COMPLETE";
@@ -2123,6 +2124,332 @@ async function executeManagementReplacement(input: {
   });
 }
 
+type CloseSettlementStage =
+  | "CLOSE_INVENTORY_SNAPSHOTTED"
+  | "CLOSE_LIQUIDITY_REMOVED"
+  | "CLOSE_CLAIMS_SETTLED"
+  | "CLOSE_INVENTORY_MEASURED"
+  | "CLOSE_INVENTORY_UNWOUND";
+
+function closeSettlementDispatch(plan: AutonomousPlan): Record<string, unknown> {
+  const value = plan.planPayload && plan.planPayload.autonomous_dispatch;
+  return value && typeof value === "object"
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function closeSettlementStage(
+  plan: AutonomousPlan,
+): CloseSettlementStage | undefined {
+  const value = closeSettlementDispatch(plan).stage;
+  return typeof value === "string" &&
+    [
+      "CLOSE_INVENTORY_SNAPSHOTTED",
+      "CLOSE_LIQUIDITY_REMOVED",
+      "CLOSE_CLAIMS_SETTLED",
+      "CLOSE_INVENTORY_MEASURED",
+      "CLOSE_INVENTORY_UNWOUND",
+    ].includes(value)
+    ? (value as CloseSettlementStage)
+    : undefined;
+}
+
+function closeSettlementAmount(value: unknown): bigint | undefined {
+  try {
+    const amount = BigInt(String(value ?? ""));
+    return amount >= 0n ? amount : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function shouldResumeCloseSettlement(value: {
+  action: string;
+  stage?: string | undefined;
+  positionExists: boolean;
+  confirmationStatus: string;
+}): boolean {
+  return (
+    (value.action === "CLOSE" || value.action === "EMERGENCY_CLOSE") &&
+    value.stage !== undefined &&
+    value.stage !== "CLOSE_INVENTORY_SNAPSHOTTED" &&
+    value.positionExists &&
+    (value.confirmationStatus === "CONFIRMED" ||
+      value.confirmationStatus === "FINALIZED")
+  );
+}
+
+/**
+ * A CLOSE is a durable settlement workflow, not one opaque mutation.  A stage
+ * is recorded only after the preceding chain action is confirmed.  Therefore
+ * a restarted worker can continue from a completed stage without resending a
+ * prior transaction or touching inventory that predates this position.
+ */
+async function executeCloseSettlement(input: {
+  store: Phase1Store;
+  plan: AutonomousPlan;
+  signer: MainnetSignerBackend;
+  config: LiveWorkerConfig;
+  pool: MeteoraOpenAddPoolLike & MeteoraRemoveClaimPoolLike;
+  positionAddress: string;
+}): Promise<LiveWorkerResult> {
+  const closeAction: "CLOSE" | "EMERGENCY_CLOSE" =
+    input.plan.action === "EMERGENCY_CLOSE" ? "EMERGENCY_CLOSE" : "CLOSE";
+  const removeStep =
+      input.plan.steps.find((candidate) => candidate.kind === "METEORA_REMOVE") ??
+      input.plan.steps[0],
+    unwindStep = input.plan.steps.find(
+      (candidate) => candidate.kind === "JUPITER_UNWIND",
+    ),
+    closeStep = input.plan.steps.find(
+      (candidate) => candidate.kind === "METEORA_CLOSE",
+    );
+  if (!removeStep || !unwindStep || !closeStep)
+    throw new Error("LPFORGE_P6_CLOSE_SEQUENCE_MISSING");
+
+  const connection = new Connection(input.config.rpcUrl, "confirmed"),
+    poolFact = await createMeteoraReadAdapter({
+      rpcUrl: input.config.rpcUrl,
+      cluster: "mainnet-beta",
+      programId: input.config.programId,
+    }).getPool(input.plan.poolAddress),
+    persist = async (
+      stage: CloseSettlementStage,
+      payload: Record<string, unknown>,
+      state: "BUILDING" | "RECONCILING" = "RECONCILING",
+    ) =>
+      input.store.transitionAutonomousPlan({
+        planId: input.plan.planId,
+        state,
+        at: new Date().toISOString(),
+        payload: { stage, tokenXMint: poolFact.tokenXMint, ...payload },
+      });
+
+  let dispatch = closeSettlementDispatch(input.plan),
+    stage = closeSettlementStage(input.plan),
+    tokenXBefore = closeSettlementAmount(dispatch.tokenXBefore);
+  if (!stage) {
+    tokenXBefore = await readWalletTokenBalance({
+      connection,
+      ownerAddress: input.plan.ownerAddress,
+      mint: poolFact.tokenXMint,
+    });
+    await persist(
+      "CLOSE_INVENTORY_SNAPSHOTTED",
+      { tokenXBefore: tokenXBefore.toString() },
+      "BUILDING",
+    );
+    stage = "CLOSE_INVENTORY_SNAPSHOTTED";
+    dispatch = { ...dispatch, tokenXBefore: tokenXBefore.toString() };
+  }
+  if (tokenXBefore === undefined) {
+    await input.store.transitionAutonomousPlan({
+      planId: input.plan.planId,
+      state: "RECONCILIATION_REQUIRED",
+      at: new Date().toISOString(),
+      reasonCodes: ["P6_CLOSE_RECOVERY_SNAPSHOT_MISSING"],
+      payload: { stage: stage ?? "CLOSE_UNKNOWN_STAGE" },
+    });
+    return {
+      status: "UNKNOWN",
+      planId: input.plan.planId,
+      reasonCodes: ["P6_CLOSE_RECOVERY_SNAPSHOT_MISSING"],
+      transactionSubmitted: true,
+    };
+  }
+
+  if (stage === "CLOSE_INVENTORY_SNAPSHOTTED") {
+    const range = await chainMutationRange({
+        plan: input.plan,
+        stepMetadata: removeStep.metadata,
+        rpcUrl: input.config.rpcUrl,
+        programId: input.config.programId,
+        positionAddress: input.positionAddress,
+      }),
+      built = await buildRemoveLiquidityTransactions(input.pool, {
+        userAddress: input.plan.ownerAddress,
+        positionAddress: input.positionAddress,
+        fromBinId: range.lower,
+        toBinId: range.upper,
+        bps: 10_000,
+        claimAndClose: false,
+      });
+    if (built.length !== 1)
+      throw new Error("LPFORGE_P6_MULTI_TRANSACTION_REMOVE_UNSUPPORTED");
+    built[0]!.metadata.transactionId = removeStep.transactionId;
+    const removed = await executeMeteoraMutation({
+      ...input,
+      built: built[0]!,
+      action: closeAction,
+      deferCompletion: true,
+    });
+    if (removed.status !== "RECONCILED") return removed;
+    await persist("CLOSE_LIQUIDITY_REMOVED", {
+      tokenXBefore: tokenXBefore.toString(),
+      removeTransactionId: removeStep.transactionId,
+    });
+    stage = "CLOSE_LIQUIDITY_REMOVED";
+  }
+
+  if (stage === "CLOSE_LIQUIDITY_REMOVED") {
+    let claimBuilt: BuiltMeteoraTransaction[] | undefined;
+    try {
+      claimBuilt = await buildClaimTransactions(input.pool, {
+        userAddress: input.plan.ownerAddress,
+        positionAddress: input.positionAddress,
+      });
+    } catch (error) {
+      if (
+        !(error instanceof Error) ||
+        error.message !== "LPFORGE_METEORA_CLAIM_NOTHING_TO_CLAIM"
+      )
+        throw error;
+    }
+    if (claimBuilt) {
+      if (claimBuilt.length !== 1)
+        throw new Error("LPFORGE_P6_MULTI_TRANSACTION_CLAIM_UNSUPPORTED");
+      const transactionId = `${closeStep.transactionId}:claim`;
+      await input.store.ensureExecutionTransactionStep({
+        planId: input.plan.planId,
+        transactionId,
+        kind: "METEORA_CLAIM",
+        state: "PLANNED",
+        requiredSignerAddresses: [input.plan.ownerAddress],
+        metadata: {
+          stage: "CLOSE_CLAIM_RESIDUAL",
+          parentTransactionId: closeStep.transactionId,
+        },
+      });
+      claimBuilt[0]!.metadata.transactionId = transactionId;
+      const claimed = await executeMeteoraMutation({
+        ...input,
+        built: claimBuilt[0]!,
+        action: closeAction,
+        deferCompletion: true,
+      });
+      if (claimed.status !== "RECONCILED") return claimed;
+    }
+    await persist("CLOSE_CLAIMS_SETTLED", {
+      tokenXBefore: tokenXBefore.toString(),
+      claimTransactionSkipped: !claimBuilt,
+    });
+    stage = "CLOSE_CLAIMS_SETTLED";
+  }
+
+  let attributableTokenX = closeSettlementAmount(dispatch.attributableTokenX);
+  if (stage === "CLOSE_CLAIMS_SETTLED") {
+    const tokenXAfter = await readWalletTokenBalance({
+      connection,
+      ownerAddress: input.plan.ownerAddress,
+      mint: poolFact.tokenXMint,
+    });
+    attributableTokenX =
+      tokenXAfter > tokenXBefore ? tokenXAfter - tokenXBefore : 0n;
+    if (attributableTokenX > 0n)
+      await input.store.insertPositionCashflow({
+        cashflowId: `${input.plan.planId}:close-token-x`,
+        positionAddress: input.positionAddress,
+        planId: input.plan.planId,
+        flowType: "CLOSE_WITHDRAWAL",
+        observedAt: new Date().toISOString(),
+        tokenMint: poolFact.tokenXMint,
+        tokenAmountRaw: attributableTokenX.toString(),
+        payload: {
+          source: "REMOVE_PLUS_CLAIM_DELTA",
+          tokenXBefore: tokenXBefore.toString(),
+          tokenXAfter: tokenXAfter.toString(),
+        },
+      });
+    await persist("CLOSE_INVENTORY_MEASURED", {
+      tokenXBefore: tokenXBefore.toString(),
+      tokenXAfter: tokenXAfter.toString(),
+      attributableTokenX: attributableTokenX.toString(),
+    });
+    stage = "CLOSE_INVENTORY_MEASURED";
+  }
+
+  if (stage === "CLOSE_INVENTORY_MEASURED") {
+    if (attributableTokenX === undefined) {
+      await input.store.transitionAutonomousPlan({
+        planId: input.plan.planId,
+        state: "RECONCILIATION_REQUIRED",
+        at: new Date().toISOString(),
+        reasonCodes: ["P6_CLOSE_RECOVERY_INVENTORY_MISSING"],
+        payload: { stage },
+      });
+      return {
+        status: "UNKNOWN",
+        planId: input.plan.planId,
+        reasonCodes: ["P6_CLOSE_RECOVERY_INVENTORY_MISSING"],
+        transactionSubmitted: true,
+      };
+    }
+    if (attributableTokenX > 0n) {
+      const unwind = await executeJupiterUnwindStep({
+        store: input.store,
+        plan: input.plan,
+        signer: input.signer,
+        config: input.config,
+        amount: attributableTokenX,
+        transactionId: unwindStep.transactionId,
+        idempotencyKey: `${input.plan.idempotencyKey}:${unwindStep.transactionId}`,
+        stage: "CLOSE_TOKEN_X_UNWIND",
+        reasonPrefix: "P6_CLOSE_UNWIND",
+      });
+      if (!unwind.ok)
+        return {
+          status: unwind.submitted ? "SUBMITTED" : "BLOCKED",
+          planId: input.plan.planId,
+          reasonCodes: unwind.reasonCodes,
+          transactionSubmitted: unwind.submitted,
+        };
+    }
+    await persist("CLOSE_INVENTORY_UNWOUND", {
+      tokenXBefore: tokenXBefore.toString(),
+      attributableTokenX: attributableTokenX.toString(),
+      unwindTransactionId: unwindStep.transactionId,
+    });
+    stage = "CLOSE_INVENTORY_UNWOUND";
+  }
+
+  if (stage !== "CLOSE_INVENTORY_UNWOUND")
+    throw new Error("LPFORGE_P6_CLOSE_SETTLEMENT_STAGE_INVALID");
+  const tokenXPostUnwind = await readWalletTokenBalance({
+    connection,
+    ownerAddress: input.plan.ownerAddress,
+    mint: poolFact.tokenXMint,
+  });
+  if (tokenXPostUnwind > tokenXBefore) {
+    await input.store.transitionAutonomousPlan({
+      planId: input.plan.planId,
+      state: "RECONCILIATION_REQUIRED",
+      at: new Date().toISOString(),
+      reasonCodes: ["P6_CLOSE_TOKEN_X_RESIDUAL"],
+      payload: {
+        stage: "CLOSE_UNWIND_VERIFY",
+        tokenXBefore: tokenXBefore.toString(),
+        tokenXPostUnwind: tokenXPostUnwind.toString(),
+      },
+    });
+    return {
+      status: "UNKNOWN",
+      planId: input.plan.planId,
+      reasonCodes: ["P6_CLOSE_TOKEN_X_RESIDUAL"],
+      transactionSubmitted: true,
+    };
+  }
+  const closedBuilt = await buildClosePositionTransaction(input.pool, {
+    userAddress: input.plan.ownerAddress,
+    positionAddress: input.positionAddress,
+  });
+  closedBuilt.metadata.transactionId = closeStep.transactionId;
+  return executeMeteoraMutation({
+    ...input,
+    built: closedBuilt,
+    action: closeAction,
+  });
+}
+
 /** Generic plan entrypoint. Every mutation is claimed through the same durable queue. */
 export async function executeAutonomousPlan(input: {
   store: Phase1Store;
@@ -2130,9 +2457,12 @@ export async function executeAutonomousPlan(input: {
   signer: MainnetSignerBackend;
   config: LiveWorkerConfig;
 }): Promise<LiveWorkerResult> {
-  await recordJournal(input.store, input.plan, "PLAN_CREATED", {
-    action: input.plan.action,
-  });
+  // Recovery resumes an already-journaled close at its next durable stage.
+  // Never overwrite its last confirmed submission with PLAN_CREATED.
+  if (!(await input.store.getExecutionJournal(input.plan.idempotencyKey)))
+    await recordJournal(input.store, input.plan, "PLAN_CREATED", {
+      action: input.plan.action,
+    });
   if (input.plan.action === "OPEN")
     return executeAutonomousOpen({
       store: input.store,
@@ -2219,110 +2549,8 @@ export async function executeAutonomousPlan(input: {
   if (
     input.plan.action === "CLOSE" ||
     input.plan.action === "EMERGENCY_CLOSE"
-  ) {
-    // Close is an economic settlement state machine.  Snapshot the owner's
-    // pre-existing paired-token inventory, REMOVE, CLAIM, then unwind only
-    // the attributable delta.  This prevents liquidation of unrelated wallet
-    // inventory and ensures late fee claims are included in the unwind.
-    const removeStep =
-        input.plan.steps.find(
-          (candidate) => candidate.kind === "METEORA_REMOVE",
-        ) ?? step,
-      unwindStep = input.plan.steps.find(
-        (candidate) => candidate.kind === "JUPITER_UNWIND",
-      ),
-      closeStep = input.plan.steps.find(
-        (candidate) => candidate.kind === "METEORA_CLOSE",
-      );
-    if (!unwindStep || !closeStep)
-      throw new Error("LPFORGE_P6_CLOSE_SEQUENCE_MISSING");
-    const closeConnection=new Connection(input.config.rpcUrl,"confirmed"),poolFact=await createMeteoraReadAdapter({rpcUrl:input.config.rpcUrl,cluster:"mainnet-beta",programId:input.config.programId}).getPool(input.plan.poolAddress),tokenXBefore=await readWalletTokenBalance({connection:closeConnection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenXMint});
-    await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:"BUILDING",at:new Date().toISOString(),payload:{stage:"CLOSE_INVENTORY_SNAPSHOTTED",tokenXBefore:tokenXBefore.toString(),tokenXMint:poolFact.tokenXMint}});
-    const range = await chainMutationRange({
-        plan: input.plan,
-        stepMetadata: removeStep.metadata,
-        rpcUrl: input.config.rpcUrl,
-        programId: input.config.programId,
-        positionAddress,
-      }),
-      built = await buildRemoveLiquidityTransactions(pool, {
-        userAddress: input.plan.ownerAddress,
-        positionAddress,
-        fromBinId: range.lower,
-        toBinId: range.upper,
-        bps: 10_000,
-        claimAndClose: false,
-      });
-    if (built.length !== 1)
-      throw new Error("LPFORGE_P6_MULTI_TRANSACTION_REMOVE_UNSUPPORTED");
-    built[0]!.metadata.transactionId = removeStep.transactionId;
-    const drained = await executeMeteoraMutation({
-      ...input,
-      built: built[0]!,
-      action: input.plan.action,
-      deferCompletion: true,
-    });
-    if (drained.status !== "RECONCILED") return drained;
-    // Claim before measuring the final inventory delta.  Otherwise claimed
-    // fees could be left as unwanted paired-token exposure after unwind.
-    let claimBuilt;
-    try {
-      claimBuilt = await buildClaimTransactions(pool, {
-        userAddress: input.plan.ownerAddress,
-        positionAddress,
-      });
-    } catch (error) {
-      if (
-        !(error instanceof Error) ||
-        error.message !== "LPFORGE_METEORA_CLAIM_NOTHING_TO_CLAIM"
-      )
-        throw error;
-      claimBuilt = undefined;
-    }
-    if (claimBuilt) {
-      if (claimBuilt.length !== 1)
-        throw new Error("LPFORGE_P6_MULTI_TRANSACTION_CLAIM_UNSUPPORTED");
-      const claimTransactionId = `${closeStep.transactionId}:claim`;
-      await input.store.ensureExecutionTransactionStep({
-        planId: input.plan.planId,
-        transactionId: claimTransactionId,
-        kind: "METEORA_CLAIM",
-        state: "PLANNED",
-        requiredSignerAddresses: [input.plan.ownerAddress],
-        metadata: {
-          stage: "CLOSE_CLAIM_RESIDUAL",
-          parentTransactionId: closeStep.transactionId,
-        },
-      });
-      claimBuilt[0]!.metadata.transactionId = claimTransactionId;
-      const claimed = await executeMeteoraMutation({
-        ...input,
-        built: claimBuilt[0]!,
-        action: input.plan.action,
-        deferCompletion: true,
-      });
-      if (claimed.status !== "RECONCILED") return claimed;
-    }
-    const tokenXAfter=await readWalletTokenBalance({connection:closeConnection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenXMint}),attributableTokenX=tokenXAfter>tokenXBefore?tokenXAfter-tokenXBefore:0n;
-    if(attributableTokenX>0n)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:close-token-x`,positionAddress,planId:input.plan.planId,flowType:'CLOSE_WITHDRAWAL',observedAt:new Date().toISOString(),tokenMint:poolFact.tokenXMint,tokenAmountRaw:attributableTokenX.toString(),payload:{source:'REMOVE_PLUS_CLAIM_DELTA',tokenXBefore:tokenXBefore.toString(),tokenXAfter:tokenXAfter.toString()}});
-    await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:"RECONCILING",at:new Date().toISOString(),payload:{stage:"CLOSE_INVENTORY_MEASURED",tokenXBefore:tokenXBefore.toString(),tokenXAfter:tokenXAfter.toString(),attributableTokenX:attributableTokenX.toString(),tokenXMint:poolFact.tokenXMint}});
-    if(attributableTokenX>0n){
-      const unwind=await executeJupiterUnwindStep({store:input.store,plan:input.plan,signer:input.signer,config:input.config,amount:attributableTokenX,transactionId:unwindStep.transactionId,idempotencyKey:`${input.plan.idempotencyKey}:${unwindStep.transactionId}`,stage:"CLOSE_TOKEN_X_UNWIND",reasonPrefix:"P6_CLOSE_UNWIND"});
-      if(!unwind.ok)return{status:unwind.submitted?"SUBMITTED":"BLOCKED",planId:input.plan.planId,reasonCodes:unwind.reasonCodes,transactionSubmitted:unwind.submitted};
-      const tokenXPostUnwind=await readWalletTokenBalance({connection:closeConnection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenXMint});
-      if(tokenXPostUnwind>tokenXBefore){await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:"RECONCILIATION_REQUIRED",at:new Date().toISOString(),reasonCodes:["P6_CLOSE_TOKEN_X_RESIDUAL"],payload:{stage:"CLOSE_UNWIND_VERIFY",tokenXBefore:tokenXBefore.toString(),tokenXPostUnwind:tokenXPostUnwind.toString()}});return{status:"UNKNOWN",planId:input.plan.planId,reasonCodes:["P6_CLOSE_TOKEN_X_RESIDUAL"],transactionSubmitted:true};}
-    }
-    const closedBuilt = await buildClosePositionTransaction(pool, {
-      userAddress: input.plan.ownerAddress,
-      positionAddress,
-    });
-    closedBuilt.metadata.transactionId = closeStep.transactionId;
-    return executeMeteoraMutation({
-      ...input,
-      built: closedBuilt,
-      action: input.plan.action,
-    });
-  }
+  )
+    return executeCloseSettlement({ ...input, pool, positionAddress });
   if (input.plan.action === "ADD") {
     const range = mutationRange(input.plan),
       funding = input.plan.intentPayload.entryFunding as
@@ -2488,6 +2716,23 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         )
           economicEffect = "ABSENT";
       } catch { positionTruth = { exists: "UNKNOWN", accountPresent: true }; }
+    }
+    // A persisted settlement stage is written only after its preceding
+    // transaction confirmed.  If the PositionV2 is still present, the next
+    // close stage is safe to resume; no already-submitted stage is resent.
+    const closeStage = closeSettlementStage(plan);
+    if (shouldResumeCloseSettlement({
+      action: plan.action,
+      stage: closeStage,
+      positionExists: positionTruth.exists === true,
+      confirmationStatus,
+    })) {
+      results.push({
+        planId: plan.planId,
+        action: "RESUME_CLOSE_SETTLEMENT",
+        reasonCodes: ["P6_RECOVERY_CLOSE_STAGE_RESUME_READY", closeStage ?? "UNKNOWN"],
+      });
+      continue;
     }
     const action = determineRecoveryAction({
       journal,

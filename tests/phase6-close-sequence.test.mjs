@@ -32,23 +32,23 @@ test('close plans are a drain → unwind → close sequence with one durable ste
 
 test('worker close sequence snapshots → drains → claims → unwinds only attributable token-X → closes',()=>{
   const worker=fs.readFileSync('packages/phase6-live-worker/src/index.ts','utf8');
-  const closeAt=worker.indexOf('input.plan.action === "CLOSE" ||');
+  const closeAt=worker.indexOf('async function executeCloseSettlement');
   const drainAt=worker.indexOf('deferCompletion: true,',closeAt);
-  const snapshotAt=worker.indexOf('tokenXBefore=await readWalletTokenBalance',closeAt);
-  const claimAt=worker.indexOf('buildClaimTransactions(pool, {',drainAt);
+  const snapshotAt=worker.indexOf('tokenXBefore = await readWalletTokenBalance',closeAt);
+  const claimAt=worker.indexOf('buildClaimTransactions(input.pool, {',drainAt);
   const claimStepAt=worker.indexOf('CLOSE_CLAIM_RESIDUAL',claimAt);
   const unwindAt=worker.indexOf('executeJupiterUnwindStep({',claimStepAt);
-  const closeBuilderAt=worker.indexOf('buildClosePositionTransaction(pool, {',unwindAt);
+  const closeBuilderAt=worker.indexOf('buildClosePositionTransaction(input.pool, {',unwindAt);
   assert.ok(closeAt>=0&&snapshotAt>closeAt&&drainAt>snapshotAt&&claimAt>drainAt&&claimStepAt>claimAt&&unwindAt>claimStepAt&&closeBuilderAt>unwindAt,'close phases must run snapshot → drain → claim → unwind → close in order');
   assert.match(worker,/stage:\s*"CLOSE_TOKEN_X_UNWIND"/);
   assert.match(worker,/reasonPrefix:\s*"P6_CLOSE_UNWIND"/);
   assert.match(worker,/LPFORGE_METEORA_CLAIM_NOTHING_TO_CLAIM/);
   assert.match(worker,/idempotencyKey:\s*`\$\{input\.plan\.idempotencyKey\}:\$\{unwindStep\.transactionId\}`/);
-  assert.match(worker,/attributableTokenX=tokenXAfter>tokenXBefore\?tokenXAfter-tokenXBefore:0n/,'only position-attributable inventory may be unwound');
+  assert.match(worker,/tokenXAfter > tokenXBefore \? tokenXAfter - tokenXBefore : 0n/,'only position-attributable inventory may be unwound');
   assert.match(worker,/P6_CLOSE_TOKEN_X_RESIDUAL/,'a failed residual-inventory verification becomes reconciliation debt');
   // The drain and claim phases must defer completion: a death between phases
-  // leaves the journal action as the plan action so recovery HOLDs instead
-  // of marking a half-executed close reconciled.
+  // leaves a durable stage for recovery rather than marking a half-executed
+  // close reconciled or blindly repeating its already-confirmed mutation.
   const drainDefer=worker.slice(closeAt,closeBuilderAt).match(/deferCompletion:\s*true/g);
   assert.ok(drainDefer&&drainDefer.length>=2,'drain and claim phases both defer completion');
   // The final close verifies chain truth before completing the plan.

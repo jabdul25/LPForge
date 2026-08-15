@@ -261,6 +261,44 @@ async function recoverOnce() {
       rpcUrl: config.rpcUrl,
       programId: config.programId,
     });
+    // CLOSE/EMERGENCY_CLOSE stages that were durably confirmed before a
+    // process interruption are protective workflows. Resume only the next
+    // uncompleted stage; executeAutonomousPlan preserves the existing journal
+    // and never re-sends the completed stage.
+    const resumed: Array<{ planId: string; status: string; reasonCodes: string[] }> = [];
+    const unresolvedPlans = [];
+    for (const recovery of plans) {
+      if (recovery.action !== "RESUME_CLOSE_SETTLEMENT") {
+        unresolvedPlans.push(recovery);
+        continue;
+      }
+      const plan = await store.loadAutonomousPlan(recovery.planId);
+      if (!plan) {
+        unresolvedPlans.push({
+          ...recovery,
+          action: "HOLD_FOR_OPERATOR",
+          reasonCodes: ["P6_RECOVERY_CLOSE_PLAN_MISSING"],
+        });
+        continue;
+      }
+      const result = await executeAutonomousPlan({
+        store,
+        plan,
+        signer: signerFromEnvironment(),
+        config,
+      });
+      resumed.push({
+        planId: recovery.planId,
+        status: result.status,
+        reasonCodes: result.reasonCodes,
+      });
+      if (result.status !== "RECONCILED")
+        unresolvedPlans.push({
+          ...recovery,
+          action: "HOLD_FOR_OPERATOR",
+          reasonCodes: result.reasonCodes,
+        });
+    }
     const policyPools=loadDeploymentPolicyFile(process.env.LPFORGE_EXECUTION_POLICY_PATH?.trim()||"policies/live-execution-policy.json").pools.map(pool=>pool.address),[candidates,unresolved]=await Promise.all([store.listDiscoveryCandidates(['A']),store.loadUnresolvedAutonomousPlans()]),recoveryPools=[...new Set([...policyPools,...candidates.map(candidate=>candidate.poolAddress),...unresolved.map(plan=>plan.poolAddress)])];
     const orphans = await reconcileOrphanedPositions({
       store,
@@ -269,7 +307,7 @@ async function recoverOnce() {
       ownerAddress: process.env.LPFORGE_OPERATOR_OWNER_ADDRESS ?? "",
       poolAddresses: recoveryPools,
     });
-    return { partial, plans, orphans };
+    return { partial, plans: unresolvedPlans, resumed, orphans };
   } finally {
     await store.close();
   }
