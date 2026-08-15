@@ -19,7 +19,7 @@ export interface BuiltMeteoraTransaction {transaction:OpaqueTransaction;required
 interface RuntimeSdk {
   PublicKey:new(value:string)=>{toBase58():string};
   Connection:new(url:string,commitment:'confirmed')=>unknown;
-  DLMM:{create(connection:unknown,pool:unknown,options:Record<string,unknown>):Promise<MeteoraOpenAddPoolLike>;getPositionsByUserAndLbPair?(user:unknown,lbPair:unknown):Promise<{userPositions:Array<{publicKey:{toBase58():string}}>}>};
+  DLMM:{create(connection:unknown,pool:unknown,options:Record<string,unknown>):Promise<MeteoraOpenAddPoolLike>;getAllLbPairPositionsByUser?(connection:unknown,user:unknown,options:Record<string,unknown>,getPositionsOptions?:Record<string,unknown>):Promise<Map<string,{lbPairPositionsData:Array<{publicKey:{toBase58():string}}> }>>};
   BN:new(value:string|number|bigint)=>{toString(base?:number):string};
   StrategyType:{Spot:number;Curve:number;BidAsk:number};
   calculateSpotDistribution(activeBinId:number,binIds:number[]):Array<{binId:number;xAmountBpsOfTotal:{toString(base?:number):string};yAmountBpsOfTotal:{toString(base?:number):string}}>;

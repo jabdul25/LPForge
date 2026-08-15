@@ -3029,19 +3029,36 @@ export async function reconcileOrphanedPositions(input: {
   const known = new Set(owned.map((row) => String(row.position_address)));
   const reasonCodes = new Set<string>();
   let adopted = 0;
+  let allWalletPositions:
+    | Promise<
+        Map<
+          string,
+          { lbPairPositionsData: Array<{ publicKey: { toBase58(): string } }> }
+        >
+      >
+    | undefined;
   const defaultProvider = async (poolAddress: string) => {
     const runtime = await loadMeteoraExecutionRuntime();
-    if (typeof runtime.DLMM.getPositionsByUserAndLbPair !== "function")
+    if (typeof runtime.DLMM.getAllLbPairPositionsByUser !== "function")
       throw new Error("LPFORGE_ORPHAN_SWEEP_RUNTIME_UNAVAILABLE");
     const adapter = createMeteoraReadAdapter({
       rpcUrl: input.rpcUrl,
       cluster: "mainnet-beta",
       programId: input.programId,
     });
-    const result = await runtime.DLMM.getPositionsByUserAndLbPair(
+    allWalletPositions ??= runtime.DLMM.getAllLbPairPositionsByUser(
+      new runtime.Connection(input.rpcUrl, "confirmed"),
       new runtime.PublicKey(ownerAddress),
-      new runtime.PublicKey(poolAddress),
+      {
+        cluster: "mainnet-beta",
+        programId: new runtime.PublicKey(input.programId),
+      },
+      // Recovery is deliberately low-pressure: a wallet scan is a fallback
+      // adoption path, never an execution-critical RPC fan-out.
+      { chunkSize: 20, isParallelExecution: false },
     );
+    const result = await allWalletPositions;
+    const positions = result.get(poolAddress)?.lbPairPositionsData ?? [];
     const facts: Array<{
       positionAddress: string;
       owner: string;
@@ -3049,7 +3066,7 @@ export async function reconcileOrphanedPositions(input: {
       lowerBinId: number;
       upperBinId: number;
     }> = [];
-    for (const position of result.userPositions) {
+    for (const position of positions) {
       try {
         const fact = await adapter.getPositionV2(
           poolAddress,

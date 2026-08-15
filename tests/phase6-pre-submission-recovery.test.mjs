@@ -2,6 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {recoverUnfinishedAutonomousPlans,reconcileOrphanedPositions} from '../.build/packages/phase6-live-worker/src/index.js';
 
+test('orphan sweep targets the installed Meteora SDK wallet-position API',async()=>{
+  const fs=await import('node:fs/promises');
+  const worker=await fs.readFile('packages/phase6-live-worker/src/index.ts','utf8');
+  const sdk=await fs.readFile('packages/meteora-execution/src/index.ts','utf8');
+  assert.match(worker,/getAllLbPairPositionsByUser/);
+  assert.doesNotMatch(worker,/getPositionsByUserAndLbPair/);
+  assert.match(sdk,/getAllLbPairPositionsByUser/);
+});
+
 test('P6 recovery terminalizes an unsubmitted claimed plan and releases any reservation',async()=>{
   const calls=[];
   const store={
