@@ -12,6 +12,8 @@ export interface DiscoveryPolicy {
   policyId: string;
   sourceMode: PoolSourceMode;
   requireWsolForAuto: boolean;
+  allowedBinSteps: number[];
+  requireWsolTokenYForAuto: boolean;
   manualPools: string[];
   maxUniverse: number;
   pageSize: number;
@@ -38,6 +40,7 @@ export interface CheapDiscoveryFeatures {
   tokenY?: string | undefined;
   pairedTokenMint?: string | undefined;
   pairedTokenSymbol?: string | undefined;
+  binStep?: number | undefined;
   wsolPair: boolean;
   blacklisted: boolean;
   poolAgeHours?: number | undefined;
@@ -97,10 +100,11 @@ function obj(v:unknown):Record<string,unknown>{if(!v||typeof v!=='object'||Array
 function finite(v:unknown, fallback:number):number{const n=Number(v);return Number.isFinite(n)?n:fallback}
 function positiveInt(v:unknown,fallback:number):number{const n=Math.trunc(finite(v,fallback));return n>0?n:fallback}
 function strings(v:unknown):string[]{return Array.isArray(v)?v.filter((x):x is string=>typeof x==='string'&&x.length>0):[]}
+function positiveInts(v:unknown):number[]{return [...new Set(Array.isArray(v)?v.map(x=>Math.trunc(Number(x))).filter(x=>Number.isInteger(x)&&x>0):[])].sort((a,b)=>a-b)}
 export function parseDiscoveryPolicy(raw:unknown):DiscoveryPolicy{
   const v=obj(raw); if(v.schemaVersion!==1)throw new Error('LPFORGE_DISCOVERY_POLICY_SCHEMA');
   const mode=v.sourceMode; if(mode!=='MANUAL'&&mode!=='AUTO'&&mode!=='HYBRID')throw new Error('LPFORGE_DISCOVERY_POLICY_SOURCE_MODE');
-  const policy:DiscoveryPolicy={schemaVersion:1,policyId:String(v.policyId??'pool-discovery-v2.1.1'),sourceMode:mode,requireWsolForAuto:v.requireWsolForAuto!==false,manualPools:[...new Set(strings(v.manualPools))],maxUniverse:positiveInt(v.maxUniverse,250),pageSize:Math.min(1000,positiveInt(v.pageSize,250)),maxDeepScreen:positiveInt(v.maxDeepScreen,40),maxActiveCandidates:positiveInt(v.maxActiveCandidates,10),maxWatchlist:positiveInt(v.maxWatchlist,30),minTvlUsd:Math.max(0,finite(v.minTvlUsd,25000)),minVolume30mUsd:Math.max(0,finite(v.minVolume30mUsd,2500)),minVolume1hUsd:Math.max(0,finite(v.minVolume1hUsd,7500)),minVolume24hUsd:Math.max(0,finite(v.minVolume24hUsd,50000)),minPoolAgeHours:Math.max(0,finite(v.minPoolAgeHours,3)),minKnownHolders:Math.max(0,positiveInt(v.minKnownHolders,250)),activeMinPriority:Math.max(0,Math.min(100,finite(v.activeMinPriority,62))),qualifiedMinPriority:Math.max(0,Math.min(100,finite(v.qualifiedMinPriority,45))),serverSideSortBy:typeof v.serverSideSortBy==='string'&&v.serverSideSortBy.trim()?v.serverSideSortBy.trim():'volume_24h:desc',useServerSidePrefilter:v.useServerSidePrefilter!==false,staleAfterMs:Math.max(60_000,positiveInt(v.staleAfterMs,900_000))};
+  const policy:DiscoveryPolicy={schemaVersion:1,policyId:String(v.policyId??'pool-discovery-v2.1.1'),sourceMode:mode,requireWsolForAuto:v.requireWsolForAuto!==false,allowedBinSteps:positiveInts(v.allowedBinSteps),requireWsolTokenYForAuto:v.requireWsolTokenYForAuto===true,manualPools:[...new Set(strings(v.manualPools))],maxUniverse:positiveInt(v.maxUniverse,250),pageSize:Math.min(1000,positiveInt(v.pageSize,250)),maxDeepScreen:positiveInt(v.maxDeepScreen,40),maxActiveCandidates:positiveInt(v.maxActiveCandidates,10),maxWatchlist:positiveInt(v.maxWatchlist,30),minTvlUsd:Math.max(0,finite(v.minTvlUsd,25000)),minVolume30mUsd:Math.max(0,finite(v.minVolume30mUsd,2500)),minVolume1hUsd:Math.max(0,finite(v.minVolume1hUsd,7500)),minVolume24hUsd:Math.max(0,finite(v.minVolume24hUsd,50000)),minPoolAgeHours:Math.max(0,finite(v.minPoolAgeHours,3)),minKnownHolders:Math.max(0,positiveInt(v.minKnownHolders,250)),activeMinPriority:Math.max(0,Math.min(100,finite(v.activeMinPriority,62))),qualifiedMinPriority:Math.max(0,Math.min(100,finite(v.qualifiedMinPriority,45))),serverSideSortBy:typeof v.serverSideSortBy==='string'&&v.serverSideSortBy.trim()?v.serverSideSortBy.trim():'volume_24h:desc',useServerSidePrefilter:v.useServerSidePrefilter!==false,staleAfterMs:Math.max(60_000,positiveInt(v.staleAfterMs,900_000))};
   if(policy.maxActiveCandidates>policy.maxDeepScreen)throw new Error('LPFORGE_DISCOVERY_POLICY_ACTIVE_GT_DEEP'); return policy;
 }
 
@@ -126,6 +130,9 @@ export function cheapScreen(pool:DataApiPool,source:CheapScreenResult['source'],
   if(!pool.address)hard.push('DISCOVERY_POOL_ADDRESS_MISSING');
   if(f.blacklisted)hard.push('DISCOVERY_BLACKLISTED');
   if(source!=='MANUAL'&&policy.requireWsolForAuto&&!f.wsolPair)hard.push('DISCOVERY_AUTO_REQUIRES_WSOL');
+  if(policy.requireWsolTokenYForAuto&&f.tokenY!==WSOL_MINT)hard.push('DISCOVERY_REQUIRES_WSOL_TOKEN_Y');
+  const binStep=n(pool.pool_config?.bin_step);
+  if(policy.allowedBinSteps.length&&(!binStep||!policy.allowedBinSteps.includes(binStep)))hard.push('DISCOVERY_BIN_STEP_NOT_ALLOWED');
   if((f.tvlUsd??0)<policy.minTvlUsd)(source==='MANUAL'?warn:hard).push('DISCOVERY_TVL_BELOW_MINIMUM');
   if((f.volume24hUsd??0)<policy.minVolume24hUsd)(source==='MANUAL'?warn:hard).push('DISCOVERY_VOLUME_24H_BELOW_MINIMUM');
   if(f.poolAgeHours!==undefined&&f.poolAgeHours<policy.minPoolAgeHours)warn.push('DISCOVERY_POOL_YOUNG');

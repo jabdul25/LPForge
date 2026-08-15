@@ -3,6 +3,8 @@
   "policyId": "pool-discovery-v2.1.1-d1d2",
   "sourceMode": "HYBRID",
   "requireWsolForAuto": true,
+  "requireWsolTokenYForAuto": true,
+  "allowedBinSteps": [80, 100, 125],
   "manualPools": [
     "3C6qVymTAwWNKCSspmd1qbUH9avaqhsjgW2yntvEYBXt",
     "E3SotafntrgRg9XjppxqoJWSR4GUaJV7sA8u4a89rYo6",
