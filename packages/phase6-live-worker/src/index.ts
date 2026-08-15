@@ -1300,7 +1300,27 @@ export async function recoverPartialEntryFunding(input: {
         results.push({ planId, action: "HOLD", reasonCodes: ["P6_PARTIAL_UNWIND_SUBMISSION_UNPROVEN"] });
         continue;
       }
-      const status = (await new Connection(input.config.rpcUrl, "confirmed").getSignatureStatuses([signature], { searchTransactionHistory: true })).value[0];
+      let status:
+        | { err: unknown; confirmationStatus?: string | null }
+        | null
+        | undefined;
+      try {
+        status = (
+          await new Connection(input.config.rpcUrl, "confirmed").getSignatureStatuses(
+            [signature],
+            { searchTransactionHistory: true },
+          )
+        ).value[0];
+      } catch {
+        // A status-read outage is unknown chain truth. Keep the durable
+        // UNWIND_SUBMITTED record; never reset it or retry the unwind.
+        results.push({
+          planId,
+          action: "HOLD",
+          reasonCodes: ["P6_PARTIAL_UNWIND_STATUS_READ_UNKNOWN"],
+        });
+        continue;
+      }
       if (!status || !status.confirmationStatus) {
         results.push({ planId, action: "HOLD", reasonCodes: ["P6_PARTIAL_UNWIND_CONFIRMATION_PENDING"] });
         continue;
@@ -2584,6 +2604,10 @@ export async function recoverUnfinishedAutonomousPlans(input: {
   now: string;
   rpcUrl?: string;
   programId?: string;
+  /** Test seam; production uses the RPC connection below. */
+  signatureStatusProvider?: (
+    signature: string,
+  ) => Promise<{ err: unknown; confirmationStatus?: string | null } | null>;
 }): Promise<LiveRecoveryResult[]> {
   const plans = await input.store.loadUnresolvedAutonomousPlans(),
     results: LiveRecoveryResult[] = [];
@@ -2661,12 +2685,23 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       | "EXPIRED"
       | "FAILED"
       | "UNKNOWN" = "UNKNOWN";
-    if (connection && journal.signature) {
-      const status = (
-        await connection.getSignatureStatus(journal.signature, {
-          searchTransactionHistory: true,
-        })
-      ).value;
+    let signatureStatusReadUnknown = false;
+    if (journal.signature && (connection || input.signatureStatusProvider)) {
+      let status:
+        | { err: unknown; confirmationStatus?: string | null }
+        | null
+        | undefined;
+      try {
+        status = input.signatureStatusProvider
+          ? await input.signatureStatusProvider(journal.signature)
+          : (
+              await connection!.getSignatureStatus(journal.signature, {
+                searchTransactionHistory: true,
+              })
+            ).value;
+      } catch {
+        signatureStatusReadUnknown = true;
+      }
       if (status?.err) confirmationStatus = "FAILED";
       else if (status?.confirmationStatus === "processed")
         confirmationStatus = "PROCESSED";
@@ -2740,6 +2775,26 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       confirmationStatus,
       economicEffect,
     });
+    // Status-read failure must never turn an unknown post-send transaction
+    // into a rebuild candidate, even after its blockhash has expired.
+    if (
+      signatureStatusReadUnknown &&
+      (action === "REBUILD_WITH_NEW_BLOCKHASH" || action === "HOLD_FOR_OPERATOR")
+    ) {
+      await input.store.transitionAutonomousPlan({
+        planId: plan.planId,
+        state: "RECOVERING",
+        at: input.now,
+        reasonCodes: ["P6_RECOVERY_SIGNATURE_STATUS_READ_UNKNOWN"],
+        payload: { journalId: journal.journalId, recovery: "STATUS_READ_UNKNOWN" },
+      });
+      results.push({
+        planId: plan.planId,
+        action: "HOLD_FOR_OPERATOR",
+        reasonCodes: ["P6_RECOVERY_SIGNATURE_STATUS_READ_UNKNOWN"],
+      });
+      continue;
+    }
     // A verified on-chain OPEN position must be adopted into the owned
     // registry even when its plan's post-submit bookkeeping died. Adoption
     // never fabricates data: identity and capital come from chain truth and

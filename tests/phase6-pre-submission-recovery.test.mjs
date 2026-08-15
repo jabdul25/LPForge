@@ -44,6 +44,19 @@ test('P6 recovery terminalizes a claimed plan that never reached durable journal
   assert.deepEqual(calls.find(([kind])=>kind==='release')[1],['plan-no-journal','2026-08-14T00:01:00.000Z',['P6_RECOVERY_JOURNAL_MISSING_PRE_SUBMISSION_ABORTED']]);
 });
 
+test('P6 recovery status-read failure never rebuilds an expired submitted plan',async()=>{
+  const calls=[];
+  const store={
+    async loadUnresolvedAutonomousPlans(){return[{planId:'plan-status-unknown',idempotencyKey:'idem-status-unknown',action:'OPEN',poolAddress:'pool',ownerAddress:'owner',expiresAt:'2030-01-01T00:00:00.000Z'}];},
+    async getExecutionJournal(){return{journal_id:'journal-status-unknown',idempotency_key:'idem-status-unknown',plan_id:'plan-status-unknown',state:'SUBMITTED',signature:'sig',last_valid_block_height:1,version:3,updated_at:'2026-08-14T00:00:00.000Z',payload:{action:'OPEN'}};},
+    async transitionAutonomousPlan(value){calls.push(value);},
+  };
+  const result=await recoverUnfinishedAutonomousPlans({store,currentBlockHeight:2,now:'2026-08-14T00:01:00.000Z',signatureStatusProvider:async()=>{throw new Error('rpc unavailable');}});
+  assert.deepEqual(result,[{planId:'plan-status-unknown',action:'HOLD_FOR_OPERATOR',reasonCodes:['P6_RECOVERY_SIGNATURE_STATUS_READ_UNKNOWN']}]);
+  assert.equal(calls[0].state,'RECOVERING');
+  assert.deepEqual(calls[0].reasonCodes,['P6_RECOVERY_SIGNATURE_STATUS_READ_UNKNOWN']);
+});
+
 test('orphan sweep is a no-op without an owner or pool set',async()=>{
   const upserts=[];
   const store={async loadOwnedPositions(){return[];},async upsertOwnedPosition(v){upserts.push(v);}};
