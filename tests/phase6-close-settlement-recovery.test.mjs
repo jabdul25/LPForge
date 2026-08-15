@@ -44,3 +44,10 @@ test('close workflow preserves every durable settlement stage and resumes from i
   assert.match(source, /P6_RECOVERY_CLOSE_STAGE_RESUME_READY/);
   assert.match(db, /COALESCE\(payload->'autonomous_dispatch','\{\}'::jsonb\)\|\|\$4::jsonb/);
 });
+
+test('pending close-child recovery queries its durable child signature, not an older parent journal signature', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile('packages/phase6-live-worker/src/index.ts', 'utf8'));
+  assert.match(source,/const pendingSignature = closeSettlementPending\(plan\)\?\.signature;/);
+  assert.match(source,/const recoverySignature = pendingSignature \?\? journal\.signature;/);
+  assert.match(source,/getSignatureStatus\(recoverySignature/);
+});

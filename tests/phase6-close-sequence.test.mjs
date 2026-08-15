@@ -42,6 +42,10 @@ test('worker close sequence snapshots → drains → claims → unwinds only att
   assert.ok(closeAt>=0&&snapshotAt>closeAt&&drainAt>snapshotAt&&claimAt>drainAt&&claimStepAt>claimAt&&unwindAt>claimStepAt&&closeBuilderAt>unwindAt,'close phases must run snapshot → drain → claim → unwind → close in order');
   assert.match(worker,/stage:\s*"CLOSE_TOKEN_X_UNWIND"/);
   assert.match(worker,/reasonPrefix:\s*"P6_CLOSE_UNWIND"/);
+  assert.match(worker,/economicReferenceLamports:\s*mutationCapital\(input\.plan\)/,'Jupiter unwind compares SOL fee to the position basis, never raw token units');
+  assert.match(worker,/action:\s*closeAction/,'emergency-close semantics propagate through the Jupiter unwind risk gate');
+  assert.match(worker,/P6_CLOSE_SETTLEMENT_RECONCILIATION_REQUIRED/,'a child failure after REMOVE is parent-level reconciliation debt, not a clean block');
+  assert.match(worker,/pendingStage:\s*"CLOSE_(?:REMOVE|CLAIM|UNWIND|POSITION)_SUBMITTED"/,'every submitted child has a durable parent settlement marker before confirmation');
   assert.match(worker,/LPFORGE_METEORA_CLAIM_NOTHING_TO_CLAIM/);
   assert.match(worker,/idempotencyKey:\s*`\$\{input\.plan\.idempotencyKey\}:\$\{unwindStep\.transactionId\}`/);
   assert.match(worker,/tokenXAfter > tokenXBefore \? tokenXAfter - tokenXBefore : 0n/,'only position-attributable inventory may be unwound');

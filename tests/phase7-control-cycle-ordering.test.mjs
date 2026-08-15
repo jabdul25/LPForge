@@ -32,7 +32,8 @@ test('drift reads lagged decoder telemetry from the prior evidence snapshot, fal
 
 test('drift folds every probed pool while preserving raw candidate BLOCK for targeted claim admission',()=>{
   const src=fs.readFileSync(production,'utf8');
-  assert.match(src,/const driftPoolAddresses=\[\.\.\.new Set\(\[input\.cfg\.smokePoolAddress,\.\.\.\(await productionEvaluationPoolAddresses\(input\.store,input\.env,input\.cycleKey\)\)\]\)\];/,'the drift set is the exact set the probe runs this cycle');
+  assert.match(src,/const evaluationPoolAddresses=await productionEvaluationPoolAddresses\(input\.store,input\.env,input\.cycleKey\),driftPoolAddresses=\[\.\.\.new Set\(\[input\.cfg\.smokePoolAddress,\.\.\.evaluationPoolAddresses\]\)\];/,'one immutable evaluation-pool snapshot feeds drift and probes');
+  assert.ok(src.includes('for(const poolAddress of evaluationPoolAddresses)'), 'operator probes reuse the same immutable evaluation-pool snapshot');
   assert.ok(src.includes('significant:poolAddress===input.cfg.smokePoolAddress||capitalPools.has(poolAddress)||openPools.has(poolAddress)'),'smoke pool, deployed capital and open positions are the significance criteria');
   assert.ok(src.includes("rank(p.status)>rank('WATCH')?'WATCH':p.status"),'idle pools are capped at WATCH');
   assert.ok(src.includes('`P7_LIVE_DRIFT_POOL_${p.status}`'),'non-stable pools surface a per-pool reason code');

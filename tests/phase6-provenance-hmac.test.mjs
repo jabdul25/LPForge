@@ -10,7 +10,8 @@ const claimGuard='packages/phase6-claim-guard/src/index.ts';
 const execution='apps/execution/src/main.ts';
 
 const secret='lpforge-test-provenance-secret';
-const fields={producer:'LPFORGE_PRODUCTION',schemaVersion:1,intentId:'i',poolAddress:'POOL',observedAt:'2026-08-13T00:04:45.000Z',action:'OPEN',ownerAddress:'OWNER',positionAddress:null,expiresAt:'2026-08-13T00:09:45.000Z',immutablePlan:{intentPayload:{},planIntent:{capitalLamports:'20000000'},steps:[]}};
+const phase7Control={decisionId:'control-1',cycleKey:'cycle-1',observedAt:'2026-08-13T00:04:30.000Z'};
+const fields={producer:'LPFORGE_PRODUCTION',schemaVersion:1,intentId:'i',poolAddress:'POOL',observedAt:'2026-08-13T00:04:45.000Z',action:'OPEN',ownerAddress:'OWNER',positionAddress:null,expiresAt:'2026-08-13T00:09:45.000Z',immutablePlan:{intentPayload:{},planIntent:{capitalLamports:'20000000'},steps:[]},phase7Control};
 
 test('provenance HMACs round-trip over a canonical sorted serialization and reject any tampering',()=>{
   const hmac=computePlanProvenanceHmac(fields,secret);
@@ -20,6 +21,7 @@ test('provenance HMACs round-trip over a canonical sorted serialization and reje
   assert.equal(verifyPlanProvenanceHmac({...fields,action:'CLOSE'},secret,hmac),false,'a changed action breaks the stamp');
   assert.equal(verifyPlanProvenanceHmac({...fields,ownerAddress:'OTHER'},secret,hmac),false,'a changed owner breaks the stamp');
   assert.equal(verifyPlanProvenanceHmac({...fields,positionAddress:'POS'},secret,hmac),false,'a changed position breaks the stamp');
+  assert.equal(verifyPlanProvenanceHmac({...fields,phase7Control:{...phase7Control,decisionId:'forged-control'}},secret,hmac),false,'a changed P7 binding breaks the stamp');
   assert.equal(verifyPlanProvenanceHmac({...fields,expiresAt:'2026-08-13T00:06:00.000Z'},secret,hmac),false,'a changed expiry breaks the stamp');
   assert.equal(verifyPlanProvenanceHmac(fields,'wrong-secret',hmac),false,'a different secret breaks the stamp');
   assert.equal(verifyPlanProvenanceHmac(fields,secret,'deadbeef'),false,'non-hex input fails closed');
@@ -53,6 +55,8 @@ test('the claim guard verifies the stamp fail-closed once the secret is configur
   assert.ok(validateClaimedPlan({plan,policy,ownedPositions:[],phase7Control:control,provenanceSecret:secret,now}).reasonCodes.includes('P6_CLAIM_PROVENANCE_HMAC_MISSING'),'a missing stamp fails closed');
   const forged={...stamped,planPayload:{...stamped.planPayload,intent:{capitalLamports:'19999999'}}};
   assert.ok(validateClaimedPlan({plan:forged,policy,ownedPositions:[],phase7Control:control,provenanceSecret:secret,now}).reasonCodes.includes('P6_CLAIM_PROVENANCE_HMAC_INVALID'),'a stamp over different fields fails closed');
+  const forgedControl={...stamped,planPayload:{...stamped.planPayload,provenance:{...stamped.planPayload.provenance,phase7Control:{...phase7Control,decisionId:'forged-control'}}}};
+  assert.ok(validateClaimedPlan({plan:forgedControl,policy,ownedPositions:[],phase7Control:control,provenanceSecret:secret,now}).reasonCodes.includes('P6_CLAIM_PROVENANCE_HMAC_INVALID'),'P7-control provenance is authenticated too');
 });
 
 test('the executor forwards the configured provenance secret into the claim guard',()=>{

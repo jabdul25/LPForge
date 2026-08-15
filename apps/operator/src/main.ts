@@ -199,6 +199,7 @@ async function persistTransactionPlan(
                   positionAddress: plan.intent.positionAddress ?? null,
                   expiresAt: plan.expiresAt,
                   immutablePlan,
+                  phase7Control: phase7Control ?? null,
                 },
                 provenanceSecret,
               ),
@@ -249,7 +250,8 @@ async function observeAndPlanOwnedPositions(input: {
   ownerAddress?: string | undefined;
   observedAt: string;
   currentResult?: OperationalCycleResult;
-  allowEconomicPlans: boolean;
+  allowRiskIncreasingPlans: boolean;
+  allowProtectiveManagementPlans: boolean;
 }) {
   if (!input.ownerAddress) return { observed: 0, planned: 0 };
   const policy = loadLivePositionManagementPolicy(
@@ -350,9 +352,14 @@ async function observeAndPlanOwnedPositions(input: {
       staleData: false,
       payload: { source: "LPFORGE_PRODUCTION_OWNED_POSITION_MONITOR" },
     });
+    const riskIncreasing = ["ADD", "RESHAPE", "REBALANCE"].includes(
+      decision.action,
+    );
     if (
-      !input.allowEconomicPlans ||
       decision.action === "HOLD" ||
+      (riskIncreasing
+        ? !input.allowRiskIncreasingPlans
+        : !input.allowProtectiveManagementPlans) ||
       (await input.store.hasActiveAutonomousPlan(position.positionAddress))
     )
       continue;
@@ -369,9 +376,11 @@ async function observeAndPlanOwnedPositions(input: {
       thesisId: position.thesisId,
       observedAt: input.observedAt,
       expiresAt,
+      // Position-management costs are assessed against the current remaining
+      // capital basis. CLOSE and CLAIM must never fall back to one lamport.
+      capitalLamports: position.initialCapitalLamports,
       ...(replacement
         ? {
-            capitalLamports: position.initialCapitalLamports,
             lowerBinId: replacement.lowerBinId,
             upperBinId: replacement.upperBinId,
             strategy: position.strategy,
@@ -381,7 +390,6 @@ async function observeAndPlanOwnedPositions(input: {
         : {}),
       ...(decision.action === "REDUCE"
         ? {
-            capitalLamports: position.initialCapitalLamports,
             reductionBps: Math.max(
               1,
               Math.min(9999, Math.round(exitDecision.reduceFraction * 10000)),
@@ -527,10 +535,15 @@ async function liveOnce() {
     const planDispatchEnabled =
       (process.env.LPFORGE_P7_PLAN_DISPATCH_ENABLED ?? "false").toLowerCase() === "true";
     const control = await store.loadLatestPhase7ControlDecision(runtimeId);
-    const allowEconomicPlans =
+    const allowRiskIncreasingPlans =
       planDispatchEnabled &&
       control?.authority_mode !== "OBSERVE_ONLY" &&
       Boolean(control?.new_economic_action_allowed);
+    // P7's new-economic-action switch governs new/increased exposure.  A
+    // normal or emergency protective exit must still be able to enter the
+    // existing execution/recovery workflow when production authority exists.
+    const allowProtectiveManagementPlans =
+      planDispatchEnabled && control?.authority_mode !== "OBSERVE_ONLY";
     let eventDecodeWarnings = 0;
     const adapter = createMeteoraReadAdapter({
       rpcUrl: cfg.solanaRpcHttpUrl,
@@ -685,7 +698,7 @@ async function liveOnce() {
       protocolCompatible: true,
       walletCapital,
       ...productionCapital,
-      planPreparationEnabled: allowEconomicPlans && openPlanCapacity.approved,
+      planPreparationEnabled: allowRiskIncreasingPlans && openPlanCapacity.approved,
       ...(!openPlanCapacity.approved
         ? { planPreparationBlockReasonCodes: openPlanCapacity.reasonCodes }
         : {}),
@@ -702,7 +715,7 @@ async function liveOnce() {
           }
         : {}),
     });
-    await persistResult(store, result, allowEconomicPlans);
+    await persistResult(store, result, allowRiskIncreasingPlans);
     const management = await observeAndPlanOwnedPositions({
       store,
       adapter,
@@ -710,7 +723,8 @@ async function liveOnce() {
       ownerAddress: process.env.LPFORGE_OPERATOR_OWNER_ADDRESS,
       observedAt: decisionAt,
       currentResult: result,
-      allowEconomicPlans,
+      allowRiskIncreasingPlans,
+      allowProtectiveManagementPlans,
     });
     await store.upsertRuntimeHeartbeat({
       runtimeId: "lpforge-live-shadow",
@@ -723,7 +737,8 @@ async function liveOnce() {
         phase3Status: result.phase3Status,
         phase4Status: result.phase4Status,
         phase5Status: result.phase5Status,
-        economicPlanDispatchAllowed: allowEconomicPlans,
+        economicPlanDispatchAllowed: allowRiskIncreasingPlans,
+        protectiveManagementPlanDispatchAllowed: allowProtectiveManagementPlans,
         openPlanCapacity: {
           approved: openPlanCapacity.approved,
           availableWalletLamports: openPlanCapacity.availableWalletLamports?.toString(),

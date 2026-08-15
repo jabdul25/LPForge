@@ -963,6 +963,9 @@ async function executeJupiterUnwindStep(input: {
   signer: MainnetSignerBackend;
   config: LiveWorkerConfig;
   amount: bigint;
+  /** SOL-denominated current position basis; never raw token-X units. */
+  economicReferenceLamports: bigint;
+  action: "CLOSE" | "EMERGENCY_CLOSE";
   transactionId: string;
   idempotencyKey: string;
   stage: "PARTIAL_ENTRY_UNWIND" | "CLOSE_TOKEN_X_UNWIND";
@@ -1052,13 +1055,13 @@ async function executeJupiterUnwindStep(input: {
       computeUnitLimit: simulation.recommendedComputeUnitLimit ?? 0,
       computeUnitPriceMicroLamports: 0n,
     }),
-    cost = assessExecutionCost(fee, input.amount, {
+    cost = assessExecutionCost(fee, input.economicReferenceLamports, {
       maxAbsoluteFeeLamports: input.config.maxFeeLamports,
       maxFeeFractionOfCapital: input.config.maxFeeFraction,
     }),
     risk = governExecutionRisk(
       {
-        action: "CLOSE",
+        action: input.action,
         planId: input.transactionId,
         now: simulatedAt,
         thesisExpiresAt: input.plan.expiresAt,
@@ -1082,7 +1085,7 @@ async function executeJupiterUnwindStep(input: {
         maxReferenceDivergenceBps: 100,
         maxActiveBinDriftBins: 100000,
         approvalTtlMs: input.config.riskPermitTtlMs,
-        allowEmergencyCostOverride: false,
+        allowEmergencyCostOverride: input.action === "EMERGENCY_CLOSE",
       },
     );
   if (risk.decision !== "APPROVE" || !risk.permitId || !risk.expiresAt)
@@ -1099,10 +1102,10 @@ async function executeJupiterUnwindStep(input: {
   const signedAt = new Date().toISOString(),
     closeTicket = ticket(
       input.plan,
-      0n,
+      input.economicReferenceLamports,
       signedAt,
       input.config.riskPermitTtlMs,
-      "CLOSE",
+      input.action,
     ),
     closeAuthority = {
       phase: "P6" as const,
@@ -1188,6 +1191,8 @@ async function unwindPartialEntry(input: {
     signer: input.signer,
     config: input.config,
     amount,
+    economicReferenceLamports: BigInt(String(input.row.intended_capital_lamports)),
+    action: "CLOSE",
     transactionId,
     idempotencyKey: `${input.plan.idempotencyKey}:unwind`,
     stage: "PARTIAL_ENTRY_UNWIND",
@@ -1616,6 +1621,8 @@ async function executeMeteoraMutation(input: {
   built: BuiltMeteoraTransaction;
   action: Exclude<AutonomousPlanAction, "OPEN" | "RESHAPE" | "REBALANCE">;
   deferCompletion?: boolean;
+  /** Persist the parent settlement's sent state before waiting for chain truth. */
+  afterSubmit?: (submitted: { signature: string }) => Promise<void>;
 }): Promise<LiveWorkerResult> {
   const transaction = legacyBuilt(input.built),
     connection = new Connection(input.config.rpcUrl, "confirmed"),
@@ -1680,7 +1687,11 @@ async function executeMeteoraMutation(input: {
         computeUnitLimit: simulation.recommendedComputeUnitLimit ?? 0,
         computeUnitPriceMicroLamports: 0n,
       }),
-      cost = assessExecutionCost(fee, capital > 0n ? capital : 1n, {
+      // A one-lamport fallback makes ordinary CLOSE/CLAIM mathematically
+      // impossible. Every mutation plan carries the remaining position basis;
+      // legacy rows without one fail closed before signing rather than using a
+      // fabricated denominator.
+      cost = assessExecutionCost(fee, capital, {
         maxAbsoluteFeeLamports: input.config.maxFeeLamports,
         maxFeeFractionOfCapital: input.config.maxFeeFraction,
       }),
@@ -1802,6 +1813,7 @@ async function executeMeteoraMutation(input: {
       at: new Date().toISOString(),
       payload: { signature: submitted.signature, transactionId },
     });
+    if (input.afterSubmit) await input.afterSubmit({ signature: submitted.signature });
     if (
       !(await awaitConfirmation({
         connection,
@@ -2151,6 +2163,12 @@ type CloseSettlementStage =
   | "CLOSE_INVENTORY_MEASURED"
   | "CLOSE_INVENTORY_UNWOUND";
 
+type CloseSettlementPendingStage =
+  | "CLOSE_REMOVE_SUBMITTED"
+  | "CLOSE_CLAIM_SUBMITTED"
+  | "CLOSE_UNWIND_SUBMITTED"
+  | "CLOSE_POSITION_SUBMITTED";
+
 function closeSettlementDispatch(plan: AutonomousPlan): Record<string, unknown> {
   const value = plan.planPayload && plan.planPayload.autonomous_dispatch;
   return value && typeof value === "object"
@@ -2181,6 +2199,18 @@ function closeSettlementAmount(value: unknown): bigint | undefined {
   } catch {
     return undefined;
   }
+}
+
+function closeSettlementPending(plan: AutonomousPlan): {
+  stage: CloseSettlementPendingStage;
+  signature: string;
+} | undefined {
+  const dispatch = closeSettlementDispatch(plan), stage = dispatch.pendingStage,
+    signature = dispatch.pendingSignature;
+  return typeof stage === "string" && typeof signature === "string" &&
+    ["CLOSE_REMOVE_SUBMITTED", "CLOSE_CLAIM_SUBMITTED", "CLOSE_UNWIND_SUBMITTED", "CLOSE_POSITION_SUBMITTED"].includes(stage)
+    ? { stage: stage as CloseSettlementPendingStage, signature }
+    : undefined;
 }
 
 export function shouldResumeCloseSettlement(value: {
@@ -2242,8 +2272,30 @@ async function executeCloseSettlement(input: {
         planId: input.plan.planId,
         state,
         at: new Date().toISOString(),
-        payload: { stage, tokenXMint: poolFact.tokenXMint, ...payload },
+        // Completed stage transitions clear any previous child submission
+        // marker. A callback that records a new pending child overrides these
+        // nulls in the same durable document.
+        payload: { stage, tokenXMint: poolFact.tokenXMint, pendingStage: null, pendingSignature: null, ...payload },
       });
+
+  // A CLOSE has parent-level chain truth. Once a child stage has been sent,
+  // a later child preflight error is reconciliation debt, never a clean
+  // BLOCKED/FAILED result for the parent.
+  const incomplete = async (reasonCodes: string[], stage: string) => {
+    await input.store.transitionAutonomousPlan({
+      planId: input.plan.planId,
+      state: "RECONCILIATION_REQUIRED",
+      at: new Date().toISOString(),
+      reasonCodes: ["P6_CLOSE_SETTLEMENT_RECONCILIATION_REQUIRED", ...reasonCodes],
+      payload: { stage, closeSettlementIncomplete: true },
+    });
+    return {
+      status: "UNKNOWN" as const,
+      planId: input.plan.planId,
+      reasonCodes: ["P6_CLOSE_SETTLEMENT_RECONCILIATION_REQUIRED", ...reasonCodes],
+      transactionSubmitted: true,
+    };
+  };
 
   let dispatch = closeSettlementDispatch(input.plan),
     stage = closeSettlementStage(input.plan),
@@ -2302,7 +2354,14 @@ async function executeCloseSettlement(input: {
       built: built[0]!,
       action: closeAction,
       deferCompletion: true,
+      afterSubmit: async ({ signature }) => persist("CLOSE_INVENTORY_SNAPSHOTTED", {
+        tokenXBefore: tokenXBefore!.toString(),
+        pendingStage: "CLOSE_REMOVE_SUBMITTED",
+        pendingSignature: signature,
+      }),
     });
+    // No preceding child exists yet. A pre-send REMOVE rejection is a normal
+    // block; only later phases must carry parent-level submitted truth.
     if (removed.status !== "RECONCILED") return removed;
     await persist("CLOSE_LIQUIDITY_REMOVED", {
       tokenXBefore: tokenXBefore.toString(),
@@ -2346,8 +2405,13 @@ async function executeCloseSettlement(input: {
         built: claimBuilt[0]!,
         action: closeAction,
         deferCompletion: true,
+        afterSubmit: async ({ signature }) => persist("CLOSE_LIQUIDITY_REMOVED", {
+          tokenXBefore: tokenXBefore!.toString(),
+          pendingStage: "CLOSE_CLAIM_SUBMITTED",
+          pendingSignature: signature,
+        }),
       });
-      if (claimed.status !== "RECONCILED") return claimed;
+      if (claimed.status !== "RECONCILED") return incomplete(claimed.reasonCodes, "CLOSE_CLAIM_PENDING");
     }
     await persist("CLOSE_CLAIMS_SETTLED", {
       tokenXBefore: tokenXBefore.toString(),
@@ -2411,18 +2475,20 @@ async function executeCloseSettlement(input: {
         signer: input.signer,
         config: input.config,
         amount: attributableTokenX,
+        economicReferenceLamports: mutationCapital(input.plan),
+        action: closeAction,
         transactionId: unwindStep.transactionId,
         idempotencyKey: `${input.plan.idempotencyKey}:${unwindStep.transactionId}`,
         stage: "CLOSE_TOKEN_X_UNWIND",
         reasonPrefix: "P6_CLOSE_UNWIND",
+        afterSubmit: async ({ signature }) => persist("CLOSE_INVENTORY_MEASURED", {
+          tokenXBefore: tokenXBefore!.toString(),
+          attributableTokenX: attributableTokenX!.toString(),
+          pendingStage: "CLOSE_UNWIND_SUBMITTED",
+          pendingSignature: signature,
+        }),
       });
-      if (!unwind.ok)
-        return {
-          status: unwind.submitted ? "SUBMITTED" : "BLOCKED",
-          planId: input.plan.planId,
-          reasonCodes: unwind.reasonCodes,
-          transactionSubmitted: unwind.submitted,
-        };
+      if (!unwind.ok) return incomplete(unwind.reasonCodes, "CLOSE_UNWIND_PENDING");
     }
     await persist("CLOSE_INVENTORY_UNWOUND", {
       tokenXBefore: tokenXBefore.toString(),
@@ -2463,11 +2529,18 @@ async function executeCloseSettlement(input: {
     positionAddress: input.positionAddress,
   });
   closedBuilt.metadata.transactionId = closeStep.transactionId;
-  return executeMeteoraMutation({
+  const closed = await executeMeteoraMutation({
     ...input,
     built: closedBuilt,
     action: closeAction,
+    afterSubmit: async ({ signature }) => persist("CLOSE_INVENTORY_UNWOUND", {
+      tokenXBefore: tokenXBefore!.toString(),
+      attributableTokenX: attributableTokenX?.toString() ?? "0",
+      pendingStage: "CLOSE_POSITION_SUBMITTED",
+      pendingSignature: signature,
+    }),
   });
+  return closed.status === "RECONCILED" ? closed : incomplete(closed.reasonCodes, "CLOSE_POSITION_PENDING");
 }
 
 /** Generic plan entrypoint. Every mutation is claimed through the same durable queue. */
@@ -2678,6 +2751,12 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       updatedAt: new Date(String(raw.updated_at)).toISOString(),
       payload: (raw.payload ?? {}) as Record<string, unknown>,
     };
+    // Jupiter unwind is a separate durable transaction step. Its parent-close
+    // marker is written before confirmation, so recovery must query that exact
+    // child signature rather than whichever earlier mutation last updated the
+    // plan journal.
+    const pendingSignature = closeSettlementPending(plan)?.signature;
+    const recoverySignature = pendingSignature ?? journal.signature;
     let confirmationStatus:
       | "PROCESSED"
       | "CONFIRMED"
@@ -2686,16 +2765,16 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       | "FAILED"
       | "UNKNOWN" = "UNKNOWN";
     let signatureStatusReadUnknown = false;
-    if (journal.signature && (connection || input.signatureStatusProvider)) {
+    if (recoverySignature && (connection || input.signatureStatusProvider)) {
       let status:
         | { err: unknown; confirmationStatus?: string | null }
         | null
         | undefined;
       try {
         status = input.signatureStatusProvider
-          ? await input.signatureStatusProvider(journal.signature)
+          ? await input.signatureStatusProvider(recoverySignature)
           : (
-              await connection!.getSignatureStatus(journal.signature, {
+              await connection!.getSignatureStatus(recoverySignature, {
                 searchTransactionHistory: true,
               })
             ).value;
@@ -2755,7 +2834,55 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     // A persisted settlement stage is written only after its preceding
     // transaction confirmed.  If the PositionV2 is still present, the next
     // close stage is safe to resume; no already-submitted stage is resent.
-    const closeStage = closeSettlementStage(plan);
+    const closeStage = closeSettlementStage(plan), closePending = closeSettlementPending(plan);
+    // A child submission is persisted before confirmation.  Its parent stage
+    // is deliberately not advanced until chain truth confirms it.  This is
+    // what makes a crash between REMOVE/CLAIM/UNWIND stages restartable
+    // without resending any already-issued child transaction.
+    if (closePending) {
+      const settled = confirmationStatus === "CONFIRMED" || confirmationStatus === "FINALIZED";
+      if (!settled) {
+        await input.store.transitionAutonomousPlan({
+          planId: plan.planId,
+          state: "RECONCILIATION_REQUIRED",
+          at: input.now,
+          reasonCodes: ["P6_CLOSE_PENDING_STAGE_RECONCILIATION_REQUIRED", closePending.stage],
+          payload: { pendingStage: closePending.stage, pendingSignature: closePending.signature },
+        });
+        results.push({ planId: plan.planId, action: "HOLD_FOR_OPERATOR", reasonCodes: ["P6_CLOSE_PENDING_STAGE_RECONCILIATION_REQUIRED", closePending.stage] });
+        continue;
+      }
+      const completedStage: Record<CloseSettlementPendingStage, CloseSettlementStage | undefined> = {
+        CLOSE_REMOVE_SUBMITTED: "CLOSE_LIQUIDITY_REMOVED",
+        CLOSE_CLAIM_SUBMITTED: "CLOSE_CLAIMS_SETTLED",
+        CLOSE_UNWIND_SUBMITTED: "CLOSE_INVENTORY_UNWOUND",
+        CLOSE_POSITION_SUBMITTED: undefined,
+      };
+      const next = completedStage[closePending.stage];
+      if (next) {
+        await input.store.transitionAutonomousPlan({
+          planId: plan.planId,
+          state: "RECONCILING",
+          at: input.now,
+          reasonCodes: ["P6_CLOSE_PENDING_STAGE_CONFIRMED", closePending.stage],
+          payload: { stage: next, pendingStage: null, pendingSignature: null },
+        });
+        results.push({ planId: plan.planId, action: "RESUME_CLOSE_SETTLEMENT", reasonCodes: ["P6_CLOSE_PENDING_STAGE_CONFIRMED", next] });
+        continue;
+      }
+      // The final account-close transaction is only economically complete
+      // when account absence is proven; confirmed signature alone is not
+      // enough to turn an RPC/decode failure into a closed position.
+      if (positionTruth.exists === false && recoveryPositionAddress) {
+        await input.store.markOwnedPositionLifecycle({ positionAddress: recoveryPositionAddress, lifecycleState: "CLOSED", reconciliationStatus: "MATCH", lastPlanId: plan.planId, at: input.now, payload: { stage: "CLOSE_CHAIN_VERIFIED", signature: closePending.signature } });
+        await input.store.completeAutonomousPlan({ planId: plan.planId, state: "COMPLETED", at: input.now, payload: { action: plan.action, signature: closePending.signature, recovery: "CLOSE_POSITION_CONFIRMED" } });
+        results.push({ planId: plan.planId, action: "MARK_RECONCILED", reasonCodes: ["P6_CLOSE_POSITION_RECOVERED"] });
+      } else {
+        await input.store.transitionAutonomousPlan({ planId: plan.planId, state: "RECONCILIATION_REQUIRED", at: input.now, reasonCodes: ["P6_CLOSE_POSITION_ABSENCE_UNPROVEN"], payload: { pendingStage: closePending.stage, pendingSignature: closePending.signature } });
+        results.push({ planId: plan.planId, action: "HOLD_FOR_OPERATOR", reasonCodes: ["P6_CLOSE_POSITION_ABSENCE_UNPROVEN"] });
+      }
+      continue;
+    }
     if (shouldResumeCloseSettlement({
       action: plan.action,
       stage: closeStage,

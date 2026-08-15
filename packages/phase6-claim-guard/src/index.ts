@@ -93,6 +93,10 @@ export function validateClaimedPlan(input: {
           positionAddress: p.positionAddress ?? null,
           expiresAt: p.expiresAt,
           immutablePlan:immutablePlanMaterial(p),
+          // The exact P7 decision is part of the authenticated immutable
+          // instruction. A database edit cannot retarget a valid economic
+          // plan to a different control decision without invalidating HMAC.
+          phase7Control:record(provenance.phase7Control),
         },
         input.provenanceSecret,
         hmac,
