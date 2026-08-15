@@ -89,6 +89,7 @@ function assertLaunchable() {
     throw new Error(current.signerError ?? "LPFORGE_P6_SIGNER_NOT_READY");
   if (!current.databaseConfigured)
     throw new Error("LPFORGE_P6_AUTONOMOUS_DATABASE_URL_REQUIRED");
+  if(yes(process.env.LPFORGE_LIVE_EXECUTION)&&!(process.env.LPFORGE_PLAN_PROVENANCE_SECRET??'').trim())throw new Error('LPFORGE_P6_PLAN_PROVENANCE_SECRET_REQUIRED');
   return current;
 }
 function workerConfig() {
@@ -154,7 +155,9 @@ async function dispatchOne() {
       };
     const now=new Date().toISOString(), dayStart=new Date(Date.UTC(new Date(now).getUTCFullYear(),new Date(now).getUTCMonth(),new Date(now).getUTCDate())).toISOString();
     const [controlRow,actionsToday]=await Promise.all([store.loadLatestPhase7ControlDecision((process.env.LPFORGE_P7_RUNTIME_ID??'lpforge-production').trim()),store.countExecutionActionsSince(plan.ownerAddress,dayStart)]);
-    const phase7Control=controlRow?{authorityMode:String(controlRow.authority_mode),healthStatus:String(controlRow.health_status),driftStatus:String(controlRow.drift_status),safetyMode:String(controlRow.safety_mode),newEconomicActionAllowed:Boolean(controlRow.new_economic_action_allowed),observedAt:new Date(String(controlRow.observed_at)).toISOString()}:undefined;
+    const controlPayload=controlRow&&typeof controlRow.payload==='object'&&controlRow.payload!==null?controlRow.payload as Record<string,unknown>:{};
+    const rawPoolDrift=Array.isArray(controlPayload.poolDrift)?controlPayload.poolDrift:[];
+    const phase7Control=controlRow?{decisionId:String(controlRow.decision_id),cycleKey:String(controlRow.cycle_key),authorityMode:String(controlRow.authority_mode),healthStatus:String(controlRow.health_status),driftStatus:String(controlRow.drift_status),safetyMode:String(controlRow.safety_mode),newEconomicActionAllowed:Boolean(controlRow.new_economic_action_allowed),observedAt:new Date(String(controlRow.observed_at)).toISOString(),poolDrift:Object.fromEntries(rawPoolDrift.filter(row=>row&&typeof row==='object').map(row=>{const value=row as Record<string,unknown>;return[String(value.poolAddress??''),String(value.rawStatus??value.status??'')]}).filter(([pool])=>Boolean(pool)))}:undefined;
     const provenanceSecret=(process.env.LPFORGE_PLAN_PROVENANCE_SECRET??'').trim();
     let positionTruth;
     if (plan.positionAddress) {
@@ -258,15 +261,13 @@ async function recoverOnce() {
       rpcUrl: config.rpcUrl,
       programId: config.programId,
     });
+    const policyPools=loadDeploymentPolicyFile(process.env.LPFORGE_EXECUTION_POLICY_PATH?.trim()||"policies/live-execution-policy.json").pools.map(pool=>pool.address),[candidates,unresolved]=await Promise.all([store.listDiscoveryCandidates(['A']),store.loadUnresolvedAutonomousPlans()]),recoveryPools=[...new Set([...policyPools,...candidates.map(candidate=>candidate.poolAddress),...unresolved.map(plan=>plan.poolAddress)])];
     const orphans = await reconcileOrphanedPositions({
       store,
       rpcUrl: config.rpcUrl,
       programId: config.programId,
       ownerAddress: process.env.LPFORGE_OPERATOR_OWNER_ADDRESS ?? "",
-      poolAddresses: loadDeploymentPolicyFile(
-        process.env.LPFORGE_EXECUTION_POLICY_PATH?.trim() ||
-          "policies/live-execution-policy.json",
-      ).pools.map((pool) => pool.address),
+      poolAddresses: recoveryPools,
     });
     return { partial, plans, orphans };
   } finally {

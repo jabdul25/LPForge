@@ -10,7 +10,7 @@ const claimGuard='packages/phase6-claim-guard/src/index.ts';
 const execution='apps/execution/src/main.ts';
 
 const secret='lpforge-test-provenance-secret';
-const fields={producer:'LPFORGE_PRODUCTION',schemaVersion:1,intentId:'i',poolAddress:'POOL',observedAt:'2026-08-13T00:00:00.000Z',action:'OPEN',ownerAddress:'OWNER',positionAddress:null,expiresAt:'2026-08-13T00:05:00.000Z'};
+const fields={producer:'LPFORGE_PRODUCTION',schemaVersion:1,intentId:'i',poolAddress:'POOL',observedAt:'2026-08-13T00:04:45.000Z',action:'OPEN',ownerAddress:'OWNER',positionAddress:null,expiresAt:'2026-08-13T00:09:45.000Z',immutablePlan:{intentPayload:{},planIntent:{capitalLamports:'20000000'},steps:[]}};
 
 test('provenance HMACs round-trip over a canonical sorted serialization and reject any tampering',()=>{
   const hmac=computePlanProvenanceHmac(fields,secret);
@@ -27,7 +27,7 @@ test('provenance HMACs round-trip over a canonical sorted serialization and reje
   assert.match(src,/sort\(\(\[a\],\[b\]\)=>a\.localeCompare\(b\)\)/,'keys serialize in sorted order so the canonical form is stable');
 });
 
-test('the operator stamps the hmac only when the provenance secret is configured',()=>{
+test('the operator stamps the complete immutable plan when the provenance secret is configured',()=>{
   const src=fs.readFileSync(operator,'utf8');
   assert.ok(src.includes("const provenanceSecret=(process.env.LPFORGE_PLAN_PROVENANCE_SECRET??'').trim();"),'the operator reads the shared secret from the environment');
   assert.ok(src.includes('hmac: computePlanProvenanceHmac('),'the provenance carries the stamp');
@@ -35,6 +35,7 @@ test('the operator stamps the hmac only when the provenance secret is configured
   assert.ok(src.includes('action: plan.intent.action'),'the stamp covers the plan action');
   assert.ok(src.includes('positionAddress: plan.intent.positionAddress ?? null'),'the stamp covers the optional position address');
   assert.ok(src.includes('expiresAt: plan.expiresAt'),'the stamp covers plan expiry');
+  assert.ok(src.includes('immutablePlan'),'the stamp covers immutable plan economics and transaction instructions');
 });
 
 test('the claim guard verifies the stamp fail-closed once the secret is configured and stays backward compatible without it',()=>{
@@ -43,13 +44,14 @@ test('the claim guard verifies the stamp fail-closed once the secret is configur
   assert.ok(src.includes('input.provenanceSecret'),'verification only runs when the secret is provided');
   assert.ok(src.includes('positionAddress: p.positionAddress ?? null'),'the guard recomputes over the row it is about to authorize');
   const policy={schemaVersion:1,policyId:'p',status:'ENABLED',approvalTtlMs:15000,minDevnetConfirmedRuns:1,maxActionsPerDay:2,maxOpenPositions:2,pools:[{address:'POOL',maxCapitalLamports:20_000_000n,maxOpenPositions:1}]};
-  const plan={planId:'p',intentId:'i',idempotencyKey:'k',action:'OPEN',poolAddress:'POOL',ownerAddress:'OWNER',thesisId:'t',observedAt:fields.observedAt,expiresAt:fields.expiresAt,intentPayload:{},planPayload:{provenance:{producer:'LPFORGE_PRODUCTION',schemaVersion:1,intentId:'i',poolAddress:'POOL',observedAt:fields.observedAt},intent:{capitalLamports:'20000000'}},steps:[]};
-  const now='2026-08-13T00:05:00.000Z',control={authorityMode:'PRODUCTION',healthStatus:'HEALTHY',driftStatus:'WATCH',safetyMode:'NORMAL',newEconomicActionAllowed:true,observedAt:'2026-08-13T00:04:30.000Z'};
+  const control={decisionId:'control-1',cycleKey:'cycle-1',authorityMode:'PRODUCTION',healthStatus:'HEALTHY',driftStatus:'WATCH',safetyMode:'NORMAL',newEconomicActionAllowed:true,observedAt:'2026-08-13T00:04:30.000Z'};
+  const plan={planId:'p',intentId:'i',idempotencyKey:'k',action:'OPEN',poolAddress:'POOL',ownerAddress:'OWNER',thesisId:'t',observedAt:fields.observedAt,expiresAt:fields.expiresAt,intentPayload:{},planPayload:{provenance:{producer:'LPFORGE_PRODUCTION',schemaVersion:1,intentId:'i',poolAddress:'POOL',observedAt:fields.observedAt,phase7Control:{decisionId:'control-1',cycleKey:'cycle-1',observedAt:control.observedAt}},intent:{capitalLamports:'20000000'}},steps:[]};
+  const now='2026-08-13T00:05:00.000Z';
   assert.equal(validateClaimedPlan({plan,policy,ownedPositions:[],phase7Control:control,now}).approved,true,'without the secret the guard keeps prior behavior');
   const stamped={...plan,planPayload:{...plan.planPayload,provenance:{...plan.planPayload.provenance,hmac:computePlanProvenanceHmac(fields,secret)}}};
   assert.equal(validateClaimedPlan({plan:stamped,policy,ownedPositions:[],phase7Control:control,provenanceSecret:secret,now}).approved,true,'a valid stamp passes');
   assert.ok(validateClaimedPlan({plan,policy,ownedPositions:[],phase7Control:control,provenanceSecret:secret,now}).reasonCodes.includes('P6_CLAIM_PROVENANCE_HMAC_MISSING'),'a missing stamp fails closed');
-  const forged={...stamped,action:'ADD'};
+  const forged={...stamped,planPayload:{...stamped.planPayload,intent:{capitalLamports:'19999999'}}};
   assert.ok(validateClaimedPlan({plan:forged,policy,ownedPositions:[],phase7Control:control,provenanceSecret:secret,now}).reasonCodes.includes('P6_CLAIM_PROVENANCE_HMAC_INVALID'),'a stamp over different fields fails closed');
 });
 

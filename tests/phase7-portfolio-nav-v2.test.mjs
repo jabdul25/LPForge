@@ -51,12 +51,15 @@ test('wallet token balances join the NAV through the same pool price feed',()=>{
   assert.match(src,/if\(!mint\|\|!amount\|\|typeof decimals!=='number'\)continue;/,'unknown or unparsable rows are skipped, not guessed');
 });
 
-test('rent locked in open position accounts is book-value equity and policy precedes valuation',()=>{
+test('rent locked in open position accounts is exact recoverable book-value equity and policy precedes valuation',()=>{
   const src=fs.readFileSync(production,'utf8');
   const policyAt=src.indexOf("const policy=loadDeploymentPolicyFile(input.env.LPFORGE_EXECUTION_POLICY_PATH?.trim()||'policies/live-execution-policy.json'),capital=policy.productionCapital;");
-  const rentAt=src.indexOf('const rentReserveLamports=BigInt(facts.openPositions)*(policy.positionConstruction?.maxPositionAccountRentLamports??0n);');
+  const accountAt=src.indexOf('connection.getAccountInfo(new PublicKey(positionAddress)');
+  const rentAt=src.indexOf('const rentReserveLamports=valuations.reduce((sum,value)=>sum+value.recoverableRentLamports,0n);');
   const currentAt=src.indexOf('current=BigInt(wallet)+positionValueLamports+walletTokenValueLamports+rentReserveLamports');
   assert.ok(policyAt>=0&&rentAt>policyAt,'the policy is loaded before the equity computation');
+  assert.ok(accountAt>=0&&accountAt<rentAt,'actual PositionV2 account lamports are read before valuation');
   assert.ok(rentAt<currentAt,'rent reserve joins current equity');
+  assert.match(src,/recoverableRentLamports:BigInt\(account\?\.lamports\?\?0\)/,'NAV uses exact recoverable account lamports, not a policy maximum');
   assert.match(src,/rentReserveLamports:rentReserveLamports\.toString\(\)/,'rent reserve is persisted with the risk state');
 });

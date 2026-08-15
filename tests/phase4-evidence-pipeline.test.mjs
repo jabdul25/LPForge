@@ -1,12 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {assessHistoryMaturity,deriveEventPathEconomicEstimate,collectActiveCandidateEvidence} from '../.build/packages/active-candidate-evidence/src/index.js';
+import {assessHistoryMaturity,deriveEventPathEconomicEstimate,collectActiveCandidateEvidence,selectActiveCandidateCollectionSlice} from '../.build/packages/active-candidate-evidence/src/index.js';
 import {estimateOpportunityEconomics} from '../.build/packages/opportunity/src/index.js';
 import {evaluateEntry,ENTRY_RESEARCH_POLICY_V1} from '../.build/packages/entry-intelligence/src/index.js';
 
 const at='2026-08-13T16:00:00.000Z',atMs=Date.parse(at);
 const history=(count=61,strideMs=60_000)=>{const market=Array.from({length:count},(_,i)=>({observedAt:new Date(atMs-(count-1-i)*strideMs).toISOString(),price:1+i*.0001,activeBinId:10+(i%2),volume:100,feeValue:1,twoWayRatio:.7,localLiquidity:100000}));return{marketObservations:market,activeBins:market.map(x=>({observedAt:x.observedAt,activeBinId:x.activeBinId})),binFrames:market.map(x=>({observedAt:x.observedAt,activeBinId:x.activeBinId,bins:[]})),swapEvents:market.map((x,i)=>({pool:'P',signature:`s${i}`,eventIndex:0,stamp:{observedAt:x.observedAt}}))};};
 const feeBuckets=(count)=>Array.from({length:count},(_,i)=>({timestamp:Math.floor((atMs-(count-1-i)*5*60_000)/1000),fees:10,protocol_fees:1,volume:1000}));
+
+test('active candidate collector rotates bounded slices instead of repeatedly sweeping the first pools',()=>{
+ const pools=['A','B','C','D'].map(poolAddress=>({poolAddress})),interval=60_000;
+ const first=selectActiveCandidateCollectionSlice(pools,1,'2026-08-13T16:00:00.000Z',interval),second=selectActiveCandidateCollectionSlice(pools,1,'2026-08-13T16:01:00.000Z',interval),third=selectActiveCandidateCollectionSlice(pools,1,'2026-08-13T16:02:00.000Z',interval),fourth=selectActiveCandidateCollectionSlice(pools,1,'2026-08-13T16:03:00.000Z',interval);
+ assert.deepEqual(new Set([...first,...second,...third,...fourth].map(x=>x.poolAddress)),new Set(['A','B','C','D']));
+});
 
 test('Phase-4 history maturity uses existing .60 threshold and can mature naturally',async()=>{
  const cold=await assessHistoryMaturity({poolAddress:'P',assessedAt:at,history:history(8)}),warm=await assessHistoryMaturity({poolAddress:'P',assessedAt:at,history:history(61)});

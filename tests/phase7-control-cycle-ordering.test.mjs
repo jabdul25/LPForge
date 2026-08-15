@@ -30,13 +30,14 @@ test('drift reads lagged decoder telemetry from the prior evidence snapshot, fal
   assert.match(src,/const decoderSkipRate=Number\.isFinite\(telemetryWarnings\)&&Number\.isFinite\(telemetrySwaps\)\?telemetryWarnings\/Math\.max\(1,telemetryWarnings\+telemetrySwaps\):undefined;/,'skip rate is undefined, not assumed, when telemetry has never been observed');
 });
 
-test('drift folds every probed pool; only pools with capital or open positions can block',()=>{
+test('drift folds every probed pool while preserving raw candidate BLOCK for targeted claim admission',()=>{
   const src=fs.readFileSync(production,'utf8');
   assert.match(src,/const driftPoolAddresses=\[\.\.\.new Set\(\[input\.cfg\.smokePoolAddress,\.\.\.\(await productionEvaluationPoolAddresses\(input\.store,input\.env,input\.cycleKey\)\)\]\)\];/,'the drift set is the exact set the probe runs this cycle');
   assert.ok(src.includes('significant:poolAddress===input.cfg.smokePoolAddress||capitalPools.has(poolAddress)||openPools.has(poolAddress)'),'smoke pool, deployed capital and open positions are the significance criteria');
   assert.ok(src.includes("rank(p.status)>rank('WATCH')?'WATCH':p.status"),'idle pools are capped at WATCH');
   assert.ok(src.includes('`P7_LIVE_DRIFT_POOL_${p.status}`'),'non-stable pools surface a per-pool reason code');
   assert.ok(src.includes('poolDrift:cappedDrift.map('),'the persisted drift payload carries the per-pool fold');
+  assert.ok(src.includes('rawStatus:p.rawStatus'),'the uncapped per-pool status survives for the executor target-pool check');
   assert.ok(src.includes('probedPoolAddresses:driftPoolAddresses'),'the probed pool set is persisted with the drift payload');
   assert.ok(src.includes('if(!smokeLive)throw new Error(\'LPFORGE_P7_DRIFT_SMOKE_POOL_MISSING\');'),'the smoke pool assessment is mandatory');
 });
@@ -60,17 +61,12 @@ test('probe failure persists suffixed assessment ids so the DO NOTHING inserts s
   assert.ok(src.includes('`${input.runtimeId}:${input.cycleKey}:control:failure`'),'failure control id is suffixed');
 });
 
-test('the claim guard rejects a control decision that predates the plan it would authorize',()=>{
+test('the claim guard binds a plan to the P7 control that existed before its operator decision',()=>{
   const src=fs.readFileSync(claimGuard,'utf8');
-  assert.ok(src.includes("reasons.push('P6_CLAIM_P7_CONTROL_PREDATES_PLAN')"),'the predates check exists');
-  assert.ok(src.includes('60_000,p.observedAt'),'the plan observedAt is passed to the freshness validator');
+  assert.ok(!src.includes('P6_CLAIM_P7_CONTROL_PREDATES_PLAN'),'timestamp ordering is not used as a false binding rule');
+  assert.ok(src.includes('P6_CLAIM_P7_CONTROL_BINDING_MISSING'),'missing plan/control binding fails closed');
+  assert.ok(src.includes('P6_CLAIM_P7_POOL_DRIFT_BLOCK'),'target-pool raw BLOCK is independently enforced');
   const control={authorityMode:'PRODUCTION',healthStatus:'HEALTHY',driftStatus:'STABLE',safetyMode:'NORMAL',newEconomicActionAllowed:true,observedAt:'2026-08-13T00:04:30.000Z'};
   const now=control.observedAt;
-  // Control after the plan: the decision could have governed it.
-  assert.deepEqual(validateFreshPhase7ExecutionControl(control,now,60_000,'2026-08-13T00:04:00.000Z'),[]);
-  // Control before the plan: the decision cannot have governed it.
-  assert.deepEqual(validateFreshPhase7ExecutionControl(control,now,60_000,'2026-08-13T00:05:00.000Z'),['P6_CLAIM_P7_CONTROL_PREDATES_PLAN']);
-  // Same instant is acceptable, and omitting the plan time keeps prior behavior.
-  assert.deepEqual(validateFreshPhase7ExecutionControl(control,now,60_000,control.observedAt),[]);
-  assert.deepEqual(validateFreshPhase7ExecutionControl(control,now,60_000),[]);
+  assert.deepEqual(validateFreshPhase7ExecutionControl(control,now,60_000),[],'freshness evaluates the current P7 control only; identity binding is checked against plan provenance');
 });

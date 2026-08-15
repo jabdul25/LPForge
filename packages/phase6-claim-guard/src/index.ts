@@ -9,22 +9,22 @@ export interface ClaimGuardResult {
 }
 export interface ProductionAdmissionCandidate {poolAddress:string;state:string;tier:string;lastSeenAt:string;tokenYMint?:string|undefined;pairedTokenMint?:string|undefined;}
 const WSOL_MINT='So11111111111111111111111111111111111111112';
-export interface Phase7ExecutionControl {authorityMode:string;healthStatus:string;driftStatus:string;safetyMode:string;newEconomicActionAllowed:boolean;observedAt:string;}
-export function validateFreshPhase7ExecutionControl(control:Phase7ExecutionControl|undefined,now:string,maxAgeMs=60_000,planObservedAt?:string):string[]{
+export interface Phase7ExecutionControl {decisionId?:string;cycleKey?:string;authorityMode:string;healthStatus:string;driftStatus:string;safetyMode:string;newEconomicActionAllowed:boolean;observedAt:string;poolDrift?:Record<string,string>;}
+export function validateFreshPhase7ExecutionControl(control:Phase7ExecutionControl|undefined,now:string,maxAgeMs=60_000):string[]{
  if(!control)return ['P6_CLAIM_P7_CONTROL_MISSING'];
  const reasons:string[]=[];const age=Date.parse(now)-Date.parse(control.observedAt);
  if(control.authorityMode!=='PRODUCTION')reasons.push('P6_CLAIM_P7_AUTHORITY_NOT_PRODUCTION');if(control.healthStatus!=='HEALTHY')reasons.push('P6_CLAIM_P7_HEALTH_NOT_HEALTHY');if(control.driftStatus==='BLOCK')reasons.push('P6_CLAIM_P7_DRIFT_BLOCK');if(control.safetyMode!=='NORMAL')reasons.push('P6_CLAIM_P7_SAFETY_NOT_NORMAL');if(!control.newEconomicActionAllowed)reasons.push('P6_CLAIM_P7_NEW_ACTION_BLOCKED');
  if(!Number.isFinite(age)||age<0||age>maxAgeMs)reasons.push('P6_CLAIM_P7_CONTROL_STALE');
- // A control decision computed after the plan cannot have governed the
- // plan's creation. The executor may only approve plans under a decision
- // that postdates them; anything else fails closed.
- if(planObservedAt!==undefined){const lead=Date.parse(control.observedAt)-Date.parse(planObservedAt);if(!Number.isFinite(lead)||lead<0)reasons.push('P6_CLAIM_P7_CONTROL_PREDATES_PLAN');}
  return reasons.sort();
 }
 function record(value: unknown) {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {};
+}
+function immutablePlanMaterial(plan:AutonomousPlan):Record<string,unknown>{
+ const intent=record(plan.planPayload.intent),planIntent=Object.fromEntries(Object.entries({capitalLamports:intent.capitalLamports,lowerBinId:intent.lowerBinId,upperBinId:intent.upperBinId,strategy:intent.strategy,maxPositionWidthBins:intent.maxPositionWidthBins}).filter(([,value])=>value!==undefined));
+ return{intentPayload:plan.intentPayload,planIntent,steps:plan.steps.map(step=>({transactionId:step.transactionId,sequence:step.sequence,kind:step.kind,requiredSignerAddresses:[...step.requiredSignerAddresses],metadata:step.metadata}))};
 }
 function capital(plan: AutonomousPlan) {
   try {
@@ -92,6 +92,7 @@ export function validateClaimedPlan(input: {
           ownerAddress: p.ownerAddress,
           positionAddress: p.positionAddress ?? null,
           expiresAt: p.expiresAt,
+          immutablePlan:immutablePlanMaterial(p),
         },
         input.provenanceSecret,
         hmac,
@@ -134,7 +135,18 @@ export function validateClaimedPlan(input: {
   }
   // Risk-increasing mutations are fail-closed when P7 authority is unavailable.
   // Protective actions retain their dedicated degraded-control authorization path.
-  if(["OPEN","ADD","RESHAPE","REBALANCE"].includes(p.action))reasons.push(...validateFreshPhase7ExecutionControl(input.phase7Control,input.now??new Date().toISOString(),60_000,p.observedAt));
+  if(["OPEN","ADD","RESHAPE","REBALANCE"].includes(p.action)){
+    reasons.push(...validateFreshPhase7ExecutionControl(input.phase7Control,input.now??new Date().toISOString()));
+    const binding=record(provenance.phase7Control),boundDecisionId=String(binding.decisionId??''),boundObservedAt=String(binding.observedAt??''),control=input.phase7Control;
+    // P7 controls are persisted *before* the operator creates a plan.  A
+    // signed plan therefore binds the decision that governed it by identity;
+    // chronological control-before-plan is expected, not a rejection reason.
+    if(!boundDecisionId||!boundObservedAt)reasons.push('P6_CLAIM_P7_CONTROL_BINDING_MISSING');
+    else if(!control?.decisionId)reasons.push('P6_CLAIM_P7_CONTROL_ID_MISSING');
+    else if(control.decisionId!==boundDecisionId&&Date.parse(control.observedAt)<Date.parse(boundObservedAt))reasons.push('P6_CLAIM_P7_CONTROL_BINDING_MISMATCH');
+    else if(!Number.isFinite(Date.parse(boundObservedAt))||Date.parse(boundObservedAt)>Date.parse(p.observedAt))reasons.push('P6_CLAIM_P7_CONTROL_BINDING_INVALID');
+    if(control?.poolDrift?.[p.poolAddress]==='BLOCK')reasons.push('P6_CLAIM_P7_POOL_DRIFT_BLOCK');
+  }
   // Protective actions (close/reduce/claim) must never be starved by the daily
   // action cap; the cap budgets only risk-increasing mutations.
   if(input.actionsToday!==undefined&&input.actionsToday>=input.policy.maxActionsPerDay&&["OPEN","ADD","RESHAPE","REBALANCE"].includes(p.action))reasons.push('P6_CLAIM_DAILY_ACTION_LIMIT');

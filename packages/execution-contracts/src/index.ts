@@ -124,6 +124,8 @@ export interface PlanProvenanceFields {
   ownerAddress:string;
   positionAddress:string|null;
   expiresAt:string;
+  /** Complete immutable economic instruction set, canonicalised before HMAC. */
+  immutablePlan?:Record<string,unknown>;
 }
 function stableProvenance(v:unknown):string{if(Array.isArray(v))return`[${v.map(stableProvenance).join(',')}]`;if(v&&typeof v==='object')return`{${Object.entries(v as Record<string,unknown>).sort(([a],[b])=>a.localeCompare(b)).map(([k,x])=>`${JSON.stringify(k)}:${stableProvenance(x)}`).join(',')}}`;return JSON.stringify(v);}
 export function computePlanProvenanceHmac(fields:PlanProvenanceFields,secret:string):string{

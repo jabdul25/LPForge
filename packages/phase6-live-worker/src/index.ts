@@ -97,6 +97,13 @@ export interface LiveRecoveryResult {
     | "NO_ACTION_COMPLETE";
   reasonCodes: string[];
 }
+function nestedGeneratedPositionAddress(value:unknown):string|undefined{
+ if(!value||typeof value!=="object")return undefined;
+ const row=value as Record<string,unknown>,direct=row.generatedPositionAddress??row.positionAddress;
+ if(typeof direct==='string'&&direct.trim())return direct;
+ for(const key of ["autonomous_dispatch","open","prepared","payload","metadata"]){const found=nestedGeneratedPositionAddress(row[key]);if(found)return found;}
+ return undefined;
+}
 function planFields(plan: AutonomousOpenPlan) {
   const intent = plan.planPayload.intent as Record<string, unknown> | undefined;
   if (!intent) throw new Error("LPFORGE_P6_PLAN_INTENT_MISSING");
@@ -697,6 +704,12 @@ export async function executeAutonomousOpen(input: {
         ticketId: openTicket.ticketId,
         reasonCodes: ["P6_AUTONOMOUS_FINAL_REVALIDATION"],
       };
+    // Persist the ephemeral PositionV2 public key before the first possible
+    // network send.  Recovery can then adopt this exact account even when
+    // the plan originally had no positionAddress (as every fresh OPEN does).
+    openPositionAddress=prepared.positionSigner.publicKeyAddress;
+    await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:"SIGNING",at:signedAt,payload:{stage:"OPEN_POSITION_GENERATED",generatedPositionAddress:openPositionAddress}});
+    await recordJournal(input.store,input.plan as unknown as AutonomousPlan,"SIGNING",{action:"OPEN",transactionId:input.plan.transactionId,generatedPositionAddress:openPositionAddress});
     const submitted = await executeMainnetCanaryOpen({
       authority: openAuthority,
       ticket: openTicket,
@@ -714,7 +727,6 @@ export async function executeAutonomousOpen(input: {
     });
     submittedAny = true;
     lastSignature = submitted.signature;
-    openPositionAddress = prepared.positionSigner.publicKeyAddress;
     await recordJournal(
       input.store,
       input.plan as unknown as AutonomousPlan,
@@ -801,6 +813,9 @@ export async function executeAutonomousOpen(input: {
           reconciliationStatus: "MATCH",
           payload: { thesisId: input.plan.thesisId, entryFunding: funding },
         });
+        const positionAccount=await connection.getAccountInfo(new PublicKey(prepared.positionSigner.publicKeyAddress),'confirmed');
+        await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:open-contribution`,positionAddress:prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'OPEN_CONTRIBUTION',observedAt:new Date().toISOString(),lamports:fields.capital,payload:{signature:submitted.signature,source:'RECONCILED_OPEN'}});
+        if(positionAccount?.lamports)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:rent-lock`,positionAddress:prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'RENT_LOCK',observedAt:new Date().toISOString(),lamports:BigInt(positionAccount.lamports),payload:{signature:submitted.signature,recoverable:true,source:'POSITION_ACCOUNT_INFO'}});
         if (input.plan.swapTransactionId)
           await input.store.upsertPartialEntryRecovery({
             planId: input.plan.planId,
@@ -1585,6 +1600,10 @@ async function executeMeteoraMutation(input: {
     connection = new Connection(input.config.rpcUrl, "confirmed"),
     capital = mutationCapital(input.plan),
     now = new Date().toISOString();
+  // From this point onward a submission may have reached the cluster.  A
+  // later local/database/reconciliation error must never rewrite that fact as
+  // FAILED/transactionSubmitted=false.
+  let submissionAttempted=false;
   try {
     if (input.signer.publicKeyAddress !== input.plan.ownerAddress)
       throw new Error("LPFORGE_P6_OWNER_SIGNER_PLAN_MISMATCH");
@@ -1745,6 +1764,7 @@ async function executeMeteoraMutation(input: {
       transport: createWeb3SubmissionTransport(connection),
       submittedAt: signedAt,
     };
+    submissionAttempted=true;
     const submitted = open
       ? await executeMainnetCanaryClose(submitInput)
       : await executeMainnetCanaryManage(submitInput);
@@ -1812,26 +1832,21 @@ async function executeMeteoraMutation(input: {
       (input.action === "CLOSE" || input.action === "EMERGENCY_CLOSE") &&
       input.plan.positionAddress
     ) {
-      let positionGone = false;
-      try {
-        await createMeteoraReadAdapter({
-          rpcUrl: input.config.rpcUrl,
-          cluster: "mainnet-beta",
-          programId: input.config.programId,
-        }).getPositionV2(input.plan.poolAddress, input.plan.positionAddress);
-      } catch {
-        positionGone = true;
-      }
+      // RPC failure/timeout/decode failure is unknown chain truth, not proof
+      // that the account was closed.  getAccountInfo=null is the only
+      // positive absence result accepted for lifecycle closure.
+      let positionGone=false,positionReadUnknown=false;
+      try{positionGone=(await connection.getAccountInfo(new PublicKey(input.plan.positionAddress),"confirmed"))===null;}catch{positionReadUnknown=true;}
       await input.store.markOwnedPositionLifecycle({
         positionAddress: input.plan.positionAddress,
         lifecycleState: positionGone ? "CLOSED" : "RECONCILIATION_REQUIRED",
-        reconciliationStatus: positionGone ? "MATCH" : "MISMATCH",
+        reconciliationStatus: positionGone ? "MATCH" : positionReadUnknown?"UNKNOWN":"MISMATCH",
         lastPlanId: input.plan.planId,
         at: new Date().toISOString(),
         payload: {
           stage: "CLOSE_CHAIN_VERIFIED",
           signature: submitted.signature,
-          positionGone,
+          positionGone,positionReadUnknown,
         },
       });
       if (!positionGone) {
@@ -1839,13 +1854,13 @@ async function executeMeteoraMutation(input: {
           planId: input.plan.planId,
           state: "RECONCILIATION_REQUIRED",
           at: new Date().toISOString(),
-          reasonCodes: ["P6_CLOSE_POSITION_STILL_PRESENT"],
+          reasonCodes: [positionReadUnknown?"P6_CLOSE_POSITION_READ_UNKNOWN":"P6_CLOSE_POSITION_STILL_PRESENT"],
           payload: { signature: submitted.signature },
         });
         return {
           status: "UNKNOWN",
           planId: input.plan.planId,
-          reasonCodes: ["P6_CLOSE_POSITION_STILL_PRESENT"],
+          reasonCodes: [positionReadUnknown?"P6_CLOSE_POSITION_READ_UNKNOWN":"P6_CLOSE_POSITION_STILL_PRESENT"],
           transactionSubmitted: true,
         };
       }
@@ -1881,6 +1896,7 @@ async function executeMeteoraMutation(input: {
             signature: submitted.signature,
           },
         });
+        await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:reduce-basis`,positionAddress:input.plan.positionAddress,planId:input.plan.planId,flowType:'REDUCE_WITHDRAWAL',observedAt:new Date().toISOString(),lamports:(capital*BigInt(reductionBps))/10_000n,payload:{signature:submitted.signature,reductionBps,accounting:'CAPITAL_BASIS_WITHDRAWAL_PENDING_TOKEN_VALUATION'}});
       }
     }
     await input.store.completeAutonomousPlan({
@@ -1898,6 +1914,11 @@ async function executeMeteoraMutation(input: {
   } catch (error) {
     const reason =
       error instanceof Error ? error.message : "LPFORGE_P6_MUTATION_UNKNOWN";
+    if(submissionAttempted){
+      await recordJournal(input.store,input.plan,"RECONCILIATION_REQUIRED",{action:input.action,error:reason,postSubmission:true});
+      await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:"RECONCILIATION_REQUIRED",at:new Date().toISOString(),reasonCodes:["P6_MUTATION_POST_SUBMISSION_RECONCILIATION_REQUIRED"],payload:{action:input.action,error:reason,submissionAttempted:true}});
+      return{status:"UNKNOWN",planId:input.plan.planId,reasonCodes:["P6_MUTATION_POST_SUBMISSION_RECONCILIATION_REQUIRED",reason],transactionSubmitted:true};
+    }
     await input.store.completeAutonomousPlan({
       planId: input.plan.planId,
       state: "FAILED",
@@ -1988,35 +2009,44 @@ async function executeManagementReplacement(input: {
     deferCompletion: true,
   });
   if (closed.status !== "RECONCILED") return closed;
-  let removed = false;
+  // Only an explicit AccountInfo null proves removal.  A decoder/RPC error
+  // is unknown truth and may not unlock a replacement position.
+  const removalConnection = new Connection(input.config.rpcUrl, "confirmed");
+  let removed = false,
+    removalReadUnknown = false;
   try {
-    await adapter.getPositionV2(input.plan.poolAddress, input.positionAddress);
+    removed =
+      (await removalConnection.getAccountInfo(
+        new PublicKey(input.positionAddress),
+        "confirmed",
+      )) === null;
   } catch {
-    removed = true;
+    removalReadUnknown = true;
   }
   if (!removed) {
     await input.store.markOwnedPositionLifecycle({
       positionAddress: input.positionAddress,
       lifecycleState: "RECONCILIATION_REQUIRED",
-      reconciliationStatus: "MISMATCH",
+      reconciliationStatus: removalReadUnknown ? "UNKNOWN" : "MISMATCH",
       lastPlanId: input.plan.planId,
       at: new Date().toISOString(),
       payload: {
         stage: "AWAIT_REMOVE_RECONCILIATION",
-        oldPositionStillExists: true,
+        oldPositionStillExists: !removalReadUnknown,
+        oldPositionReadUnknown: removalReadUnknown,
       },
     });
     await input.store.transitionAutonomousPlan({
       planId: input.plan.planId,
       state: "RECONCILIATION_REQUIRED",
       at: new Date().toISOString(),
-      reasonCodes: ["P6_MANAGEMENT_OLD_POSITION_STILL_EXISTS"],
+      reasonCodes: [removalReadUnknown?"P6_MANAGEMENT_OLD_POSITION_READ_UNKNOWN":"P6_MANAGEMENT_OLD_POSITION_STILL_EXISTS"],
       payload: { stage: "AWAIT_REMOVE_RECONCILIATION" },
     });
     return {
       status: "BLOCKED",
       planId: input.plan.planId,
-      reasonCodes: ["P6_MANAGEMENT_OLD_POSITION_STILL_EXISTS"],
+      reasonCodes: [removalReadUnknown?"P6_MANAGEMENT_OLD_POSITION_READ_UNKNOWN":"P6_MANAGEMENT_OLD_POSITION_STILL_EXISTS"],
       transactionSubmitted: true,
     };
   }
@@ -2121,6 +2151,7 @@ export async function executeAutonomousPlan(input: {
   const step = input.plan.steps[0];
   if (!step) throw new Error("LPFORGE_P6_MUTATION_STEP_REQUIRED");
   if (input.plan.action === "CLAIM") {
+    const claimConnection=new Connection(input.config.rpcUrl,"confirmed"),claimPoolFact=await createMeteoraReadAdapter({rpcUrl:input.config.rpcUrl,cluster:"mainnet-beta",programId:input.config.programId}).getPool(input.plan.poolAddress),claimBeforeX=await readWalletTokenBalance({connection:claimConnection,ownerAddress:input.plan.ownerAddress,mint:claimPoolFact.tokenXMint}),claimBeforeY=await readWalletTokenBalance({connection:claimConnection,ownerAddress:input.plan.ownerAddress,mint:claimPoolFact.tokenYMint});
     let built;
     try {
       built = await buildClaimTransactions(pool, {
@@ -2145,11 +2176,17 @@ export async function executeAutonomousPlan(input: {
     if (built.length !== 1)
       throw new Error("LPFORGE_P6_MULTI_TRANSACTION_CLAIM_UNSUPPORTED");
     built[0]!.metadata.transactionId = step.transactionId;
-    return executeMeteoraMutation({
+    const result=await executeMeteoraMutation({
       ...input,
       built: built[0]!,
       action: "CLAIM",
     });
+    if(result.status==='RECONCILED'){
+      const afterX=await readWalletTokenBalance({connection:claimConnection,ownerAddress:input.plan.ownerAddress,mint:claimPoolFact.tokenXMint}),afterY=await readWalletTokenBalance({connection:claimConnection,ownerAddress:input.plan.ownerAddress,mint:claimPoolFact.tokenYMint}),observedAt=new Date().toISOString();
+      if(afterX>claimBeforeX)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:claim-x`,positionAddress,planId:input.plan.planId,flowType:'FEE_CLAIM',observedAt,tokenMint:claimPoolFact.tokenXMint,tokenAmountRaw:(afterX-claimBeforeX).toString(),payload:{source:'WALLET_DELTA'}});
+      if(afterY>claimBeforeY)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:claim-y`,positionAddress,planId:input.plan.planId,flowType:'FEE_CLAIM',observedAt,tokenMint:claimPoolFact.tokenYMint,tokenAmountRaw:(afterY-claimBeforeY).toString(),payload:{source:'WALLET_DELTA'}});
+    }
+    return result;
   }
   if (input.plan.action === "REDUCE") {
     const range = await chainMutationRange({
@@ -2183,10 +2220,10 @@ export async function executeAutonomousPlan(input: {
     input.plan.action === "CLOSE" ||
     input.plan.action === "EMERGENCY_CLOSE"
   ) {
-    // A close drains liquidity, unwinds the token-X proceeds into the
-    // SOL-side token, then closes the drained account. Every phase journals
-    // the plan action, so a death between phases surfaces as a recovery HOLD
-    // instead of a blind resubmit that could double-spend or strand tokens.
+    // Close is an economic settlement state machine.  Snapshot the owner's
+    // pre-existing paired-token inventory, REMOVE, CLAIM, then unwind only
+    // the attributable delta.  This prevents liquidation of unrelated wallet
+    // inventory and ensures late fee claims are included in the unwind.
     const removeStep =
         input.plan.steps.find(
           (candidate) => candidate.kind === "METEORA_REMOVE",
@@ -2199,6 +2236,8 @@ export async function executeAutonomousPlan(input: {
       );
     if (!unwindStep || !closeStep)
       throw new Error("LPFORGE_P6_CLOSE_SEQUENCE_MISSING");
+    const closeConnection=new Connection(input.config.rpcUrl,"confirmed"),poolFact=await createMeteoraReadAdapter({rpcUrl:input.config.rpcUrl,cluster:"mainnet-beta",programId:input.config.programId}).getPool(input.plan.poolAddress),tokenXBefore=await readWalletTokenBalance({connection:closeConnection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenXMint});
+    await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:"BUILDING",at:new Date().toISOString(),payload:{stage:"CLOSE_INVENTORY_SNAPSHOTTED",tokenXBefore:tokenXBefore.toString(),tokenXMint:poolFact.tokenXMint}});
     const range = await chainMutationRange({
         plan: input.plan,
         stepMetadata: removeStep.metadata,
@@ -2224,38 +2263,8 @@ export async function executeAutonomousPlan(input: {
       deferCompletion: true,
     });
     if (drained.status !== "RECONCILED") return drained;
-    const poolFact = await createMeteoraReadAdapter({
-        rpcUrl: input.config.rpcUrl,
-        cluster: "mainnet-beta",
-        programId: input.config.programId,
-      }).getPool(input.plan.poolAddress),
-      tokenXBalance = await readWalletTokenBalance({
-        connection: new Connection(input.config.rpcUrl, "confirmed"),
-        ownerAddress: input.plan.ownerAddress,
-        mint: poolFact.tokenXMint,
-      });
-    if (tokenXBalance > 0n) {
-      const unwind = await executeJupiterUnwindStep({
-        store: input.store,
-        plan: input.plan,
-        signer: input.signer,
-        config: input.config,
-        amount: tokenXBalance,
-        transactionId: unwindStep.transactionId,
-        idempotencyKey: `${input.plan.idempotencyKey}:${unwindStep.transactionId}`,
-        stage: "CLOSE_TOKEN_X_UNWIND",
-        reasonPrefix: "P6_CLOSE_UNWIND",
-      });
-      if (!unwind.ok)
-        return {
-          status: unwind.submitted ? "SUBMITTED" : "BLOCKED",
-          planId: input.plan.planId,
-          reasonCodes: unwind.reasonCodes,
-          transactionSubmitted: unwind.submitted,
-        };
-    }
-    // Residual fees must be claimed before the account can be closed; only
-    // an empty PositionV2 is closable. Nothing to claim is a clean skip.
+    // Claim before measuring the final inventory delta.  Otherwise claimed
+    // fees could be left as unwanted paired-token exposure after unwind.
     let claimBuilt;
     try {
       claimBuilt = await buildClaimTransactions(pool, {
@@ -2293,6 +2302,15 @@ export async function executeAutonomousPlan(input: {
         deferCompletion: true,
       });
       if (claimed.status !== "RECONCILED") return claimed;
+    }
+    const tokenXAfter=await readWalletTokenBalance({connection:closeConnection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenXMint}),attributableTokenX=tokenXAfter>tokenXBefore?tokenXAfter-tokenXBefore:0n;
+    if(attributableTokenX>0n)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:close-token-x`,positionAddress,planId:input.plan.planId,flowType:'CLOSE_WITHDRAWAL',observedAt:new Date().toISOString(),tokenMint:poolFact.tokenXMint,tokenAmountRaw:attributableTokenX.toString(),payload:{source:'REMOVE_PLUS_CLAIM_DELTA',tokenXBefore:tokenXBefore.toString(),tokenXAfter:tokenXAfter.toString()}});
+    await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:"RECONCILING",at:new Date().toISOString(),payload:{stage:"CLOSE_INVENTORY_MEASURED",tokenXBefore:tokenXBefore.toString(),tokenXAfter:tokenXAfter.toString(),attributableTokenX:attributableTokenX.toString(),tokenXMint:poolFact.tokenXMint}});
+    if(attributableTokenX>0n){
+      const unwind=await executeJupiterUnwindStep({store:input.store,plan:input.plan,signer:input.signer,config:input.config,amount:attributableTokenX,transactionId:unwindStep.transactionId,idempotencyKey:`${input.plan.idempotencyKey}:${unwindStep.transactionId}`,stage:"CLOSE_TOKEN_X_UNWIND",reasonPrefix:"P6_CLOSE_UNWIND"});
+      if(!unwind.ok)return{status:unwind.submitted?"SUBMITTED":"BLOCKED",planId:input.plan.planId,reasonCodes:unwind.reasonCodes,transactionSubmitted:unwind.submitted};
+      const tokenXPostUnwind=await readWalletTokenBalance({connection:closeConnection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenXMint});
+      if(tokenXPostUnwind>tokenXBefore){await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:"RECONCILIATION_REQUIRED",at:new Date().toISOString(),reasonCodes:["P6_CLOSE_TOKEN_X_RESIDUAL"],payload:{stage:"CLOSE_UNWIND_VERIFY",tokenXBefore:tokenXBefore.toString(),tokenXPostUnwind:tokenXPostUnwind.toString()}});return{status:"UNKNOWN",planId:input.plan.planId,reasonCodes:["P6_CLOSE_TOKEN_X_RESIDUAL"],transactionSubmitted:true};}
     }
     const closedBuilt = await buildClosePositionTransaction(pool, {
       userAddress: input.plan.ownerAddress,
@@ -2434,13 +2452,26 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       )
         confirmationStatus = "EXPIRED";
     }
+    const recoveryPositionAddress=plan.positionAddress??nestedGeneratedPositionAddress(plan.planPayload)??nestedGeneratedPositionAddress(raw.payload);
     let economicEffect: "PRESENT" | "ABSENT" | "UNKNOWN" = "UNKNOWN";
     let positionTruth: Record<string, unknown> = { available: false };
-    if (adapter && plan.positionAddress) {
+    if (connection && adapter && recoveryPositionAddress) {
+      // Only AccountInfo null proves absence. Do not convert an RPC/decode
+      // failure into a successful close/open absence signal.
+      let accountPresent: boolean | undefined;
       try {
+        accountPresent = (await connection.getAccountInfo(new PublicKey(recoveryPositionAddress), "confirmed")) !== null;
+      } catch {
+        positionTruth = { exists: "UNKNOWN", accountReadUnknown: true };
+      }
+      if (accountPresent === false) {
+        positionTruth = { exists: false, absenceProven: true };
+        if (["CLOSE", "EMERGENCY_CLOSE", "RESHAPE", "REBALANCE"].includes(plan.action)) economicEffect = "PRESENT";
+        else if (plan.action === "OPEN") economicEffect = "ABSENT";
+      } else if (accountPresent === true) try {
         const position = await adapter.getPositionV2(
           plan.poolAddress,
-          plan.positionAddress,
+          recoveryPositionAddress,
         );
         positionTruth = {
           exists: true,
@@ -2456,16 +2487,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
           )
         )
           economicEffect = "ABSENT";
-      } catch {
-        positionTruth = { exists: false };
-        if (
-          ["CLOSE", "EMERGENCY_CLOSE", "RESHAPE", "REBALANCE"].includes(
-            plan.action,
-          )
-        )
-          economicEffect = "PRESENT";
-        else if (plan.action === "OPEN") economicEffect = "ABSENT";
-      }
+      } catch { positionTruth = { exists: "UNKNOWN", accountPresent: true }; }
     }
     const action = determineRecoveryAction({
       journal,
@@ -2479,11 +2501,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     // the intent itself, and any missing input fails closed to HOLD.
     const adoptOpenPosition = async (): Promise<boolean> => {
       if (plan.action !== "OPEN" || economicEffect !== "PRESENT") return false;
-      const address =
-        plan.positionAddress ??
-        String(
-          (plan.planPayload as Record<string, unknown>).positionAddress ?? "",
-        );
+      const address=recoveryPositionAddress??"";
       const intent = (plan.planPayload.intent ?? {}) as Record<
         string,
         unknown

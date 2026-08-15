@@ -150,6 +150,8 @@ async function persistTransactionPlan(
   plan: TransactionPlan,
 ) {
   const provenanceSecret=(process.env.LPFORGE_PLAN_PROVENANCE_SECRET??'').trim();
+  const phase7RuntimeId=(process.env.LPFORGE_P7_RUNTIME_ID??'lpforge-production').trim(),control=await store.loadLatestPhase7ControlDecision(phase7RuntimeId),phase7Control=control?{decisionId:String(control.decision_id),cycleKey:String(control.cycle_key),observedAt:new Date(String(control.observed_at)).toISOString()}:undefined;
+  const immutablePlan={intentPayload:plan.intent.payload,planIntent:Object.fromEntries(Object.entries({capitalLamports:plan.intent.capitalLamports?.toString(),lowerBinId:plan.intent.lowerBinId,upperBinId:plan.intent.upperBinId,strategy:plan.intent.strategy,maxPositionWidthBins:plan.transactions.find((step)=>step.kind==='METEORA_OPEN'||step.kind==='METEORA_POSITION_EXTEND')?.metadata.maxPositionWidthBins}).filter(([,value])=>value!==undefined)),steps:plan.transactions.map(step=>({transactionId:step.transactionId,sequence:step.sequence,kind:step.kind,requiredSignerAddresses:[...step.requiredSignerAddresses],metadata:step.metadata}))};
   await store.insertExecutionIntent({
     intentId: plan.intent.intentId,
     idempotencyKey: plan.intent.idempotencyKey,
@@ -180,6 +182,7 @@ async function persistTransactionPlan(
         intentId: plan.intent.intentId,
         poolAddress: plan.intent.poolAddress,
         observedAt: plan.intent.observedAt,
+        ...(phase7Control?{phase7Control}:{}),
         // Stamped only when the provenance secret is configured; the claim
         // guard verifies it fail-closed from that moment on.
         ...(provenanceSecret
@@ -195,6 +198,7 @@ async function persistTransactionPlan(
                   ownerAddress: plan.intent.ownerAddress,
                   positionAddress: plan.intent.positionAddress ?? null,
                   expiresAt: plan.expiresAt,
+                  immutablePlan,
                 },
                 provenanceSecret,
               ),
@@ -208,6 +212,7 @@ async function persistTransactionPlan(
         strategy: plan.intent.strategy,
         maxPositionWidthBins: plan.transactions.find((step) => step.kind === "METEORA_OPEN" || step.kind === "METEORA_POSITION_EXTEND")?.metadata.maxPositionWidthBins,
       },
+      immutablePlanVersion:1,
     },
     steps: plan.transactions.map((t) => ({
       transactionId: t.transactionId,
