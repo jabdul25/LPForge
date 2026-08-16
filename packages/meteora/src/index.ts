@@ -60,14 +60,14 @@ class PostgresRpcCoordinator implements RpcCoordinator {
   async note429(priority:RpcPriority,method:string,backoffMs:number):Promise<void>{const db=await this.db();await db.query('SELECT execution.report_rpc_pressure($1,$2,$3,$4)',[this.providerKey,priority,method,Math.max(1,backoffMs)]);}
   async noteRetry(priority:RpcPriority,method:string):Promise<void>{const db=await this.db();await db.query("SELECT execution.rpc_metric_event($1,$2,$3,'RETRY',0)",[this.providerKey,priority,method]);}
 }
-let sharedCoordinator:RpcCoordinator|undefined;
+const sharedCoordinators=new Map<string,RpcCoordinator>();
 /** Returns the process handle for the database-backed system-wide coordinator. */
-export function defaultRpcCoordinator():RpcCoordinator|undefined {if(!process.env.DATABASE_URL?.trim())return undefined;return sharedCoordinator??=new PostgresRpcCoordinator(process.env.DATABASE_URL);}
+export function defaultRpcCoordinator(providerUrl:string):RpcCoordinator|undefined {if(!process.env.DATABASE_URL?.trim())return undefined;return sharedCoordinators.get(providerUrl)??(()=>{const coordinator=new PostgresRpcCoordinator(providerUrl);sharedCoordinators.set(providerUrl,coordinator);return coordinator;})();}
 function methodFromBody(body:unknown):string{try{const parsed=typeof body==='string'?JSON.parse(body):body;return typeof parsed==='object'&&parsed&&typeof (parsed as {method?:unknown}).method==='string'?(parsed as {method:string}).method:'sdk';}catch{return'sdk';}}
 /** SDK Connection fetch hook. Every web3/Meteora RPC request receives the same shared permit as direct JSON-RPC. */
-export function createGovernedRpcFetch(input:{fetchImpl?:FetchLike;coordinator?:RpcCoordinator;priority:RpcPriority}):FetchLike {const fetchImpl=input.fetchImpl??fetch;const coordinator=input.coordinator??defaultRpcCoordinator();return async(url,init)=>{const method=methodFromBody(init?.body);await coordinator?.acquire(input.priority,method);const response=await fetchImpl(url,init);if(response.status===429)await coordinator?.note429(input.priority,method,retryAfterMs(response,Date.now())??1000);return response;};}
+export function createGovernedRpcFetch(input:{rpcUrl?:string;fetchImpl?:FetchLike;coordinator?:RpcCoordinator;priority:RpcPriority}):FetchLike {const fetchImpl=input.fetchImpl??fetch;const coordinator=input.coordinator??(input.rpcUrl?defaultRpcCoordinator(input.rpcUrl):undefined);return async(url,init)=>{const method=methodFromBody(init?.body);await coordinator?.acquire(input.priority,method);const response=await fetchImpl(url,init);if(response.status===429)await coordinator?.note429(input.priority,method,retryAfterMs(response,Date.now())??1000);return response;};}
 /** Create a web3 Connection whose SDK fan-out is admitted by the shared coordinator. */
-export function createGovernedConnection(input:{rpcUrl:string;priority:RpcPriority;coordinator?:RpcCoordinator;commitment?:'confirmed'|'finalized'|'processed'}):Connection{return new Connection(input.rpcUrl,{commitment:input.commitment??'confirmed',fetch:createGovernedRpcFetch({priority:input.priority,...(input.coordinator?{coordinator:input.coordinator}:{})})});}
+export function createGovernedConnection(input:{rpcUrl:string;priority:RpcPriority;coordinator?:RpcCoordinator;commitment?:'confirmed'|'finalized'|'processed'}):Connection{return new Connection(input.rpcUrl,{commitment:input.commitment??'confirmed',fetch:createGovernedRpcFetch({rpcUrl:input.rpcUrl,priority:input.priority,...(input.coordinator?{coordinator:input.coordinator}:{})})});}
 export interface SolanaRpcClientOptions {
   url:string;
   timeoutMs?:number;
@@ -92,7 +92,7 @@ export function createSolanaRpcClient(opts:SolanaRpcClientOptions):SolanaRpcClie
   const minIntervalMs=Math.max(0,opts.minIntervalMs??125); const maxRetries=Math.max(0,opts.maxRetries??5);
   const retryBaseDelayMs=Math.max(1,opts.retryBaseDelayMs??250); const retryMaxDelayMs=Math.max(retryBaseDelayMs,opts.retryMaxDelayMs??4000);
   const sleepImpl=opts.sleepImpl??(ms=>new Promise(resolve=>setTimeout(resolve,ms))); const nowImpl=opts.nowImpl??(()=>Date.now());
-  const priority=opts.priority??'P2_POSITION_MANAGEMENT'; const coordinator=opts.coordinator??defaultRpcCoordinator();
+  const priority=opts.priority??'P2_POSITION_MANAGEMENT'; const coordinator=opts.coordinator??defaultRpcCoordinator(opts.url);
   async function pace(){const wait=Math.max(0,minIntervalMs-(nowImpl()-lastRequestStartedAt));if(wait>0)await sleepImpl(wait);lastRequestStartedAt=nowImpl();}
   async function call<T>(method:string,params:unknown[]):Promise<T>{
     for(let attempt=0;;attempt++){
@@ -173,10 +173,10 @@ async function loadSdk() {
 }
 
 export function createMeteoraReadAdapter(opts:{rpcUrl:string;cluster:'mainnet-beta'|'devnet';programId:string;expectedSdkVersion?:string;rpcTimeoutMs?:number;rpcMinIntervalMs?:number;rpcMaxRetries?:number;retryBaseDelayMs?:number;retryMaxDelayMs?:number;priority?:RpcPriority;coordinator?:RpcCoordinator;onEventDecodeWarning?:(warning:MeteoraEventDecodeWarning)=>void}):MeteoraReadAdapter {
-  const priority=opts.priority??'P2_POSITION_MANAGEMENT'; const coordinator=opts.coordinator??defaultRpcCoordinator();
+  const priority=opts.priority??'P2_POSITION_MANAGEMENT'; const coordinator=opts.coordinator??defaultRpcCoordinator(opts.rpcUrl);
   const rpc=createSolanaRpcClient({url:opts.rpcUrl,...(opts.rpcTimeoutMs!==undefined?{timeoutMs:opts.rpcTimeoutMs}:{}),...(opts.rpcMinIntervalMs!==undefined?{minIntervalMs:opts.rpcMinIntervalMs}:{}),...(opts.rpcMaxRetries!==undefined?{maxRetries:opts.rpcMaxRetries}:{}),...(opts.retryBaseDelayMs!==undefined?{retryBaseDelayMs:opts.retryBaseDelayMs}:{}),...(opts.retryMaxDelayMs!==undefined?{retryMaxDelayMs:opts.retryMaxDelayMs}:{}),priority,...(coordinator?{coordinator}:{})});
   const clientCache=new Map<string,Promise<Record<string,unknown>>>();
-  async function client(address:string):Promise<Record<string,unknown>> { let pending=clientCache.get(address); if(!pending){ pending=(async()=>{const {web3,DLMM}=await loadSdk(); const connection=new web3.Connection(opts.rpcUrl,{commitment:'confirmed',fetch:createGovernedRpcFetch({priority,...(coordinator?{coordinator}:{})})}); const key=new web3.PublicKey(address); const programId=new web3.PublicKey(opts.programId); return DLMM.create(connection,key,{cluster:opts.cluster,programId});})(); clientCache.set(address,pending); } return pending; }
+  async function client(address:string):Promise<Record<string,unknown>> { let pending=clientCache.get(address); if(!pending){ pending=(async()=>{const {web3,DLMM}=await loadSdk(); const connection=new web3.Connection(opts.rpcUrl,{commitment:'confirmed',fetch:createGovernedRpcFetch({rpcUrl:opts.rpcUrl,priority,...(coordinator?{coordinator}:{})})}); const key=new web3.PublicKey(address); const programId=new web3.PublicKey(opts.programId); return DLMM.create(connection,key,{cluster:opts.cluster,programId});})(); clientCache.set(address,pending); } return pending; }
   return {
     async verifyCompatibility(smokePool){ const checkedAt=nowIso(); try { if(opts.programId!==EXPECTED_DLMM_PROGRAM_ID)throw new Error('PROGRAM_ID_MISMATCH'); await loadSdk(); const details:Record<string,unknown>={sdkImport:true,programIdMatch:true}; if(smokePool){const p=await client(smokePool); details.smokePoolLoaded=Boolean(p.lbPair); details.slot=(await rpc.getSlot()).toString();} return {state:'VERIFIED',programId:opts.programId,expectedSdkVersion:opts.expectedSdkVersion??BASELINE_METEORA_SDK_VERSION,decoderVersion:EVENT_DECODER_VERSION,checkedAt,details}; } catch(error){return {state:'HOLD',programId:opts.programId,expectedSdkVersion:opts.expectedSdkVersion??BASELINE_METEORA_SDK_VERSION,decoderVersion:EVENT_DECODER_VERSION,checkedAt,details:{error:error instanceof Error?error.message:String(error)}};} },
     async getPool(address){ const c=await client(address); const slot=await rpc.getSlot(); const dyn=typeof c.getDynamicFee==='function'?await (c.getDynamicFee as ()=>Promise<unknown>|unknown)():undefined; return normalizePoolFromSdk(address,c,slot,dyn); },
