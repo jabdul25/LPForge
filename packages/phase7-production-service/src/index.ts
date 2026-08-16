@@ -3,12 +3,12 @@ import {spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {readFileSync,readdirSync} from 'node:fs';
 import path from 'node:path';
-import {Connection,PublicKey} from '@solana/web3.js';
+import {PublicKey} from '@solana/web3.js';
 import {loadDeploymentPolicyFile,type MainnetCanaryDeploymentPolicy} from '../../deployment-policy/src/index.js';
 import {createMeteoraDataApi} from '../../data-api/src/index.js';
 import type {Phase1Config} from '../../config/src/index.js';
 import type {Phase1Store} from '../../db/src/index.js';
-import {createMeteoraReadAdapter,createSolanaRpcClient} from '../../meteora/src/index.js';
+import {createGovernedConnection,createMeteoraReadAdapter,createSolanaRpcClient} from '../../meteora/src/index.js';
 import {derivePositionMarkToMarket} from '../../live-exit-governor/src/index.js';
 import {loadPhase7ControlConfig,loadPhase7ManualApproval,resolvePhase7Authority} from '../../phase7-authority/src/index.js';
 import type {Phase7DriftAssessment,Phase7EvaluationMetrics} from '../../phase7-drift/src/index.js';
@@ -40,7 +40,7 @@ async function assessLivePortfolioAuthority(input:{store:Phase1Store;cfg:Phase1C
   try{
     const policy=loadDeploymentPolicyFile(input.env.LPFORGE_EXECUTION_POLICY_PATH?.trim()||'policies/live-execution-policy.json'),capital=policy.productionCapital;
     if(!capital)return{valid:false,reasonCodes:['P7_PORTFOLIO_CAPITAL_POLICY_MISSING']};
-    const connection=new Connection(input.cfg.solanaRpcHttpUrl,'confirmed');
+    const connection=createGovernedConnection({rpcUrl:input.cfg.solanaRpcHttpUrl,priority:'P2_POSITION_MANAGEMENT'});
     const [facts,prior,wallet,walletTokenAccounts,positions,ownedPoolHistory,inventoryLots]=await Promise.all([
       input.store.loadPhase7PortfolioFacts(owner),
       input.store.loadPhase7PortfolioRiskState(owner),
@@ -50,7 +50,7 @@ async function assessLivePortfolioAuthority(input:{store:Phase1Store;cfg:Phase1C
       input.store.loadOwnedPoolHistory(owner),
       input.store.loadOwnerPositionInventoryLots(owner),
     ]);
-    const adapter=createMeteoraReadAdapter({rpcUrl:input.cfg.solanaRpcHttpUrl,cluster:input.cfg.cluster,programId:input.cfg.programId,expectedSdkVersion:input.cfg.expectedSdkVersion,rpcTimeoutMs:input.cfg.rpcTimeoutMs});
+    const adapter=createMeteoraReadAdapter({rpcUrl:input.cfg.solanaRpcHttpUrl,cluster:input.cfg.cluster,programId:input.cfg.programId,expectedSdkVersion:input.cfg.expectedSdkVersion,rpcTimeoutMs:input.cfg.rpcTimeoutMs,priority:'P2_POSITION_MANAGEMENT'});
     const api=createMeteoraDataApi({baseUrl:input.cfg.meteoraDataApiUrl,maxRps:input.cfg.dataApiMaxRps,timeoutMs:input.cfg.httpTimeoutMs});
     const valuations=await Promise.all(positions.map(async row=>{
       const poolAddress=String(row.pool_address),positionAddress=String(row.position_address);
@@ -135,7 +135,7 @@ export async function runAutonomousDecisionProbe(input:{cwd:string;env:NodeJS.Pr
 export async function runPhase7ProductionOnce(input:{cfg:Phase1Config;store:Phase1Store;runtimeId:string;instanceId:string;cycleKey:string;driftBaseline:Phase7EvaluationMetrics;sourceCommit?:string;policyHash?:string;cwd:string;env:NodeJS.ProcessEnv;leaseTtlMs?:number;restarted:boolean}):Promise<Phase7ProductionOnceResult>{
   const startedAt=new Date().toISOString();if(!input.cfg.smokePoolAddress)throw new Error('LPFORGE_CONFIG_REQUIRED:LPFORGE_SMOKE_POOL_ADDRESS');const ttl=input.leaseTtlMs??60_000;const lease=await input.store.claimPhase7RuntimeLease({runtimeId:input.runtimeId,holderId:input.instanceId,now:startedAt,expiresAt:new Date(Date.parse(startedAt)+ttl).toISOString()});if(!lease){const runtime={runtimeId:input.runtimeId,instanceId:input.instanceId,cycleKey:input.cycleKey,leaseAcquired:false,recoveryScanCompleted:false,recoveryFacts:{previousCompletedCycleKeys:[],completedEconomicActionKeys:[],recoveryQueueCount:0,unknownSubmissionCount:0,unresolvedReconciliationDebt:0},plan:'HOLD' as const,reasonCodes:['P7_RUNTIME_LEASE_HELD_BY_OTHER'],newEconomicActionAllowed:false,cycleInserted:false,requiresExistingExecutionWorkflow:true as const,directSigner:false as const,directTransactionSend:false as const};return{runtimeId:input.runtimeId,instanceId:input.instanceId,cycleKey:input.cycleKey,observedAt:startedAt,runtime,directSigner:false,directTransactionSend:false,mainnetTransactionSent:false};}
   const recovery=await input.store.loadPhase7RecoveryFacts(input.runtimeId);if(recovery.recoveryQueueCount>0||recovery.unknownSubmissionCount>0||recovery.unresolvedReconciliationDebt>0||recovery.partialEntryRecoveryCount>0){const runtime=await runPhase7RecoveryRuntimeTick({store:input.store,runtimeId:input.runtimeId,instanceId:input.instanceId,cycleKey:input.cycleKey,now:new Date().toISOString(),leaseTtlMs:ttl,restarted:input.restarted,control:{authorityMode:'OBSERVE_ONLY',healthStatus:'CRITICAL',newEconomicActionAllowed:false}});return{runtimeId:input.runtimeId,instanceId:input.instanceId,cycleKey:input.cycleKey,observedAt:new Date().toISOString(),runtime,directSigner:false,directTransactionSend:false,mainnetTransactionSent:false};}
-  const productionRpcInterval=Math.max(0,Number(input.env.LPFORGE_PRODUCTION_RPC_MIN_INTERVAL_MS??input.cfg.rpcMinIntervalMs));const rpc=createSolanaRpcClient({url:input.cfg.solanaRpcHttpUrl,timeoutMs:input.cfg.rpcTimeoutMs,minIntervalMs:productionRpcInterval,maxRetries:input.cfg.rpcMaxRetries,retryBaseDelayMs:input.cfg.rpcRetryBaseDelayMs,retryMaxDelayMs:input.cfg.rpcRetryMaxDelayMs});const dataApi=createMeteoraDataApi({baseUrl:input.cfg.meteoraDataApiUrl,maxRps:input.cfg.dataApiMaxRps,timeoutMs:input.cfg.httpTimeoutMs});
+  const productionRpcInterval=Math.max(0,Number(input.env.LPFORGE_PRODUCTION_RPC_MIN_INTERVAL_MS??input.cfg.rpcMinIntervalMs));const rpc=createSolanaRpcClient({url:input.cfg.solanaRpcHttpUrl,timeoutMs:input.cfg.rpcTimeoutMs,minIntervalMs:productionRpcInterval,maxRetries:input.cfg.rpcMaxRetries,retryBaseDelayMs:input.cfg.rpcRetryBaseDelayMs,retryMaxDelayMs:input.cfg.rpcRetryMaxDelayMs,priority:'P2_POSITION_MANAGEMENT'});const dataApi=createMeteoraDataApi({baseUrl:input.cfg.meteoraDataApiUrl,maxRps:input.cfg.dataApiMaxRps,timeoutMs:input.cfg.httpTimeoutMs});
   // Health, drift and the control decision persist BEFORE the operator probes
   // so the operator's own control read sees this cycle's decision — never the
   // previous cycle's. Probe outputs (decoder telemetry, probed pools) lag one

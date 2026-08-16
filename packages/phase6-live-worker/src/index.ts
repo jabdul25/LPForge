@@ -56,7 +56,7 @@ import {
   loadAutonomousEntryPolicy,
   readJupiterMetisQuote,
 } from "../../phase6-swap-quote/src/index.js";
-import { createMeteoraReadAdapter, type MeteoraReadAdapter } from "../../meteora/src/index.js";
+import { createGovernedConnection, createMeteoraReadAdapter, type MeteoraReadAdapter } from "../../meteora/src/index.js";
 import { assessLifecycleSettlement } from "../../db/src/index.js";
 import type {
   AutonomousPlan,
@@ -608,7 +608,7 @@ export async function executeAutonomousOpen(input: {
   try {
     if (input.signer.publicKeyAddress !== input.plan.ownerAddress)
       throw new Error("LPFORGE_P6_OWNER_SIGNER_PLAN_MISMATCH");
-    const connection = new Connection(input.config.rpcUrl, "confirmed");
+    const connection = createGovernedConnection({rpcUrl:input.config.rpcUrl,priority:'P0_EXECUTION_CRITICAL'});
     // Build the entire Meteora route before swapping into the paired asset.
     // This construction-only preflight never signs or submits a transaction.
     const pool = await createLiveMeteoraOpenPool({
@@ -1093,11 +1093,12 @@ async function executeJupiterUnwindStep(input: {
   fundingTransactionId?: string;
   afterSubmit?: (submitted: { signature: string }) => Promise<void>;
 }): Promise<{ ok: boolean; submitted: boolean; reasonCodes: string[]; signature?:string }> {
-  const connection = new Connection(input.config.rpcUrl, "confirmed"),
+  const connection = createGovernedConnection({rpcUrl:input.config.rpcUrl,priority:'P0_EXECUTION_CRITICAL'}),
     adapter = createMeteoraReadAdapter({
       rpcUrl: input.config.rpcUrl,
       cluster: "mainnet-beta",
       programId: input.config.programId,
+      priority:'P0_EXECUTION_CRITICAL',
     }),
     pool = await adapter.getPool(input.plan.poolAddress),
     [nativeLamportsBefore,wsolRawBefore,tokenXRawBefore]=await Promise.all([
@@ -1468,7 +1469,7 @@ export async function recoverPartialEntryFunding(input: {
         | undefined;
       try {
         status = (
-          await new Connection(input.config.rpcUrl, "confirmed").getSignatureStatuses(
+          await createGovernedConnection({rpcUrl:input.config.rpcUrl,priority:'P1_RECOVERY_CRITICAL'}).getSignatureStatuses(
             [signature],
             { searchTransactionHistory: true },
           )
@@ -1619,11 +1620,12 @@ export async function recoverPartialEntryFunding(input: {
       });
       continue;
     }
-    const connection = new Connection(input.config.rpcUrl, "confirmed"),
+    const connection = createGovernedConnection({rpcUrl:input.config.rpcUrl,priority:'P1_RECOVERY_CRITICAL'}),
       adapter = createMeteoraReadAdapter({
         rpcUrl: input.config.rpcUrl,
         cluster: "mainnet-beta",
         programId: input.config.programId,
+        priority:'P1_RECOVERY_CRITICAL',
       }),
       pool = await adapter.getPool(plan.poolAddress),
       accounts = await connection.getParsedTokenAccountsByOwner(
@@ -1794,7 +1796,7 @@ async function executeMeteoraMutation(input: {
   afterConfirmed?: (submitted: { signature: string; estimatedFeeLamports: bigint }) => Promise<void>;
 }): Promise<LiveWorkerResult> {
   const transaction = legacyBuilt(input.built),
-    connection = new Connection(input.config.rpcUrl, "confirmed"),
+    connection = createGovernedConnection({rpcUrl:input.config.rpcUrl,priority:'P0_EXECUTION_CRITICAL'}),
     capital = mutationCapital(input.plan),
     now = new Date().toISOString();
   // From this point onward a submission may have reached the cluster.  A
@@ -2188,7 +2190,7 @@ async function executeManagementReplacement(input: {
     range.lower > range.upper
   )
     throw new Error("LPFORGE_P6_MANAGEMENT_REMOVE_RANGE_REQUIRED");
-  const removalConnection = new Connection(input.config.rpcUrl, "confirmed"),
+  const removalConnection = createGovernedConnection({rpcUrl:input.config.rpcUrl,priority:'P0_EXECUTION_CRITICAL'}),
     poolFactBefore = await adapter.getPool(input.plan.poolAddress),
     [tokenXBeforeRemove,tokenYBeforeRemove]=await Promise.all([
       readWalletTokenBalance({connection:removalConnection,ownerAddress:input.plan.ownerAddress,mint:poolFactBefore.tokenXMint}),
@@ -2464,7 +2466,7 @@ async function executeCloseSettlement(input: {
   if (!removeStep || !unwindStep || !closeStep)
     throw new Error("LPFORGE_P6_CLOSE_SEQUENCE_MISSING");
 
-  const connection = new Connection(input.config.rpcUrl, "confirmed"),
+  const connection = createGovernedConnection({rpcUrl:input.config.rpcUrl,priority:'P0_EXECUTION_CRITICAL'}),
     poolFact = await createMeteoraReadAdapter({
       rpcUrl: input.config.rpcUrl,
       cluster: "mainnet-beta",
@@ -2811,7 +2813,7 @@ export async function executeAutonomousPlan(input: {
   const step = input.plan.steps[0];
   if (!step) throw new Error("LPFORGE_P6_MUTATION_STEP_REQUIRED");
   if (input.plan.action === "CLAIM") {
-    const claimConnection=new Connection(input.config.rpcUrl,"confirmed"),claimPoolFact=await createMeteoraReadAdapter({rpcUrl:input.config.rpcUrl,cluster:"mainnet-beta",programId:input.config.programId}).getPool(input.plan.poolAddress),claimBeforeX=await readWalletTokenBalance({connection:claimConnection,ownerAddress:input.plan.ownerAddress,mint:claimPoolFact.tokenXMint}),claimBeforeY=await readWalletTokenBalance({connection:claimConnection,ownerAddress:input.plan.ownerAddress,mint:claimPoolFact.tokenYMint});
+    const claimConnection=createGovernedConnection({rpcUrl:input.config.rpcUrl,priority:'P0_EXECUTION_CRITICAL'}),claimPoolFact=await createMeteoraReadAdapter({rpcUrl:input.config.rpcUrl,cluster:"mainnet-beta",programId:input.config.programId,priority:'P0_EXECUTION_CRITICAL'}).getPool(input.plan.poolAddress),claimBeforeX=await readWalletTokenBalance({connection:claimConnection,ownerAddress:input.plan.ownerAddress,mint:claimPoolFact.tokenXMint}),claimBeforeY=await readWalletTokenBalance({connection:claimConnection,ownerAddress:input.plan.ownerAddress,mint:claimPoolFact.tokenYMint});
     let built;
     try {
       built = await buildClaimTransactions(pool, {
@@ -2851,7 +2853,7 @@ export async function executeAutonomousPlan(input: {
     });
   }
   if (input.plan.action === "REDUCE") {
-    const reductionConnection=new Connection(input.config.rpcUrl,"confirmed"),reductionPoolFact=await createMeteoraReadAdapter({rpcUrl:input.config.rpcUrl,cluster:"mainnet-beta",programId:input.config.programId}).getPool(input.plan.poolAddress),reductionBeforeX=await readWalletTokenBalance({connection:reductionConnection,ownerAddress:input.plan.ownerAddress,mint:reductionPoolFact.tokenXMint}),reductionBeforeY=await readWalletTokenBalance({connection:reductionConnection,ownerAddress:input.plan.ownerAddress,mint:reductionPoolFact.tokenYMint}),range = await chainMutationRange({
+    const reductionConnection=createGovernedConnection({rpcUrl:input.config.rpcUrl,priority:'P0_EXECUTION_CRITICAL'}),reductionPoolFact=await createMeteoraReadAdapter({rpcUrl:input.config.rpcUrl,cluster:"mainnet-beta",programId:input.config.programId,priority:'P0_EXECUTION_CRITICAL'}).getPool(input.plan.poolAddress),reductionBeforeX=await readWalletTokenBalance({connection:reductionConnection,ownerAddress:input.plan.ownerAddress,mint:reductionPoolFact.tokenXMint}),reductionBeforeY=await readWalletTokenBalance({connection:reductionConnection,ownerAddress:input.plan.ownerAddress,mint:reductionPoolFact.tokenYMint}),range = await chainMutationRange({
         plan: input.plan,
         stepMetadata: step.metadata,
         rpcUrl: input.config.rpcUrl,
@@ -2939,7 +2941,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
   const plans = await input.store.loadUnresolvedAutonomousPlans(),
     results: LiveRecoveryResult[] = [];
   const connection = input.rpcUrl
-    ? new Connection(input.rpcUrl, "confirmed")
+    ? createGovernedConnection({rpcUrl:input.rpcUrl,priority:'P1_RECOVERY_CRITICAL'})
     : undefined;
   const adapter =
     input.rpcUrl && input.programId
@@ -3483,7 +3485,7 @@ export async function reconcileOrphanedPositions(input: {
       programId: input.programId,
     });
     allWalletPositions ??= runtime.DLMM.getAllLbPairPositionsByUser(
-      new runtime.Connection(input.rpcUrl, "confirmed"),
+      createGovernedConnection({rpcUrl:input.rpcUrl,priority:'P1_RECOVERY_CRITICAL'}),
       new runtime.PublicKey(ownerAddress),
       {
         cluster: "mainnet-beta",

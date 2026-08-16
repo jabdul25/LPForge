@@ -15,11 +15,11 @@ import {
   recoverUnfinishedAutonomousPlans,
   reconcileOrphanedPositions,
 } from "../../../packages/phase6-live-worker/src/index.js";
-import { Connection, PublicKey } from "@solana/web3.js";
+import { PublicKey } from "@solana/web3.js";
 import { EXPECTED_DLMM_PROGRAM_ID } from "../../../packages/meteora/src/index.js";
 import { loadDeploymentPolicyFile } from "../../../packages/deployment-policy/src/index.js";
 import { validateClaimedPlan } from "../../../packages/phase6-claim-guard/src/index.js";
-import { createMeteoraReadAdapter } from "../../../packages/meteora/src/index.js";
+import { createGovernedConnection, createMeteoraReadAdapter } from "../../../packages/meteora/src/index.js";
 import { assertPreinitializedMeteoraBinArrays } from "../../../packages/meteora-execution/src/index.js";
 import { Phase7TelegramAlerter,alertsForExecutionResult,loadPhase7TelegramConfig,type Phase7Alert } from "../../../packages/phase7-alerting/src/index.js";
 
@@ -211,7 +211,7 @@ async function dispatchOne() {
     if(["OPEN","ADD"].includes(plan.action)){
       const capital=guard.capitalLamports, deployment=staticPolicy.productionCapital;
       if(!deployment){await store.transitionAutonomousPlan({planId:plan.planId,state:"BLOCKED",at:now,reasonCodes:['P6_CAPITAL_POLICY_MISSING'],payload:{stage:'CAPITAL_RESERVATION'}});return{service:'lpforge-execution',status:'BLOCKED',planId:plan.planId,reasonCodes:['P6_CAPITAL_POLICY_MISSING'],transactionSubmitted:false};}
-      const walletLamports=BigInt(await new Connection(config.rpcUrl,'confirmed').getBalance(new PublicKey(plan.ownerAddress),'confirmed'));
+      const walletLamports=BigInt(await createGovernedConnection({rpcUrl:config.rpcUrl,priority:'P0_EXECUTION_CRITICAL'}).getBalance(new PublicKey(plan.ownerAddress),'confirmed'));
       if(plan.action==='OPEN'){
         const construction=staticPolicy.positionConstruction,intent=(plan.planPayload.intent??{}) as Record<string,unknown>,lower=Number(intent.lowerBinId),upper=Number(intent.upperBinId),width=upper-lower+1;
         if(!construction||!Number.isInteger(lower)||!Number.isInteger(upper)||width<3||width>construction.maxInitialPositionWidthBins){await store.transitionAutonomousPlan({planId:plan.planId,state:'BLOCKED',at:now,reasonCodes:['P6_POSITION_CONSTRUCTION_POLICY_BLOCK'],payload:{stage:'POSITION_CONSTRUCTION',widthBins:width}});return{service:'lpforge-execution',status:'BLOCKED',planId:plan.planId,reasonCodes:['P6_POSITION_CONSTRUCTION_POLICY_BLOCK'],transactionSubmitted:false};}
@@ -250,10 +250,7 @@ async function recoverOnce() {
     store = await createPostgresStore(process.env.DATABASE_URL ?? "");
   try {
     const config = workerConfig(),
-      currentBlockHeight = await new Connection(
-        config.rpcUrl,
-        "confirmed",
-      ).getBlockHeight("confirmed");
+      currentBlockHeight = await createGovernedConnection({rpcUrl:config.rpcUrl,priority:'P1_RECOVERY_CRITICAL'}).getBlockHeight("confirmed");
     await store.reconcileExecutionCapitalReservations(new Date().toISOString());
     const partial = await recoverPartialEntryFunding({
       store,

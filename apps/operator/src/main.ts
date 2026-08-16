@@ -6,6 +6,7 @@ import {
 } from "../../../packages/db/src/index.js";
 import {
   createMeteoraReadAdapter,
+  createGovernedConnection,
   createSolanaRpcClient,
   scanAddressTransactions,
 } from "../../../packages/meteora/src/index.js";
@@ -42,7 +43,7 @@ import {
 } from "../../../packages/test-fixtures/src/index.js";
 import { loadDeploymentPolicyFile } from "../../../packages/deployment-policy/src/index.js";
 import { assessProductionOpenPlanCapacity } from "../../../packages/production-entry-capacity/src/index.js";
-import { Connection, PublicKey } from "@solana/web3.js";
+import { PublicKey } from "@solana/web3.js";
 
 function json(v: unknown) {
   return JSON.stringify(
@@ -138,7 +139,7 @@ async function loadLiveOpenPlanCapacity(input: {
   const walletLamports = currentEnough
     ? BigInt(priorWallet)
     : BigInt(
-        await new Connection(input.rpcUrl, "confirmed").getBalance(
+        await createGovernedConnection({rpcUrl:input.rpcUrl,priority:'P2_POSITION_MANAGEMENT'}).getBalance(
           new PublicKey(input.ownerAddress),
           "confirmed",
         ),

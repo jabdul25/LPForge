@@ -1,3 +1,5 @@
+import {createHash} from 'node:crypto';
+import {Connection} from '@solana/web3.js';
 import { asNumber, asString, nowIso, type Base58Address, type BinLiquidityFact, type CollectFeeMode, type FunctionType, type PoolStateFact, type PositionV2Fact, type ProtocolCompatibilityCheck, type SwapEventFact } from '../../domain/src/index.js';
 
 export const EXPECTED_DLMM_PROGRAM_ID = 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo';
@@ -39,8 +41,33 @@ export interface SolanaRpcClient {
   getTransaction(signature:string): Promise<Record<string,unknown>|null>;
 }
 
-type FetchLike=(input:string|URL,init?:RequestInit)=>Promise<Response>;
+type FetchLike=(input:RequestInfo|URL,init?:RequestInit)=>Promise<Response>;
 type SleepLike=(ms:number)=>Promise<void>;
+export type RpcPriority='P0_EXECUTION_CRITICAL'|'P1_RECOVERY_CRITICAL'|'P2_POSITION_MANAGEMENT'|'P3_DISCOVERY'|'P4_BACKFILL';
+export interface RpcCoordinator { acquire(priority:RpcPriority,method:string):Promise<void>; note429(priority:RpcPriority,method:string,retryAfterMs:number):Promise<void>; noteRetry(priority:RpcPriority,method:string):Promise<void>; }
+export class RpcBudgetShedError extends Error { readonly code='LPFORGE_RPC_BUDGET_SHED'; constructor(readonly priority:RpcPriority,readonly method:string){super(`LPFORGE_RPC_BUDGET_SHED:${priority}:${method}`);} }
+type PgClient={query:(sql:string,params?:unknown[])=>Promise<{rows:Array<Record<string,unknown>>}>;end:()=>Promise<void>};
+type RpcBudgetConfig={total:number;p0:number;p1:number;p2:number;p3:number;p4:number;};
+const priorityWaitMs:Record<RpcPriority,number>={P0_EXECUTION_CRITICAL:60_000,P1_RECOVERY_CRITICAL:60_000,P2_POSITION_MANAGEMENT:10_000,P3_DISCOVERY:1_500,P4_BACKFILL:250};
+const sleep=(ms:number)=>new Promise<void>(resolve=>setTimeout(resolve,ms));
+function envInt(name:string,fallback:number,min:number){const value=Number(process.env[name]??fallback);return Number.isSafeInteger(value)&&value>=min?value:fallback;}
+function rpcBudgetConfig():RpcBudgetConfig{const total=envInt('LPFORGE_RPC_GLOBAL_MAX_RPS',12,3);const p0=envInt('LPFORGE_RPC_P0_RESERVED_RPS',3,0);const p1=envInt('LPFORGE_RPC_P1_RESERVED_RPS',3,0);if(p0+p1>=total)throw new Error('LPFORGE_RPC_BUDGET_INVALID');return{total,p0,p1,p2:envInt('LPFORGE_RPC_P2_MAX_RPS',Math.max(1,total-p0-p1),1),p3:envInt('LPFORGE_RPC_P3_MAX_RPS',Math.max(1,Math.floor((total-p0-p1)/2)),1),p4:envInt('LPFORGE_RPC_P4_MAX_RPS',1,1)};}
+class PostgresRpcCoordinator implements RpcCoordinator {
+  private client?:PgClient; private readonly providerKey:string; private readonly config=rpcBudgetConfig();
+  constructor(url:string){this.providerKey=createHash('sha256').update(url).digest('hex');}
+  private async db():Promise<PgClient>{if(this.client)return this.client;const pg=await import('pg') as unknown as {Client:new(input:{connectionString:string})=>PgClient};const url=process.env.DATABASE_URL?.trim();if(!url)throw new Error('LPFORGE_RPC_COORDINATOR_DATABASE_URL_REQUIRED');this.client=new pg.Client({connectionString:url});return this.client;}
+  async acquire(priority:RpcPriority,method:string):Promise<void>{const started=Date.now();for(;;){const db=await this.db();const r=await db.query('SELECT * FROM execution.acquire_rpc_permit($1,$2,$3,$4,$5,$6,$7,$8,$9)',[this.providerKey,priority,method,this.config.total,this.config.p0,this.config.p1,this.config.p2,this.config.p3,this.config.p4]);const row=r.rows[0]??{};if(row.granted===true||row.granted==='t')return;const waited=Date.now()-started;if(waited>=priorityWaitMs[priority]&&priority!=='P0_EXECUTION_CRITICAL'&&priority!=='P1_RECOVERY_CRITICAL')throw new RpcBudgetShedError(priority,method);await sleep(Math.max(1,Math.min(Number(row.wait_ms??100),1000)));}}
+  async note429(priority:RpcPriority,method:string,backoffMs:number):Promise<void>{const db=await this.db();await db.query('SELECT execution.report_rpc_pressure($1,$2,$3,$4)',[this.providerKey,priority,method,Math.max(1,backoffMs)]);}
+  async noteRetry(priority:RpcPriority,method:string):Promise<void>{const db=await this.db();await db.query("SELECT execution.rpc_metric_event($1,$2,$3,'RETRY',0)",[this.providerKey,priority,method]);}
+}
+let sharedCoordinator:RpcCoordinator|undefined;
+/** Returns the process handle for the database-backed system-wide coordinator. */
+export function defaultRpcCoordinator():RpcCoordinator|undefined {if(!process.env.DATABASE_URL?.trim())return undefined;return sharedCoordinator??=new PostgresRpcCoordinator(process.env.DATABASE_URL);}
+function methodFromBody(body:unknown):string{try{const parsed=typeof body==='string'?JSON.parse(body):body;return typeof parsed==='object'&&parsed&&typeof (parsed as {method?:unknown}).method==='string'?(parsed as {method:string}).method:'sdk';}catch{return'sdk';}}
+/** SDK Connection fetch hook. Every web3/Meteora RPC request receives the same shared permit as direct JSON-RPC. */
+export function createGovernedRpcFetch(input:{fetchImpl?:FetchLike;coordinator?:RpcCoordinator;priority:RpcPriority}):FetchLike {const fetchImpl=input.fetchImpl??fetch;const coordinator=input.coordinator??defaultRpcCoordinator();return async(url,init)=>{const method=methodFromBody(init?.body);await coordinator?.acquire(input.priority,method);const response=await fetchImpl(url,init);if(response.status===429)await coordinator?.note429(input.priority,method,retryAfterMs(response,Date.now())??1000);return response;};}
+/** Create a web3 Connection whose SDK fan-out is admitted by the shared coordinator. */
+export function createGovernedConnection(input:{rpcUrl:string;priority:RpcPriority;coordinator?:RpcCoordinator;commitment?:'confirmed'|'finalized'|'processed'}):Connection{return new Connection(input.rpcUrl,{commitment:input.commitment??'confirmed',fetch:createGovernedRpcFetch({priority:input.priority,...(input.coordinator?{coordinator:input.coordinator}:{})})});}
 export interface SolanaRpcClientOptions {
   url:string;
   timeoutMs?:number;
@@ -51,6 +78,8 @@ export interface SolanaRpcClientOptions {
   retryMaxDelayMs?:number;
   sleepImpl?:SleepLike;
   nowImpl?:()=>number;
+  priority?:RpcPriority;
+  coordinator?:RpcCoordinator;
 }
 function retryAfterMs(response:Response,now:number):number|undefined {
   const raw=response.headers.get('retry-after')?.trim(); if(!raw)return undefined;
@@ -63,9 +92,11 @@ export function createSolanaRpcClient(opts:SolanaRpcClientOptions):SolanaRpcClie
   const minIntervalMs=Math.max(0,opts.minIntervalMs??125); const maxRetries=Math.max(0,opts.maxRetries??5);
   const retryBaseDelayMs=Math.max(1,opts.retryBaseDelayMs??250); const retryMaxDelayMs=Math.max(retryBaseDelayMs,opts.retryMaxDelayMs??4000);
   const sleepImpl=opts.sleepImpl??(ms=>new Promise(resolve=>setTimeout(resolve,ms))); const nowImpl=opts.nowImpl??(()=>Date.now());
+  const priority=opts.priority??'P2_POSITION_MANAGEMENT'; const coordinator=opts.coordinator??defaultRpcCoordinator();
   async function pace(){const wait=Math.max(0,minIntervalMs-(nowImpl()-lastRequestStartedAt));if(wait>0)await sleepImpl(wait);lastRequestStartedAt=nowImpl();}
   async function call<T>(method:string,params:unknown[]):Promise<T>{
     for(let attempt=0;;attempt++){
+      await coordinator?.acquire(priority,method);
       await pace();
       const controller=new AbortController(); const timer=setTimeout(()=>controller.abort(),timeout);
       try {
@@ -75,6 +106,7 @@ export function createSolanaRpcClient(opts:SolanaRpcClientOptions):SolanaRpcClie
           if(transient&&attempt<maxRetries){
             const exponential=Math.min(retryMaxDelayMs,retryBaseDelayMs*(2**attempt));
             const wait=Math.max(exponential,retryAfterMs(r,nowImpl())??0);
+            if(r.status===429)await coordinator?.note429(priority,method,wait); else await coordinator?.noteRetry(priority,method);
             await sleepImpl(wait); continue;
           }
           throw new Error(`LPFORGE_RPC_HTTP:${r.status}`);
@@ -86,6 +118,7 @@ export function createSolanaRpcClient(opts:SolanaRpcClientOptions):SolanaRpcClie
           // budget before scanner-level quarantine is considered.
           const transient=body.error.code===-32603||body.error.code===-32005||body.error.code===-32004;
           if(transient&&attempt<maxRetries){
+            await coordinator?.noteRetry(priority,method);
             await sleepImpl(Math.min(retryMaxDelayMs,retryBaseDelayMs*(2**attempt)));
             continue;
           }
@@ -134,15 +167,16 @@ async function loadSdk() {
   const moduleName='node:module';
   const mod=await import(moduleName) as unknown as {createRequire:(url:string)=>((id:string)=>unknown)&{resolve:(id:string)=>string}};
   const rootRequire=mod.createRequire(import.meta.url);
-  const web3=rootRequire('@solana/web3.js') as {Connection:new(url:string,commitment:string)=>unknown;PublicKey:new(value:string)=>unknown};
+  const web3=rootRequire('@solana/web3.js') as {Connection:new(url:string,config:unknown)=>unknown;PublicKey:new(value:string)=>unknown};
   const DLMM=rootRequire('@meteora-ag/dlmm') as {create:(connection:unknown,key:unknown,opt:unknown)=>Promise<Record<string,unknown>>};
   if(!DLMM||typeof DLMM.create!=='function')throw new Error('LPFORGE_METEORA_SDK_INCOMPATIBLE'); return {web3,DLMM};
 }
 
-export function createMeteoraReadAdapter(opts:{rpcUrl:string;cluster:'mainnet-beta'|'devnet';programId:string;expectedSdkVersion?:string;rpcTimeoutMs?:number;rpcMinIntervalMs?:number;rpcMaxRetries?:number;retryBaseDelayMs?:number;retryMaxDelayMs?:number;onEventDecodeWarning?:(warning:MeteoraEventDecodeWarning)=>void}):MeteoraReadAdapter {
-  const rpc=createSolanaRpcClient({url:opts.rpcUrl,...(opts.rpcTimeoutMs!==undefined?{timeoutMs:opts.rpcTimeoutMs}:{}),...(opts.rpcMinIntervalMs!==undefined?{minIntervalMs:opts.rpcMinIntervalMs}:{}),...(opts.rpcMaxRetries!==undefined?{maxRetries:opts.rpcMaxRetries}:{}),...(opts.retryBaseDelayMs!==undefined?{retryBaseDelayMs:opts.retryBaseDelayMs}:{}),...(opts.retryMaxDelayMs!==undefined?{retryMaxDelayMs:opts.retryMaxDelayMs}:{})});
+export function createMeteoraReadAdapter(opts:{rpcUrl:string;cluster:'mainnet-beta'|'devnet';programId:string;expectedSdkVersion?:string;rpcTimeoutMs?:number;rpcMinIntervalMs?:number;rpcMaxRetries?:number;retryBaseDelayMs?:number;retryMaxDelayMs?:number;priority?:RpcPriority;coordinator?:RpcCoordinator;onEventDecodeWarning?:(warning:MeteoraEventDecodeWarning)=>void}):MeteoraReadAdapter {
+  const priority=opts.priority??'P2_POSITION_MANAGEMENT'; const coordinator=opts.coordinator??defaultRpcCoordinator();
+  const rpc=createSolanaRpcClient({url:opts.rpcUrl,...(opts.rpcTimeoutMs!==undefined?{timeoutMs:opts.rpcTimeoutMs}:{}),...(opts.rpcMinIntervalMs!==undefined?{minIntervalMs:opts.rpcMinIntervalMs}:{}),...(opts.rpcMaxRetries!==undefined?{maxRetries:opts.rpcMaxRetries}:{}),...(opts.retryBaseDelayMs!==undefined?{retryBaseDelayMs:opts.retryBaseDelayMs}:{}),...(opts.retryMaxDelayMs!==undefined?{retryMaxDelayMs:opts.retryMaxDelayMs}:{}),priority,...(coordinator?{coordinator}:{})});
   const clientCache=new Map<string,Promise<Record<string,unknown>>>();
-  async function client(address:string):Promise<Record<string,unknown>> { let pending=clientCache.get(address); if(!pending){ pending=(async()=>{const {web3,DLMM}=await loadSdk(); const connection=new web3.Connection(opts.rpcUrl,'confirmed'); const key=new web3.PublicKey(address); const programId=new web3.PublicKey(opts.programId); return DLMM.create(connection,key,{cluster:opts.cluster,programId});})(); clientCache.set(address,pending); } return pending; }
+  async function client(address:string):Promise<Record<string,unknown>> { let pending=clientCache.get(address); if(!pending){ pending=(async()=>{const {web3,DLMM}=await loadSdk(); const connection=new web3.Connection(opts.rpcUrl,{commitment:'confirmed',fetch:createGovernedRpcFetch({priority,...(coordinator?{coordinator}:{})})}); const key=new web3.PublicKey(address); const programId=new web3.PublicKey(opts.programId); return DLMM.create(connection,key,{cluster:opts.cluster,programId});})(); clientCache.set(address,pending); } return pending; }
   return {
     async verifyCompatibility(smokePool){ const checkedAt=nowIso(); try { if(opts.programId!==EXPECTED_DLMM_PROGRAM_ID)throw new Error('PROGRAM_ID_MISMATCH'); await loadSdk(); const details:Record<string,unknown>={sdkImport:true,programIdMatch:true}; if(smokePool){const p=await client(smokePool); details.smokePoolLoaded=Boolean(p.lbPair); details.slot=(await rpc.getSlot()).toString();} return {state:'VERIFIED',programId:opts.programId,expectedSdkVersion:opts.expectedSdkVersion??BASELINE_METEORA_SDK_VERSION,decoderVersion:EVENT_DECODER_VERSION,checkedAt,details}; } catch(error){return {state:'HOLD',programId:opts.programId,expectedSdkVersion:opts.expectedSdkVersion??BASELINE_METEORA_SDK_VERSION,decoderVersion:EVENT_DECODER_VERSION,checkedAt,details:{error:error instanceof Error?error.message:String(error)}};} },
     async getPool(address){ const c=await client(address); const slot=await rpc.getSlot(); const dyn=typeof c.getDynamicFee==='function'?await (c.getDynamicFee as ()=>Promise<unknown>|unknown)():undefined; return normalizePoolFromSdk(address,c,slot,dyn); },
