@@ -918,6 +918,11 @@ async function liveRun() {
 }
 const cmd = process.argv[2] ?? "fixture-once";
 if (cmd === "fixture-once") await fixtureOnce();
-else if (cmd === "live-once") await liveOnce();
+else if (cmd === "live-once") {
+  await liveOnce();
+  // Phase-7 runs this as a child probe. Governed clients may retain idle
+  // handles after the cycle is durable, so let the parent advance explicitly.
+  process.exit(0);
+}
 else if (cmd === "live-run") await liveRun();
 else throw new Error("Usage: operator fixture-once|live-once|live-run");

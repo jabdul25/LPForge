@@ -3,6 +3,7 @@ declare const process: {
   env: NodeJS.ProcessEnv;
   argv: string[];
   exitCode?: number;
+  exit(code?: number): never;
   cwd(): string;
   on(event: string, listener: (...args: unknown[]) => void): void;
 };
