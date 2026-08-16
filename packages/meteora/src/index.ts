@@ -46,7 +46,7 @@ type SleepLike=(ms:number)=>Promise<void>;
 export type RpcPriority='P0_EXECUTION_CRITICAL'|'P1_RECOVERY_CRITICAL'|'P2_POSITION_MANAGEMENT'|'P3_DISCOVERY'|'P4_BACKFILL';
 export interface RpcCoordinator { acquire(priority:RpcPriority,method:string):Promise<void>; note429(priority:RpcPriority,method:string,retryAfterMs:number):Promise<void>; noteRetry(priority:RpcPriority,method:string):Promise<void>; }
 export class RpcBudgetShedError extends Error { readonly code='LPFORGE_RPC_BUDGET_SHED'; constructor(readonly priority:RpcPriority,readonly method:string){super(`LPFORGE_RPC_BUDGET_SHED:${priority}:${method}`);} }
-type PgClient={query:(sql:string,params?:unknown[])=>Promise<{rows:Array<Record<string,unknown>>}>;end:()=>Promise<void>};
+type PgClient={connect:()=>Promise<void>;query:(sql:string,params?:unknown[])=>Promise<{rows:Array<Record<string,unknown>>}>;end:()=>Promise<void>};
 type RpcBudgetConfig={total:number;p0:number;p1:number;p2:number;p3:number;p4:number;};
 const priorityWaitMs:Record<RpcPriority,number>={P0_EXECUTION_CRITICAL:60_000,P1_RECOVERY_CRITICAL:60_000,P2_POSITION_MANAGEMENT:10_000,P3_DISCOVERY:1_500,P4_BACKFILL:250};
 const sleep=(ms:number)=>new Promise<void>(resolve=>setTimeout(resolve,ms));
@@ -55,7 +55,7 @@ function rpcBudgetConfig():RpcBudgetConfig{const total=envInt('LPFORGE_RPC_GLOBA
 class PostgresRpcCoordinator implements RpcCoordinator {
   private client?:PgClient; private readonly providerKey:string; private readonly config=rpcBudgetConfig();
   constructor(url:string){this.providerKey=createHash('sha256').update(url).digest('hex');}
-  private async db():Promise<PgClient>{if(this.client)return this.client;const pg=await import('pg') as unknown as {Client:new(input:{connectionString:string})=>PgClient};const url=process.env.DATABASE_URL?.trim();if(!url)throw new Error('LPFORGE_RPC_COORDINATOR_DATABASE_URL_REQUIRED');this.client=new pg.Client({connectionString:url});return this.client;}
+  private async db():Promise<PgClient>{if(this.client)return this.client;const pg=await import('pg') as unknown as {Client:new(input:{connectionString:string})=>PgClient};const url=process.env.DATABASE_URL?.trim();if(!url)throw new Error('LPFORGE_RPC_COORDINATOR_DATABASE_URL_REQUIRED');const client=new pg.Client({connectionString:url});await client.connect();this.client=client;return client;}
   async acquire(priority:RpcPriority,method:string):Promise<void>{const started=Date.now();for(;;){const db=await this.db();const r=await db.query('SELECT * FROM execution.acquire_rpc_permit($1,$2,$3,$4,$5,$6,$7,$8,$9)',[this.providerKey,priority,method,this.config.total,this.config.p0,this.config.p1,this.config.p2,this.config.p3,this.config.p4]);const row=r.rows[0]??{};if(row.granted===true||row.granted==='t')return;const waited=Date.now()-started;if(waited>=priorityWaitMs[priority]&&priority!=='P0_EXECUTION_CRITICAL'&&priority!=='P1_RECOVERY_CRITICAL')throw new RpcBudgetShedError(priority,method);await sleep(Math.max(1,Math.min(Number(row.wait_ms??100),1000)));}}
   async note429(priority:RpcPriority,method:string,backoffMs:number):Promise<void>{const db=await this.db();await db.query('SELECT execution.report_rpc_pressure($1,$2,$3,$4)',[this.providerKey,priority,method,Math.max(1,backoffMs)]);}
   async noteRetry(priority:RpcPriority,method:string):Promise<void>{const db=await this.db();await db.query("SELECT execution.rpc_metric_event($1,$2,$3,'RETRY',0)",[this.providerKey,priority,method]);}
