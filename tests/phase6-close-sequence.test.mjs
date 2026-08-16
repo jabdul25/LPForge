@@ -34,7 +34,7 @@ test('worker close sequence snapshots → drains → claims → unwinds only att
   const worker=fs.readFileSync('packages/phase6-live-worker/src/index.ts','utf8');
   const closeAt=worker.indexOf('async function executeCloseSettlement');
   const drainAt=worker.indexOf('deferCompletion: true,',closeAt);
-  const snapshotAt=worker.indexOf('tokenXBefore = await readWalletTokenBalance',closeAt);
+  const snapshotAt=worker.indexOf('[tokenXBefore,tokenYBefore]=await Promise.all',closeAt);
   const claimAt=worker.indexOf('buildClaimTransactions(input.pool, {',drainAt);
   const claimStepAt=worker.indexOf('CLOSE_CLAIM_RESIDUAL',claimAt);
   const unwindAt=worker.indexOf('executeJupiterUnwindStep({',claimStepAt);
@@ -49,6 +49,7 @@ test('worker close sequence snapshots → drains → claims → unwinds only att
   assert.match(worker,/LPFORGE_METEORA_CLAIM_NOTHING_TO_CLAIM/);
   assert.match(worker,/idempotencyKey:\s*`\$\{input\.plan\.idempotencyKey\}:\$\{unwindStep\.transactionId\}`/);
   assert.match(worker,/tokenXAfter > tokenXBefore \? tokenXAfter - tokenXBefore : 0n/,'only position-attributable inventory may be unwound');
+  assert.match(worker,/tokenYAfter>tokenYBefore\?tokenYAfter-tokenYBefore:0n/,'the close ledger also records the position-attributable SOL-side withdrawal');
   assert.match(worker,/P6_CLOSE_TOKEN_X_RESIDUAL/,'a failed residual-inventory verification becomes reconciliation debt');
   // The drain and claim phases must defer completion: a death between phases
   // leaves a durable stage for recovery rather than marking a half-executed

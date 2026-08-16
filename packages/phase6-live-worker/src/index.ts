@@ -1623,6 +1623,8 @@ async function executeMeteoraMutation(input: {
   deferCompletion?: boolean;
   /** Persist the parent settlement's sent state before waiting for chain truth. */
   afterSubmit?: (submitted: { signature: string }) => Promise<void>;
+  /** Runs after confirmation but before the plan can be marked complete. */
+  afterConfirmed?: (submitted: { signature: string; estimatedFeeLamports: bigint }) => Promise<void>;
 }): Promise<LiveWorkerResult> {
   const transaction = legacyBuilt(input.built),
     connection = new Connection(input.config.rpcUrl, "confirmed"),
@@ -1851,6 +1853,13 @@ async function executeMeteoraMutation(input: {
         deferredCompletion: Boolean(input.deferCompletion),
       },
     });
+    // Persist the approved fee estimate for every confirmed child action,
+    // including deferred CLOSE-settlement children. It is durable economic
+    // evidence, not an excuse to send a transaction; a write failure here is
+    // post-submit reconciliation debt.
+    if (input.plan.positionAddress)
+      await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:tx-cost:${transactionId}`,positionAddress:input.plan.positionAddress,planId:input.plan.planId,flowType:'TX_COST',observedAt:new Date().toISOString(),lamports:fee.totalFeeLamports,payload:{signature:submitted.signature,transactionId,source:'EXECUTION_FEE_ESTIMATE'}});
+    if(input.afterConfirmed)await input.afterConfirmed({signature:submitted.signature,estimatedFeeLamports:fee.totalFeeLamports});
     if (input.deferCompletion)
       return {
         status: "RECONCILED",
@@ -1929,7 +1938,9 @@ async function executeMeteoraMutation(input: {
             signature: submitted.signature,
           },
         });
-        await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:reduce-basis`,positionAddress:input.plan.positionAddress,planId:input.plan.planId,flowType:'REDUCE_WITHDRAWAL',observedAt:new Date().toISOString(),lamports:(capital*BigInt(reductionBps))/10_000n,payload:{signature:submitted.signature,reductionBps,accounting:'CAPITAL_BASIS_WITHDRAWAL_PENDING_TOKEN_VALUATION'}});
+        // Principal realization is written by the REDUCE caller from actual
+        // post-confirmation wallet deltas.  A capital-basis estimate is not a
+        // cashflow and must never be used as economic PnL.
       }
     }
     await input.store.completeAutonomousPlan({
@@ -2299,22 +2310,19 @@ async function executeCloseSettlement(input: {
 
   let dispatch = closeSettlementDispatch(input.plan),
     stage = closeSettlementStage(input.plan),
-    tokenXBefore = closeSettlementAmount(dispatch.tokenXBefore);
+    tokenXBefore = closeSettlementAmount(dispatch.tokenXBefore),
+    tokenYBefore = closeSettlementAmount(dispatch.tokenYBefore);
   if (!stage) {
-    tokenXBefore = await readWalletTokenBalance({
-      connection,
-      ownerAddress: input.plan.ownerAddress,
-      mint: poolFact.tokenXMint,
-    });
+    [tokenXBefore,tokenYBefore]=await Promise.all([readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenXMint}),readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenYMint})]);
     await persist(
       "CLOSE_INVENTORY_SNAPSHOTTED",
-      { tokenXBefore: tokenXBefore.toString() },
+      { tokenXBefore: tokenXBefore.toString(),tokenYBefore: tokenYBefore.toString() },
       "BUILDING",
     );
     stage = "CLOSE_INVENTORY_SNAPSHOTTED";
-    dispatch = { ...dispatch, tokenXBefore: tokenXBefore.toString() };
+    dispatch = { ...dispatch, tokenXBefore: tokenXBefore.toString(),tokenYBefore: tokenYBefore.toString() };
   }
-  if (tokenXBefore === undefined) {
+  if (tokenXBefore === undefined||tokenYBefore===undefined) {
     await input.store.transitionAutonomousPlan({
       planId: input.plan.planId,
       state: "RECONCILIATION_REQUIRED",
@@ -2356,6 +2364,7 @@ async function executeCloseSettlement(input: {
       deferCompletion: true,
       afterSubmit: async ({ signature }) => persist("CLOSE_INVENTORY_SNAPSHOTTED", {
         tokenXBefore: tokenXBefore!.toString(),
+        tokenYBefore: tokenYBefore!.toString(),
         pendingStage: "CLOSE_REMOVE_SUBMITTED",
         pendingSignature: signature,
       }),
@@ -2365,6 +2374,7 @@ async function executeCloseSettlement(input: {
     if (removed.status !== "RECONCILED") return removed;
     await persist("CLOSE_LIQUIDITY_REMOVED", {
       tokenXBefore: tokenXBefore.toString(),
+      tokenYBefore: tokenYBefore.toString(),
       removeTransactionId: removeStep.transactionId,
     });
     stage = "CLOSE_LIQUIDITY_REMOVED";
@@ -2407,6 +2417,7 @@ async function executeCloseSettlement(input: {
         deferCompletion: true,
         afterSubmit: async ({ signature }) => persist("CLOSE_LIQUIDITY_REMOVED", {
           tokenXBefore: tokenXBefore!.toString(),
+          tokenYBefore: tokenYBefore!.toString(),
           pendingStage: "CLOSE_CLAIM_SUBMITTED",
           pendingSignature: signature,
         }),
@@ -2415,20 +2426,18 @@ async function executeCloseSettlement(input: {
     }
     await persist("CLOSE_CLAIMS_SETTLED", {
       tokenXBefore: tokenXBefore.toString(),
+      tokenYBefore: tokenYBefore.toString(),
       claimTransactionSkipped: !claimBuilt,
     });
     stage = "CLOSE_CLAIMS_SETTLED";
   }
 
-  let attributableTokenX = closeSettlementAmount(dispatch.attributableTokenX);
+  let attributableTokenX = closeSettlementAmount(dispatch.attributableTokenX),attributableTokenY=closeSettlementAmount(dispatch.attributableTokenY);
   if (stage === "CLOSE_CLAIMS_SETTLED") {
-    const tokenXAfter = await readWalletTokenBalance({
-      connection,
-      ownerAddress: input.plan.ownerAddress,
-      mint: poolFact.tokenXMint,
-    });
+    const [tokenXAfter,tokenYAfter]=await Promise.all([readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenXMint}),readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenYMint})]);
     attributableTokenX =
       tokenXAfter > tokenXBefore ? tokenXAfter - tokenXBefore : 0n;
+    attributableTokenY=tokenYAfter>tokenYBefore?tokenYAfter-tokenYBefore:0n;
     if (attributableTokenX > 0n)
       await input.store.insertPositionCashflow({
         cashflowId: `${input.plan.planId}:close-token-x`,
@@ -2444,10 +2453,15 @@ async function executeCloseSettlement(input: {
           tokenXAfter: tokenXAfter.toString(),
         },
       });
+    if(attributableTokenY>0n)
+      await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:close-token-y`,positionAddress:input.positionAddress,planId:input.plan.planId,flowType:"CLOSE_WITHDRAWAL",observedAt:new Date().toISOString(),tokenMint:poolFact.tokenYMint,tokenAmountRaw:attributableTokenY.toString(),payload:{source:"REMOVE_PLUS_CLAIM_DELTA",tokenYBefore:tokenYBefore.toString(),tokenYAfter:tokenYAfter.toString()}});
     await persist("CLOSE_INVENTORY_MEASURED", {
       tokenXBefore: tokenXBefore.toString(),
+      tokenYBefore: tokenYBefore.toString(),
       tokenXAfter: tokenXAfter.toString(),
+      tokenYAfter:tokenYAfter.toString(),
       attributableTokenX: attributableTokenX.toString(),
+      attributableTokenY:attributableTokenY.toString(),
     });
     stage = "CLOSE_INVENTORY_MEASURED";
   }
@@ -2483,7 +2497,9 @@ async function executeCloseSettlement(input: {
         reasonPrefix: "P6_CLOSE_UNWIND",
         afterSubmit: async ({ signature }) => persist("CLOSE_INVENTORY_MEASURED", {
           tokenXBefore: tokenXBefore!.toString(),
+          tokenYBefore: tokenYBefore!.toString(),
           attributableTokenX: attributableTokenX!.toString(),
+          attributableTokenY:attributableTokenY?.toString()??"0",
           pendingStage: "CLOSE_UNWIND_SUBMITTED",
           pendingSignature: signature,
         }),
@@ -2492,7 +2508,9 @@ async function executeCloseSettlement(input: {
     }
     await persist("CLOSE_INVENTORY_UNWOUND", {
       tokenXBefore: tokenXBefore.toString(),
+      tokenYBefore: tokenYBefore.toString(),
       attributableTokenX: attributableTokenX.toString(),
+      attributableTokenY:attributableTokenY?.toString()??"0",
       unwindTransactionId: unwindStep.transactionId,
     });
     stage = "CLOSE_INVENTORY_UNWOUND";
@@ -2535,7 +2553,9 @@ async function executeCloseSettlement(input: {
     action: closeAction,
     afterSubmit: async ({ signature }) => persist("CLOSE_INVENTORY_UNWOUND", {
       tokenXBefore: tokenXBefore!.toString(),
+      tokenYBefore: tokenYBefore!.toString(),
       attributableTokenX: attributableTokenX?.toString() ?? "0",
+      attributableTokenY:attributableTokenY?.toString()??"0",
       pendingStage: "CLOSE_POSITION_SUBMITTED",
       pendingSignature: signature,
     }),
@@ -2599,20 +2619,22 @@ export async function executeAutonomousPlan(input: {
     if (built.length !== 1)
       throw new Error("LPFORGE_P6_MULTI_TRANSACTION_CLAIM_UNSUPPORTED");
     built[0]!.metadata.transactionId = step.transactionId;
-    const result=await executeMeteoraMutation({
+    return executeMeteoraMutation({
       ...input,
       built: built[0]!,
       action: "CLAIM",
-    });
-    if(result.status==='RECONCILED'){
+      // This is deliberately inside the submitted mutation lifecycle. A
+      // balance read/write failure after the claim is sent is reconciliation
+      // debt, never a completed plan with missing realized-fee evidence.
+      afterConfirmed: async()=>{
       const afterX=await readWalletTokenBalance({connection:claimConnection,ownerAddress:input.plan.ownerAddress,mint:claimPoolFact.tokenXMint}),afterY=await readWalletTokenBalance({connection:claimConnection,ownerAddress:input.plan.ownerAddress,mint:claimPoolFact.tokenYMint}),observedAt=new Date().toISOString();
       if(afterX>claimBeforeX)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:claim-x`,positionAddress,planId:input.plan.planId,flowType:'FEE_CLAIM',observedAt,tokenMint:claimPoolFact.tokenXMint,tokenAmountRaw:(afterX-claimBeforeX).toString(),payload:{source:'WALLET_DELTA'}});
       if(afterY>claimBeforeY)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:claim-y`,positionAddress,planId:input.plan.planId,flowType:'FEE_CLAIM',observedAt,tokenMint:claimPoolFact.tokenYMint,tokenAmountRaw:(afterY-claimBeforeY).toString(),payload:{source:'WALLET_DELTA'}});
-    }
-    return result;
+      },
+    });
   }
   if (input.plan.action === "REDUCE") {
-    const range = await chainMutationRange({
+    const reductionConnection=new Connection(input.config.rpcUrl,"confirmed"),reductionPoolFact=await createMeteoraReadAdapter({rpcUrl:input.config.rpcUrl,cluster:"mainnet-beta",programId:input.config.programId}).getPool(input.plan.poolAddress),reductionBeforeX=await readWalletTokenBalance({connection:reductionConnection,ownerAddress:input.plan.ownerAddress,mint:reductionPoolFact.tokenXMint}),reductionBeforeY=await readWalletTokenBalance({connection:reductionConnection,ownerAddress:input.plan.ownerAddress,mint:reductionPoolFact.tokenYMint}),range = await chainMutationRange({
         plan: input.plan,
         stepMetadata: step.metadata,
         rpcUrl: input.config.rpcUrl,
@@ -2637,6 +2659,13 @@ export async function executeAutonomousPlan(input: {
       ...input,
       built: built[0]!,
       action: "REDUCE",
+      // Record what actually reached the owner's wallet.  The former
+      // percentage-of-basis record was a sizing estimate, not a withdrawal.
+      afterConfirmed: async()=>{
+        const afterX=await readWalletTokenBalance({connection:reductionConnection,ownerAddress:input.plan.ownerAddress,mint:reductionPoolFact.tokenXMint}),afterY=await readWalletTokenBalance({connection:reductionConnection,ownerAddress:input.plan.ownerAddress,mint:reductionPoolFact.tokenYMint}),observedAt=new Date().toISOString();
+        if(afterX>reductionBeforeX)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:reduce-x`,positionAddress,planId:input.plan.planId,flowType:'REDUCE_WITHDRAWAL',observedAt,tokenMint:reductionPoolFact.tokenXMint,tokenAmountRaw:(afterX-reductionBeforeX).toString(),payload:{source:'WALLET_DELTA'}});
+        if(afterY>reductionBeforeY)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:reduce-y`,positionAddress,planId:input.plan.planId,flowType:'REDUCE_WITHDRAWAL',observedAt,tokenMint:reductionPoolFact.tokenYMint,tokenAmountRaw:(afterY-reductionBeforeY).toString(),payload:{source:'WALLET_DELTA'}});
+      },
     });
   }
   if (
@@ -2663,8 +2692,16 @@ export async function executeAutonomousPlan(input: {
       upperBinId: range.upper,
       strategy: strategy as "SPOT" | "CURVE" | "BID_ASK",
     });
+    const additionalCapital=mutationCapital(input.plan);
+    if(additionalCapital<=0n)throw new Error("LPFORGE_P6_ADD_CAPITAL_REQUIRED");
+    const owned=(await input.store.loadOwnedPositions(input.plan.ownerAddress)).find(row=>String(row.position_address??'')===positionAddress);
+    if(!owned)throw new Error("LPFORGE_P6_ADD_OWNED_POSITION_REQUIRED");
+    let priorCapital:bigint;try{priorCapital=BigInt(String(owned.initial_capital_lamports));}catch{throw new Error("LPFORGE_P6_ADD_POSITION_CAPITAL_INVALID");}
     built.metadata.transactionId = step.transactionId;
-    return executeMeteoraMutation({ ...input, built, action: "ADD" });
+    return executeMeteoraMutation({ ...input, built, action: "ADD", afterConfirmed:async({signature})=>{
+      await input.store.adjustOwnedPositionCapital({positionAddress,capitalLamports:priorCapital+additionalCapital,at:new Date().toISOString(),payload:{planId:input.plan.planId,priorCapitalLamports:priorCapital.toString(),additionalCapitalLamports:additionalCapital.toString(),signature}});
+      await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:add-contribution`,positionAddress,planId:input.plan.planId,flowType:'ADD_CONTRIBUTION',observedAt:new Date().toISOString(),lamports:additionalCapital,payload:{signature,source:'CONFIRMED_PLAN_CAPITAL'}});
+    }});
   }
   if (input.plan.action === "RESHAPE" || input.plan.action === "REBALANCE")
     return executeManagementReplacement({ ...input, pool, positionAddress });

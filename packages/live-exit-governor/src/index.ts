@@ -31,6 +31,9 @@ export interface PositionEconomicsSnapshot {
   feesValueUsd?:number;
   /** Fees/rewards already moved out of PositionV2 and recorded durably. */
   realizedFeeValueUsd?:number;
+  realizedWithdrawalValueUsd?:number;
+  contributedCapitalUsd?:number;
+  executionCostUsd?:number;
   reasonCodes:string[];
 }
 export interface ExitHighWaterState {peakNetReturnFraction:number;peakEconomicValueUsd?:number;peakObservedAt:string;}
@@ -74,25 +77,36 @@ function tokenUsd(raw:string|undefined,decimals:number|undefined,price:number|un
   if(raw===undefined||!Number.isInteger(decimals)||decimals!<0||!finite(price)||price!<0)return undefined;
   let n:number;try{n=Number(BigInt(raw))/10**decimals!;}catch{return undefined;}return Number.isFinite(n)?n*price!:undefined;
 }
-export interface RealizedPositionCashflow {flowType:string;lamports?:bigint;tokenMint?:string;tokenAmountRaw?:string;}
+export interface RealizedPositionCashflow {flowType:string;lamports?:bigint;tokenMint?:string;tokenAmountRaw?:string;payload?:Record<string,unknown>;}
 /**
- * Values only fee/reward cashflows that have left PositionV2.  The caller
- * supplies the contemporaneous pool price/decimals; unknown token prices are
- * reported rather than guessed.  Principal withdrawals/additions remain
- * capital-basis events and are intentionally not mixed into fee PnL here.
+ * Values the durable lifecycle ledger at current pool prices. Unknown values
+ * are reported rather than guessed, so exit governance never invents PnL.
+ * Legacy capital-basis-only withdrawal rows are deliberately ignored.
  */
-export function valueRealizedFeeCashflows(input:{cashflows:readonly RealizedPositionCashflow[];pool:DataApiPool}):{valueUsd:number;complete:boolean;reasonCodes:string[]}{
+export function valuePositionCashflows(input:{cashflows:readonly RealizedPositionCashflow[];pool:DataApiPool}):{contributionsUsd:number;realizedFeeUsd:number;realizedWithdrawalUsd:number;executionCostUsd:number;complete:boolean;hasEconomicCashflow:boolean;hasRealizedFeeFlow:boolean;reasonCodes:string[]}{
   const tokens=[input.pool.token_x,input.pool.token_y].filter((x):x is NonNullable<typeof x>=>Boolean(x));
-  let valueUsd=0,complete=true;const reasons:string[]=[];
+  const sol=tokens.find(token=>token.address==='So11111111111111111111111111111111111111112');
+  let contributionsUsd=0,realizedFeeUsd=0,realizedWithdrawalUsd=0,executionCostUsd=0,complete=true,hasEconomicCashflow=false,hasRealizedFeeFlow=false;const reasons:string[]=[];
   for(const flow of input.cashflows){
-    if(flow.flowType!=="FEE_CLAIM"&&flow.flowType!=="REWARD_CLAIM")continue;
+    if(!['OPEN_CONTRIBUTION','ADD_CONTRIBUTION','FEE_CLAIM','REWARD_CLAIM','REDUCE_WITHDRAWAL','CLOSE_WITHDRAWAL','SWAP_COST','TX_COST'].includes(flow.flowType))continue;
+    hasEconomicCashflow=true;
+    // Legacy reductions stored an estimated capital basis in lamports. That
+    // is not a wallet realization and is never treated as PnL.
+    if((flow.flowType==='REDUCE_WITHDRAWAL'||flow.flowType==='CLOSE_WITHDRAWAL')&&!flow.tokenMint&&!flow.tokenAmountRaw)continue;
     const token=tokens.find(candidate=>candidate.address===flow.tokenMint);
-    const value=tokenUsd(flow.tokenAmountRaw,token?.decimals,token?.price);
-    if(value===undefined){complete=false;reasons.push('EXIT_CASHFLOW_FEE_VALUE_UNAVAILABLE');continue;}
-    valueUsd+=value;
+    const tokenValue=flow.tokenMint?tokenUsd(flow.tokenAmountRaw,token?.decimals,token?.price):undefined;
+    const lamportValue=flow.lamports!==undefined&&sol?Number(flow.lamports)/1e9*(sol.price??Number.NaN):undefined;
+    const value=tokenValue??lamportValue;
+    if(value===undefined||!Number.isFinite(value)){complete=false;reasons.push('EXIT_CASHFLOW_VALUE_UNAVAILABLE');continue;}
+    if(flow.flowType==='OPEN_CONTRIBUTION'||flow.flowType==='ADD_CONTRIBUTION')contributionsUsd+=value;
+    else if(flow.flowType==='FEE_CLAIM'||flow.flowType==='REWARD_CLAIM'){realizedFeeUsd+=value;hasRealizedFeeFlow=true;}
+    else if(flow.flowType==='REDUCE_WITHDRAWAL'||flow.flowType==='CLOSE_WITHDRAWAL')realizedWithdrawalUsd+=value;
+    else executionCostUsd+=value;
   }
-  return{valueUsd,complete,reasonCodes:[...new Set(reasons)].sort()};
+  return{contributionsUsd,realizedFeeUsd,realizedWithdrawalUsd,executionCostUsd,complete,hasEconomicCashflow,hasRealizedFeeFlow,reasonCodes:[...new Set(reasons)].sort()};
 }
+/** Backward-compatible fee-only view for reporting callers. */
+export function valueRealizedFeeCashflows(input:{cashflows:readonly RealizedPositionCashflow[];pool:DataApiPool}){const v=valuePositionCashflows(input);return{valueUsd:v.realizedFeeUsd,complete:v.complete,reasonCodes:v.reasonCodes};}
 /** Capital-normalized economic valuation. No value is fabricated when token price/decimals are unavailable. */
 export function derivePositionEconomics(input:{position:PositionV2Fact;pool:DataApiPool;initialCapitalLamports:bigint;observedAt:string;realizedFeeCashflows?:readonly RealizedPositionCashflow[]}):PositionEconomicsSnapshot{
   const {position,pool,initialCapitalLamports,observedAt}=input,x=pool.token_x,y=pool.token_y;
@@ -101,15 +115,15 @@ export function derivePositionEconomics(input:{position:PositionV2Fact;pool:Data
   const xv=tokenUsd(position.totalXAmount,x?.decimals,x?.price),yv=tokenUsd(position.totalYAmount,y?.decimals,y?.price);
   const fux=tokenUsd(position.feeX,x?.decimals,x?.price)??0,fuy=tokenUsd(position.feeY,y?.decimals,y?.price)??0;
   const onPositionClaimedX=tokenUsd(position.claimedFeeX,x?.decimals,x?.price)??0,onPositionClaimedY=tokenUsd(position.claimedFeeY,y?.decimals,y?.price)??0,
-    ledger=input.realizedFeeCashflows&&input.realizedFeeCashflows.length>0?valueRealizedFeeCashflows({cashflows:input.realizedFeeCashflows,pool}):undefined;
+    ledger=input.realizedFeeCashflows&&input.realizedFeeCashflows.length>0?valuePositionCashflows({cashflows:input.realizedFeeCashflows,pool}):undefined;
   const reasons:string[]=[];if(initial===undefined||!(initial>0))reasons.push('EXIT_VALUATION_INITIAL_CAPITAL_UNAVAILABLE');if(xv===undefined)reasons.push('EXIT_VALUATION_TOKEN_X_UNAVAILABLE');if(yv===undefined)reasons.push('EXIT_VALUATION_TOKEN_Y_UNAVAILABLE');
   if(ledger&&!ledger.complete)reasons.push(...ledger.reasonCodes);
   if(reasons.length)return{evidenceState:'UNAVAILABLE',observedAt,reasonCodes:[...new Set(reasons)].sort()};
   // Once the durable ledger is present it is the authority for fees already
   // withdrawn to the wallet. This prevents a CLAIM from looking like a loss
   // and avoids double counting an SDK cumulative claimed-fee field.
-  const realized=ledger?.valueUsd??(onPositionClaimedX+onPositionClaimedY),fees=fux+fuy+realized,current=xv!+yv!+fees,net=current-initial!,fraction=net/initial!;
-  return{evidenceState:'AVAILABLE',observedAt,initialCapitalUsd:initial!,currentEconomicValueUsd:current,netPnlUsd:net,netReturnFraction:fraction,feesValueUsd:fees,realizedFeeValueUsd:realized,reasonCodes:['EXIT_VALUATION_CAPITAL_NORMALIZED',...(ledger?['EXIT_VALUATION_REALIZED_CASHFLOWS']:[])]};
+  const realizedFees=ledger?.hasRealizedFeeFlow?ledger.realizedFeeUsd:(onPositionClaimedX+onPositionClaimedY),contributed=ledger?.contributionsUsd&&ledger.contributionsUsd>0?ledger.contributionsUsd:initial!,withdrawals=ledger?.realizedWithdrawalUsd??0,costs=ledger?.executionCostUsd??0,fees=fux+fuy+realizedFees,current=xv!+yv!+fees+withdrawals-costs,net=current-contributed,fraction=net/contributed;
+  return{evidenceState:'AVAILABLE',observedAt,initialCapitalUsd:contributed,currentEconomicValueUsd:current,netPnlUsd:net,netReturnFraction:fraction,feesValueUsd:fees,realizedFeeValueUsd:realizedFees,realizedWithdrawalValueUsd:withdrawals,contributedCapitalUsd:contributed,executionCostUsd:costs,reasonCodes:['EXIT_VALUATION_CAPITAL_NORMALIZED',...(ledger?['EXIT_VALUATION_REALIZED_CASHFLOWS']:[])]};
 }
 function nextHighWater(e:PositionEconomicsSnapshot,prior?:ExitHighWaterState):ExitHighWaterState{
   const current=e.netReturnFraction??Number.NEGATIVE_INFINITY;
