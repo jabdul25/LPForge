@@ -87,6 +87,7 @@ export interface LiveWorkerResult {
   planId?: string;
   reasonCodes: string[];
   transactionSubmitted: boolean;
+  positionAddress?: string;
 }
 export interface LiveRecoveryResult {
   planId: string;
@@ -585,7 +586,7 @@ async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:Auto
       const submitted=await executeMainnetCanaryOpen({authority:openAuthority,ticket:openTicket,transactionId:step.transactionId,idempotencyKey:`${input.plan.idempotencyKey}:${step.transactionId}`,requiredSignerAddresses:step.requiredSignerAddresses,backend:input.signer,auxiliaryBackends:auxiliaryPositionSignersForOpenStep(step,input.prepared.positionSigner),envelope:step.envelope,phase5RiskDecision:risk,lease:latest,ledger:ledger(input.store),transport:createWeb3SubmissionTransport(input.connection),submittedAt});submittedAny=true;lastSignature=submitted.signature;await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SUBMITTED',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata},submitted.signature);
       let confirmed=false;for(let attempt=0;attempt<input.config.confirmAttempts;attempt++){await new Promise(resolve=>setTimeout(resolve,input.config.confirmPollMs));const confirmation=await observeConfirmation({attemptId:`${step.transactionId}:attempt:1`,record:{transactionId:step.transactionId,signature:submitted.signature,submittedAt,blockhash:latest.blockhash,lastValidBlockHeight:latest.lastValidBlockHeight,attempt:1},transport:createWeb3SubmissionTransport(input.connection),ledger:ledger(input.store),observedAt:new Date().toISOString()});if(confirmation.status==='CONFIRMED'||confirmation.status==='FINALIZED'){confirmed=true;break;}if(confirmation.status==='FAILED'||confirmation.status==='EXPIRED')throw new Error(`LPFORGE_P6_CHUNK_CONFIRM_${confirmation.status}`);}if(!confirmed)throw new Error('LPFORGE_P6_CHUNK_CONFIRMATION_PENDING');completedSteps.push({transactionId:step.transactionId,signature:submitted.signature,estimatedFeeLamports:fee.totalFeeLamports});
     }
-    const position=await input.pool.getPosition?.(new PublicKey(input.prepared.positionSigner.publicKeyAddress));if(!position)throw new Error('LPFORGE_P6_POSITION_RECONCILIATION_MISSING');const intent=input.plan.planPayload.intent as Record<string,unknown>,funding=input.plan.intentPayload.entryFunding as Record<string,unknown>;await input.store.insertExecutionReconciliation({reconciliationId:`${input.plan.planId}:open`,planId:input.plan.planId,observedAt:new Date().toISOString(),status:'MATCH',expected:{owner:input.plan.ownerAddress,pool:input.plan.poolAddress,lowerBinId:input.fields.lower,upperBinId:input.fields.upper},actual:{positionAddress:input.prepared.positionSigner.publicKeyAddress},discrepancies:[],payload:{signature:lastSignature,autonomous:true,chunked:true}});await input.store.upsertOwnedPosition({lpforgePositionId:`position-${input.prepared.positionSigner.publicKeyAddress}`,poolAddress:input.plan.poolAddress,positionAddress:input.prepared.positionSigner.publicKeyAddress,ownerAddress:input.plan.ownerAddress,strategy:String(intent.strategy??'SPOT'),orientation:String(funding.orientation??'ONE_SIDED_Y'),lowerBinId:input.fields.lower,upperBinId:input.fields.upper,activeBinAtEntry:input.fields.plannedActiveBinId,initialCapitalLamports:input.fields.capital,entryPlanId:input.plan.planId,entrySignature:lastSignature,enteredAt:new Date().toISOString(),lifecycleState:'OPEN',lastPlanId:input.plan.planId,reconciliationStatus:'MATCH',payload:{thesisId:input.plan.thesisId,entryFunding:funding,chunked:true}});const positionAccount=await input.connection.getAccountInfo(new PublicKey(input.prepared.positionSigner.publicKeyAddress),'confirmed');await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:open-contribution`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'OPEN_CONTRIBUTION',observedAt:new Date().toISOString(),lamports:input.fields.capital,payload:{signature:lastSignature,source:'RECONCILED_CHUNKABLE_OPEN'}});if(positionAccount?.lamports)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:rent-lock`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'RENT_LOCK',observedAt:new Date().toISOString(),lamports:BigInt(positionAccount.lamports),payload:{signature:lastSignature,recoverable:true,source:'POSITION_ACCOUNT_INFO'}});for(const child of completedSteps){const actualFee=await confirmedTransactionFeeLamports(input.connection,child.signature);await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:tx-cost:${child.transactionId}`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'TX_COST',observedAt:new Date().toISOString(),lamports:actualFee??child.estimatedFeeLamports,payload:{signature:child.signature,transactionId:child.transactionId,source:actualFee===undefined?'EXECUTION_FEE_ESTIMATE':'CHAIN_RECEIPT_META',...(actualFee===undefined?{estimatedLamports:child.estimatedFeeLamports.toString()}:{})}});}await persistOpenResidualInventory({store:input.store,connection:input.connection,plan:input.plan,positionAddress:input.prepared.positionSigner.publicKeyAddress,funding:input.entryFundingMeasurement,signature:lastSignature});await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'RECONCILED',at:new Date().toISOString(),payload:{signature:lastSignature,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true}});return{status:'RECONCILED',planId:input.plan.planId,reasonCodes:[],transactionSubmitted:true};
+    const position=await input.pool.getPosition?.(new PublicKey(input.prepared.positionSigner.publicKeyAddress));if(!position)throw new Error('LPFORGE_P6_POSITION_RECONCILIATION_MISSING');const intent=input.plan.planPayload.intent as Record<string,unknown>,funding=input.plan.intentPayload.entryFunding as Record<string,unknown>;await input.store.insertExecutionReconciliation({reconciliationId:`${input.plan.planId}:open`,planId:input.plan.planId,observedAt:new Date().toISOString(),status:'MATCH',expected:{owner:input.plan.ownerAddress,pool:input.plan.poolAddress,lowerBinId:input.fields.lower,upperBinId:input.fields.upper},actual:{positionAddress:input.prepared.positionSigner.publicKeyAddress},discrepancies:[],payload:{signature:lastSignature,autonomous:true,chunked:true}});await input.store.upsertOwnedPosition({lpforgePositionId:`position-${input.prepared.positionSigner.publicKeyAddress}`,poolAddress:input.plan.poolAddress,positionAddress:input.prepared.positionSigner.publicKeyAddress,ownerAddress:input.plan.ownerAddress,strategy:String(intent.strategy??'SPOT'),orientation:String(funding.orientation??'ONE_SIDED_Y'),lowerBinId:input.fields.lower,upperBinId:input.fields.upper,activeBinAtEntry:input.fields.plannedActiveBinId,initialCapitalLamports:input.fields.capital,entryPlanId:input.plan.planId,entrySignature:lastSignature,enteredAt:new Date().toISOString(),lifecycleState:'OPEN',lastPlanId:input.plan.planId,reconciliationStatus:'MATCH',payload:{thesisId:input.plan.thesisId,entryFunding:funding,chunked:true}});const positionAccount=await input.connection.getAccountInfo(new PublicKey(input.prepared.positionSigner.publicKeyAddress),'confirmed');await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:open-contribution`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'OPEN_CONTRIBUTION',observedAt:new Date().toISOString(),lamports:input.fields.capital,payload:{signature:lastSignature,source:'RECONCILED_CHUNKABLE_OPEN'}});if(positionAccount?.lamports)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:rent-lock`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'RENT_LOCK',observedAt:new Date().toISOString(),lamports:BigInt(positionAccount.lamports),payload:{signature:lastSignature,recoverable:true,source:'POSITION_ACCOUNT_INFO'}});for(const child of completedSteps){const actualFee=await confirmedTransactionFeeLamports(input.connection,child.signature);await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:tx-cost:${child.transactionId}`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'TX_COST',observedAt:new Date().toISOString(),lamports:actualFee??child.estimatedFeeLamports,payload:{signature:child.signature,transactionId:child.transactionId,source:actualFee===undefined?'EXECUTION_FEE_ESTIMATE':'CHAIN_RECEIPT_META',...(actualFee===undefined?{estimatedLamports:child.estimatedFeeLamports.toString()}:{})}});}await persistOpenResidualInventory({store:input.store,connection:input.connection,plan:input.plan,positionAddress:input.prepared.positionSigner.publicKeyAddress,funding:input.entryFundingMeasurement,signature:lastSignature});await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'RECONCILED',at:new Date().toISOString(),payload:{signature:lastSignature,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true}});return{status:'RECONCILED',planId:input.plan.planId,reasonCodes:[],transactionSubmitted:true,positionAddress:input.prepared.positionSigner.publicKeyAddress};
   }catch(error){const reason=error instanceof Error?error.message:'LPFORGE_P6_CHUNKABLE_OPEN_UNKNOWN';if(submittedAny){await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECONCILIATION_REQUIRED',at:new Date().toISOString(),reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',reason],payload:{stage:'CHUNKABLE_OPEN',error:reason,positionAddress:input.prepared.positionSigner.publicKeyAddress,lastSignature}});return{status:'UNKNOWN',planId:input.plan.planId,reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',reason],transactionSubmitted:true};}await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'BLOCKED',at:new Date().toISOString(),payload:{stage:'CHUNKABLE_OPEN',error:reason}});return{status:'BLOCKED',planId:input.plan.planId,reasonCodes:[reason],transactionSubmitted:false};}
 }
 /** Executes one already-claimed plan. A caller must claim from storage before calling this function. */
@@ -940,6 +941,7 @@ export async function executeAutonomousOpen(input: {
           planId: input.plan.planId,
           reasonCodes: [],
           transactionSubmitted: true,
+          positionAddress: prepared.positionSigner.publicKeyAddress,
         };
       }
       if (
@@ -2170,6 +2172,12 @@ async function executeManagementReplacement(input: {
     range.lower > range.upper
   )
     throw new Error("LPFORGE_P6_MANAGEMENT_REMOVE_RANGE_REQUIRED");
+  const removalConnection = new Connection(input.config.rpcUrl, "confirmed"),
+    poolFactBefore = await adapter.getPool(input.plan.poolAddress),
+    [tokenXBeforeRemove,tokenYBeforeRemove]=await Promise.all([
+      readWalletTokenBalance({connection:removalConnection,ownerAddress:input.plan.ownerAddress,mint:poolFactBefore.tokenXMint}),
+      readWalletTokenBalance({connection:removalConnection,ownerAddress:input.plan.ownerAddress,mint:poolFactBefore.tokenYMint}),
+    ]);
   await input.store.transitionAutonomousPlan({
     planId: input.plan.planId,
     state: "BUILDING",
@@ -2206,7 +2214,6 @@ async function executeManagementReplacement(input: {
   if (closed.status !== "RECONCILED") return closed;
   // Only an explicit AccountInfo null proves removal.  A decoder/RPC error
   // is unknown truth and may not unlock a replacement position.
-  const removalConnection = new Connection(input.config.rpcUrl, "confirmed");
   let removed = false,
     removalReadUnknown = false;
   try {
@@ -2245,8 +2252,13 @@ async function executeManagementReplacement(input: {
       transactionSubmitted: true,
     };
   }
-  const connection = new Connection(input.config.rpcUrl, "confirmed");
+  const connection = removalConnection;
   const poolFact = await adapter.getPool(input.plan.poolAddress);
+  const [tokenXAfterRemove,tokenYAfterRemove]=await Promise.all([
+    readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenXMint}),
+    readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenYMint}),
+  ]),actualX=tokenXAfterRemove>tokenXBeforeRemove?tokenXAfterRemove-tokenXBeforeRemove:0n,
+    actualY=tokenYAfterRemove>tokenYBeforeRemove?tokenYAfterRemove-tokenYBeforeRemove:0n;
   const walletTruth = {
     nativeLamports: await connection.getBalance(
       new PublicKey(input.plan.ownerAddress),
@@ -2273,7 +2285,7 @@ async function executeManagementReplacement(input: {
     reconciliationStatus: "MATCH",
     lastPlanId: input.plan.planId,
     at: new Date().toISOString(),
-    payload: { stage: "REFRESH_WALLET_TRUTH", walletTruth },
+    payload: { stage: "REFRESH_WALLET_TRUTH", walletTruth,actualSettlement:{tokenXRaw:actualX.toString(),tokenYRaw:actualY.toString(),tokenXBeforeRemove:tokenXBeforeRemove.toString(),tokenYBeforeRemove:tokenYBeforeRemove.toString()} },
   });
   await input.store.transitionAutonomousPlan({
     planId: input.plan.planId,
@@ -2282,6 +2294,7 @@ async function executeManagementReplacement(input: {
     payload: {
       stage: "BUILD_REPLACEMENT",
       walletTruth,
+      actualSettlement:{tokenXRaw:actualX.toString(),tokenYRaw:actualY.toString()},
       oldPositionAddress: input.positionAddress,
     },
   });
@@ -2298,24 +2311,37 @@ async function executeManagementReplacement(input: {
     intentPayload: {
       ...input.plan.intentPayload,
       entryFunding: {
-        totalPairedTokenRaw: old.totalXAmount,
-        solForLpLamports: old.totalYAmount,
+        totalPairedTokenRaw: actualX.toString(),
+        solForLpLamports: actualY.toString(),
         orientation: String(
           input.plan.intentPayload.orientation ?? "REDEPLOYED",
         ),
         rebuildFromRemovedPosition: true,
+        source:"WALLET_DELTA_AFTER_REMOVAL",
       },
     },
     planPayload: { ...input.plan.planPayload, intent },
     transactionId: open.transactionId,
     transactionMetadata: open.metadata,
   };
-  return executeAutonomousOpen({
+  const oldSettlementCashflowId=`${input.plan.planId}:reshape-old-x`,at=new Date().toISOString();
+  if(actualX>0n){
+    await input.store.insertPositionCashflow({cashflowId:oldSettlementCashflowId,positionAddress:input.positionAddress,planId:input.plan.planId,flowType:'CLOSE_WITHDRAWAL',observedAt:at,tokenMint:poolFact.tokenXMint,tokenAmountRaw:actualX.toString(),payload:{source:'WALLET_DELTA_RESHAPE',successorPlanId:input.plan.planId}});
+    const supply=await connection.getTokenSupply(new PublicKey(poolFact.tokenXMint),'confirmed');
+    await input.store.createPositionInventoryLot({lotId:`${input.plan.planId}:reshape-old-x`,createdEventId:`${input.plan.planId}:reshape-old-x-created`,positionAddress:input.positionAddress,planId:input.plan.planId,ownerAddress:input.plan.ownerAddress,poolAddress:input.plan.poolAddress,tokenMint:poolFact.tokenXMint,tokenSide:'X',sourceEvent:'RESHAPE_SETTLEMENT',sourceCashflowId:oldSettlementCashflowId,rawAmount:actualX,decimals:supply.value.decimals,acquiredAt:at,payload:{successorPlanId:input.plan.planId,source:'WALLET_DELTA_AFTER_REMOVAL'}});
+  }
+  if(actualY>0n)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:reshape-old-y`,positionAddress:input.positionAddress,planId:input.plan.planId,flowType:'CLOSE_WITHDRAWAL',observedAt:at,lamports:actualY,payload:{source:'WALLET_DELTA_RESHAPE',successorPlanId:input.plan.planId}});
+  const opened=await executeAutonomousOpen({
     store: input.store,
     plan: replacement,
     signer: input.signer,
     config: input.config,
   });
+  if(opened.status==='RECONCILED'&&opened.positionAddress&&actualX>0n){
+    const tokenXAfterReplacement=await readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenXMint}),usedX=tokenXAfterRemove>tokenXAfterReplacement?tokenXAfterRemove-tokenXAfterReplacement:0n,transferredX=usedX<actualX?usedX:actualX;
+    if(transferredX>0n)await input.store.settlePositionInventoryLot({eventId:`${input.plan.planId}:reshape-old-x-transferred`,lotId:`${input.plan.planId}:reshape-old-x`,planId:input.plan.planId,eventType:'TRANSFERRED',settledRawAmount:transferredX,observedAt:new Date().toISOString(),payload:{successorPositionAddress:opened.positionAddress,source:'MEASURED_REPLACEMENT_DEPOSIT'}});
+  }
+  return opened;
 }
 
 type CloseSettlementStage =
