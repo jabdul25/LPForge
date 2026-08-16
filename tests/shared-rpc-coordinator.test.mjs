@@ -31,3 +31,9 @@ test('production RPC constructors use governed connections and priority lanes',a
   const migration=await readFile(new URL('../packages/db/migrations/M0043_shared_rpc_coordinator.sql',import.meta.url),'utf8');
   assert.match(migration,/FOR UPDATE/);assert.match(migration,/pressure_until/);assert.match(migration,/P0_EXECUTION_CRITICAL/);assert.match(migration,/rpc_provider_metrics/);
 });
+
+test('deep historical discovery is backfill while live candidate collection remains discovery priority',async()=>{
+  const source=await readFile(new URL('../apps/discovery/src/main.ts',import.meta.url),'utf8');
+  assert.match(source,/deep screening replays historical chain activity[\s\S]*?priority:'P4_BACKFILL'/i);
+  assert.match(source,/collectActiveCandidateEvidence[\s\S]*?priority:'P3_DISCOVERY'/);
+});
