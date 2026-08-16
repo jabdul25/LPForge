@@ -605,6 +605,7 @@ export interface Phase1Store {
   createPositionInventoryLot(value:Omit<PositionInventoryLot,"remainingRawAmount"|"status">&{createdEventId:string;transactionSignature?:string}):Promise<void>;
   settlePositionInventoryLot(value:{eventId:string;lotId:string;planId?:string;eventType:"SETTLED"|"TRANSFERRED";settledRawAmount:bigint;observedAt:string;transactionSignature?:string;payload:Record<string,unknown>}):Promise<{remainingRawAmount:bigint;status:PositionInventoryLotStatus}>;
   loadPositionInventoryLots(positionAddress:string,tokenMint?:string):Promise<PositionInventoryLot[]>;
+  loadOwnerPositionInventoryLots(ownerAddress:string):Promise<PositionInventoryLot[]>;
   insertPlanCashflow(value:PlanCashflow):Promise<void>;
   loadPlanCashflows(planId:string):Promise<PlanCashflow[]>;
   upsertPartialEntryRecovery(value: {
@@ -2016,6 +2017,10 @@ export async function createPostgresStore(
       const r=await db.query("SELECT lot_id,position_address,plan_id,owner_address,pool_address,token_mint,token_side,source_event,source_cashflow_id,raw_amount,remaining_raw_amount,decimals,acquired_at,status,payload FROM execution.position_inventory_lots WHERE position_address=$1 AND ($2::text IS NULL OR token_mint=$2) ORDER BY acquired_at ASC,lot_id ASC",[positionAddress,tokenMint??null]);
       return r.rows.map(row=>({lotId:String(row.lot_id),positionAddress:String(row.position_address),planId:String(row.plan_id),ownerAddress:String(row.owner_address),poolAddress:String(row.pool_address),tokenMint:String(row.token_mint),tokenSide:String(row.token_side) as PositionInventoryLotSide,sourceEvent:String(row.source_event) as PositionInventoryLotSource,...(row.source_cashflow_id?{sourceCashflowId:String(row.source_cashflow_id)}:{}),rawAmount:BigInt(String(row.raw_amount)),remainingRawAmount:BigInt(String(row.remaining_raw_amount)),decimals:Number(row.decimals),acquiredAt:toIsoTimestamp(row.acquired_at),status:String(row.status) as PositionInventoryLotStatus,payload:(row.payload??{}) as Record<string,unknown>}));
     },
+    async loadOwnerPositionInventoryLots(ownerAddress){
+      const r=await db.query("SELECT lot_id,position_address,plan_id,owner_address,pool_address,token_mint,token_side,source_event,source_cashflow_id,raw_amount,remaining_raw_amount,decimals,acquired_at,status,payload FROM execution.position_inventory_lots WHERE owner_address=$1 AND status IN ('OPEN','PARTIALLY_SETTLED') AND remaining_raw_amount>0 ORDER BY acquired_at ASC,lot_id ASC",[ownerAddress]);
+      return r.rows.map(row=>({lotId:String(row.lot_id),positionAddress:String(row.position_address),planId:String(row.plan_id),ownerAddress:String(row.owner_address),poolAddress:String(row.pool_address),tokenMint:String(row.token_mint),tokenSide:String(row.token_side) as PositionInventoryLotSide,sourceEvent:String(row.source_event) as PositionInventoryLotSource,...(row.source_cashflow_id?{sourceCashflowId:String(row.source_cashflow_id)}:{}),rawAmount:BigInt(String(row.raw_amount)),remainingRawAmount:BigInt(String(row.remaining_raw_amount)),decimals:Number(row.decimals),acquiredAt:toIsoTimestamp(row.acquired_at),status:String(row.status) as PositionInventoryLotStatus,payload:(row.payload??{}) as Record<string,unknown>}));
+    },
     async insertPlanCashflow(v){
       await db.query("INSERT INTO execution.plan_cashflows(cashflow_id,plan_id,flow_type,observed_at,lamports,token_mint,token_amount_raw,transaction_signature,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) ON CONFLICT(cashflow_id) DO UPDATE SET lamports=EXCLUDED.lamports,token_mint=EXCLUDED.token_mint,token_amount_raw=EXCLUDED.token_amount_raw,transaction_signature=EXCLUDED.transaction_signature,payload=EXCLUDED.payload",[v.cashflowId,v.planId,v.flowType,v.observedAt,v.lamports?.toString()??null,v.tokenMint??null,v.tokenAmountRaw??null,v.transactionSignature??null,json(v.payload)]);
     },
@@ -2920,6 +2925,7 @@ export function createMemoryStore(): Phase1Store {
     async createPositionInventoryLot() {},
     async settlePositionInventoryLot() { return {remainingRawAmount:0n,status:"SETTLED" as PositionInventoryLotStatus}; },
     async loadPositionInventoryLots() { return []; },
+    async loadOwnerPositionInventoryLots() { return []; },
     async insertPlanCashflow() {},
     async loadPlanCashflows() { return []; },
     async upsertPartialEntryRecovery() {},

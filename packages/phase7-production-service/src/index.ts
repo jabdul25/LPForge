@@ -41,13 +41,14 @@ async function assessLivePortfolioAuthority(input:{store:Phase1Store;cfg:Phase1C
     const policy=loadDeploymentPolicyFile(input.env.LPFORGE_EXECUTION_POLICY_PATH?.trim()||'policies/live-execution-policy.json'),capital=policy.productionCapital;
     if(!capital)return{valid:false,reasonCodes:['P7_PORTFOLIO_CAPITAL_POLICY_MISSING']};
     const connection=new Connection(input.cfg.solanaRpcHttpUrl,'confirmed');
-    const [facts,prior,wallet,walletTokenAccounts,positions,ownedPoolHistory]=await Promise.all([
+    const [facts,prior,wallet,walletTokenAccounts,positions,ownedPoolHistory,inventoryLots]=await Promise.all([
       input.store.loadPhase7PortfolioFacts(owner),
       input.store.loadPhase7PortfolioRiskState(owner),
       connection.getBalance(new PublicKey(owner),'confirmed'),
       connection.getParsedTokenAccountsByOwner(new PublicKey(owner),{programId:new PublicKey(TOKEN_PROGRAM_ID)},'confirmed'),
       input.store.loadOwnedPositions(owner),
       input.store.loadOwnedPoolHistory(owner),
+      input.store.loadOwnerPositionInventoryLots(owner),
     ]);
     const adapter=createMeteoraReadAdapter({rpcUrl:input.cfg.solanaRpcHttpUrl,cluster:input.cfg.cluster,programId:input.cfg.programId,expectedSdkVersion:input.cfg.expectedSdkVersion,rpcTimeoutMs:input.cfg.rpcTimeoutMs});
     const api=createMeteoraDataApi({baseUrl:input.cfg.meteoraDataApiUrl,maxRps:input.cfg.dataApiMaxRps,timeoutMs:input.cfg.httpTimeoutMs});
@@ -73,6 +74,17 @@ async function assessLivePortfolioAuthority(input:{store:Phase1Store;cfg:Phase1C
     // inventory remains in NAV even when there are no open positions.
     for(const history of ownedPoolHistory)try{const pool=await api.getPool(history.poolAddress);for(const token of [pool.token_x,pool.token_y])if(token?.address&&typeof token.price==='number'&&Number.isFinite(token.price)&&token.price>0)tokenPrices.set(token.address,token.price);}catch{/* a missing historical price is excluded conservatively */}
     const solPriceUsd=tokenPrices.get(WSOL_MINT);
+    if(!solPriceUsd)throw new Error('P7_PORTFOLIO_INVENTORY_VALUATION_MISSING');
+    const inventoryExposureLamports:{[mint:string]:bigint}={};
+    for(const lot of inventoryLots){
+      const price=tokenPrices.get(lot.tokenMint);
+      if(price===undefined)throw new Error('P7_PORTFOLIO_INVENTORY_VALUATION_MISSING');
+      const usd=Number(lot.remainingRawAmount)/10**lot.decimals*price;
+      if(!Number.isFinite(usd)||usd<0)throw new Error('P7_PORTFOLIO_INVENTORY_VALUATION_MISSING');
+      inventoryExposureLamports[lot.tokenMint]=(inventoryExposureLamports[lot.tokenMint]??0n)+positionUsdValueToSolLamports(usd,solPriceUsd);
+    }
+    const tokenExposureLamports={...facts.tokenExposureLamports};
+    for(const [mint,lamports] of Object.entries(inventoryExposureLamports))tokenExposureLamports[mint]=(tokenExposureLamports[mint]??0n)+lamports;
     let walletTokenValueLamports=0n;const valuedWalletTokens:{mint:string;amount:string;usdValue:number;lamports:string}[]=[];
     if(solPriceUsd)for(const account of walletTokenAccounts.value){
       const info=(account.account.data.parsed as {info?:{mint?:string;tokenAmount?:{amount?:string;decimals?:number}}}).info;
@@ -90,9 +102,9 @@ async function assessLivePortfolioAuthority(input:{store:Phase1Store;cfg:Phase1C
     // the operator when the position is closed.
     const rentReserveLamports=valuations.reduce((sum,value)=>sum+value.recoverableRentLamports,0n);
     const valuationMethod='POSITION_MARK_TO_MARKET_PLUS_WALLET_LIFECYCLE_V3',priorPayload=(prior?.payload??{}) as Record<string,unknown>,dayStart=new Date(Date.UTC(new Date(input.now).getUTCFullYear(),new Date(input.now).getUTCMonth(),new Date(input.now).getUTCDate())).toISOString(),sameDay=Boolean(prior&&new Date(String(prior.day_start)).toISOString()===dayStart&&priorPayload.valuationMethod===valuationMethod),current=BigInt(wallet)+positionValueLamports+walletTokenValueLamports+rentReserveLamports,daily=sameDay?BigInt(String(prior!.daily_start_equity_lamports)):current,peak=sameDay?([BigInt(String(prior!.peak_equity_lamports)),current].reduce((a,b)=>a>b?a:b)):current;
-    const decision=governPhase7Portfolio({observedAt:input.now,walletBalanceLamports:BigInt(wallet),deployedLamports:facts.deployedLamports,pendingReservedLamports:facts.pendingReservedLamports,poolExposureLamports:facts.poolExposureLamports,poolPendingLamports:facts.poolPendingLamports,tokenExposureLamports:facts.tokenExposureLamports,tokenPendingLamports:facts.tokenPendingLamports,dailyStartEquityLamports:daily,currentEquityLamports:current,peakEquityLamports:peak,openPositions:facts.openPositions,unresolvedReconciliationDebt:facts.unresolvedReconciliationDebt},{requestId:`p7-health-${input.now}`,pool:'__P7_HEALTH__',token:'__P7_HEALTH__',requestedLamports:1n,action:'OPEN',now:input.now},{minReserveLamports:capital.reserveLamports,maxDeployedBps:10000,maxPoolBps:10000,maxTokenBps:10000,maxDailyDrawdownBps:Number(input.env.LPFORGE_P7_MAX_DAILY_DRAWDOWN_BPS??600),maxRollingDrawdownBps:Number(input.env.LPFORGE_P7_MAX_ROLLING_DRAWDOWN_BPS??1000),maxOpenPositions:policy.maxOpenPositions,maxSnapshotAgeMs:60_000,permitTtlMs:60_000});
+    const decision=governPhase7Portfolio({observedAt:input.now,walletBalanceLamports:BigInt(wallet),deployedLamports:facts.deployedLamports,pendingReservedLamports:facts.pendingReservedLamports,poolExposureLamports:facts.poolExposureLamports,poolPendingLamports:facts.poolPendingLamports,tokenExposureLamports,tokenPendingLamports:facts.tokenPendingLamports,dailyStartEquityLamports:daily,currentEquityLamports:current,peakEquityLamports:peak,openPositions:facts.openPositions,unresolvedReconciliationDebt:facts.unresolvedReconciliationDebt},{requestId:`p7-health-${input.now}`,pool:'__P7_HEALTH__',token:'__P7_HEALTH__',requestedLamports:1n,action:'OPEN',now:input.now},{minReserveLamports:capital.reserveLamports,maxDeployedBps:10000,maxPoolBps:10000,maxTokenBps:10000,maxDailyDrawdownBps:Number(input.env.LPFORGE_P7_MAX_DAILY_DRAWDOWN_BPS??600),maxRollingDrawdownBps:Number(input.env.LPFORGE_P7_MAX_ROLLING_DRAWDOWN_BPS??1000),maxOpenPositions:policy.maxOpenPositions,maxSnapshotAgeMs:60_000,permitTtlMs:60_000});
     await input.store.upsertPhase7PortfolioRiskState({ownerAddress:owner,dayStart,dailyStartEquityLamports:daily,peakEquityLamports:peak,currentEquityLamports:current,observedAt:input.now,valuationState:'RECONCILED',reasonCodes:[...(sameDay?[]:['P7_PORTFOLIO_VALUATION_BASELINE_RESET']),...decision.reasonCodes],payload:{valuationMethod,walletLamports:String(wallet),positionValueLamports:positionValueLamports.toString(),valuedPositions:valuations.map(value=>({positionAddress:value.positionAddress,lamports:value.lamports.toString(),recoverableRentLamports:value.recoverableRentLamports.toString(),cashflowCount:value.cashflowCount})),walletTokenValueLamports:walletTokenValueLamports.toString(),valuedWalletTokens,rentReserveLamports:rentReserveLamports.toString(),deployedLamports:facts.deployedLamports.toString(),pendingReservedLamports:facts.pendingReservedLamports.toString()}});
-    return{valid:decision.decision==='APPROVE',reasonCodes:decision.reasonCodes,facts};
+    return{valid:decision.decision==='APPROVE',reasonCodes:decision.reasonCodes,facts:{...facts,tokenExposureLamports}};
   }catch(error){
     const code=error instanceof Error?error.message:'';
     return{valid:false,reasonCodes:[code==='P7_PORTFOLIO_POSITION_VALUATION_UNAVAILABLE'?code:'P7_PORTFOLIO_FACTS_UNAVAILABLE']};
