@@ -57,6 +57,7 @@ import {
   readJupiterMetisQuote,
 } from "../../phase6-swap-quote/src/index.js";
 import { createMeteoraReadAdapter, type MeteoraReadAdapter } from "../../meteora/src/index.js";
+import { assessLifecycleSettlement } from "../../db/src/index.js";
 import type {
   AutonomousPlan,
   AutonomousPlanAction,
@@ -172,11 +173,11 @@ function planFields(plan: AutonomousOpenPlan) {
     throw new Error("LPFORGE_P6_PLAN_FIELDS_INVALID");
   return { capital, lower, upper, plannedActiveBinId, binStep };
 }
-async function recordPositionTokenXLot(input:{store:Phase1Store;connection:Connection;plan:AutonomousPlan;positionAddress:string;tokenMint:string;sourceEvent:"FEE_CLAIM"|"REDUCE_WITHDRAWAL";sourceCashflowId:string;rawAmount:bigint;observedAt:string;signature:string}){
+async function recordPositionTokenXLot(input:{store:Phase1Store;connection:Connection;plan:AutonomousPlan;positionAddress:string;tokenMint:string;sourceEvent:"FEE_CLAIM"|"REDUCE_WITHDRAWAL"|"CLOSE_WITHDRAWAL";sourceCashflowId:string;rawAmount:bigint;observedAt:string;signature:string}){
   if(input.rawAmount<=0n)return;
   const supply=await input.connection.getTokenSupply(new PublicKey(input.tokenMint),"confirmed"),decimals=Number(supply.value.decimals);
   if(!Number.isInteger(decimals)||decimals<0||decimals>255)throw new Error("LPFORGE_P6_INVENTORY_TOKEN_DECIMALS_INVALID");
-  const suffix=input.sourceEvent==="FEE_CLAIM"?"claim-x":"reduce-x";
+  const suffix=input.sourceEvent==="FEE_CLAIM"?"claim-x":input.sourceEvent==="REDUCE_WITHDRAWAL"?"reduce-x":"close-x";
   await input.store.createPositionInventoryLot({lotId:`${input.plan.planId}:${suffix}:lot`,createdEventId:`${input.plan.planId}:${suffix}:lot-created`,positionAddress:input.positionAddress,planId:input.plan.planId,ownerAddress:input.plan.ownerAddress,poolAddress:input.plan.poolAddress,tokenMint:input.tokenMint,tokenSide:"X",sourceEvent:input.sourceEvent,sourceCashflowId:input.sourceCashflowId,rawAmount:input.rawAmount,decimals,acquiredAt:input.observedAt,payload:{source:"WALLET_DELTA",signature:input.signature}});
 }
 /** Read the chain immediately before signing.  The plan's market inputs are
@@ -1091,7 +1092,7 @@ async function executeJupiterUnwindStep(input: {
   reasonPrefix: "P6_PARTIAL_UNWIND" | "P6_CLOSE_UNWIND";
   fundingTransactionId?: string;
   afterSubmit?: (submitted: { signature: string }) => Promise<void>;
-}): Promise<{ ok: boolean; submitted: boolean; reasonCodes: string[] }> {
+}): Promise<{ ok: boolean; submitted: boolean; reasonCodes: string[]; signature?:string }> {
   const connection = new Connection(input.config.rpcUrl, "confirmed"),
     adapter = createMeteoraReadAdapter({
       rpcUrl: input.config.rpcUrl,
@@ -1314,6 +1315,7 @@ async function executeJupiterUnwindStep(input: {
     ok: true,
     submitted: true,
     reasonCodes: [`${input.reasonPrefix}_RECONCILED`],
+    signature:record.signature,
   };
 }
 
@@ -2337,9 +2339,12 @@ async function executeManagementReplacement(input: {
     signer: input.signer,
     config: input.config,
   });
-  if(opened.status==='RECONCILED'&&opened.positionAddress&&actualX>0n){
+  if(opened.status==='RECONCILED'&&opened.positionAddress){
+    await input.store.ensurePositionLifecycle({positionAddress:opened.positionAddress,entryPlanId:input.plan.planId,ownerAddress:input.plan.ownerAddress,poolAddress:input.plan.poolAddress,predecessorLifecycleId:`lifecycle:${input.positionAddress}`,at:new Date().toISOString()});
+    if(actualX>0n){
     const tokenXAfterReplacement=await readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenXMint}),usedX=tokenXAfterRemove>tokenXAfterReplacement?tokenXAfterRemove-tokenXAfterReplacement:0n,transferredX=usedX<actualX?usedX:actualX;
-    if(transferredX>0n)await input.store.settlePositionInventoryLot({eventId:`${input.plan.planId}:reshape-old-x-transferred`,lotId:`${input.plan.planId}:reshape-old-x`,planId:input.plan.planId,eventType:'TRANSFERRED',settledRawAmount:transferredX,observedAt:new Date().toISOString(),payload:{successorPositionAddress:opened.positionAddress,source:'MEASURED_REPLACEMENT_DEPOSIT'}});
+    if(transferredX>0n)await input.store.settlePositionInventoryLot({eventId:`${input.plan.planId}:reshape-old-x-transferred`,lotId:`${input.plan.planId}:reshape-old-x`,planId:input.plan.planId,eventType:'TRANSFERRED',settledRawAmount:transferredX,observedAt:new Date().toISOString(),payload:{successorPositionAddress:opened.positionAddress,transferredRawAmount:transferredX.toString(),source:'MEASURED_REPLACEMENT_DEPOSIT'}});
+    }
   }
   return opened;
 }
@@ -2615,9 +2620,15 @@ async function executeCloseSettlement(input: {
     attributableTokenX =
       tokenXAfter > tokenXBefore ? tokenXAfter - tokenXBefore : 0n;
     attributableTokenY=tokenYAfter>tokenYBefore?tokenYAfter-tokenYBefore:0n;
-    // Do not book token-X as a realized withdrawal here: when it is unwound
-    // below, the economically realized amount is Jupiter's actual token-Y
-    // output. Recording both would overstate close PnL.
+    // Token X is non-SOL inventory, not PnL.  Record an attributable lot
+    // before the unwind so terminal settlement can require an exact
+    // disposition transaction instead of inferring ownership from wallet
+    // balance. Jupiter's later WSOL output is the only realized SOL receipt.
+    if(attributableTokenX>0n){
+      const cashflowId=`${input.plan.planId}:close-token-x`,at=new Date().toISOString();
+      await input.store.insertPositionCashflow({cashflowId,positionAddress:input.positionAddress,planId:input.plan.planId,flowType:"CLOSE_WITHDRAWAL",observedAt:at,tokenMint:poolFact.tokenXMint,tokenAmountRaw:attributableTokenX.toString(),payload:{source:"REMOVE_PLUS_CLAIM_DELTA",nonSolInventory:true}});
+      await recordPositionTokenXLot({store:input.store,connection,plan:input.plan,positionAddress:input.positionAddress,tokenMint:poolFact.tokenXMint,sourceEvent:"CLOSE_WITHDRAWAL",sourceCashflowId:cashflowId,rawAmount:attributableTokenX,observedAt:at,signature:"CLOSE_REMOVE_CONFIRMED"});
+    }
     if(attributableTokenY>0n)
       await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:close-token-y`,positionAddress:input.positionAddress,planId:input.plan.planId,flowType:"CLOSE_WITHDRAWAL",observedAt:new Date().toISOString(),tokenMint:poolFact.tokenYMint,tokenAmountRaw:attributableTokenY.toString(),payload:{source:"REMOVE_PLUS_CLAIM_DELTA",tokenYBefore:tokenYBefore.toString(),tokenYAfter:tokenYAfter.toString()}});
     await persist("CLOSE_INVENTORY_MEASURED", {
@@ -2676,6 +2687,7 @@ async function executeCloseSettlement(input: {
       swapProceedsY=tokenYPostUnwind>tokenYBeforeUnwind?tokenYPostUnwind-tokenYBeforeUnwind:0n;
       if(swapProceedsY<=0n)return incomplete(['P6_CLOSE_UNWIND_OUTPUT_MISSING'],"CLOSE_UNWIND_OUTPUT_UNKNOWN");
       await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:close-swap-proceeds-y`,positionAddress:input.positionAddress,planId:input.plan.planId,flowType:'SWAP_PROCEEDS',observedAt:new Date().toISOString(),tokenMint:poolFact.tokenYMint,tokenAmountRaw:swapProceedsY.toString(),payload:{source:'JUPITER_WALLET_DELTA',inputMint:poolFact.tokenXMint,inputAmountRaw:attributableTokenX.toString(),tokenYBeforeUnwind:tokenYBeforeUnwind.toString(),tokenYAfterUnwind:tokenYPostUnwind.toString()}});
+      await input.store.settlePositionInventoryLot({eventId:`${input.plan.planId}:close-x:lot-settled`,lotId:`${input.plan.planId}:close-x:lot`,planId:input.plan.planId,eventType:"SETTLED",settledRawAmount:attributableTokenX,observedAt:new Date().toISOString(),...(unwind.signature?{transactionSignature:unwind.signature}:{}),payload:{disposition:"JUPITER_UNWIND",transactionId:unwindStep.transactionId,proceedsCashflowId:`${input.plan.planId}:close-swap-proceeds-y`}});
     }
     await persist("CLOSE_INVENTORY_UNWOUND", {
       tokenXBefore: tokenXBefore.toString(),
@@ -2732,7 +2744,23 @@ async function executeCloseSettlement(input: {
       pendingSignature: signature,
     }),
   });
-  return closed.status === "RECONCILED" ? closed : incomplete(closed.reasonCodes, "CLOSE_POSITION_PENDING");
+  if(closed.status!=="RECONCILED")return incomplete(closed.reasonCodes,"CLOSE_POSITION_PENDING");
+  // CLOSED is chain-account absence only.  Make the lifecycle terminal only
+  // after the shared DB boundary proves every child transaction, lot and
+  // cashflow can be reconciled into a deterministic SOL result.
+  const positionCheck=await connection.getAccountInfoAndContext(new PublicKey(input.positionAddress),"confirmed");
+  if(positionCheck.value!==null)return incomplete(["SETTLEMENT_POSITION_STILL_EXISTS"],"CLOSE_SETTLEMENT_POSITION_VERIFY");
+  const settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
+  if(!settlementInput)return incomplete(["SETTLEMENT_LIFECYCLE_MISSING"],"CLOSE_SETTLEMENT_LIFECYCLE");
+  const positionCheckedAt=new Date().toISOString(),positionCheckedSlot=BigInt(positionCheck.context.slot),settlementEvidence={positionCheckedAt,positionCheckedSlot:positionCheckedSlot.toString(),rpcUrl:input.config.rpcUrl,commitment:"confirmed"};
+  const assessment=assessLifecycleSettlement({...settlementInput,positionAbsent:true,positionCheckedAt,positionCheckedSlot});
+  if(!assessment.ready){
+    await input.store.markOwnedPositionLifecycle({positionAddress:input.positionAddress,lifecycleState:"RECONCILIATION_REQUIRED",reconciliationStatus:"SETTLEMENT_BLOCKED",lastPlanId:input.plan.planId,at:new Date().toISOString(),payload:{stage:"SOL_SETTLEMENT_BLOCKED",reasonCodes:assessment.reasonCodes,lifecycleId:settlementInput.lifecycle.lifecycleId,settlementEvidence}});
+    await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:"RECONCILIATION_REQUIRED",at:new Date().toISOString(),reasonCodes:assessment.reasonCodes,payload:{stage:"SOL_SETTLEMENT_BLOCKED",lifecycleId:settlementInput.lifecycle.lifecycleId}});
+    return {status:"UNKNOWN",planId:input.plan.planId,reasonCodes:assessment.reasonCodes,transactionSubmitted:true};
+  }
+  await input.store.persistLifecycleSolSettlement({assessment,input:{...settlementInput,positionAbsent:true,positionCheckedAt,positionCheckedSlot},...(process.env.LPFORGE_SOURCE_COMMIT?{sourceCommit:process.env.LPFORGE_SOURCE_COMMIT}:{}),...(process.env.LPFORGE_P7_POLICY_HASH?{policyHash:process.env.LPFORGE_P7_POLICY_HASH}:{}),migrationHead:"M0041_lifecycle_sol_settlements.sql",...(process.env.LPFORGE_BUILD_ID?{buildId:process.env.LPFORGE_BUILD_ID}:{}),at:new Date().toISOString()});
+  return closed;
 }
 
 /** Generic plan entrypoint. Every mutation is claimed through the same durable queue. */
@@ -2763,6 +2791,7 @@ export async function executeAutonomousPlan(input: {
     positionAddress = input.plan.positionAddress;
   if (!positionAddress)
     throw new Error(`LPFORGE_P6_POSITION_REQUIRED:${input.plan.action}`);
+  await input.store.linkPositionLifecyclePlan({positionAddress,planId:input.plan.planId,role:input.plan.action==="CLOSE"||input.plan.action==="EMERGENCY_CLOSE"?"CLOSE":"MANAGEMENT",at:new Date().toISOString()});
   const step = input.plan.steps[0];
   if (!step) throw new Error("LPFORGE_P6_MUTATION_STEP_REQUIRED");
   if (input.plan.action === "CLAIM") {

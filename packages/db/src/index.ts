@@ -163,6 +163,90 @@ export interface PlanCashflow {
   payload:Record<string,unknown>;
 }
 /**
+ * A lifecycle is the durable economic boundary for one PositionV2.  A
+ * replacement position deliberately receives a new lifecycle and is linked
+ * through predecessorLifecycleId instead of inheriting mutable economics.
+ */
+export interface PositionLifecycle {
+  lifecycleId:string;
+  positionAddress:string;
+  entryPlanId?:string;
+  ownerAddress:string;
+  poolAddress:string;
+  predecessorLifecycleId?:string;
+  status:"OPEN"|"CLOSED"|"SOL_SETTLED"|"RECONCILIATION_REQUIRED";
+}
+export type LifecycleChildTransactionState="CONFIRMED"|"FAILED_FINAL"|"PROVEN_NOT_LANDED"|"SUBMITTED"|"UNKNOWN"|"RECOVERY_PENDING"|"CONFIRMATION_PENDING";
+export interface LifecycleChildTransaction {transactionId:string;signature?:string;state:LifecycleChildTransactionState;}
+export interface LifecycleSettlementCashflow {cashflowId:string;flowType:string;lamports?:bigint;tokenMint?:string;tokenAmountRaw?:string;}
+export interface LifecycleSettlementInput {
+  lifecycle:PositionLifecycle;
+  cashflows:LifecycleSettlementCashflow[];
+  inventoryLots:PositionInventoryLot[];
+  transactions:LifecycleChildTransaction[];
+  positionAbsent:boolean;
+  positionCheckedAt:string;
+  positionCheckedSlot?:bigint;
+  reconciliationClean:boolean;
+  reservationClean:boolean;
+}
+export interface LifecycleSettlementAssessment {
+  ready:boolean;
+  reasonCodes:string[];
+  totalSolInLamports:bigint;
+  totalSolOutLamports:bigint;
+  rentLockedLamports:bigint;
+  rentRecoveredLamports:bigint;
+  netRentCostLamports:bigint;
+  realizedSolPnlLamports:bigint;
+}
+const SETTLEMENT_TERMINAL_TRANSACTION_STATES=new Set<LifecycleChildTransactionState>(["CONFIRMED","FAILED_FINAL","PROVEN_NOT_LANDED"]);
+const SETTLEMENT_SOL_IN=new Set(["FEE_CLAIM","REWARD_CLAIM","REDUCE_WITHDRAWAL","CLOSE_WITHDRAWAL","SWAP_PROCEEDS","RENT_RECOVERY"]);
+const SETTLEMENT_SOL_OUT=new Set(["OPEN_CONTRIBUTION","ADD_CONTRIBUTION","SWAP_COST","TX_COST","RENT_LOCK"]);
+/**
+ * Canonical terminal convention: gross observed SOL/WSOL instruction flows.
+ * A network fee is represented exactly once by TX_COST.  RENT_LOCK is an
+ * outflow and RENT_RECOVERY an inflow, so temporary rent is never a loss.
+ * Non-SOL cashflows affect terminal PnL only through a later actual
+ * SOL/WSOL receipt (for example SWAP_PROCEEDS), never a mark price.
+ */
+export function assessLifecycleSettlement(input:LifecycleSettlementInput):LifecycleSettlementAssessment{
+  const reasons:string[]=[];
+  if(!input.positionAbsent)reasons.push("SETTLEMENT_POSITION_STILL_EXISTS");
+  if(!input.reconciliationClean)reasons.push("SETTLEMENT_RECONCILIATION_REQUIRED");
+  if(!input.reservationClean)reasons.push("SETTLEMENT_RESERVATION_PENDING");
+  reasons.push(...assertLifecycleTransactionsTerminal(input.transactions));
+  for(const lot of input.inventoryLots){
+    if(lot.remainingRawAmount!==0n||!(lot.status==="SETTLED"||lot.status==="TRANSFERRED")){reasons.push(`SETTLEMENT_INVENTORY_REMAINS:${lot.lotId}`);continue;}
+    const terminal=lot.payload.terminalSettlement;
+    if(lot.status==="SETTLED"&&(!terminal||typeof terminal!=="object"||typeof (terminal as Record<string,unknown>).transactionSignature!=="string"))reasons.push(`SETTLEMENT_INVENTORY_DISPOSITION_MISSING:${lot.lotId}`);
+    if(lot.status==="TRANSFERRED"&&(!terminal||typeof terminal!=="object"||typeof (terminal as Record<string,unknown>).successorPositionAddress!=="string"||String((terminal as Record<string,unknown>).transferredRawAmount??"")!==lot.rawAmount.toString()))reasons.push(`SETTLEMENT_INVENTORY_SUCCESSOR_MISSING:${lot.lotId}`);
+  }
+  let totalSolInLamports=0n,totalSolOutLamports=0n,rentLockedLamports=0n,rentRecoveredLamports=0n;
+  for(const cashflow of input.cashflows){
+    // A lamport field is authoritative. WSOL raw amounts are equivalent to
+    // lamports only when explicitly identified by the canonical mint.
+    const amount=cashflow.lamports??(cashflow.tokenMint==="So11111111111111111111111111111111111111112"&&cashflow.tokenAmountRaw!==undefined?BigInt(cashflow.tokenAmountRaw):undefined);
+    if(amount===undefined){
+      if(cashflow.tokenAmountRaw!==undefined&&cashflow.tokenMint)continue;
+      reasons.push(`SETTLEMENT_CASHFLOW_INCOMPLETE:${cashflow.cashflowId}`);continue;
+    }
+    if(SETTLEMENT_SOL_IN.has(cashflow.flowType))totalSolInLamports+=amount;
+    else if(SETTLEMENT_SOL_OUT.has(cashflow.flowType))totalSolOutLamports+=amount;
+    else reasons.push(`SETTLEMENT_CASHFLOW_UNCLASSIFIED:${cashflow.cashflowId}`);
+    if(cashflow.flowType==="RENT_LOCK")rentLockedLamports+=amount;
+    if(cashflow.flowType==="RENT_RECOVERY")rentRecoveredLamports+=amount;
+  }
+  return {ready:reasons.length===0,reasonCodes:[...new Set(reasons)].sort(),totalSolInLamports,totalSolOutLamports,rentLockedLamports,rentRecoveredLamports,netRentCostLamports:rentLockedLamports-rentRecoveredLamports,realizedSolPnlLamports:totalSolInLamports-totalSolOutLamports};
+}
+/** Exact transaction IDs are retained so recovery has a concrete proof target. */
+export function assertLifecycleTransactionsTerminal(transactions:ReadonlyArray<LifecycleChildTransaction>):string[]{
+  return transactions.filter(tx=>!SETTLEMENT_TERMINAL_TRANSACTION_STATES.has(tx.state)).map(tx=>`SETTLEMENT_TX_${tx.state}:${tx.transactionId}`);
+}
+export async function lifecycleSettlementEvidenceHash(input:LifecycleSettlementInput,assessment:LifecycleSettlementAssessment):Promise<string>{
+  return sha256Hex(canonicalJson({lifecycleId:input.lifecycle.lifecycleId,assessment:{in:assessment.totalSolInLamports.toString(),out:assessment.totalSolOutLamports.toString(),pnl:assessment.realizedSolPnlLamports.toString(),rent:assessment.netRentCostLamports.toString()},cashflows:input.cashflows.map(flow=>[flow.cashflowId,flow.flowType,flow.lamports?.toString()??null,flow.tokenMint??null,flow.tokenAmountRaw??null]),inventoryLots:input.inventoryLots.map(lot=>[lot.lotId,lot.remainingRawAmount.toString(),lot.status]),transactions:input.transactions.map(tx=>[tx.transactionId,tx.signature??null,tx.state])}));
+}
+/**
  * The balance projection is deliberately independent of wallet balances.
  * Wallet truth says what an owner holds; inventory lots say which portion is
  * economically attributable to one LPForge position.
@@ -545,6 +629,7 @@ export interface Phase1Store {
       | "OPEN"
       | "CLOSING"
       | "CLOSED"
+      | "SOL_SETTLED"
       | "RECONCILIATION_REQUIRED"
       | "ENTRY_FUNDED_NOT_OPEN"
       | "ABORTED";
@@ -586,6 +671,7 @@ export interface Phase1Store {
       | "OPEN"
       | "CLOSING"
       | "CLOSED"
+      | "SOL_SETTLED"
       | "RECONCILIATION_REQUIRED"
       | "ENTRY_FUNDED_NOT_OPEN"
       | "ABORTED";
@@ -602,6 +688,10 @@ export interface Phase1Store {
   }): Promise<void>;
   insertPositionCashflow(value:{cashflowId:string;positionAddress:string;planId:string;flowType:'OPEN_CONTRIBUTION'|'ADD_CONTRIBUTION'|'FEE_CLAIM'|'REWARD_CLAIM'|'REDUCE_WITHDRAWAL'|'CLOSE_WITHDRAWAL'|'SWAP_PROCEEDS'|'SWAP_COST'|'TX_COST'|'RENT_LOCK'|'RENT_RECOVERY';observedAt:string;lamports?:bigint;tokenMint?:string;tokenAmountRaw?:string;payload:Record<string,unknown>}):Promise<void>;
   loadPositionCashflows(positionAddress:string):Promise<Array<{flowType:string;lamports?:bigint;tokenMint?:string;tokenAmountRaw?:string;payload?:Record<string,unknown>}>>;
+  ensurePositionLifecycle(value:{positionAddress:string;entryPlanId?:string;ownerAddress:string;poolAddress:string;predecessorLifecycleId?:string;at:string}):Promise<PositionLifecycle>;
+  linkPositionLifecyclePlan(value:{positionAddress:string;planId:string;role:"ENTRY"|"MANAGEMENT"|"CLOSE"|"RECOVERY";at:string}):Promise<void>;
+  loadLifecycleSettlementInput(positionAddress:string):Promise<Omit<LifecycleSettlementInput,"positionAbsent"|"positionCheckedAt"|"positionCheckedSlot">|undefined>;
+  persistLifecycleSolSettlement(value:{assessment:LifecycleSettlementAssessment;input:LifecycleSettlementInput;sourceCommit?:string;policyHash?:string;migrationHead?:string;buildId?:string;at:string}):Promise<{lifecycleId:string;settlementId:string;created:boolean}>;
   createPositionInventoryLot(value:Omit<PositionInventoryLot,"remainingRawAmount"|"status">&{createdEventId:string;transactionSignature?:string}):Promise<void>;
   settlePositionInventoryLot(value:{eventId:string;lotId:string;planId?:string;eventType:"SETTLED"|"TRANSFERRED";settledRawAmount:bigint;observedAt:string;transactionSignature?:string;payload:Record<string,unknown>}):Promise<{remainingRawAmount:bigint;status:PositionInventoryLotStatus}>;
   loadPositionInventoryLots(positionAddress:string,tokenMint?:string):Promise<PositionInventoryLot[]>;
@@ -1910,6 +2000,8 @@ export async function createPostgresStore(
           json(v.payload),
         ],
       );
+      await db.query("INSERT INTO execution.position_lifecycles(lifecycle_id,position_address,entry_plan_id,owner_address,pool_address,status,created_at,payload) VALUES($1,$2,$3,$4,$5,$6,$7,'{}'::jsonb) ON CONFLICT(position_address) DO UPDATE SET entry_plan_id=COALESCE(execution.position_lifecycles.entry_plan_id,EXCLUDED.entry_plan_id)",[`lifecycle:${v.positionAddress}`,v.positionAddress,v.entryPlanId??null,v.ownerAddress,v.poolAddress,v.lifecycleState==='RECONCILIATION_REQUIRED'?'RECONCILIATION_REQUIRED':v.lifecycleState==='CLOSED'?'CLOSED':'OPEN',v.enteredAt]);
+      if(v.entryPlanId)await db.query("INSERT INTO execution.lifecycle_plan_links(lifecycle_id,plan_id,role,linked_at) VALUES($1,$2,'ENTRY',$3) ON CONFLICT DO NOTHING",[`lifecycle:${v.positionAddress}`,v.entryPlanId,v.enteredAt]);
     },
     async insertPositionObservation(v) {
       await db.query(
@@ -1972,6 +2064,8 @@ export async function createPostgresStore(
           json(v.payload),
         ],
       );
+      if(v.lifecycleState==='RECONCILIATION_REQUIRED')await db.query("UPDATE execution.position_lifecycles SET status='RECONCILIATION_REQUIRED' WHERE position_address=$1 AND status<>'SOL_SETTLED'",[v.positionAddress]);
+      if(v.lifecycleState==='CLOSED')await db.query("UPDATE execution.position_lifecycles SET status='CLOSED' WHERE position_address=$1 AND status<>'SOL_SETTLED'",[v.positionAddress]);
     },
     async adjustOwnedPositionCapital(v) {
       await db.query(
@@ -1979,8 +2073,34 @@ export async function createPostgresStore(
         [v.positionAddress, v.capitalLamports.toString(), v.at, json(v.payload)],
       );
     },
-    async insertPositionCashflow(v){await db.query("INSERT INTO execution.position_cashflows(cashflow_id,position_address,plan_id,flow_type,observed_at,lamports,token_mint,token_amount_raw,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) ON CONFLICT(cashflow_id) DO UPDATE SET lamports=EXCLUDED.lamports,token_mint=EXCLUDED.token_mint,token_amount_raw=EXCLUDED.token_amount_raw,payload=EXCLUDED.payload",[v.cashflowId,v.positionAddress,v.planId,v.flowType,v.observedAt,v.lamports?.toString()??null,v.tokenMint??null,v.tokenAmountRaw??null,json(v.payload)]);},
+    async insertPositionCashflow(v){await db.query("INSERT INTO execution.position_cashflows(cashflow_id,position_address,plan_id,flow_type,observed_at,lamports,token_mint,token_amount_raw,payload,lifecycle_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,(SELECT lifecycle_id FROM execution.position_lifecycles WHERE position_address=$2)) ON CONFLICT(cashflow_id) DO UPDATE SET lamports=EXCLUDED.lamports,token_mint=EXCLUDED.token_mint,token_amount_raw=EXCLUDED.token_amount_raw,payload=EXCLUDED.payload",[v.cashflowId,v.positionAddress,v.planId,v.flowType,v.observedAt,v.lamports?.toString()??null,v.tokenMint??null,v.tokenAmountRaw??null,json(v.payload)]);},
     async loadPositionCashflows(positionAddress){const r=await db.query("SELECT flow_type,lamports,token_mint,token_amount_raw,payload FROM execution.position_cashflows WHERE position_address=$1 ORDER BY observed_at ASC,cashflow_id ASC",[positionAddress]);return r.rows.map(row=>({flowType:String(row.flow_type),...(row.lamports!==null&&row.lamports!==undefined?{lamports:BigInt(String(row.lamports))}:{}),...(row.token_mint?{tokenMint:String(row.token_mint)}:{}),...(row.token_amount_raw?{tokenAmountRaw:String(row.token_amount_raw)}:{}),...(row.payload&&typeof row.payload==='object'?{payload:row.payload as Record<string,unknown>}:{})}));},
+    async ensurePositionLifecycle(v){
+      const lifecycleId=`lifecycle:${v.positionAddress}`;
+      const r=await db.query("INSERT INTO execution.position_lifecycles(lifecycle_id,position_address,entry_plan_id,owner_address,pool_address,predecessor_lifecycle_id,status,created_at,payload) VALUES($1,$2,$3,$4,$5,$6,'OPEN',$7,'{}'::jsonb) ON CONFLICT(position_address) DO UPDATE SET entry_plan_id=COALESCE(execution.position_lifecycles.entry_plan_id,EXCLUDED.entry_plan_id),predecessor_lifecycle_id=COALESCE(execution.position_lifecycles.predecessor_lifecycle_id,EXCLUDED.predecessor_lifecycle_id) RETURNING lifecycle_id,position_address,entry_plan_id,owner_address,pool_address,predecessor_lifecycle_id,status",[lifecycleId,v.positionAddress,v.entryPlanId??null,v.ownerAddress,v.poolAddress,v.predecessorLifecycleId??null,v.at]);
+      if(v.entryPlanId)await db.query("INSERT INTO execution.lifecycle_plan_links(lifecycle_id,plan_id,role,linked_at) VALUES($1,$2,'ENTRY',$3) ON CONFLICT DO NOTHING",[lifecycleId,v.entryPlanId,v.at]);
+      const row=r.rows[0]!;return{lifecycleId:String(row.lifecycle_id),positionAddress:String(row.position_address),...(row.entry_plan_id?{entryPlanId:String(row.entry_plan_id)}:{}),ownerAddress:String(row.owner_address),poolAddress:String(row.pool_address),...(row.predecessor_lifecycle_id?{predecessorLifecycleId:String(row.predecessor_lifecycle_id)}:{}),status:String(row.status) as PositionLifecycle["status"]};
+    },
+    async linkPositionLifecyclePlan(v){
+      const r=await db.query("SELECT lifecycle_id FROM execution.position_lifecycles WHERE position_address=$1",[v.positionAddress]);if(!r.rows[0])throw new Error("LPFORGE_LIFECYCLE_MISSING");
+      await db.query("INSERT INTO execution.lifecycle_plan_links(lifecycle_id,plan_id,role,linked_at) VALUES($1,$2,$3,$4) ON CONFLICT(lifecycle_id,plan_id) DO NOTHING",[r.rows[0].lifecycle_id,v.planId,v.role,v.at]);
+    },
+    async loadLifecycleSettlementInput(positionAddress){
+      const lr=await db.query("SELECT lifecycle_id,position_address,entry_plan_id,owner_address,pool_address,predecessor_lifecycle_id,status FROM execution.position_lifecycles WHERE position_address=$1",[positionAddress]);if(!lr.rows[0])return undefined;const l=lr.rows[0];
+      const [cash,lots,tx,res]=await Promise.all([
+        db.query("SELECT cashflow_id,flow_type,lamports,token_mint,token_amount_raw FROM execution.position_cashflows WHERE lifecycle_id=$1 ORDER BY observed_at,cashflow_id",[l.lifecycle_id]),
+        db.query("SELECT lot_id,position_address,plan_id,owner_address,pool_address,token_mint,token_side,source_event,source_cashflow_id,raw_amount,remaining_raw_amount,decimals,acquired_at,status,payload FROM execution.position_inventory_lots WHERE lifecycle_id=$1 ORDER BY acquired_at,lot_id",[l.lifecycle_id]),
+        db.query("SELECT s.transaction_id,a.signature,COALESCE(c.status,a.state,CASE WHEN s.state IN ('CONFIRMED','COMPLETED') THEN 'CONFIRMED' ELSE s.state END) state FROM execution.lifecycle_plan_links link JOIN execution.transaction_steps s ON s.plan_id=link.plan_id LEFT JOIN LATERAL (SELECT attempt_id,signature,state FROM execution.submission_attempts WHERE transaction_id=s.transaction_id ORDER BY attempt DESC LIMIT 1) a ON true LEFT JOIN LATERAL (SELECT status FROM execution.confirmations WHERE attempt_id=a.attempt_id ORDER BY observed_at DESC LIMIT 1) c ON true WHERE link.lifecycle_id=$1 ORDER BY s.sequence",[l.lifecycle_id]),
+        db.query("SELECT NOT EXISTS(SELECT 1 FROM execution.owned_positions WHERE position_address=$1 AND lifecycle_state='RECONCILIATION_REQUIRED') AS reconciliation_clean,NOT EXISTS(SELECT 1 FROM execution.capital_reservations r JOIN execution.lifecycle_plan_links link ON link.plan_id=r.plan_id WHERE link.lifecycle_id=$2 AND r.state IN ('RESERVED','SUBMITTED')) AS reservation_clean",[positionAddress,l.lifecycle_id])
+      ]);
+      const normalize=(state:string):LifecycleChildTransactionState=>state==='CONFIRMED'||state==='FINALIZED'?"CONFIRMED":state==='FAILED'||state==='EXPIRED'?"FAILED_FINAL":state==='PROVEN_NOT_LANDED'?"PROVEN_NOT_LANDED":state==='UNKNOWN'?"UNKNOWN":state==='SUBMITTED'||state==='SENT'||state==='PROCESSED'?"SUBMITTED":state==='PREPARED'?"CONFIRMATION_PENDING":"RECOVERY_PENDING";
+      return {lifecycle:{lifecycleId:String(l.lifecycle_id),positionAddress:String(l.position_address),...(l.entry_plan_id?{entryPlanId:String(l.entry_plan_id)}:{}),ownerAddress:String(l.owner_address),poolAddress:String(l.pool_address),...(l.predecessor_lifecycle_id?{predecessorLifecycleId:String(l.predecessor_lifecycle_id)}:{}),status:String(l.status) as PositionLifecycle["status"]},cashflows:cash.rows.map(row=>({cashflowId:String(row.cashflow_id),flowType:String(row.flow_type),...(row.lamports===null?{}:{lamports:BigInt(String(row.lamports))}),...(row.token_mint?{tokenMint:String(row.token_mint)}:{}),...(row.token_amount_raw===null?{}:{tokenAmountRaw:String(row.token_amount_raw)} )})),inventoryLots:lots.rows.map(row=>({lotId:String(row.lot_id),positionAddress:String(row.position_address),planId:String(row.plan_id),ownerAddress:String(row.owner_address),poolAddress:String(row.pool_address),tokenMint:String(row.token_mint),tokenSide:String(row.token_side) as PositionInventoryLotSide,sourceEvent:String(row.source_event) as PositionInventoryLotSource,...(row.source_cashflow_id?{sourceCashflowId:String(row.source_cashflow_id)}:{}),rawAmount:BigInt(String(row.raw_amount)),remainingRawAmount:BigInt(String(row.remaining_raw_amount)),decimals:Number(row.decimals),acquiredAt:toIsoTimestamp(row.acquired_at),status:String(row.status) as PositionInventoryLotStatus,payload:(row.payload??{}) as Record<string,unknown>})),transactions:tx.rows.map(row=>({transactionId:String(row.transaction_id),...(row.signature?{signature:String(row.signature)}:{}),state:normalize(String(row.state))})),reconciliationClean:Boolean(res.rows[0]?.reconciliation_clean),reservationClean:Boolean(res.rows[0]?.reservation_clean)};
+    },
+    async persistLifecycleSolSettlement(v){
+      if(!v.assessment.ready)throw new Error(`LPFORGE_SETTLEMENT_NOT_READY:${v.assessment.reasonCodes.join(',')}`);const input=v.input,assessment=v.assessment,evidenceHash=await lifecycleSettlementEvidenceHash(input,assessment),settlementId=`settlement:${input.lifecycle.lifecycleId}:v1`;
+      const existing=await db.query("SELECT settlement_id,evidence_hash FROM execution.lifecycle_sol_settlements WHERE lifecycle_id=$1 AND settlement_version=1",[input.lifecycle.lifecycleId]);if(existing.rows[0]){if(String(existing.rows[0].evidence_hash)!==evidenceHash)throw new Error("LPFORGE_SETTLEMENT_EVIDENCE_MISMATCH");return{lifecycleId:input.lifecycle.lifecycleId,settlementId:String(existing.rows[0].settlement_id),created:false};}
+      await db.query("BEGIN");try{const inserted=await db.query("INSERT INTO execution.lifecycle_sol_settlements(settlement_id,lifecycle_id,settlement_version,position_address,owner_address,pool_address,entry_plan_id,total_sol_in_lamports,total_sol_out_lamports,rent_locked_lamports,rent_recovered_lamports,net_rent_cost_lamports,realized_sol_pnl_lamports,cashflow_count,inventory_lot_count,child_transaction_count,position_checked_at,position_checked_slot,reconciliation_verified_at,source_commit,policy_hash,migration_head,build_id,evidence_hash,settled_at,payload) VALUES($1,$2,1,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25::jsonb) ON CONFLICT(lifecycle_id,settlement_version) DO NOTHING RETURNING settlement_id,evidence_hash",[settlementId,input.lifecycle.lifecycleId,input.lifecycle.positionAddress,input.lifecycle.ownerAddress,input.lifecycle.poolAddress,input.lifecycle.entryPlanId??null,assessment.totalSolInLamports.toString(),assessment.totalSolOutLamports.toString(),assessment.rentLockedLamports.toString(),assessment.rentRecoveredLamports.toString(),assessment.netRentCostLamports.toString(),assessment.realizedSolPnlLamports.toString(),input.cashflows.length,input.inventoryLots.length,input.transactions.length,input.positionCheckedAt,input.positionCheckedSlot?.toString()??null,v.at,v.sourceCommit??null,v.policyHash??null,v.migrationHead??null,v.buildId??null,evidenceHash,v.at,json({accountingConvention:'gross-sol-instruction-flows-v1',reasonCodes:assessment.reasonCodes,positionAbsence:{checkedAt:input.positionCheckedAt,slot:input.positionCheckedSlot?.toString()??null,commitment:'confirmed'}})]);if(!inserted.rows[0]){const same=await db.query("SELECT settlement_id,evidence_hash FROM execution.lifecycle_sol_settlements WHERE lifecycle_id=$1 AND settlement_version=1 FOR UPDATE",[input.lifecycle.lifecycleId]),row=same.rows[0];if(!row||String(row.evidence_hash)!==evidenceHash)throw new Error("LPFORGE_SETTLEMENT_EVIDENCE_MISMATCH");await db.query("COMMIT");return{lifecycleId:input.lifecycle.lifecycleId,settlementId:String(row.settlement_id),created:false};}await db.query("UPDATE execution.position_lifecycles SET status='SOL_SETTLED',settled_at=$2 WHERE lifecycle_id=$1",[input.lifecycle.lifecycleId,v.at]);await db.query("UPDATE execution.owned_positions SET lifecycle_state='SOL_SETTLED',reconciliation_status='MATCH' WHERE position_address=$1",[input.lifecycle.positionAddress]);await db.query("COMMIT");return{lifecycleId:input.lifecycle.lifecycleId,settlementId,created:true};}catch(error){try{await db.query("ROLLBACK");}catch{}throw error;}
+    },
     async createPositionInventoryLot(v){
       const tx=db;
       try{
@@ -1992,7 +2112,7 @@ export async function createPostgresStore(
           await tx.query("COMMIT");
           return;
         }
-        await tx.query("INSERT INTO execution.position_inventory_lots(lot_id,position_address,plan_id,owner_address,pool_address,token_mint,token_side,source_event,source_cashflow_id,raw_amount,remaining_raw_amount,decimals,acquired_at,status,payload,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10,$11,$12,'OPEN',$13::jsonb,$12,$12)",[v.lotId,v.positionAddress,v.planId,v.ownerAddress,v.poolAddress,v.tokenMint,v.tokenSide,v.sourceEvent,v.sourceCashflowId??null,v.rawAmount.toString(),v.decimals,v.acquiredAt,json(v.payload)]);
+        await tx.query("INSERT INTO execution.position_inventory_lots(lot_id,position_address,plan_id,owner_address,pool_address,token_mint,token_side,source_event,source_cashflow_id,raw_amount,remaining_raw_amount,decimals,acquired_at,status,payload,created_at,updated_at,lifecycle_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10,$11,$12,'OPEN',$13::jsonb,$12,$12,(SELECT lifecycle_id FROM execution.position_lifecycles WHERE position_address=$2))",[v.lotId,v.positionAddress,v.planId,v.ownerAddress,v.poolAddress,v.tokenMint,v.tokenSide,v.sourceEvent,v.sourceCashflowId??null,v.rawAmount.toString(),v.decimals,v.acquiredAt,json(v.payload)]);
         await tx.query("INSERT INTO execution.position_inventory_lot_events(event_id,lot_id,plan_id,event_type,raw_amount,remaining_raw_amount,observed_at,transaction_signature,payload) VALUES($1,$2,$3,'CREATED',$4,$4,$5,$6,$7::jsonb)",[v.createdEventId,v.lotId,v.planId,v.rawAmount.toString(),v.acquiredAt,v.transactionSignature??null,json({sourceEvent:v.sourceEvent,...v.payload})]);
         await tx.query("COMMIT");
       }catch(error){try{await tx.query("ROLLBACK");}catch{}throw error;}
@@ -2007,7 +2127,7 @@ export async function createPostgresStore(
         const current={remainingRawAmount:BigInt(String(lot.rows[0].remaining_raw_amount)),status:String(lot.rows[0].status) as PositionInventoryLotStatus};
         if(priorEvent.rows[0]){await tx.query("COMMIT");return current;}
         const next=settlePositionInventoryLotBalance({remainingRawAmount:current.remainingRawAmount,settledRawAmount:v.settledRawAmount,eventType:v.eventType});
-        await tx.query("UPDATE execution.position_inventory_lots SET remaining_raw_amount=$2,status=$3,updated_at=$4 WHERE lot_id=$1",[v.lotId,next.remainingRawAmount.toString(),next.status,v.observedAt]);
+        await tx.query("UPDATE execution.position_inventory_lots SET remaining_raw_amount=$2,status=$3,updated_at=$4,payload=CASE WHEN $3 IN ('SETTLED','TRANSFERRED') THEN payload||jsonb_build_object('terminalSettlement',$5::jsonb) ELSE payload END WHERE lot_id=$1",[v.lotId,next.remainingRawAmount.toString(),next.status,v.observedAt,json({eventType:v.eventType,transactionSignature:v.transactionSignature??null,...v.payload})]);
         await tx.query("INSERT INTO execution.position_inventory_lot_events(event_id,lot_id,plan_id,event_type,raw_amount,remaining_raw_amount,observed_at,transaction_signature,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)",[v.eventId,v.lotId,v.planId??null,v.eventType,v.settledRawAmount.toString(),next.remainingRawAmount.toString(),v.observedAt,v.transactionSignature??null,json(v.payload)]);
         await tx.query("COMMIT");
         return next;
@@ -2922,6 +3042,10 @@ export function createMemoryStore(): Phase1Store {
     async adjustOwnedPositionCapital() {},
     async insertPositionCashflow() {},
     async loadPositionCashflows() { return []; },
+    async ensurePositionLifecycle(v) { return {lifecycleId:`lifecycle:${v.positionAddress}`,positionAddress:v.positionAddress,...(v.entryPlanId?{entryPlanId:v.entryPlanId}:{}),ownerAddress:v.ownerAddress,poolAddress:v.poolAddress,...(v.predecessorLifecycleId?{predecessorLifecycleId:v.predecessorLifecycleId}:{}),status:"OPEN" as const}; },
+    async linkPositionLifecyclePlan() {},
+    async loadLifecycleSettlementInput() { return undefined; },
+    async persistLifecycleSolSettlement(v) { if(!v.assessment.ready)throw new Error("LPFORGE_SETTLEMENT_NOT_READY");return{lifecycleId:v.input.lifecycle.lifecycleId,settlementId:`settlement:${v.input.lifecycle.lifecycleId}:v1`,created:true}; },
     async createPositionInventoryLot() {},
     async settlePositionInventoryLot() { return {remainingRawAmount:0n,status:"SETTLED" as PositionInventoryLotStatus}; },
     async loadPositionInventoryLots() { return []; },
