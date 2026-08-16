@@ -37,6 +37,36 @@ export interface LivePositionManagementDecision {
   reasonCodes: string[];
   replacementRange?: { lowerBinId: number; upperBinId: number };
 }
+/**
+ * Normal management actions are economic decisions and must be bound to the
+ * pool result that produced their regime, flow, and forward-EV context.  An
+ * emergency close is deliberately different: it may be issued from durable
+ * position or chain-truth safety evidence when no current market assessment
+ * is available for that pool.
+ */
+export function assessLiveManagementContext(input: {
+  positionPoolAddress: string;
+  managementPoolAddress?: string;
+  action: LiveManagementAction;
+}) {
+  const matchingPoolContext = input.managementPoolAddress === input.positionPoolAddress;
+  const independentlyProtective = input.action === "EMERGENCY_CLOSE";
+  const normalManagementAllowed = matchingPoolContext && input.action !== "HOLD";
+  const protectiveManagementAllowed = independentlyProtective;
+  return {
+    matchingPoolContext,
+    normalManagementAllowed,
+    protectiveManagementAllowed,
+    planAllowed:
+      input.action !== "HOLD" &&
+      (normalManagementAllowed || protectiveManagementAllowed),
+    reasonCodes: matchingPoolContext
+      ? ["LIVE_MANAGEMENT_CONTEXT_POOL_MATCH"]
+      : independentlyProtective
+        ? ["LIVE_MANAGEMENT_CONTEXT_EMERGENCY_INDEPENDENT"]
+        : ["LIVE_MANAGEMENT_CONTEXT_POOL_MISMATCH"],
+  };
+}
 
 function object(v: unknown) {
   if (!v || typeof v !== "object" || Array.isArray(v))

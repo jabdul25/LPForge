@@ -23,6 +23,7 @@ import { buildTransactionPlan } from "../../../packages/transaction-planner/src/
 import { computePlanProvenanceHmac } from "../../../packages/execution-contracts/src/index.js";
 import type { TransactionPlan } from "../../../packages/execution-contracts/src/index.js";
 import {
+  assessLiveManagementContext,
   decideLivePositionManagement,
   loadLivePositionManagementPolicy,
   type OwnedLivePosition,
@@ -266,7 +267,8 @@ async function observeAndPlanOwnedPositions(input: {
         "policies/live-exit-governor-policy.json",
     ),
     positions = await input.store.loadOwnedPositions(input.ownerAddress);
-  let planned = 0;
+  let planned = 0,
+    skippedNoMatchingContext = 0;
   for (const row of positions) {
     const position = owned(row);
     let fact;
@@ -320,6 +322,11 @@ async function observeAndPlanOwnedPositions(input: {
       activeBinId,
       exitDecision,
     });
+    const managementContext = assessLiveManagementContext({
+      positionPoolAddress: position.poolAddress,
+      ...(current ? { managementPoolAddress: current.poolAddress } : {}),
+      action: decision.action,
+    });
     await input.store.upsertPositionExitState({
       lpforgePositionId:position.lpforgePositionId,observedAt:input.observedAt,evidenceState:exitDecision.economics.evidenceState,
       ...(exitDecision.economics.initialCapitalUsd!==undefined?{initialCapitalUsd:exitDecision.economics.initialCapitalUsd}:{}),
@@ -350,7 +357,15 @@ async function observeAndPlanOwnedPositions(input: {
         : {}),
       walletTruth: { source: "NOT_REQUIRED_FOR_OBSERVATION" },
       positionTruth: fact ?? { missing: true },
-      managementContext: { decision, policy, exitDecision, exitPolicy },
+      managementContext: {
+        decision,
+        policy,
+        exitDecision,
+        exitPolicy,
+        positionPoolAddress: position.poolAddress,
+        managementPoolAddress: current?.poolAddress ?? null,
+        ...managementContext,
+      },
       reconciliationDebt: !fact,
       staleData: false,
       payload: { source: "LPFORGE_PRODUCTION_OWNED_POSITION_MONITOR" },
@@ -360,12 +375,16 @@ async function observeAndPlanOwnedPositions(input: {
     );
     if (
       decision.action === "HOLD" ||
+      !managementContext.planAllowed ||
       (riskIncreasing
         ? !input.allowRiskIncreasingPlans
         : !input.allowProtectiveManagementPlans) ||
       (await input.store.hasActiveAutonomousPlan(position.positionAddress))
-    )
+    ) {
+      if (decision.action !== "HOLD" && !managementContext.planAllowed)
+        skippedNoMatchingContext++;
       continue;
+    }
     const expiresAt = new Date(
         Date.parse(input.observedAt) + policy.planTtlMs,
       ).toISOString(),
@@ -401,6 +420,9 @@ async function observeAndPlanOwnedPositions(input: {
         : {}),
       metadata: {
         managementReasonCodes: decision.reasonCodes,
+        managementContextReasonCodes: managementContext.reasonCodes,
+        managementContextPoolAddress: current?.poolAddress ?? null,
+        positionPoolAddress: position.poolAddress,
         sourcePositionAddress: position.positionAddress,
         orientation: position.orientation,
         entryFunding: { rebuildFromRemovedPosition: true },
@@ -410,7 +432,7 @@ async function observeAndPlanOwnedPositions(input: {
     await persistTransactionPlan(input.store, plan);
     planned++;
   }
-  return { observed: positions.length, planned };
+  return { observed: positions.length, planned, skippedNoMatchingContext };
 }
 async function persistResult(
   store: Phase1Store,
