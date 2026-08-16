@@ -1713,7 +1713,7 @@ export async function createPostgresStore(
     },
     async releaseExecutionCapital(planId,at,reasonCodes){await db.query("UPDATE execution.capital_reservations SET state='RELEASED',updated_at=$2,reason_codes=$3::jsonb WHERE plan_id=$1 AND state IN ('RESERVED','SUBMITTED')",[planId,at,json(reasonCodes)]);},
     async markExecutionCapitalSubmitted(planId,at){await db.query("UPDATE execution.capital_reservations SET state='SUBMITTED',updated_at=$2 WHERE plan_id=$1 AND state='RESERVED'",[planId,at]);},
-    async reconcileExecutionCapitalReservations(at){await db.query("UPDATE execution.capital_reservations r SET state=CASE WHEN p.state IN ('BLOCKED','FAILED') THEN 'RELEASED' WHEN EXISTS(SELECT 1 FROM execution.owned_positions o WHERE o.entry_plan_id=r.plan_id AND o.lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN')) THEN 'DEPLOYED' ELSE r.state END,updated_at=$1 FROM execution.transaction_plans p WHERE p.plan_id=r.plan_id AND r.state IN ('RESERVED','SUBMITTED')",[at]);},
+    async reconcileExecutionCapitalReservations(at){await db.query("UPDATE execution.capital_reservations r SET state=CASE WHEN p.state IN ('BLOCKED','FAILED') THEN 'RELEASED' WHEN EXISTS(SELECT 1 FROM execution.owned_positions o WHERE o.entry_plan_id=r.plan_id AND o.lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN')) THEN 'DEPLOYED' WHEN r.state='DEPLOYED' AND EXISTS(SELECT 1 FROM execution.owned_positions o WHERE o.entry_plan_id=r.plan_id AND o.lifecycle_state='CLOSED') THEN 'RELEASED' ELSE r.state END,updated_at=$1,reason_codes=CASE WHEN r.state='DEPLOYED' AND EXISTS(SELECT 1 FROM execution.owned_positions o WHERE o.entry_plan_id=r.plan_id AND o.lifecycle_state='CLOSED') THEN '[\"P6_CAPITAL_POSITION_CLOSED_RECONCILED\"]'::jsonb ELSE r.reason_codes END FROM execution.transaction_plans p WHERE p.plan_id=r.plan_id AND r.state IN ('RESERVED','SUBMITTED','DEPLOYED')",[at]);},
     async countExecutionActionsSince(ownerAddress,since){const r=await db.query("SELECT count(DISTINCT p.plan_id)::int AS n FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id LEFT JOIN execution.transaction_steps s ON s.plan_id=p.plan_id LEFT JOIN execution.submission_attempts a ON a.transaction_id=s.transaction_id WHERE i.owner_address=$1 AND a.state IN ('SENT','UNKNOWN') AND a.submitted_at >= $2::timestamptz",[ownerAddress,since]);return Number(r.rows[0]?.n??0);},
     async claimNextAutonomousOpenPlan(now) {
       const claimed = await db.query(
@@ -1766,12 +1766,30 @@ export async function createPostgresStore(
           json(v.payload),
         ],
       );
+      const terminalJournalState =
+        v.state === "EXPIRED"
+          ? "EXPIRED"
+          : v.state === "BLOCKED" || v.state === "FAILED"
+            ? "FAILED"
+            : undefined;
+      if (terminalJournalState)
+        await db.query(
+          `UPDATE execution.execution_journal SET state=$2,updated_at=$3,payload=payload||jsonb_build_object('terminalPlanState',$4,'terminalizedAt',$3::text) WHERE plan_id=$1 AND state IN ('PLAN_CREATED','BUILT','SIMULATED','APPROVED','SIGNED')`,
+          [v.planId, terminalJournalState, v.at, v.state],
+        );
     },
     async completeAutonomousPlan(v) {
       await db.query(
         `UPDATE execution.transaction_plans SET state=$2,payload=payload||jsonb_build_object('autonomous_dispatch_completed_at',$3::text,'autonomous_dispatch',COALESCE(payload->'autonomous_dispatch','{}'::jsonb)||$4::jsonb) WHERE plan_id=$1`,
         [v.planId, v.state, v.at, json(v.payload)],
       );
+      const terminalJournalState =
+        v.state === "BLOCKED" || v.state === "FAILED" ? "FAILED" : undefined;
+      if (terminalJournalState)
+        await db.query(
+          `UPDATE execution.execution_journal SET state=$2,updated_at=$3,payload=payload||jsonb_build_object('terminalPlanState',$4,'terminalizedAt',$3::text) WHERE plan_id=$1 AND state IN ('PLAN_CREATED','BUILT','SIMULATED','APPROVED','SIGNED')`,
+          [v.planId, terminalJournalState, v.at, v.state],
+        );
     },
     async upsertOwnedPosition(v) {
       await db.query(
@@ -2470,7 +2488,7 @@ export async function createPostgresStore(
             `WITH latest AS (SELECT DISTINCT ON (plan_id) plan_id,status FROM execution.reconciliations ORDER BY plan_id,observed_at DESC) SELECT count(*)::int AS n FROM latest WHERE status<>'MATCH'`,
           ),
           db.query(
-            `SELECT count(*)::int AS n FROM execution.execution_journal WHERE state NOT IN ('RECONCILED','EXPIRED','FAILED','HOLD')`,
+            `SELECT count(*)::int AS n FROM execution.execution_journal j JOIN execution.transaction_plans p ON p.plan_id=j.plan_id WHERE j.state NOT IN ('RECONCILED','EXPIRED','FAILED','HOLD') AND p.state NOT IN ('BLOCKED','FAILED','EXPIRED','RECONCILED')`,
           ),
           db.query(
             `SELECT count(*)::int AS n FROM operations.phase6_canary_sessions WHERE status NOT IN ('CLOSED','FAILED')`,

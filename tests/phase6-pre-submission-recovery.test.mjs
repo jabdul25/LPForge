@@ -11,6 +11,22 @@ test('orphan sweep targets the installed Meteora SDK wallet-position API',async(
   assert.match(sdk,/getAllLbPairPositionsByUser/);
 });
 
+test('capital reconciliation releases a deployed reservation only after its recorded PositionV2 is CLOSED',async()=>{
+  const fs=await import('node:fs/promises');
+  const db=await fs.readFile('packages/db/src/index.ts','utf8');
+  assert.match(db,/r\.state IN \('RESERVED','SUBMITTED','DEPLOYED'\)/);
+  assert.match(db,/r\.state='DEPLOYED' AND EXISTS\(SELECT 1 FROM execution\.owned_positions o WHERE o\.entry_plan_id=r\.plan_id AND o\.lifecycle_state='CLOSED'\) THEN 'RELEASED'/);
+  assert.match(db,/P6_CAPITAL_POSITION_CLOSED_RECONCILED/);
+  assert.doesNotMatch(db,/r\.state='DEPLOYED' THEN 'RELEASED'/);
+});
+
+test('terminal plans terminalize pre-send journals and P7 excludes terminal parent plans from active-journal health',async()=>{
+  const fs=await import('node:fs/promises');
+  const db=await fs.readFile('packages/db/src/index.ts','utf8');
+  assert.match(db,/WHERE plan_id=\$1 AND state IN \('PLAN_CREATED','BUILT','SIMULATED','APPROVED','SIGNED'\)/);
+  assert.match(db,/JOIN execution\.transaction_plans p ON p\.plan_id=j\.plan_id WHERE j\.state NOT IN \('RECONCILED','EXPIRED','FAILED','HOLD'\) AND p\.state NOT IN \('BLOCKED','FAILED','EXPIRED','RECONCILED'\)/);
+});
+
 test('P6 recovery terminalizes an unsubmitted claimed plan and releases any reservation',async()=>{
   const calls=[];
   const store={
