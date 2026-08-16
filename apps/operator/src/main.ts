@@ -1,5 +1,5 @@
 import { loadPhase1Config } from "../../../packages/config/src/index.js";
-import { createMeteoraDataApi } from "../../../packages/data-api/src/index.js";
+import { createMeteoraDataApi, type DataApiPool } from "../../../packages/data-api/src/index.js";
 import {
   createPostgresStore,
   type Phase1Store,
@@ -52,6 +52,22 @@ function json(v: unknown) {
   );
 }
 const lamportsToSol = (value: bigint) => Number(value) / 1_000_000_000;
+const WSOL_MINT="So11111111111111111111111111111111111111112";
+function claimValueLamports(input:{feeX?:string|undefined;feeY?:string|undefined;pool:DataApiPool}):bigint|undefined{
+  const tokens=[input.pool.token_x,input.pool.token_y],sol=tokens.find(token=>token?.address===WSOL_MINT);
+  if(!sol||typeof sol.price!=="number"||!Number.isFinite(sol.price)||sol.price<=0)return undefined;
+  const value=(raw:string|undefined,token:typeof input.pool.token_x)=>{
+    let amount:bigint;try{amount=BigInt(raw??"0");}catch{return undefined;}
+    if(amount===0n)return 0n;
+    if(token?.address===WSOL_MINT)return amount;
+    const decimals=token?.decimals,price=token?.price,solPrice=sol.price;
+    if(!token||!Number.isInteger(decimals)||decimals===undefined||decimals<0||typeof price!=="number"||!Number.isFinite(price)||price<=0||solPrice===undefined)return undefined;
+    const solLamports=Number(amount)/10**decimals*price/solPrice*1e9;
+    return Number.isFinite(solLamports)&&solLamports>=0&&solLamports<=Number.MAX_SAFE_INTEGER?BigInt(Math.floor(solLamports)):undefined;
+  };
+  const x=value(input.feeX,input.pool.token_x),y=value(input.feeY,input.pool.token_y);
+  return x===undefined||y===undefined?undefined:x+y;
+}
 function loadProductionCapitalEnvelope(poolAddress: string) {
   const deployment = loadDeploymentPolicyFile(
     process.env.LPFORGE_EXECUTION_POLICY_PATH ?? "policies/live-execution-policy.json",
@@ -285,10 +301,11 @@ async function observeAndPlanOwnedPositions(input: {
       activeBinId = (await input.adapter.getPool(position.poolAddress))
         .activeBinId;
     } catch {}
-    let economics = { evidenceState: "UNAVAILABLE" as const, observedAt: input.observedAt, reasonCodes: ["EXIT_VALUATION_POOL_DATA_UNAVAILABLE"] };
+    let economics = { evidenceState: "UNAVAILABLE" as const, observedAt: input.observedAt, reasonCodes: ["EXIT_VALUATION_POOL_DATA_UNAVAILABLE"] },apiPool:DataApiPool|undefined;
     if (fact) {
       try {
-        const [apiPool,cashflows] = await Promise.all([input.api.getPool(position.poolAddress),input.store.loadPositionCashflows(position.positionAddress)]);
+        const [loadedPool,cashflows] = await Promise.all([input.api.getPool(position.poolAddress),input.store.loadPositionCashflows(position.positionAddress)]);
+        apiPool=loadedPool;
         economics = derivePositionEconomics({position: fact, pool: apiPool, initialCapitalLamports: position.initialCapitalLamports, observedAt: input.observedAt,realizedFeeCashflows:cashflows}) as typeof economics;
       } catch {}
     }
@@ -315,12 +332,14 @@ async function observeAndPlanOwnedPositions(input: {
       liquidityCollapse:Number.isFinite(liquidityChange)&&liquidityChange<=-50,
       ...(position.enteredAt&&Number.isFinite(Date.parse(position.enteredAt))?{positionAgeMinutes:Math.max(0,(Date.parse(input.observedAt)-Date.parse(position.enteredAt))/60000)}:{}),
     });
+    const claimExpectedValueLamports=fact&&apiPool?claimValueLamports({feeX:fact.feeX,feeY:fact.feeY,pool:apiPool}):undefined;
     const decision = decideLivePositionManagement({
       policy,
       owned: position,
       ...(fact ? { position: fact } : {}),
       activeBinId,
       exitDecision,
+      ...(claimExpectedValueLamports!==undefined?{claimExpectedValueLamports}:{}),
     });
     const managementContext = assessLiveManagementContext({
       positionPoolAddress: position.poolAddress,

@@ -15,9 +15,18 @@ export interface LivePositionManagementPolicy {
   enabled: boolean;
   outOfRangeAction: "HOLD" | "RESHAPE" | "REBALANCE" | "CLOSE";
   claimAccruedFees: boolean;
+  /** Conservative execution estimate used only to avoid claiming dust. */
+  estimatedClaimCostLamports: bigint;
+  /** Claim requires this much net SOL benefit after the execution estimate. */
+  minimumClaimNetBenefitLamports: bigint;
   missingPositionAction: "HOLD" | "EMERGENCY_CLOSE";
   replacementRange: "PRESERVE_WIDTH_CENTER_ACTIVE";
   planTtlMs: number;
+}
+export function assessClaimEconomics(input:{expectedClaimValueLamports?:bigint|undefined;estimatedClaimCostLamports:bigint;minimumClaimNetBenefitLamports:bigint}):{approved:boolean;netBenefitLamports?:bigint;reasonCodes:string[]}{
+  if(input.expectedClaimValueLamports===undefined)return{approved:false,reasonCodes:['POSITION_CLAIM_VALUE_UNAVAILABLE']};
+  const netBenefitLamports=input.expectedClaimValueLamports-input.estimatedClaimCostLamports;
+  return netBenefitLamports>=input.minimumClaimNetBenefitLamports?{approved:true,netBenefitLamports,reasonCodes:['POSITION_CLAIM_NET_BENEFIT_APPROVED']}:{approved:false,netBenefitLamports,reasonCodes:['POSITION_CLAIM_NET_BENEFIT_TOO_LOW']};
 }
 export interface OwnedLivePosition {
   lpforgePositionId: string;
@@ -78,6 +87,7 @@ export function parseLivePositionManagementPolicy(
 ): LivePositionManagementPolicy {
   const v = object(raw),
     action = v.outOfRangeAction;
+  const lamports=(value:unknown,code:string)=>{try{const parsed=BigInt(String(value));if(parsed<0n)throw new Error();return parsed;}catch{throw new Error(code);}},estimatedClaimCostLamports=lamports(v.estimatedClaimCostLamports,'LPFORGE_LIVE_MANAGEMENT_CLAIM_COST'),minimumClaimNetBenefitLamports=lamports(v.minimumClaimNetBenefitLamports,'LPFORGE_LIVE_MANAGEMENT_CLAIM_BENEFIT');
   if (
     v.schemaVersion !== 1 ||
     typeof v.enabled !== "boolean" ||
@@ -95,6 +105,8 @@ export function parseLivePositionManagementPolicy(
     outOfRangeAction:
       action as LivePositionManagementPolicy["outOfRangeAction"],
     claimAccruedFees: v.claimAccruedFees,
+    estimatedClaimCostLamports,
+    minimumClaimNetBenefitLamports,
     missingPositionAction:
       v.missingPositionAction as LivePositionManagementPolicy["missingPositionAction"],
     replacementRange: "PRESERVE_WIDTH_CENTER_ACTIVE",
@@ -127,6 +139,7 @@ export function decideLivePositionManagement(input: {
   position?: PositionV2Fact;
   activeBinId: number;
   exitDecision?: LiveExitGovernorDecision;
+  claimExpectedValueLamports?: bigint | undefined;
 }): LivePositionManagementDecision {
   const { policy, owned, position, activeBinId } = input;
   if (!policy.enabled)
@@ -167,10 +180,9 @@ export function decideLivePositionManagement(input: {
       replacementRange: replacement(owned, activeBinId),
     };
   }
-  if (
-    policy.claimAccruedFees &&
-    (positive(position.feeX) || positive(position.feeY))
-  )
-    return { action: "CLAIM", reasonCodes: ["POSITION_ACCRUED_FEES"] };
+  if (policy.claimAccruedFees && (positive(position.feeX) || positive(position.feeY))) {
+    const claim=assessClaimEconomics({expectedClaimValueLamports:input.claimExpectedValueLamports,estimatedClaimCostLamports:policy.estimatedClaimCostLamports,minimumClaimNetBenefitLamports:policy.minimumClaimNetBenefitLamports});
+    return claim.approved?{action:"CLAIM",reasonCodes:["POSITION_ACCRUED_FEES",...claim.reasonCodes]}:{action:"HOLD",reasonCodes:claim.reasonCodes};
+  }
   return { action: "HOLD", reasonCodes: ["POSITION_IN_RANGE_NO_ACTION"] };
 }

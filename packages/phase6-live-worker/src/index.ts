@@ -120,6 +120,13 @@ function planFields(plan: AutonomousOpenPlan) {
     throw new Error("LPFORGE_P6_PLAN_FIELDS_INVALID");
   return { capital, lower, upper, plannedActiveBinId, binStep };
 }
+async function recordPositionTokenXLot(input:{store:Phase1Store;connection:Connection;plan:AutonomousPlan;positionAddress:string;tokenMint:string;sourceEvent:"FEE_CLAIM"|"REDUCE_WITHDRAWAL";sourceCashflowId:string;rawAmount:bigint;observedAt:string;signature:string}){
+  if(input.rawAmount<=0n)return;
+  const supply=await input.connection.getTokenSupply(new PublicKey(input.tokenMint),"confirmed"),decimals=Number(supply.value.decimals);
+  if(!Number.isInteger(decimals)||decimals<0||decimals>255)throw new Error("LPFORGE_P6_INVENTORY_TOKEN_DECIMALS_INVALID");
+  const suffix=input.sourceEvent==="FEE_CLAIM"?"claim-x":"reduce-x";
+  await input.store.createPositionInventoryLot({lotId:`${input.plan.planId}:${suffix}:lot`,createdEventId:`${input.plan.planId}:${suffix}:lot-created`,positionAddress:input.positionAddress,planId:input.plan.planId,ownerAddress:input.plan.ownerAddress,poolAddress:input.plan.poolAddress,tokenMint:input.tokenMint,tokenSide:"X",sourceEvent:input.sourceEvent,sourceCashflowId:input.sourceCashflowId,rawAmount:input.rawAmount,decimals,acquiredAt:input.observedAt,payload:{source:"WALLET_DELTA",signature:input.signature}});
+}
 /** Read the chain immediately before signing.  The plan's market inputs are
  * immutable; a missing/mismatched value is a fail-closed condition, not a
  * reason to substitute the planned lower bin. */
@@ -2633,9 +2640,9 @@ export async function executeAutonomousPlan(input: {
       // This is deliberately inside the submitted mutation lifecycle. A
       // balance read/write failure after the claim is sent is reconciliation
       // debt, never a completed plan with missing realized-fee evidence.
-      afterConfirmed: async()=>{
+      afterConfirmed: async({signature})=>{
       const afterX=await readWalletTokenBalance({connection:claimConnection,ownerAddress:input.plan.ownerAddress,mint:claimPoolFact.tokenXMint}),afterY=await readWalletTokenBalance({connection:claimConnection,ownerAddress:input.plan.ownerAddress,mint:claimPoolFact.tokenYMint}),observedAt=new Date().toISOString();
-      if(afterX>claimBeforeX)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:claim-x`,positionAddress,planId:input.plan.planId,flowType:'FEE_CLAIM',observedAt,tokenMint:claimPoolFact.tokenXMint,tokenAmountRaw:(afterX-claimBeforeX).toString(),payload:{source:'WALLET_DELTA'}});
+      if(afterX>claimBeforeX){const rawAmount=afterX-claimBeforeX,cashflowId=`${input.plan.planId}:claim-x`;await input.store.insertPositionCashflow({cashflowId,positionAddress,planId:input.plan.planId,flowType:'FEE_CLAIM',observedAt,tokenMint:claimPoolFact.tokenXMint,tokenAmountRaw:rawAmount.toString(),payload:{source:'WALLET_DELTA'}});await recordPositionTokenXLot({store:input.store,connection:claimConnection,plan:input.plan,positionAddress,tokenMint:claimPoolFact.tokenXMint,sourceEvent:"FEE_CLAIM",sourceCashflowId:cashflowId,rawAmount,observedAt,signature});}
       if(afterY>claimBeforeY)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:claim-y`,positionAddress,planId:input.plan.planId,flowType:'FEE_CLAIM',observedAt,tokenMint:claimPoolFact.tokenYMint,tokenAmountRaw:(afterY-claimBeforeY).toString(),payload:{source:'WALLET_DELTA'}});
       },
     });
@@ -2668,9 +2675,9 @@ export async function executeAutonomousPlan(input: {
       action: "REDUCE",
       // Record what actually reached the owner's wallet.  The former
       // percentage-of-basis record was a sizing estimate, not a withdrawal.
-      afterConfirmed: async()=>{
+      afterConfirmed: async({signature})=>{
         const afterX=await readWalletTokenBalance({connection:reductionConnection,ownerAddress:input.plan.ownerAddress,mint:reductionPoolFact.tokenXMint}),afterY=await readWalletTokenBalance({connection:reductionConnection,ownerAddress:input.plan.ownerAddress,mint:reductionPoolFact.tokenYMint}),observedAt=new Date().toISOString();
-        if(afterX>reductionBeforeX)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:reduce-x`,positionAddress,planId:input.plan.planId,flowType:'REDUCE_WITHDRAWAL',observedAt,tokenMint:reductionPoolFact.tokenXMint,tokenAmountRaw:(afterX-reductionBeforeX).toString(),payload:{source:'WALLET_DELTA'}});
+        if(afterX>reductionBeforeX){const rawAmount=afterX-reductionBeforeX,cashflowId=`${input.plan.planId}:reduce-x`;await input.store.insertPositionCashflow({cashflowId,positionAddress,planId:input.plan.planId,flowType:'REDUCE_WITHDRAWAL',observedAt,tokenMint:reductionPoolFact.tokenXMint,tokenAmountRaw:rawAmount.toString(),payload:{source:'WALLET_DELTA'}});await recordPositionTokenXLot({store:input.store,connection:reductionConnection,plan:input.plan,positionAddress,tokenMint:reductionPoolFact.tokenXMint,sourceEvent:"REDUCE_WITHDRAWAL",sourceCashflowId:cashflowId,rawAmount,observedAt,signature});}
         if(afterY>reductionBeforeY)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:reduce-y`,positionAddress,planId:input.plan.planId,flowType:'REDUCE_WITHDRAWAL',observedAt,tokenMint:reductionPoolFact.tokenYMint,tokenAmountRaw:(afterY-reductionBeforeY).toString(),payload:{source:'WALLET_DELTA'}});
       },
     });
