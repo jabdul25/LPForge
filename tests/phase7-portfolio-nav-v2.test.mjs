@@ -25,7 +25,7 @@ test('portfolio facts aggregate per pool and per token with grouped sums, never 
 test('partial-entry recovery rows feed the phase-7 hold gate and recovery facts',()=>{
   const src=fs.readFileSync(db,'utf8');
   assert.match(src,/partialEntryRecoveryCount:\s*number;/,'facts interface carries the count');
-  assert.ok(src.includes("SELECT count(*)::int AS n FROM execution.partial_entry_recovery WHERE state<>'RESOLVED'"),'postgres counts unresolved partial entries');
+  assert.ok(src.includes("state NOT IN ('RESOLVED','OPEN_RECOVERED','ABORTED_SOL_SETTLED')"),'postgres counts only unresolved partial entries');
   assert.ok(src.includes('partialEntryRecoveryCount: Number(partial.rows[0]?.n ?? 0)'),'postgres result feeds the facts');
   assert.ok(src.includes('partialEntryRecoveryCount: 0,'),'memory stub stays zero');
   const service=fs.readFileSync(production,'utf8');

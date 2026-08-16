@@ -144,6 +144,24 @@ export interface PositionInventoryLotEvent {
   transactionSignature?:string;
   payload:Record<string,unknown>;
 }
+export type PlanCashflowType =
+  | "ENTRY_FUNDING_SOL_OUT"
+  | "ENTRY_FUNDING_X_IN"
+  | "FUNDING_TX_COST"
+  | "RECOVERY_UNWIND_X_OUT"
+  | "RECOVERY_SOL_IN"
+  | "RECOVERY_TX_COST";
+export interface PlanCashflow {
+  cashflowId:string;
+  planId:string;
+  flowType:PlanCashflowType;
+  observedAt:string;
+  lamports?:bigint;
+  tokenMint?:string;
+  tokenAmountRaw?:string;
+  transactionSignature?:string;
+  payload:Record<string,unknown>;
+}
 /**
  * The balance projection is deliberately independent of wallet balances.
  * Wallet truth says what an owner holds; inventory lots say which portion is
@@ -587,6 +605,8 @@ export interface Phase1Store {
   createPositionInventoryLot(value:Omit<PositionInventoryLot,"remainingRawAmount"|"status">&{createdEventId:string;transactionSignature?:string}):Promise<void>;
   settlePositionInventoryLot(value:{eventId:string;lotId:string;planId?:string;eventType:"SETTLED"|"TRANSFERRED";settledRawAmount:bigint;observedAt:string;transactionSignature?:string;payload:Record<string,unknown>}):Promise<{remainingRawAmount:bigint;status:PositionInventoryLotStatus}>;
   loadPositionInventoryLots(positionAddress:string,tokenMint?:string):Promise<PositionInventoryLot[]>;
+  insertPlanCashflow(value:PlanCashflow):Promise<void>;
+  loadPlanCashflows(planId:string):Promise<PlanCashflow[]>;
   upsertPartialEntryRecovery(value: {
     planId: string;
     poolAddress: string;
@@ -604,7 +624,9 @@ export interface Phase1Store {
       | "UNWIND_REQUIRED"
       | "UNWIND_SUBMITTED"
       | "RESOLVED"
-      | "RECONCILIATION_REQUIRED";
+      | "RECONCILIATION_REQUIRED"
+      | "OPEN_RECOVERED"
+      | "ABORTED_SOL_SETTLED";
     walletTruth: Record<string, unknown>;
     payload: Record<string, unknown>;
     updatedAt: string;
@@ -1994,6 +2016,13 @@ export async function createPostgresStore(
       const r=await db.query("SELECT lot_id,position_address,plan_id,owner_address,pool_address,token_mint,token_side,source_event,source_cashflow_id,raw_amount,remaining_raw_amount,decimals,acquired_at,status,payload FROM execution.position_inventory_lots WHERE position_address=$1 AND ($2::text IS NULL OR token_mint=$2) ORDER BY acquired_at ASC,lot_id ASC",[positionAddress,tokenMint??null]);
       return r.rows.map(row=>({lotId:String(row.lot_id),positionAddress:String(row.position_address),planId:String(row.plan_id),ownerAddress:String(row.owner_address),poolAddress:String(row.pool_address),tokenMint:String(row.token_mint),tokenSide:String(row.token_side) as PositionInventoryLotSide,sourceEvent:String(row.source_event) as PositionInventoryLotSource,...(row.source_cashflow_id?{sourceCashflowId:String(row.source_cashflow_id)}:{}),rawAmount:BigInt(String(row.raw_amount)),remainingRawAmount:BigInt(String(row.remaining_raw_amount)),decimals:Number(row.decimals),acquiredAt:toIsoTimestamp(row.acquired_at),status:String(row.status) as PositionInventoryLotStatus,payload:(row.payload??{}) as Record<string,unknown>}));
     },
+    async insertPlanCashflow(v){
+      await db.query("INSERT INTO execution.plan_cashflows(cashflow_id,plan_id,flow_type,observed_at,lamports,token_mint,token_amount_raw,transaction_signature,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) ON CONFLICT(cashflow_id) DO UPDATE SET lamports=EXCLUDED.lamports,token_mint=EXCLUDED.token_mint,token_amount_raw=EXCLUDED.token_amount_raw,transaction_signature=EXCLUDED.transaction_signature,payload=EXCLUDED.payload",[v.cashflowId,v.planId,v.flowType,v.observedAt,v.lamports?.toString()??null,v.tokenMint??null,v.tokenAmountRaw??null,v.transactionSignature??null,json(v.payload)]);
+    },
+    async loadPlanCashflows(planId){
+      const r=await db.query("SELECT cashflow_id,plan_id,flow_type,observed_at,lamports,token_mint,token_amount_raw,transaction_signature,payload FROM execution.plan_cashflows WHERE plan_id=$1 ORDER BY observed_at,cashflow_id",[planId]);
+      return r.rows.map(row=>({cashflowId:String(row.cashflow_id),planId:String(row.plan_id),flowType:String(row.flow_type) as PlanCashflowType,observedAt:toIsoTimestamp(row.observed_at),...(row.lamports===null?{}:{lamports:BigInt(String(row.lamports))}),...(row.token_mint?{tokenMint:String(row.token_mint)}:{}),...(row.token_amount_raw===null?{}:{tokenAmountRaw:String(row.token_amount_raw)}),...(row.transaction_signature?{transactionSignature:String(row.transaction_signature)}:{}),payload:(row.payload??{}) as Record<string,unknown>}));
+    },
     async upsertPartialEntryRecovery(v) {
       await db.query(
         `INSERT INTO execution.partial_entry_recovery(plan_id,pool_address,owner_address,token_mint,funding_transaction_id,funding_signature,funded_at,paired_token_amount,intended_capital_lamports,intended_range,state,wallet_truth,payload,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12::jsonb,$13::jsonb,$14) ON CONFLICT(plan_id) DO UPDATE SET state=EXCLUDED.state,wallet_truth=EXCLUDED.wallet_truth,payload=EXCLUDED.payload,updated_at=EXCLUDED.updated_at`,
@@ -2668,7 +2697,7 @@ export async function createPostgresStore(
             `WITH latest AS (SELECT DISTINCT ON (plan_id) plan_id,status FROM execution.reconciliations ORDER BY plan_id,observed_at DESC) SELECT count(*)::int AS n FROM latest WHERE status<>'MATCH'`,
           ),
           db.query(
-            `SELECT count(*)::int AS n FROM execution.partial_entry_recovery WHERE state<>'RESOLVED'`,
+            `SELECT count(*)::int AS n FROM execution.partial_entry_recovery WHERE state NOT IN ('RESOLVED','OPEN_RECOVERED','ABORTED_SOL_SETTLED')`,
           ),
         ]);
       return {
@@ -2891,6 +2920,8 @@ export function createMemoryStore(): Phase1Store {
     async createPositionInventoryLot() {},
     async settlePositionInventoryLot() { return {remainingRawAmount:0n,status:"SETTLED" as PositionInventoryLotStatus}; },
     async loadPositionInventoryLots() { return []; },
+    async insertPlanCashflow() {},
+    async loadPlanCashflows() { return []; },
     async upsertPartialEntryRecovery() {},
     async loadPartialEntryRecoveries() {
       return [];

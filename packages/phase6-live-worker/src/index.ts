@@ -101,6 +101,57 @@ export interface LiveRecoveryResult {
     | "NO_ACTION_COMPLETE";
   reasonCodes: string[];
 }
+const WSOL_MINT = "So11111111111111111111111111111111111111112";
+
+/**
+ * Wallet observations, not a Jupiter request amount, are the authority for
+ * funded-entry economics.  Native SOL and WSOL are deliberately combined:
+ * Jupiter may wrap or unwrap native SOL as part of an otherwise equivalent
+ * funding route.
+ */
+export function deriveEntryFundingSettlement(input:{
+  nativeLamportsBefore:bigint;
+  nativeLamportsAfter:bigint;
+  wsolRawBefore:bigint;
+  wsolRawAfter:bigint;
+  pairedTokenRawBefore:bigint;
+  pairedTokenRawAfter:bigint;
+  transactionFeeLamports:bigint;
+}):{solAssetOutLamports:bigint;transactionFeeLamports:bigint;pairedTokenReceivedRaw:bigint}{
+  const solAssetBefore=input.nativeLamportsBefore+input.wsolRawBefore,
+    solAssetAfter=input.nativeLamportsAfter+input.wsolRawAfter,
+    totalSolDelta=solAssetBefore>solAssetAfter?solAssetBefore-solAssetAfter:0n,
+    tokenDelta=input.pairedTokenRawAfter>input.pairedTokenRawBefore?input.pairedTokenRawAfter-input.pairedTokenRawBefore:0n;
+  return {
+    solAssetOutLamports:totalSolDelta>input.transactionFeeLamports?totalSolDelta-input.transactionFeeLamports:0n,
+    transactionFeeLamports:input.transactionFeeLamports,
+    pairedTokenReceivedRaw:tokenDelta,
+  };
+}
+
+/** Only newly funded token-X left after OPEN is attributable as entry residual. */
+export function deriveOpenResidualInventory(input:{
+  pairedTokenRawBeforeFunding:bigint;
+  pairedTokenRawBeforeOpen:bigint;
+  pairedTokenRawAfterOpen:bigint;
+  pairedTokenReceivedRaw:bigint;
+}):bigint{
+  const walletIncrease=input.pairedTokenRawAfterOpen>input.pairedTokenRawBeforeFunding
+    ?input.pairedTokenRawAfterOpen-input.pairedTokenRawBeforeFunding:0n;
+  // The pre-open snapshot documents the maximum funded asset that could have
+  // been used.  The final residual remains bounded by the measured funding
+  // delta so pre-existing/manual wallet inventory is never attributed.
+  const availableBeforeOpen=input.pairedTokenRawBeforeOpen>input.pairedTokenRawBeforeFunding
+    ?input.pairedTokenRawBeforeOpen-input.pairedTokenRawBeforeFunding:0n;
+  return [walletIncrease,availableBeforeOpen,input.pairedTokenReceivedRaw].reduce((least,value)=>value<least?value:least);
+}
+type EntryFundingMeasurement={
+  tokenMint:string;
+  pairedTokenReceivedRaw:bigint;
+  pairedTokenRawBeforeFunding:bigint;
+  pairedTokenRawBeforeOpen:bigint;
+  fundingSignature:string;
+};
 function nestedGeneratedPositionAddress(value:unknown):string|undefined{
  if(!value||typeof value!=="object")return undefined;
  const row=value as Record<string,unknown>,direct=row.generatedPositionAddress??row.positionAddress;
@@ -314,6 +365,9 @@ async function executeRequiredJupiterSwap(input: {
   signature: string;
   tokenMint: string;
   pairedTokenAmount: string;
+  pairedTokenRawBeforeFunding: string;
+  nativeLamportsBefore: string;
+  wsolRawBefore: string;
   fundedAt: string;
 }> {
   if (!input.plan.swapTransactionId)
@@ -333,6 +387,11 @@ async function executeRequiredJupiterSwap(input: {
     programId: input.config.programId,
   });
   const pool = await adapter.getPool(input.plan.poolAddress);
+  const [nativeLamportsBefore,wsolRawBefore,pairedTokenRawBeforeFunding]=await Promise.all([
+    input.connection.getBalance(new PublicKey(input.plan.ownerAddress),"confirmed").then(value=>BigInt(value)),
+    readWalletTokenBalance({connection:input.connection,ownerAddress:input.plan.ownerAddress,mint:WSOL_MINT}),
+    readWalletTokenBalance({connection:input.connection,ownerAddress:input.plan.ownerAddress,mint:pool.tokenXMint}),
+  ]);
   const quote = await readJupiterMetisQuote({
     policy: policy.swapQuote,
     inputMint: pool.tokenYMint,
@@ -486,11 +545,25 @@ async function executeRequiredJupiterSwap(input: {
     }))
   )
     throw new Error("LPFORGE_P6_SWAP_CONFIRMATION_PENDING");
+  const [nativeLamportsAfter,wsolRawAfter,pairedTokenRawAfter]=await Promise.all([
+    input.connection.getBalance(new PublicKey(input.plan.ownerAddress),"confirmed").then(value=>BigInt(value)),
+    readWalletTokenBalance({connection:input.connection,ownerAddress:input.plan.ownerAddress,mint:WSOL_MINT}),
+    readWalletTokenBalance({connection:input.connection,ownerAddress:input.plan.ownerAddress,mint:pool.tokenXMint}),
+  ]);
+  const actualFee=await confirmedTransactionFeeLamports(input.connection,record.signature)??fee.totalFeeLamports,
+    settlement=deriveEntryFundingSettlement({nativeLamportsBefore,nativeLamportsAfter,wsolRawBefore,wsolRawAfter,pairedTokenRawBefore:pairedTokenRawBeforeFunding,pairedTokenRawAfter,transactionFeeLamports:actualFee}),
+    fundedAt=new Date().toISOString();
+  await input.store.insertPlanCashflow({cashflowId:`${input.plan.planId}:entry-funding-sol-out`,planId:input.plan.planId,flowType:"ENTRY_FUNDING_SOL_OUT",observedAt:fundedAt,lamports:settlement.solAssetOutLamports,transactionSignature:record.signature,payload:{source:"WALLET_DELTA",nativeLamportsBefore:nativeLamportsBefore.toString(),nativeLamportsAfter:nativeLamportsAfter.toString(),wsolRawBefore:wsolRawBefore.toString(),wsolRawAfter:wsolRawAfter.toString(),quoteInputAmount:String(quote.inAmount??sol),quoteOutputAmount:String(quote.outAmount??"")}});
+  await input.store.insertPlanCashflow({cashflowId:`${input.plan.planId}:entry-funding-x-in`,planId:input.plan.planId,flowType:"ENTRY_FUNDING_X_IN",observedAt:fundedAt,tokenMint:pool.tokenXMint,tokenAmountRaw:settlement.pairedTokenReceivedRaw.toString(),transactionSignature:record.signature,payload:{source:"WALLET_DELTA",before:pairedTokenRawBeforeFunding.toString(),after:pairedTokenRawAfter.toString(),requestedRaw:required.toString()}});
+  await input.store.insertPlanCashflow({cashflowId:`${input.plan.planId}:entry-funding-tx-cost`,planId:input.plan.planId,flowType:"FUNDING_TX_COST",observedAt:fundedAt,lamports:actualFee,transactionSignature:record.signature,payload:{source:actualFee===fee.totalFeeLamports?"EXECUTION_FEE_ESTIMATE":"CHAIN_RECEIPT_META",transactionId:input.plan.swapTransactionId}});
   return {
     signature: record.signature,
     tokenMint: pool.tokenXMint,
-    pairedTokenAmount: required.toString(),
-    fundedAt: new Date().toISOString(),
+    pairedTokenAmount: settlement.pairedTokenReceivedRaw.toString(),
+    pairedTokenRawBeforeFunding: pairedTokenRawBeforeFunding.toString(),
+    nativeLamportsBefore: nativeLamportsBefore.toString(),
+    wsolRawBefore: wsolRawBefore.toString(),
+    fundedAt,
   };
 }
 /**
@@ -499,7 +572,7 @@ async function executeRequiredJupiterSwap(input: {
  * A post-extension interruption is never retried blindly: the plan remains in
  * reconciliation-required state with its exact completed step/signature.
  */
-async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:AutonomousOpenPlan;signer:MainnetSignerBackend;config:LiveWorkerConfig;connection:Connection;pool:MeteoraOpenAddPoolLike;prepared:PreparedAutonomousOpen;fields:ReturnType<typeof planFields>}):Promise<LiveWorkerResult>{
+async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:AutonomousOpenPlan;signer:MainnetSignerBackend;config:LiveWorkerConfig;connection:Connection;pool:MeteoraOpenAddPoolLike;prepared:PreparedAutonomousOpen;fields:ReturnType<typeof planFields>;entryFundingMeasurement?:EntryFundingMeasurement}):Promise<LiveWorkerResult>{
   let submittedAny=false,lastSignature='',completedSteps:Array<{transactionId:string;signature:string;estimatedFeeLamports:bigint}>=[];
   try{
     for(const step of input.prepared.steps){
@@ -512,7 +585,7 @@ async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:Auto
       const submitted=await executeMainnetCanaryOpen({authority:openAuthority,ticket:openTicket,transactionId:step.transactionId,idempotencyKey:`${input.plan.idempotencyKey}:${step.transactionId}`,requiredSignerAddresses:step.requiredSignerAddresses,backend:input.signer,auxiliaryBackends:auxiliaryPositionSignersForOpenStep(step,input.prepared.positionSigner),envelope:step.envelope,phase5RiskDecision:risk,lease:latest,ledger:ledger(input.store),transport:createWeb3SubmissionTransport(input.connection),submittedAt});submittedAny=true;lastSignature=submitted.signature;await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SUBMITTED',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata},submitted.signature);
       let confirmed=false;for(let attempt=0;attempt<input.config.confirmAttempts;attempt++){await new Promise(resolve=>setTimeout(resolve,input.config.confirmPollMs));const confirmation=await observeConfirmation({attemptId:`${step.transactionId}:attempt:1`,record:{transactionId:step.transactionId,signature:submitted.signature,submittedAt,blockhash:latest.blockhash,lastValidBlockHeight:latest.lastValidBlockHeight,attempt:1},transport:createWeb3SubmissionTransport(input.connection),ledger:ledger(input.store),observedAt:new Date().toISOString()});if(confirmation.status==='CONFIRMED'||confirmation.status==='FINALIZED'){confirmed=true;break;}if(confirmation.status==='FAILED'||confirmation.status==='EXPIRED')throw new Error(`LPFORGE_P6_CHUNK_CONFIRM_${confirmation.status}`);}if(!confirmed)throw new Error('LPFORGE_P6_CHUNK_CONFIRMATION_PENDING');completedSteps.push({transactionId:step.transactionId,signature:submitted.signature,estimatedFeeLamports:fee.totalFeeLamports});
     }
-    const position=await input.pool.getPosition?.(new PublicKey(input.prepared.positionSigner.publicKeyAddress));if(!position)throw new Error('LPFORGE_P6_POSITION_RECONCILIATION_MISSING');const intent=input.plan.planPayload.intent as Record<string,unknown>,funding=input.plan.intentPayload.entryFunding as Record<string,unknown>;await input.store.insertExecutionReconciliation({reconciliationId:`${input.plan.planId}:open`,planId:input.plan.planId,observedAt:new Date().toISOString(),status:'MATCH',expected:{owner:input.plan.ownerAddress,pool:input.plan.poolAddress,lowerBinId:input.fields.lower,upperBinId:input.fields.upper},actual:{positionAddress:input.prepared.positionSigner.publicKeyAddress},discrepancies:[],payload:{signature:lastSignature,autonomous:true,chunked:true}});await input.store.upsertOwnedPosition({lpforgePositionId:`position-${input.prepared.positionSigner.publicKeyAddress}`,poolAddress:input.plan.poolAddress,positionAddress:input.prepared.positionSigner.publicKeyAddress,ownerAddress:input.plan.ownerAddress,strategy:String(intent.strategy??'SPOT'),orientation:String(funding.orientation??'ONE_SIDED_Y'),lowerBinId:input.fields.lower,upperBinId:input.fields.upper,activeBinAtEntry:input.fields.plannedActiveBinId,initialCapitalLamports:input.fields.capital,entryPlanId:input.plan.planId,entrySignature:lastSignature,enteredAt:new Date().toISOString(),lifecycleState:'OPEN',lastPlanId:input.plan.planId,reconciliationStatus:'MATCH',payload:{thesisId:input.plan.thesisId,entryFunding:funding,chunked:true}});const positionAccount=await input.connection.getAccountInfo(new PublicKey(input.prepared.positionSigner.publicKeyAddress),'confirmed');await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:open-contribution`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'OPEN_CONTRIBUTION',observedAt:new Date().toISOString(),lamports:input.fields.capital,payload:{signature:lastSignature,source:'RECONCILED_CHUNKABLE_OPEN'}});if(positionAccount?.lamports)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:rent-lock`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'RENT_LOCK',observedAt:new Date().toISOString(),lamports:BigInt(positionAccount.lamports),payload:{signature:lastSignature,recoverable:true,source:'POSITION_ACCOUNT_INFO'}});for(const child of completedSteps){const actualFee=await confirmedTransactionFeeLamports(input.connection,child.signature);await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:tx-cost:${child.transactionId}`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'TX_COST',observedAt:new Date().toISOString(),lamports:actualFee??child.estimatedFeeLamports,payload:{signature:child.signature,transactionId:child.transactionId,source:actualFee===undefined?'EXECUTION_FEE_ESTIMATE':'CHAIN_RECEIPT_META',...(actualFee===undefined?{estimatedLamports:child.estimatedFeeLamports.toString()}:{})}});}await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'RECONCILED',at:new Date().toISOString(),payload:{signature:lastSignature,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true}});return{status:'RECONCILED',planId:input.plan.planId,reasonCodes:[],transactionSubmitted:true};
+    const position=await input.pool.getPosition?.(new PublicKey(input.prepared.positionSigner.publicKeyAddress));if(!position)throw new Error('LPFORGE_P6_POSITION_RECONCILIATION_MISSING');const intent=input.plan.planPayload.intent as Record<string,unknown>,funding=input.plan.intentPayload.entryFunding as Record<string,unknown>;await input.store.insertExecutionReconciliation({reconciliationId:`${input.plan.planId}:open`,planId:input.plan.planId,observedAt:new Date().toISOString(),status:'MATCH',expected:{owner:input.plan.ownerAddress,pool:input.plan.poolAddress,lowerBinId:input.fields.lower,upperBinId:input.fields.upper},actual:{positionAddress:input.prepared.positionSigner.publicKeyAddress},discrepancies:[],payload:{signature:lastSignature,autonomous:true,chunked:true}});await input.store.upsertOwnedPosition({lpforgePositionId:`position-${input.prepared.positionSigner.publicKeyAddress}`,poolAddress:input.plan.poolAddress,positionAddress:input.prepared.positionSigner.publicKeyAddress,ownerAddress:input.plan.ownerAddress,strategy:String(intent.strategy??'SPOT'),orientation:String(funding.orientation??'ONE_SIDED_Y'),lowerBinId:input.fields.lower,upperBinId:input.fields.upper,activeBinAtEntry:input.fields.plannedActiveBinId,initialCapitalLamports:input.fields.capital,entryPlanId:input.plan.planId,entrySignature:lastSignature,enteredAt:new Date().toISOString(),lifecycleState:'OPEN',lastPlanId:input.plan.planId,reconciliationStatus:'MATCH',payload:{thesisId:input.plan.thesisId,entryFunding:funding,chunked:true}});const positionAccount=await input.connection.getAccountInfo(new PublicKey(input.prepared.positionSigner.publicKeyAddress),'confirmed');await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:open-contribution`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'OPEN_CONTRIBUTION',observedAt:new Date().toISOString(),lamports:input.fields.capital,payload:{signature:lastSignature,source:'RECONCILED_CHUNKABLE_OPEN'}});if(positionAccount?.lamports)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:rent-lock`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'RENT_LOCK',observedAt:new Date().toISOString(),lamports:BigInt(positionAccount.lamports),payload:{signature:lastSignature,recoverable:true,source:'POSITION_ACCOUNT_INFO'}});for(const child of completedSteps){const actualFee=await confirmedTransactionFeeLamports(input.connection,child.signature);await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:tx-cost:${child.transactionId}`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'TX_COST',observedAt:new Date().toISOString(),lamports:actualFee??child.estimatedFeeLamports,payload:{signature:child.signature,transactionId:child.transactionId,source:actualFee===undefined?'EXECUTION_FEE_ESTIMATE':'CHAIN_RECEIPT_META',...(actualFee===undefined?{estimatedLamports:child.estimatedFeeLamports.toString()}:{})}});}await persistOpenResidualInventory({store:input.store,connection:input.connection,plan:input.plan,positionAddress:input.prepared.positionSigner.publicKeyAddress,funding:input.entryFundingMeasurement,signature:lastSignature});await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'RECONCILED',at:new Date().toISOString(),payload:{signature:lastSignature,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true}});return{status:'RECONCILED',planId:input.plan.planId,reasonCodes:[],transactionSubmitted:true};
   }catch(error){const reason=error instanceof Error?error.message:'LPFORGE_P6_CHUNKABLE_OPEN_UNKNOWN';if(submittedAny){await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECONCILIATION_REQUIRED',at:new Date().toISOString(),reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',reason],payload:{stage:'CHUNKABLE_OPEN',error:reason,positionAddress:input.prepared.positionSigner.publicKeyAddress,lastSignature}});return{status:'UNKNOWN',planId:input.plan.planId,reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',reason],transactionSubmitted:true};}await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'BLOCKED',at:new Date().toISOString(),payload:{stage:'CHUNKABLE_OPEN',error:reason}});return{status:'BLOCKED',planId:input.plan.planId,reasonCodes:[reason],transactionSubmitted:false};}
 }
 /** Executes one already-claimed plan. A caller must claim from storage before calling this function. */
@@ -528,7 +601,8 @@ export async function executeAutonomousOpen(input: {
   // even if post-submit bookkeeping fails; recovery must adopt, never resend.
   let submittedAny = false,
     lastSignature = "",
-    openPositionAddress = "";
+    openPositionAddress = "",
+    entryFundingMeasurement:EntryFundingMeasurement|undefined;
   try {
     if (input.signer.publicKeyAddress !== input.plan.ownerAddress)
       throw new Error("LPFORGE_P6_OWNER_SIGNER_PLAN_MISMATCH");
@@ -574,6 +648,13 @@ export async function executeAutonomousOpen(input: {
           openAuthority: swapAuthority,
         }),
         intent = input.plan.planPayload.intent as Record<string, unknown>;
+      entryFundingMeasurement={
+        tokenMint:funded.tokenMint,
+        pairedTokenReceivedRaw:BigInt(funded.pairedTokenAmount),
+        pairedTokenRawBeforeFunding:BigInt(funded.pairedTokenRawBeforeFunding),
+        pairedTokenRawBeforeOpen:await readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:funded.tokenMint}),
+        fundingSignature:funded.signature,
+      };
       await input.store.upsertPartialEntryRecovery({
         planId: input.plan.planId,
         poolAddress: input.plan.poolAddress,
@@ -590,7 +671,7 @@ export async function executeAutonomousOpen(input: {
           strategy: intent.strategy,
         },
         state: "ENTRY_FUNDED_NOT_OPEN",
-        walletTruth: { refreshRequired: true },
+        walletTruth: { refreshRequired: true,entryFundingMeasurement:{pairedTokenRawBeforeFunding:funded.pairedTokenRawBeforeFunding,pairedTokenRawBeforeOpen:entryFundingMeasurement.pairedTokenRawBeforeOpen.toString(),nativeLamportsBefore:funded.nativeLamportsBefore,wsolRawBefore:funded.wsolRawBefore} },
         payload: {
           thesisId: input.plan.thesisId,
           reasonCodes: ["P6_ENTRY_FUNDED_NOT_OPEN"],
@@ -613,6 +694,7 @@ export async function executeAutonomousOpen(input: {
         pool,
         prepared,
         fields,
+        ...(entryFundingMeasurement?{entryFundingMeasurement}:{}),
       });
     const simAuthority = authority(
       "MAINNET_BUILD_SIMULATE",
@@ -820,23 +902,24 @@ export async function executeAutonomousOpen(input: {
         if(positionAccount?.lamports)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:rent-lock`,positionAddress:prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'RENT_LOCK',observedAt:new Date().toISOString(),lamports:BigInt(positionAccount.lamports),payload:{signature:submitted.signature,recoverable:true,source:'POSITION_ACCOUNT_INFO'}});
         const actualOpenFee=await confirmedTransactionFeeLamports(connection,submitted.signature);
         await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:tx-cost:${input.plan.transactionId}`,positionAddress:prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'TX_COST',observedAt:new Date().toISOString(),lamports:actualOpenFee??fee.totalFeeLamports,payload:{signature:submitted.signature,transactionId:input.plan.transactionId,source:actualOpenFee===undefined?'EXECUTION_FEE_ESTIMATE':'CHAIN_RECEIPT_META',...(actualOpenFee===undefined?{estimatedLamports:fee.totalFeeLamports.toString()}:{})}});
+        await persistOpenResidualInventory({store:input.store,connection,plan:input.plan,positionAddress:prepared.positionSigner.publicKeyAddress,funding:entryFundingMeasurement,signature:submitted.signature});
         if (input.plan.swapTransactionId)
           await input.store.upsertPartialEntryRecovery({
             planId: input.plan.planId,
             poolAddress: input.plan.poolAddress,
             ownerAddress: input.plan.ownerAddress,
-            tokenMint: String(funding.tokenMint ?? ""),
+            tokenMint: entryFundingMeasurement?.tokenMint ?? String(funding.tokenMint ?? ""),
             fundingTransactionId: input.plan.swapTransactionId,
-            fundingSignature: "confirmed",
+            fundingSignature: entryFundingMeasurement?.fundingSignature ?? "confirmed",
             fundedAt: new Date().toISOString(),
-            pairedTokenAmount: String(funding.totalPairedTokenRaw ?? "0"),
+            pairedTokenAmount: entryFundingMeasurement?.pairedTokenReceivedRaw.toString() ?? String(funding.totalPairedTokenRaw ?? "0"),
             intendedCapitalLamports: fields.capital,
             intendedRange: {
               lowerBinId: fields.lower,
               upperBinId: fields.upper,
               strategy: intent.strategy,
             },
-            state: "RESOLVED",
+            state: "OPEN_RECOVERED",
             walletTruth: { refreshRequired: false },
             payload: {
               positionAddress: prepared.positionSigner.publicKeyAddress,
@@ -955,6 +1038,37 @@ async function readWalletTokenBalance(input: {
   return total;
 }
 
+async function persistOpenResidualInventory(input:{
+  store:Phase1Store;
+  connection:Connection;
+  plan:AutonomousOpenPlan;
+  positionAddress:string;
+  funding:EntryFundingMeasurement|undefined;
+  signature:string;
+}):Promise<void>{
+  if(!input.funding||input.funding.pairedTokenReceivedRaw<=0n)return;
+  const pairedTokenRawAfterOpen=await readWalletTokenBalance({connection:input.connection,ownerAddress:input.plan.ownerAddress,mint:input.funding.tokenMint}),
+    residual=deriveOpenResidualInventory({...input.funding,pairedTokenRawAfterOpen});
+  if(residual<=0n)return;
+  const supply=await input.connection.getTokenSupply(new PublicKey(input.funding.tokenMint),"confirmed");
+  await input.store.createPositionInventoryLot({
+    lotId:`${input.plan.planId}:open-residual:${input.funding.tokenMint}`,
+    createdEventId:`${input.plan.planId}:open-residual-created`,
+    positionAddress:input.positionAddress,
+    planId:input.plan.planId,
+    ownerAddress:input.plan.ownerAddress,
+    poolAddress:input.plan.poolAddress,
+    tokenMint:input.funding.tokenMint,
+    tokenSide:"X",
+    sourceEvent:"OPEN_RESIDUAL",
+    rawAmount:residual,
+    decimals:supply.value.decimals,
+    acquiredAt:new Date().toISOString(),
+    transactionSignature:input.signature,
+    payload:{source:"MEASURED_ENTRY_FUNDING_RESIDUAL",fundingSignature:input.funding.fundingSignature,pairedTokenRawBeforeFunding:input.funding.pairedTokenRawBeforeFunding.toString(),pairedTokenRawBeforeOpen:input.funding.pairedTokenRawBeforeOpen.toString(),pairedTokenRawAfterOpen:pairedTokenRawAfterOpen.toString(),pairedTokenReceivedRaw:input.funding.pairedTokenReceivedRaw.toString()},
+  });
+}
+
 /**
  * Executes one Jupiter token-X→token-Y swap with the full simulation, cost,
  * risk, signing and confirmation chain. Shared by partial-entry recovery and
@@ -983,6 +1097,11 @@ async function executeJupiterUnwindStep(input: {
       programId: input.config.programId,
     }),
     pool = await adapter.getPool(input.plan.poolAddress),
+    [nativeLamportsBefore,wsolRawBefore,tokenXRawBefore]=await Promise.all([
+      connection.getBalance(new PublicKey(input.plan.ownerAddress),"confirmed").then(value=>BigInt(value)),
+      readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:WSOL_MINT}),
+      readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:pool.tokenXMint}),
+    ]),
     policy = loadAutonomousEntryPolicy(),
     quote = await readJupiterMetisQuote({
       policy: policy.swapQuote,
@@ -1172,8 +1291,21 @@ async function executeJupiterUnwindStep(input: {
       submitted: true,
       reasonCodes: [`${input.reasonPrefix}_CONFIRMATION_PENDING`],
     };
+  const actualFee=await confirmedTransactionFeeLamports(connection,record.signature)??fee.totalFeeLamports;
+  if(input.stage==="PARTIAL_ENTRY_UNWIND"){
+    const [nativeLamportsAfter,wsolRawAfter,tokenXRawAfter]=await Promise.all([
+      connection.getBalance(new PublicKey(input.plan.ownerAddress),"confirmed").then(value=>BigInt(value)),
+      readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:WSOL_MINT}),
+      readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:pool.tokenXMint}),
+    ]),solBefore=nativeLamportsBefore+wsolRawBefore,solAfter=nativeLamportsAfter+wsolRawAfter,
+      solIn=solAfter>solBefore?solAfter-solBefore:0n,
+      tokenXOut=tokenXRawBefore>tokenXRawAfter?tokenXRawBefore-tokenXRawAfter:0n,
+      at=new Date().toISOString();
+    await input.store.insertPlanCashflow({cashflowId:`${input.plan.planId}:recovery-unwind-x-out`,planId:input.plan.planId,flowType:"RECOVERY_UNWIND_X_OUT",observedAt:at,tokenMint:pool.tokenXMint,tokenAmountRaw:tokenXOut.toString(),transactionSignature:record.signature,payload:{source:"WALLET_DELTA",before:tokenXRawBefore.toString(),after:tokenXRawAfter.toString(),requested:input.amount.toString()}});
+    await input.store.insertPlanCashflow({cashflowId:`${input.plan.planId}:recovery-sol-in`,planId:input.plan.planId,flowType:"RECOVERY_SOL_IN",observedAt:at,lamports:solIn,transactionSignature:record.signature,payload:{source:"WALLET_DELTA",nativeLamportsBefore:nativeLamportsBefore.toString(),nativeLamportsAfter:nativeLamportsAfter.toString(),wsolRawBefore:wsolRawBefore.toString(),wsolRawAfter:wsolRawAfter.toString()}});
+    await input.store.insertPlanCashflow({cashflowId:`${input.plan.planId}:recovery-unwind-tx-cost`,planId:input.plan.planId,flowType:"RECOVERY_TX_COST",observedAt:at,lamports:actualFee,transactionSignature:record.signature,payload:{source:actualFee===fee.totalFeeLamports?"EXECUTION_FEE_ESTIMATE":"CHAIN_RECEIPT_META",transactionId:input.transactionId}});
+  }
   if(input.plan.positionAddress){
-    const actualFee=await confirmedTransactionFeeLamports(connection,record.signature);
     await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:tx-cost:${input.transactionId}`,positionAddress:input.plan.positionAddress,planId:input.plan.planId,flowType:'TX_COST',observedAt:new Date().toISOString(),lamports:actualFee??fee.totalFeeLamports,payload:{signature:record.signature,transactionId:input.transactionId,source:actualFee===undefined?'EXECUTION_FEE_ESTIMATE':'CHAIN_RECEIPT_META',...(actualFee===undefined?{estimatedLamports:fee.totalFeeLamports.toString()}:{})}});
   }
   return {
@@ -1273,7 +1405,7 @@ export async function recoverPartialEntryFunding(input: {
         pairedTokenAmount: String(row.paired_token_amount),
         intendedCapitalLamports: BigInt(String(row.intended_capital_lamports)),
         intendedRange: (row.intended_range ?? {}) as Record<string, unknown>,
-        state: "RESOLVED",
+        state: "OPEN_RECOVERED",
         walletTruth: {
           ...(row.wallet_truth ?? {}),
           reconciledPlanId: plan.planId,
@@ -1368,7 +1500,7 @@ export async function recoverPartialEntryFunding(input: {
         pairedTokenAmount: String(row.paired_token_amount),
         intendedCapitalLamports: BigInt(String(row.intended_capital_lamports)),
         intendedRange: (row.intended_range ?? {}) as Record<string, unknown>,
-        state: "RESOLVED",
+        state: "ABORTED_SOL_SETTLED",
         walletTruth: { unwindSignature: signature, confirmationStatus: status.confirmationStatus, refreshedAt: new Date().toISOString() },
         payload: { reasonCodes: ["P6_PARTIAL_UNWIND_RECONCILED"] },
         updatedAt: new Date().toISOString(),
@@ -1446,7 +1578,7 @@ export async function recoverPartialEntryFunding(input: {
         pairedTokenAmount: String(row.paired_token_amount),
         intendedCapitalLamports: BigInt(String(row.intended_capital_lamports)),
         intendedRange: (row.intended_range ?? {}) as Record<string, unknown>,
-        state: unwind.ok ? "RESOLVED" : unwind.submitted ? "UNWIND_SUBMITTED" : "UNWIND_REQUIRED",
+        state: unwind.ok ? "ABORTED_SOL_SETTLED" : unwind.submitted ? "UNWIND_SUBMITTED" : "UNWIND_REQUIRED",
         walletTruth: { refreshedAt: new Date().toISOString() },
         payload: { reasonCodes: unwind.reasonCodes },
         updatedAt: new Date().toISOString(),
@@ -1544,7 +1676,7 @@ export async function recoverPartialEntryFunding(input: {
         pairedTokenAmount: String(row.paired_token_amount),
         intendedCapitalLamports: BigInt(String(row.intended_capital_lamports)),
         intendedRange: (row.intended_range ?? {}) as Record<string, unknown>,
-        state: "RESOLVED",
+        state: "OPEN_RECOVERED",
         walletTruth: {
           tokenBalance: tokenBalance.toString(),
           refreshedAt: new Date().toISOString(),

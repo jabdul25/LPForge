@@ -11,7 +11,7 @@ test('a reconciled OPEN resolves a stale partial-entry recovery before any unwin
   assert.ok(loadPlan >= 0 && reconciled > loadPlan, 'recovery must load plan state first');
   assert.ok(reconciled < unwindSubmitted && reconciled < genericUnwindHold, 'reconciled OPEN must resolve before unwind handling');
   assert.match(worker, /P6_PARTIAL_OPEN_RECONCILED_AFTER_RECOVERY/);
-  assert.match(worker, /state: "RESOLVED"/);
+  assert.match(worker, /state: "OPEN_RECOVERED"/);
 });
 
 test('autonomous plan mapping preserves the durable transaction-plan state', () => {
