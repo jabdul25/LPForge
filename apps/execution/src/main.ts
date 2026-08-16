@@ -108,6 +108,10 @@ function workerConfig() {
     !Number.isFinite(maxFeeFraction) ||
     maxFeeFraction <= 0 ||
     maxFeeFraction > 1 ||
+    !Number.isInteger(Number(process.env.LPFORGE_P6_MAX_PRESIGN_ACTIVE_BIN_DRIFT_BINS ?? 2)) ||
+    Number(process.env.LPFORGE_P6_MAX_PRESIGN_ACTIVE_BIN_DRIFT_BINS ?? 2) < 0 ||
+    !Number.isFinite(Number(process.env.LPFORGE_P6_MAX_PRESIGN_REFERENCE_DIVERGENCE_BPS ?? 250)) ||
+    Number(process.env.LPFORGE_P6_MAX_PRESIGN_REFERENCE_DIVERGENCE_BPS ?? 250) < 0 ||
     !Number.isInteger(configuredLiquiditySlippageBps) ||
     liquiditySlippageBps < 1 ||
     liquiditySlippageBps > 10_000
@@ -123,6 +127,8 @@ function workerConfig() {
       process.env.LPFORGE_P6_SIMULATION_FRESHNESS_MS ?? 30000,
     ),
     riskPermitTtlMs: Number(process.env.LPFORGE_P6_RISK_PERMIT_TTL_MS ?? 15000),
+    maxPresignActiveBinDriftBins: Number(process.env.LPFORGE_P6_MAX_PRESIGN_ACTIVE_BIN_DRIFT_BINS ?? 2),
+    maxPresignReferenceDivergenceBps: Number(process.env.LPFORGE_P6_MAX_PRESIGN_REFERENCE_DIVERGENCE_BPS ?? 250),
     confirmPollMs: Number(process.env.LPFORGE_P6_CONFIRM_POLL_MS ?? 1000),
     confirmAttempts: Number(process.env.LPFORGE_P6_CONFIRM_ATTEMPTS ?? 30),
   };

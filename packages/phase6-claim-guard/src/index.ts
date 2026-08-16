@@ -23,7 +23,7 @@ function record(value: unknown) {
     : {};
 }
 function immutablePlanMaterial(plan:AutonomousPlan):Record<string,unknown>{
- const intent=record(plan.planPayload.intent),planIntent=Object.fromEntries(Object.entries({capitalLamports:intent.capitalLamports,lowerBinId:intent.lowerBinId,upperBinId:intent.upperBinId,strategy:intent.strategy,maxPositionWidthBins:intent.maxPositionWidthBins}).filter(([,value])=>value!==undefined));
+ const intent=record(plan.planPayload.intent),planIntent=Object.fromEntries(Object.entries({capitalLamports:intent.capitalLamports,lowerBinId:intent.lowerBinId,upperBinId:intent.upperBinId,activeBinId:intent.activeBinId,binStep:intent.binStep,strategy:intent.strategy,maxPositionWidthBins:intent.maxPositionWidthBins}).filter(([,value])=>value!==undefined));
  return{intentPayload:plan.intentPayload,planIntent,steps:plan.steps.map(step=>({transactionId:step.transactionId,sequence:step.sequence,kind:step.kind,requiredSignerAddresses:[...step.requiredSignerAddresses],metadata:step.metadata}))};
 }
 function capital(plan: AutonomousPlan) {

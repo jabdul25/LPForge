@@ -22,6 +22,9 @@ export interface PlanRequest {
   capitalLamports?: bigint;
   lowerBinId?: number;
   upperBinId?: number;
+  /** Immutable market state used to construct the range and funding split. */
+  activeBinId?: number;
+  binStep?: number;
   strategy?: "SPOT" | "CURVE" | "BID_ASK";
   /** Per-release execution policy ceiling; never inferred from a range. */
   maxPositionWidthBins?: number;
@@ -116,6 +119,8 @@ export function buildTransactionPlan(r: PlanRequest): TransactionPlan {
       : {}),
     ...(r.lowerBinId !== undefined ? { lowerBinId: r.lowerBinId } : {}),
     ...(r.upperBinId !== undefined ? { upperBinId: r.upperBinId } : {}),
+    ...(r.activeBinId !== undefined ? { activeBinId: r.activeBinId } : {}),
+    ...(r.binStep !== undefined ? { binStep: r.binStep } : {}),
     ...(r.strategy ? { strategy: r.strategy } : {}),
     payload: {
       reductionBps: r.reductionBps ?? null,
@@ -138,7 +143,7 @@ export function buildTransactionPlan(r: PlanRequest): TransactionPlan {
         }),
       );
     const width=(r.upperBinId??0)-(r.lowerBinId??0)+1;
-    const metadata={lowerBinId:r.lowerBinId,upperBinId:r.upperBinId,strategy:r.strategy,maxPositionWidthBins:r.maxPositionWidthBins??100};
+    const metadata={lowerBinId:r.lowerBinId,upperBinId:r.upperBinId,activeBinId:r.activeBinId,binStep:r.binStep,strategy:r.strategy,maxPositionWidthBins:r.maxPositionWidthBins??100};
     if(width<=70)transactions.push(tx("METEORA_OPEN",sequence,r.ownerAddress,r.replacementPositionAddress??r.positionAddress,metadata));
     else {
       transactions.push(tx('METEORA_POSITION_EXTEND',sequence++,r.ownerAddress,r.replacementPositionAddress??r.positionAddress,{...metadata,positionWidthBins:width}));

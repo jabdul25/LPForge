@@ -12,6 +12,7 @@ import {
 import { Logger } from "../../../packages/observability/src/index.js";
 import {
   evaluateOperationalCycle,
+  decisionTimeEconomicEvidenceAgeSeconds,
   type OperationalCycleResult,
 } from "../../../packages/operational-runtime/src/index.js";
 import {
@@ -151,7 +152,7 @@ async function persistTransactionPlan(
 ) {
   const provenanceSecret=(process.env.LPFORGE_PLAN_PROVENANCE_SECRET??'').trim();
   const phase7RuntimeId=(process.env.LPFORGE_P7_RUNTIME_ID??'lpforge-production').trim(),control=await store.loadLatestPhase7ControlDecision(phase7RuntimeId),phase7Control=control?{decisionId:String(control.decision_id),cycleKey:String(control.cycle_key),observedAt:new Date(String(control.observed_at)).toISOString()}:undefined;
-  const immutablePlan={intentPayload:plan.intent.payload,planIntent:Object.fromEntries(Object.entries({capitalLamports:plan.intent.capitalLamports?.toString(),lowerBinId:plan.intent.lowerBinId,upperBinId:plan.intent.upperBinId,strategy:plan.intent.strategy,maxPositionWidthBins:plan.transactions.find((step)=>step.kind==='METEORA_OPEN'||step.kind==='METEORA_POSITION_EXTEND')?.metadata.maxPositionWidthBins}).filter(([,value])=>value!==undefined)),steps:plan.transactions.map(step=>({transactionId:step.transactionId,sequence:step.sequence,kind:step.kind,requiredSignerAddresses:[...step.requiredSignerAddresses],metadata:step.metadata}))};
+  const immutablePlan={intentPayload:plan.intent.payload,planIntent:Object.fromEntries(Object.entries({capitalLamports:plan.intent.capitalLamports?.toString(),lowerBinId:plan.intent.lowerBinId,upperBinId:plan.intent.upperBinId,activeBinId:plan.intent.activeBinId,binStep:plan.intent.binStep,strategy:plan.intent.strategy,maxPositionWidthBins:plan.transactions.find((step)=>step.kind==='METEORA_OPEN'||step.kind==='METEORA_POSITION_EXTEND')?.metadata.maxPositionWidthBins}).filter(([,value])=>value!==undefined)),steps:plan.transactions.map(step=>({transactionId:step.transactionId,sequence:step.sequence,kind:step.kind,requiredSignerAddresses:[...step.requiredSignerAddresses],metadata:step.metadata}))};
   await store.insertExecutionIntent({
     intentId: plan.intent.intentId,
     idempotencyKey: plan.intent.idempotencyKey,
@@ -210,6 +211,8 @@ async function persistTransactionPlan(
         capitalLamports: plan.intent.capitalLamports?.toString(),
         lowerBinId: plan.intent.lowerBinId,
         upperBinId: plan.intent.upperBinId,
+        activeBinId: plan.intent.activeBinId,
+        binStep: plan.intent.binStep,
         strategy: plan.intent.strategy,
         maxPositionWidthBins: plan.transactions.find((step) => step.kind === "METEORA_OPEN" || step.kind === "METEORA_POSITION_EXTEND")?.metadata.maxPositionWidthBins,
       },
@@ -648,18 +651,23 @@ async function liveOnce() {
       decisionAt,
     );
     const economicEvidence = economicRow && String(economicRow.fidelity) === "EVENT_PATH_ESTIMATE"
-      ? {
+      ? (() => {
+          // evidence_age_seconds is valid only at the estimate's as_of. Age it
+          // forward to this exact decision; invalid provenance fails closed.
+          const evidenceAgeSeconds=decisionTimeEconomicEvidenceAgeSeconds({estimateAsOf:String(economicRow.as_of??''),storedEvidenceAgeSeconds:Number(economicRow.evidence_age_seconds),decisionAt});
+          return {
           fidelity: String(economicRow.fidelity),
           effectiveSampleCount: Number(economicRow.effective_sample_count),
           feeRatePerCapitalHour: Number(economicRow.fee_rate_per_capital_hour),
           uncertainty: Number(economicRow.uncertainty),
-          evidenceAgeSeconds: Number(economicRow.evidence_age_seconds),
+          evidenceAgeSeconds,
           rawObservationCount: Number(economicRow.raw_observation_count),
           independentEpisodeCount: Number(economicRow.independent_episode_count),
           feeObservationCount: Number(economicRow.fee_observation_count),
           eventPathObservationCount: Number(economicRow.event_path_observation_count),
           sourceHashes: (economicRow.source_hashes ?? {}) as Record<string, unknown>,
-        }
+          };
+        })()
       : undefined;
     const priorRegimeAssessments = await store.loadRegimeAssessmentHistory(
       cfg.smokePoolAddress,

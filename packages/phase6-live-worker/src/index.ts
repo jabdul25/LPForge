@@ -56,7 +56,7 @@ import {
   loadAutonomousEntryPolicy,
   readJupiterMetisQuote,
 } from "../../phase6-swap-quote/src/index.js";
-import { createMeteoraReadAdapter } from "../../meteora/src/index.js";
+import { createMeteoraReadAdapter, type MeteoraReadAdapter } from "../../meteora/src/index.js";
 import type {
   AutonomousPlan,
   AutonomousPlanAction,
@@ -76,6 +76,9 @@ export interface LiveWorkerConfig {
   maxFeeFraction: number;
   simulationFreshnessMs: number;
   riskPermitTtlMs: number;
+  /** Final, fresh chain-state guard; values come from deployment config. */
+  maxPresignActiveBinDriftBins: number;
+  maxPresignReferenceDivergenceBps: number;
   confirmPollMs: number;
   confirmAttempts: number;
 }
@@ -110,10 +113,27 @@ function planFields(plan: AutonomousOpenPlan) {
   if (!intent) throw new Error("LPFORGE_P6_PLAN_INTENT_MISSING");
   const capital = BigInt(String(intent.capitalLamports ?? "")),
     lower = Number(intent.lowerBinId),
-    upper = Number(intent.upperBinId);
-  if (capital <= 0n || !Number.isInteger(lower) || !Number.isInteger(upper))
+    upper = Number(intent.upperBinId),
+    plannedActiveBinId=Number(intent.activeBinId),
+    binStep=Number(intent.binStep);
+  if (capital <= 0n || !Number.isInteger(lower) || !Number.isInteger(upper)||!Number.isInteger(plannedActiveBinId)||!Number.isInteger(binStep)||binStep<=0)
     throw new Error("LPFORGE_P6_PLAN_FIELDS_INVALID");
-  return { capital, lower, upper };
+  return { capital, lower, upper, plannedActiveBinId, binStep };
+}
+/** Read the chain immediately before signing.  The plan's market inputs are
+ * immutable; a missing/mismatched value is a fail-closed condition, not a
+ * reason to substitute the planned lower bin. */
+export async function readOpenPresignMarketFacts(input:{rpcUrl:string;programId:string;poolAddress:string;plannedActiveBinId:number;plannedBinStep:number;lowerBinId:number;upperBinId:number;adapter?:Pick<MeteoraReadAdapter,'getPool'|'getActiveBin'>}):Promise<{activeBinId:number;referenceDivergenceBps:number;outsidePlannedRange:boolean}>{
+  const adapter=input.adapter??createMeteoraReadAdapter({rpcUrl:input.rpcUrl,cluster:'mainnet-beta',programId:input.programId});
+  const [pool,active]=await Promise.all([adapter.getPool(input.poolAddress),adapter.getActiveBin(input.poolAddress)]);
+  if(pool.binStep!==input.plannedBinStep)throw new Error('LPFORGE_P6_PRESIGN_BIN_STEP_MISMATCH');
+  const activeBinId=active.binId;
+  if(!Number.isInteger(activeBinId))throw new Error('LPFORGE_P6_PRESIGN_ACTIVE_BIN_INVALID');
+  return{activeBinId,referenceDivergenceBps:Math.abs(activeBinId-input.plannedActiveBinId)*input.plannedBinStep,outsidePlannedRange:activeBinId<input.lowerBinId||activeBinId>input.upperBinId};
+}
+async function governFreshOpenRisk(input:{plan:AutonomousOpenPlan;config:LiveWorkerConfig;simulation:{ok:boolean;simulationFreshUntil:string};costApproved:boolean;fields:ReturnType<typeof planFields>}):Promise<ReturnType<typeof governExecutionRisk>>{
+  const market=await readOpenPresignMarketFacts({rpcUrl:input.config.rpcUrl,programId:input.config.programId,poolAddress:input.plan.poolAddress,plannedActiveBinId:input.fields.plannedActiveBinId,plannedBinStep:input.fields.binStep,lowerBinId:input.fields.lower,upperBinId:input.fields.upper});
+  return governExecutionRisk({action:'OPEN',planId:input.plan.planId,now:new Date().toISOString(),thesisExpiresAt:input.plan.expiresAt,planExpiresAt:input.plan.expiresAt,simulationOk:input.simulation.ok,simulationFreshUntil:input.simulation.simulationFreshUntil,walletTruthConsistent:true,protocolCompatible:true,rpcHealthy:true,referenceDivergenceBps:market.referenceDivergenceBps,activeBinId:market.activeBinId,intendedCenterBinId:input.fields.plannedActiveBinId,costApproved:input.costApproved,reconciliationRequired:false,globalKillSwitch:false,liquidityCollapse:market.outsidePlannedRange},{maxReferenceDivergenceBps:input.config.maxPresignReferenceDivergenceBps,maxActiveBinDriftBins:input.config.maxPresignActiveBinDriftBins,approvalTtlMs:input.config.riskPermitTtlMs,allowEmergencyCostOverride:false});
 }
 function openPlan(plan: AutonomousPlan): AutonomousOpenPlan {
   if (plan.action !== "OPEN")
@@ -371,9 +391,11 @@ async function executeRequiredJupiterSwap(input: {
       computeUnitPriceMicroLamports: 0n,
     }),
     cost = assessExecutionCost(fee, sol, {
-      maxAbsoluteFeeLamports: input.config.maxFeeLamports,
-      maxFeeFractionOfCapital: input.config.maxFeeFraction,
+        maxAbsoluteFeeLamports: input.config.maxFeeLamports,
+        maxFeeFractionOfCapital: input.config.maxFeeFraction,
     }),
+    fields=planFields(input.plan),
+    market=await readOpenPresignMarketFacts({rpcUrl:input.config.rpcUrl,programId:input.config.programId,poolAddress:input.plan.poolAddress,plannedActiveBinId:fields.plannedActiveBinId,plannedBinStep:fields.binStep,lowerBinId:fields.lower,upperBinId:fields.upper}),
     risk = governExecutionRisk(
       {
         action: "OPEN",
@@ -386,17 +408,17 @@ async function executeRequiredJupiterSwap(input: {
         walletTruthConsistent: true,
         protocolCompatible: true,
         rpcHealthy: true,
-        referenceDivergenceBps: 0,
-        activeBinId: 0,
-        intendedCenterBinId: 0,
+        referenceDivergenceBps: market.referenceDivergenceBps,
+        activeBinId: market.activeBinId,
+        intendedCenterBinId: fields.plannedActiveBinId,
         costApproved: cost.approved,
         reconciliationRequired: false,
         globalKillSwitch: false,
-        liquidityCollapse: false,
+        liquidityCollapse: market.outsidePlannedRange,
       },
       {
-        maxReferenceDivergenceBps: 100,
-        maxActiveBinDriftBins: 100,
+        maxReferenceDivergenceBps: input.config.maxPresignReferenceDivergenceBps,
+        maxActiveBinDriftBins: input.config.maxPresignActiveBinDriftBins,
         approvalTtlMs: input.config.riskPermitTtlMs,
         allowEmergencyCostOverride: false,
       },
@@ -470,20 +492,20 @@ async function executeRequiredJupiterSwap(input: {
  * A post-extension interruption is never retried blindly: the plan remains in
  * reconciliation-required state with its exact completed step/signature.
  */
-async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:AutonomousOpenPlan;signer:MainnetSignerBackend;config:LiveWorkerConfig;connection:Connection;pool:MeteoraOpenAddPoolLike;prepared:PreparedAutonomousOpen;capital:bigint;lower:number;upper:number}):Promise<LiveWorkerResult>{
+async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:AutonomousOpenPlan;signer:MainnetSignerBackend;config:LiveWorkerConfig;connection:Connection;pool:MeteoraOpenAddPoolLike;prepared:PreparedAutonomousOpen;fields:ReturnType<typeof planFields>}):Promise<LiveWorkerResult>{
   let submittedAny=false,lastSignature='',completedSteps:Array<{transactionId:string;signature:string;estimatedFeeLamports:bigint}>=[];
   try{
     for(const step of input.prepared.steps){
       const simulatedAt=new Date().toISOString(),simulation=await simulateExecutionTransaction({authority:authority('MAINNET_BUILD_SIMULATE',simulatedAt,input.config.riskPermitTtlMs),transactionId:step.transactionId,transaction:step.transaction,transport:createWeb3SimulationTransport(input.connection),simulatedAt,freshnessMs:input.config.simulationFreshnessMs});
       await input.store.insertExecutionSimulation({transactionId:step.transactionId,simulatedAt:simulation.simulatedAt,freshUntil:simulation.simulationFreshUntil,ok:simulation.ok,...(simulation.unitsConsumed!==undefined?{unitsConsumed:simulation.unitsConsumed}:{}),logs:simulation.logs,...(simulation.error?{error:simulation.error}:{}),payload:{planId:input.plan.planId,positionAddress:input.prepared.positionSigner.publicKeyAddress,operation:step.kind,chunked:true}});
-      const fee=estimateExecutionFee({signatureCount:step.requiredSignerAddresses.length,computeUnitLimit:simulation.recommendedComputeUnitLimit??0,computeUnitPriceMicroLamports:0n}),cost=assessExecutionCost(fee,input.capital,{maxAbsoluteFeeLamports:input.config.maxFeeLamports,maxFeeFractionOfCapital:input.config.maxFeeFraction}),risk=governExecutionRisk({action:'OPEN',planId:input.plan.planId,now:new Date().toISOString(),thesisExpiresAt:input.plan.expiresAt,planExpiresAt:input.plan.expiresAt,simulationOk:simulation.ok,simulationFreshUntil:simulation.simulationFreshUntil,walletTruthConsistent:true,protocolCompatible:true,rpcHealthy:true,referenceDivergenceBps:0,activeBinId:input.lower,intendedCenterBinId:input.lower,costApproved:cost.approved,reconciliationRequired:false,globalKillSwitch:false,liquidityCollapse:false},{maxReferenceDivergenceBps:100,maxActiveBinDriftBins:100000,approvalTtlMs:input.config.riskPermitTtlMs,allowEmergencyCostOverride:false});
+      const fee=estimateExecutionFee({signatureCount:step.requiredSignerAddresses.length,computeUnitLimit:simulation.recommendedComputeUnitLimit??0,computeUnitPriceMicroLamports:0n}),cost=assessExecutionCost(fee,input.fields.capital,{maxAbsoluteFeeLamports:input.config.maxFeeLamports,maxFeeFractionOfCapital:input.config.maxFeeFraction}),risk=await governFreshOpenRisk({plan:input.plan,config:input.config,simulation,costApproved:cost.approved,fields:input.fields});
       if(risk.decision!=='APPROVE'||!risk.permitId||!risk.expiresAt)throw new Error(`LPFORGE_P6_CHUNK_SIMULATE_RISK:${risk.reasonCodes.join(',')}`);
       await input.store.insertExecutionRiskPermit({permitId:`${risk.permitId}:${step.transactionId}`,planId:input.plan.planId,decision:risk.decision,issuedAt:risk.issuedAt,expiresAt:risk.expiresAt,reasonCodes:risk.reasonCodes,payload:{autonomous:true,transactionId:step.transactionId,chunked:true,feeLamports:fee.totalFeeLamports.toString()}});
-      const latest=await input.connection.getLatestBlockhash('confirmed');step.transaction.recentBlockhash=latest.blockhash;step.transaction.lastValidBlockHeight=latest.lastValidBlockHeight;step.transaction.feePayer=new PublicKey(input.plan.ownerAddress);const submittedAt=new Date().toISOString(),openTicket=ticket(input.plan as unknown as AutonomousPlan,input.capital,submittedAt,input.config.riskPermitTtlMs),openAuthority={phase:'P6' as const,cluster:'mainnet-beta' as const,level:'MAINNET_CANARY_OPEN' as const,liveExecution:true,canaryOnly:true,issuedAt:submittedAt,expiresAt:openTicket.expiresAt,ticketId:openTicket.ticketId,reasonCodes:['P6_AUTONOMOUS_CHUNK_FINAL_REVALIDATION',step.kind]};
+      const latest=await input.connection.getLatestBlockhash('confirmed');step.transaction.recentBlockhash=latest.blockhash;step.transaction.lastValidBlockHeight=latest.lastValidBlockHeight;step.transaction.feePayer=new PublicKey(input.plan.ownerAddress);const submittedAt=new Date().toISOString(),openTicket=ticket(input.plan as unknown as AutonomousPlan,input.fields.capital,submittedAt,input.config.riskPermitTtlMs),openAuthority={phase:'P6' as const,cluster:'mainnet-beta' as const,level:'MAINNET_CANARY_OPEN' as const,liveExecution:true,canaryOnly:true,issuedAt:submittedAt,expiresAt:openTicket.expiresAt,ticketId:openTicket.ticketId,reasonCodes:['P6_AUTONOMOUS_CHUNK_FINAL_REVALIDATION',step.kind]};
       const submitted=await executeMainnetCanaryOpen({authority:openAuthority,ticket:openTicket,transactionId:step.transactionId,idempotencyKey:`${input.plan.idempotencyKey}:${step.transactionId}`,requiredSignerAddresses:step.requiredSignerAddresses,backend:input.signer,auxiliaryBackends:auxiliaryPositionSignersForOpenStep(step,input.prepared.positionSigner),envelope:step.envelope,phase5RiskDecision:risk,lease:latest,ledger:ledger(input.store),transport:createWeb3SubmissionTransport(input.connection),submittedAt});submittedAny=true;lastSignature=submitted.signature;await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SUBMITTED',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata},submitted.signature);
       let confirmed=false;for(let attempt=0;attempt<input.config.confirmAttempts;attempt++){await new Promise(resolve=>setTimeout(resolve,input.config.confirmPollMs));const confirmation=await observeConfirmation({attemptId:`${step.transactionId}:attempt:1`,record:{transactionId:step.transactionId,signature:submitted.signature,submittedAt,blockhash:latest.blockhash,lastValidBlockHeight:latest.lastValidBlockHeight,attempt:1},transport:createWeb3SubmissionTransport(input.connection),ledger:ledger(input.store),observedAt:new Date().toISOString()});if(confirmation.status==='CONFIRMED'||confirmation.status==='FINALIZED'){confirmed=true;break;}if(confirmation.status==='FAILED'||confirmation.status==='EXPIRED')throw new Error(`LPFORGE_P6_CHUNK_CONFIRM_${confirmation.status}`);}if(!confirmed)throw new Error('LPFORGE_P6_CHUNK_CONFIRMATION_PENDING');completedSteps.push({transactionId:step.transactionId,signature:submitted.signature,estimatedFeeLamports:fee.totalFeeLamports});
     }
-    const position=await input.pool.getPosition?.(new PublicKey(input.prepared.positionSigner.publicKeyAddress));if(!position)throw new Error('LPFORGE_P6_POSITION_RECONCILIATION_MISSING');const intent=input.plan.planPayload.intent as Record<string,unknown>,funding=input.plan.intentPayload.entryFunding as Record<string,unknown>;await input.store.insertExecutionReconciliation({reconciliationId:`${input.plan.planId}:open`,planId:input.plan.planId,observedAt:new Date().toISOString(),status:'MATCH',expected:{owner:input.plan.ownerAddress,pool:input.plan.poolAddress,lowerBinId:input.lower,upperBinId:input.upper},actual:{positionAddress:input.prepared.positionSigner.publicKeyAddress},discrepancies:[],payload:{signature:lastSignature,autonomous:true,chunked:true}});await input.store.upsertOwnedPosition({lpforgePositionId:`position-${input.prepared.positionSigner.publicKeyAddress}`,poolAddress:input.plan.poolAddress,positionAddress:input.prepared.positionSigner.publicKeyAddress,ownerAddress:input.plan.ownerAddress,strategy:String(intent.strategy??'SPOT'),orientation:String(funding.orientation??'ONE_SIDED_Y'),lowerBinId:input.lower,upperBinId:input.upper,activeBinAtEntry:Number(intent.activeBinId??input.lower),initialCapitalLamports:input.capital,entryPlanId:input.plan.planId,entrySignature:lastSignature,enteredAt:new Date().toISOString(),lifecycleState:'OPEN',lastPlanId:input.plan.planId,reconciliationStatus:'MATCH',payload:{thesisId:input.plan.thesisId,entryFunding:funding,chunked:true}});const positionAccount=await input.connection.getAccountInfo(new PublicKey(input.prepared.positionSigner.publicKeyAddress),'confirmed');await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:open-contribution`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'OPEN_CONTRIBUTION',observedAt:new Date().toISOString(),lamports:input.capital,payload:{signature:lastSignature,source:'RECONCILED_CHUNKABLE_OPEN'}});if(positionAccount?.lamports)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:rent-lock`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'RENT_LOCK',observedAt:new Date().toISOString(),lamports:BigInt(positionAccount.lamports),payload:{signature:lastSignature,recoverable:true,source:'POSITION_ACCOUNT_INFO'}});for(const child of completedSteps){const actualFee=await confirmedTransactionFeeLamports(input.connection,child.signature);await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:tx-cost:${child.transactionId}`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'TX_COST',observedAt:new Date().toISOString(),lamports:actualFee??child.estimatedFeeLamports,payload:{signature:child.signature,transactionId:child.transactionId,source:actualFee===undefined?'EXECUTION_FEE_ESTIMATE':'CHAIN_RECEIPT_META',...(actualFee===undefined?{estimatedLamports:child.estimatedFeeLamports.toString()}:{})}});}await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'RECONCILED',at:new Date().toISOString(),payload:{signature:lastSignature,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true}});return{status:'RECONCILED',planId:input.plan.planId,reasonCodes:[],transactionSubmitted:true};
+    const position=await input.pool.getPosition?.(new PublicKey(input.prepared.positionSigner.publicKeyAddress));if(!position)throw new Error('LPFORGE_P6_POSITION_RECONCILIATION_MISSING');const intent=input.plan.planPayload.intent as Record<string,unknown>,funding=input.plan.intentPayload.entryFunding as Record<string,unknown>;await input.store.insertExecutionReconciliation({reconciliationId:`${input.plan.planId}:open`,planId:input.plan.planId,observedAt:new Date().toISOString(),status:'MATCH',expected:{owner:input.plan.ownerAddress,pool:input.plan.poolAddress,lowerBinId:input.fields.lower,upperBinId:input.fields.upper},actual:{positionAddress:input.prepared.positionSigner.publicKeyAddress},discrepancies:[],payload:{signature:lastSignature,autonomous:true,chunked:true}});await input.store.upsertOwnedPosition({lpforgePositionId:`position-${input.prepared.positionSigner.publicKeyAddress}`,poolAddress:input.plan.poolAddress,positionAddress:input.prepared.positionSigner.publicKeyAddress,ownerAddress:input.plan.ownerAddress,strategy:String(intent.strategy??'SPOT'),orientation:String(funding.orientation??'ONE_SIDED_Y'),lowerBinId:input.fields.lower,upperBinId:input.fields.upper,activeBinAtEntry:input.fields.plannedActiveBinId,initialCapitalLamports:input.fields.capital,entryPlanId:input.plan.planId,entrySignature:lastSignature,enteredAt:new Date().toISOString(),lifecycleState:'OPEN',lastPlanId:input.plan.planId,reconciliationStatus:'MATCH',payload:{thesisId:input.plan.thesisId,entryFunding:funding,chunked:true}});const positionAccount=await input.connection.getAccountInfo(new PublicKey(input.prepared.positionSigner.publicKeyAddress),'confirmed');await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:open-contribution`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'OPEN_CONTRIBUTION',observedAt:new Date().toISOString(),lamports:input.fields.capital,payload:{signature:lastSignature,source:'RECONCILED_CHUNKABLE_OPEN'}});if(positionAccount?.lamports)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:rent-lock`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'RENT_LOCK',observedAt:new Date().toISOString(),lamports:BigInt(positionAccount.lamports),payload:{signature:lastSignature,recoverable:true,source:'POSITION_ACCOUNT_INFO'}});for(const child of completedSteps){const actualFee=await confirmedTransactionFeeLamports(input.connection,child.signature);await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:tx-cost:${child.transactionId}`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'TX_COST',observedAt:new Date().toISOString(),lamports:actualFee??child.estimatedFeeLamports,payload:{signature:child.signature,transactionId:child.transactionId,source:actualFee===undefined?'EXECUTION_FEE_ESTIMATE':'CHAIN_RECEIPT_META',...(actualFee===undefined?{estimatedLamports:child.estimatedFeeLamports.toString()}:{})}});}await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'RECONCILED',at:new Date().toISOString(),payload:{signature:lastSignature,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true}});return{status:'RECONCILED',planId:input.plan.planId,reasonCodes:[],transactionSubmitted:true};
   }catch(error){const reason=error instanceof Error?error.message:'LPFORGE_P6_CHUNKABLE_OPEN_UNKNOWN';if(submittedAny){await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECONCILIATION_REQUIRED',at:new Date().toISOString(),reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',reason],payload:{stage:'CHUNKABLE_OPEN',error:reason,positionAddress:input.prepared.positionSigner.publicKeyAddress,lastSignature}});return{status:'UNKNOWN',planId:input.plan.planId,reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',reason],transactionSubmitted:true};}await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'BLOCKED',at:new Date().toISOString(),payload:{stage:'CHUNKABLE_OPEN',error:reason}});return{status:'BLOCKED',planId:input.plan.planId,reasonCodes:[reason],transactionSubmitted:false};}
 }
 /** Executes one already-claimed plan. A caller must claim from storage before calling this function. */
@@ -583,9 +605,7 @@ export async function executeAutonomousOpen(input: {
         connection,
         pool,
         prepared,
-        capital: fields.capital,
-        lower: fields.lower,
-        upper: fields.upper,
+        fields,
       });
     const simAuthority = authority(
       "MAINNET_BUILD_SIMULATE",
@@ -625,33 +645,7 @@ export async function executeAutonomousOpen(input: {
         maxAbsoluteFeeLamports: input.config.maxFeeLamports,
         maxFeeFractionOfCapital: input.config.maxFeeFraction,
       });
-    const risk = governExecutionRisk(
-      {
-        action: "OPEN",
-        planId: input.plan.planId,
-        now: new Date().toISOString(),
-        thesisExpiresAt: input.plan.expiresAt,
-        planExpiresAt: input.plan.expiresAt,
-        simulationOk: simulation.ok,
-        simulationFreshUntil: simulation.simulationFreshUntil,
-        walletTruthConsistent: true,
-        protocolCompatible: true,
-        rpcHealthy: true,
-        referenceDivergenceBps: 0,
-        activeBinId: fields.lower,
-        intendedCenterBinId: fields.lower,
-        costApproved: cost.approved,
-        reconciliationRequired: false,
-        globalKillSwitch: false,
-        liquidityCollapse: false,
-      },
-      {
-        maxReferenceDivergenceBps: 100,
-        maxActiveBinDriftBins: 100000,
-        approvalTtlMs: input.config.riskPermitTtlMs,
-        allowEmergencyCostOverride: false,
-      },
-    );
+    const risk = await governFreshOpenRisk({plan:input.plan,config:input.config,simulation,costApproved:cost.approved,fields});
     if (risk.decision !== "APPROVE" || !risk.permitId || !risk.expiresAt) {
       await input.store.completeAutonomousPlan({
         planId: input.plan.planId,

@@ -38,6 +38,8 @@ export interface ExecutionIntent {
   capitalLamports?:bigint;
   lowerBinId?:number;
   upperBinId?:number;
+  activeBinId?:number;
+  binStep?:number;
   strategy?:'SPOT'|'CURVE'|'BID_ASK';
   payload:Record<string,unknown>;
 }

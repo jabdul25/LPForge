@@ -91,8 +91,19 @@ const clamp=(x:number,min=0,max=1)=>Math.max(min,Math.min(max,x));
  * requirement; timing-sensitive features continue to use the current stream.
  */
 export function resolvePhase4DataCompleteness(current:number,evidenceMaturity?:OperationalCycleInput['evidenceMaturity']):{value:number;source:'CURRENT_STREAM'|'BACKFILL_PLUS_LIVE_CONFIRMATION'}{
- const mature=evidenceMaturity?.state==='MATURE'&&evidenceMaturity.historicalState==='MATURE'&&evidenceMaturity.liveConfirmationState==='CONFIRMED';
+ const mature=hasConfirmedEvidenceMaturity(evidenceMaturity);
  return mature?{value:Math.max(clamp(current),.60),source:'BACKFILL_PLUS_LIVE_CONFIRMATION'}:{value:clamp(current),source:'CURRENT_STREAM'};
+}
+/** An automatic capital-moving decision requires both historical maturity and
+ * a separate current live confirmation.  A missing DB row is not evidence. */
+export function hasConfirmedEvidenceMaturity(evidenceMaturity?:OperationalCycleInput['evidenceMaturity']):boolean{
+ return evidenceMaturity?.state==='MATURE'&&evidenceMaturity.historicalState==='MATURE'&&evidenceMaturity.liveConfirmationState==='CONFIRMED';
+}
+/** Stored evidence age is a fact at estimate creation, not at decision time. */
+export function decisionTimeEconomicEvidenceAgeSeconds(input:{estimateAsOf:string;storedEvidenceAgeSeconds:number;decisionAt:string}):number{
+ const estimateMs=Date.parse(input.estimateAsOf),decisionMs=Date.parse(input.decisionAt);
+ if(!Number.isFinite(estimateMs)||!Number.isFinite(decisionMs)||!Number.isFinite(input.storedEvidenceAgeSeconds)||input.storedEvidenceAgeSeconds<0)return Number.POSITIVE_INFINITY;
+ return Math.max(0,input.storedEvidenceAgeSeconds+(decisionMs-estimateMs)/1000);
 }
 function numeric(v:unknown,fallback=0){const n=Number(v);return Number.isFinite(n)?n:fallback;}
 const WRAPPED_SOL_MINT='So11111111111111111111111111111111111111112';
@@ -139,12 +150,16 @@ export async function evaluateOperationalCycle(input:OperationalCycleInput):Prom
   const flow=computeSwapFlowFeatures(input.history.swapEvents);
   const fee=computeFeeQuality(input.dataApiPool);
   const poolAssessment=assessPool(poolInputFromDataApi(input.dataApiPool,{bin,movement,flow,fee},{protocolCompatible:input.protocolCompatible,dataFreshness:'GOOD',observedAt:input.observedAt,dataAgeSeconds:0,functionType:input.pool.functionType==='UNDETERMINED'?'UNKNOWN':input.pool.functionType}),PHASE6_CANARY_POOL_POLICY_V1);
-  const rateEvidence=input.economicEvidence?.fidelity==='EVENT_PATH_ESTIMATE'&&input.economicEvidence.evidenceAgeSeconds<=300?deriveEventPathRateEvidence(input.economicEvidence,poolAssessment,p):deriveAggregateRateEvidence(input.dataApiPool,poolAssessment,p);
+  const freshEventPathEvidence=input.economicEvidence?.fidelity==='EVENT_PATH_ESTIMATE'&&Number.isFinite(input.economicEvidence.evidenceAgeSeconds)&&input.economicEvidence.evidenceAgeSeconds<=300;
+  const rateEvidence=freshEventPathEvidence?deriveEventPathRateEvidence(input.economicEvidence!,poolAssessment,p):deriveAggregateRateEvidence(input.dataApiPool,poolAssessment,p);
   const valuation=deriveCandidateValuationCalibration(input.pool,input.dataApiPool,input.bins);
   const reasonCodes:string[]=[];
   const ready=input.history.marketObservations.length>=p.minMarketObservations&&input.history.activeBins.length>=p.minActiveBinObservations&&input.history.binFrames.length>=p.minBinFrames;
   const base={poolAddress:input.pool.address,observedAt:input.observedAt,poolAssessment,evidence:{history:{market:input.history.marketObservations.length,activeBins:input.history.activeBins.length,frames:input.history.binFrames.length,swaps:input.history.swapEvents.length},rateEvidence,valuation,policyId:p.id}};
+  const automaticCapitalPath=Boolean(input.productionCapitalPolicy||input.planPreparationEnabled);
+  if(automaticCapitalPath&&!hasConfirmedEvidenceMaturity(input.evidenceMaturity)){reasonCodes.push(input.evidenceMaturity?'OPERATIONAL_EVIDENCE_MATURITY_PENDING':'OPERATIONAL_EVIDENCE_MATURITY_MISSING',...(input.evidenceMaturity?.reasonCodes??[]));const core={...base,phase3Status:'WARMING' as const,phase4Status:'WARMING' as const,phase5Status:'NOT_REACHED' as const,...(input.evidenceMaturity?{evidenceMaturity:input.evidenceMaturity}:{}),reasonCodes:[...new Set(reasonCodes)].sort()};return{cycleId:await sha256Hex(canonicalJson(core)),...core};}
   if(input.evidenceMaturity?.state&&input.evidenceMaturity.state!=='MATURE'){reasonCodes.push('OPERATIONAL_EVIDENCE_MATURITY_PENDING',...(input.evidenceMaturity.reasonCodes??[]));const core={...base,phase3Status:'WARMING' as const,phase4Status:'WARMING' as const,phase5Status:'NOT_REACHED' as const,evidenceMaturity:input.evidenceMaturity,reasonCodes:[...new Set(reasonCodes)].sort()};return{cycleId:await sha256Hex(canonicalJson(core)),...core};}
+  if(automaticCapitalPath&&!freshEventPathEvidence){reasonCodes.push(input.economicEvidence?'OPERATIONAL_ECONOMIC_EVIDENCE_STALE':'OPERATIONAL_ECONOMIC_EVIDENCE_MISSING');const core={...base,phase3Status:'WARMING' as const,phase4Status:'WARMING' as const,phase5Status:'NOT_REACHED' as const,reasonCodes:[...new Set(reasonCodes)].sort()};return{cycleId:await sha256Hex(canonicalJson(core)),...core};}
   if(!ready){reasonCodes.push('OPERATIONAL_FORWARD_HISTORY_WARMING');const core={...base,phase3Status:'WARMING' as const,phase4Status:'WARMING' as const,phase5Status:'NOT_REACHED' as const,reasonCodes};return{cycleId:await sha256Hex(canonicalJson(core)),...core};}
   const market=[...input.history.marketObservations];const last=market.at(-1);if(!last||Date.parse(last.observedAt)<Date.parse(input.observedAt)){market.push({observedAt:input.observedAt,price:numeric(input.dataApiPool.current_price,1),activeBinId:input.pool.activeBinId,volume:numeric(input.dataApiPool.volume?.['5m']),feeValue:numeric(input.dataApiPool.fees?.['5m']),twoWayRatio:flow.twoWayRatio,localLiquidity:numeric(input.dataApiPool.tvl)});}
   const expiresAt=new Date(Date.parse(input.observedAt)+p.thesisTtlMinutes*60000).toISOString();
@@ -166,7 +181,7 @@ export async function evaluateOperationalCycle(input:OperationalCycleInput):Prom
   let phase5Status:OperationalCycleResult['phase5Status']='NOT_REACHED';let plan:TransactionPlan|undefined;
   if(phase4Status==='ENTRY_READY'){
     if(!input.ownerAddress){phase5Status='PREPARE_BLOCKED_PUBLIC_ADDRESSES';reasonCodes.push('OPERATIONAL_P5_OWNER_ADDRESS_REQUIRED');}
-    else {plan=buildTransactionPlan({action:'OPEN',cluster:'mainnet-beta',ownerAddress:input.ownerAddress,poolAddress:input.pool.address,...(input.replacementPositionAddress?{replacementPositionAddress:input.replacementPositionAddress}:{}),thesisId:shadow.thesis.thesisId,candidateId:candidate.id,observedAt:input.observedAt,expiresAt,capitalLamports,lowerBinId:entryFunding.lowerBinId,upperBinId:entryFunding.upperBinId,strategy:entryFunding.strategy,...(input.maxRangeWidthBins!==undefined?{maxPositionWidthBins:input.maxRangeWidthBins}:{}),metadata:{authority:'AUTONOMOUS_DISPATCH',operationalCompletion:true,positionSigner:input.replacementPositionAddress?'EXTERNAL_POSITION_ADDRESS':'EPHEMERAL_POSITION_V2',entryFunding:{orientation:entryFunding.orientation,pairedTokenTargetBps:entryFunding.pairedTokenTargetBps,solForLpLamports:entryFunding.solForLpLamports.toString(),solToPairedTokenLamports:entryFunding.solToPairedTokenLamports.toString(),totalPairedTokenRaw:entryFunding.totalPairedTokenRaw.toString(),meteoraSdkVersion:entryFunding.sdkVersion,reasonCodes:entryFunding.reasonCodes}}});phase5Status='PLAN_PREPARED_BUILD_ONLY';phase4Status='PLAN_PREPARED';reasonCodes.push('OPERATIONAL_P5_AUTONOMOUS_PLAN_READY');}
+    else {plan=buildTransactionPlan({action:'OPEN',cluster:'mainnet-beta',ownerAddress:input.ownerAddress,poolAddress:input.pool.address,...(input.replacementPositionAddress?{replacementPositionAddress:input.replacementPositionAddress}:{}),thesisId:shadow.thesis.thesisId,candidateId:candidate.id,observedAt:input.observedAt,expiresAt,capitalLamports,lowerBinId:entryFunding.lowerBinId,upperBinId:entryFunding.upperBinId,activeBinId:input.pool.activeBinId,binStep:input.pool.binStep,strategy:entryFunding.strategy,...(input.maxRangeWidthBins!==undefined?{maxPositionWidthBins:input.maxRangeWidthBins}:{}),metadata:{authority:'AUTONOMOUS_DISPATCH',operationalCompletion:true,positionSigner:input.replacementPositionAddress?'EXTERNAL_POSITION_ADDRESS':'EPHEMERAL_POSITION_V2',entryFunding:{orientation:entryFunding.orientation,pairedTokenTargetBps:entryFunding.pairedTokenTargetBps,solForLpLamports:entryFunding.solForLpLamports.toString(),solToPairedTokenLamports:entryFunding.solToPairedTokenLamports.toString(),totalPairedTokenRaw:entryFunding.totalPairedTokenRaw.toString(),meteoraSdkVersion:entryFunding.sdkVersion,reasonCodes:entryFunding.reasonCodes}}});phase5Status='PLAN_PREPARED_BUILD_ONLY';phase4Status='PLAN_PREPARED';reasonCodes.push('OPERATIONAL_P5_AUTONOMOUS_PLAN_READY');}
   }
   reasonCodes.push(...entry.reasonCodes,...risk.reasonCodes,...entryFunding.reasonCodes,...(swapQuote?.reasonCodes??[]));const core={...base,phase3Status:'ENTRY_READY' as const,phase4Status,phase5Status,shadow,entry,risk,allocation,entryFunding,...(swapQuote?{swapQuote}:{}),...(plan?{plan}:{}),reasonCodes:[...new Set(reasonCodes)].sort()};return{cycleId:await sha256Hex(canonicalJson(core)),...core};
 }
