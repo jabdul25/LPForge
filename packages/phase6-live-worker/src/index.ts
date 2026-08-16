@@ -184,7 +184,7 @@ async function recordPositionTokenXLot(input:{store:Phase1Store;connection:Conne
  * immutable; a missing/mismatched value is a fail-closed condition, not a
  * reason to substitute the planned lower bin. */
 export async function readOpenPresignMarketFacts(input:{rpcUrl:string;programId:string;poolAddress:string;plannedActiveBinId:number;plannedBinStep:number;lowerBinId:number;upperBinId:number;adapter?:Pick<MeteoraReadAdapter,'getPool'|'getActiveBin'>}):Promise<{activeBinId:number;referenceDivergenceBps:number;outsidePlannedRange:boolean}>{
-  const adapter=input.adapter??createMeteoraReadAdapter({rpcUrl:input.rpcUrl,cluster:'mainnet-beta',programId:input.programId});
+  const adapter=input.adapter??createMeteoraReadAdapter({rpcUrl:input.rpcUrl,cluster:'mainnet-beta',programId:input.programId,priority:'P0_EXECUTION_CRITICAL'});
   const [pool,active]=await Promise.all([adapter.getPool(input.poolAddress),adapter.getActiveBin(input.poolAddress)]);
   if(pool.binStep!==input.plannedBinStep)throw new Error('LPFORGE_P6_PRESIGN_BIN_STEP_MISMATCH');
   const activeBinId=active.binId;
@@ -387,6 +387,7 @@ async function executeRequiredJupiterSwap(input: {
     rpcUrl: input.config.rpcUrl,
     cluster: "mainnet-beta",
     programId: input.config.programId,
+    priority:'P0_EXECUTION_CRITICAL',
   });
   const pool = await adapter.getPool(input.plan.poolAddress);
   const [nativeLamportsBefore,wsolRawBefore,pairedTokenRawBeforeFunding]=await Promise.all([
@@ -1766,6 +1767,7 @@ async function chainMutationRange(input: {
     rpcUrl: input.rpcUrl,
     cluster: "mainnet-beta",
     programId: input.programId,
+    priority:'P0_EXECUTION_CRITICAL',
   }).getPositionV2(input.plan.poolAddress, input.positionAddress);
   const chainLower = Number(truth.lowerBinId),
     chainUpper = Number(truth.upperBinId);
@@ -2170,6 +2172,7 @@ async function executeManagementReplacement(input: {
     rpcUrl: input.config.rpcUrl,
     cluster: "mainnet-beta",
     programId: input.config.programId,
+    priority:'P0_EXECUTION_CRITICAL',
   });
   const old = await adapter.getPositionV2(
     input.plan.poolAddress,
@@ -2471,6 +2474,7 @@ async function executeCloseSettlement(input: {
       rpcUrl: input.config.rpcUrl,
       cluster: "mainnet-beta",
       programId: input.config.programId,
+      priority:'P0_EXECUTION_CRITICAL',
     }).getPool(input.plan.poolAddress),
     persist = async (
       stage: CloseSettlementStage,
@@ -2949,6 +2953,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
           rpcUrl: input.rpcUrl,
           cluster: "mainnet-beta",
           programId: input.programId,
+          priority:'P1_RECOVERY_CRITICAL',
         })
       : undefined;
   for (const plan of plans) {
@@ -3483,6 +3488,7 @@ export async function reconcileOrphanedPositions(input: {
       rpcUrl: input.rpcUrl,
       cluster: "mainnet-beta",
       programId: input.programId,
+      priority:'P1_RECOVERY_CRITICAL',
     });
     allWalletPositions ??= runtime.DLMM.getAllLbPairPositionsByUser(
       createGovernedConnection({rpcUrl:input.rpcUrl,priority:'P1_RECOVERY_CRITICAL'}),
