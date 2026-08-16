@@ -506,7 +506,7 @@ export interface Phase1Store {
     at: string;
     payload: Record<string, unknown>;
   }): Promise<void>;
-  insertPositionCashflow(value:{cashflowId:string;positionAddress:string;planId:string;flowType:'OPEN_CONTRIBUTION'|'ADD_CONTRIBUTION'|'FEE_CLAIM'|'REWARD_CLAIM'|'REDUCE_WITHDRAWAL'|'CLOSE_WITHDRAWAL'|'SWAP_COST'|'TX_COST'|'RENT_LOCK'|'RENT_RECOVERY';observedAt:string;lamports?:bigint;tokenMint?:string;tokenAmountRaw?:string;payload:Record<string,unknown>}):Promise<void>;
+  insertPositionCashflow(value:{cashflowId:string;positionAddress:string;planId:string;flowType:'OPEN_CONTRIBUTION'|'ADD_CONTRIBUTION'|'FEE_CLAIM'|'REWARD_CLAIM'|'REDUCE_WITHDRAWAL'|'CLOSE_WITHDRAWAL'|'SWAP_PROCEEDS'|'SWAP_COST'|'TX_COST'|'RENT_LOCK'|'RENT_RECOVERY';observedAt:string;lamports?:bigint;tokenMint?:string;tokenAmountRaw?:string;payload:Record<string,unknown>}):Promise<void>;
   loadPositionCashflows(positionAddress:string):Promise<Array<{flowType:string;lamports?:bigint;tokenMint?:string;tokenAmountRaw?:string;payload?:Record<string,unknown>}>>;
   upsertPartialEntryRecovery(value: {
     planId: string;
@@ -1865,7 +1865,7 @@ export async function createPostgresStore(
         [v.positionAddress, v.capitalLamports.toString(), v.at, json(v.payload)],
       );
     },
-    async insertPositionCashflow(v){await db.query("INSERT INTO execution.position_cashflows(cashflow_id,position_address,plan_id,flow_type,observed_at,lamports,token_mint,token_amount_raw,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) ON CONFLICT(cashflow_id) DO NOTHING",[v.cashflowId,v.positionAddress,v.planId,v.flowType,v.observedAt,v.lamports?.toString()??null,v.tokenMint??null,v.tokenAmountRaw??null,json(v.payload)]);},
+    async insertPositionCashflow(v){await db.query("INSERT INTO execution.position_cashflows(cashflow_id,position_address,plan_id,flow_type,observed_at,lamports,token_mint,token_amount_raw,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) ON CONFLICT(cashflow_id) DO UPDATE SET lamports=EXCLUDED.lamports,token_mint=EXCLUDED.token_mint,token_amount_raw=EXCLUDED.token_amount_raw,payload=EXCLUDED.payload",[v.cashflowId,v.positionAddress,v.planId,v.flowType,v.observedAt,v.lamports?.toString()??null,v.tokenMint??null,v.tokenAmountRaw??null,json(v.payload)]);},
     async loadPositionCashflows(positionAddress){const r=await db.query("SELECT flow_type,lamports,token_mint,token_amount_raw,payload FROM execution.position_cashflows WHERE position_address=$1 ORDER BY observed_at ASC,cashflow_id ASC",[positionAddress]);return r.rows.map(row=>({flowType:String(row.flow_type),...(row.lamports!==null&&row.lamports!==undefined?{lamports:BigInt(String(row.lamports))}:{}),...(row.token_mint?{tokenMint:String(row.token_mint)}:{}),...(row.token_amount_raw?{tokenAmountRaw:String(row.token_amount_raw)}:{}),...(row.payload&&typeof row.payload==='object'?{payload:row.payload as Record<string,unknown>}:{})}));},
     async upsertPartialEntryRecovery(v) {
       await db.query(

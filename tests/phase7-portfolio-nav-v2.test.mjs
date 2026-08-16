@@ -46,9 +46,18 @@ test('wallet token balances join the NAV through the same pool price feed',()=>{
   assert.ok(pricesAt<solPriceAt&&solPriceAt<loopAt,'prices derive from the same pool feed that values positions');
   assert.ok(loopAt<currentAt,'token value enters current equity');
   assert.ok(currentAt<upsertAt,'the persisted state records the new NAV lines');
-  assert.match(src,/'POSITION_AND_WALLET_TOKENS_USD_TO_SOL_V2'/, 'valuation method v2 names both components');
+  assert.match(src,/'POSITION_MARK_TO_MARKET_PLUS_WALLET_LIFECYCLE_V3'/, 'valuation method separates current PositionV2 value from wallet lifecycle flows');
+  assert.match(src,/input\.store\.loadPositionCashflows\(positionAddress\)/,'portfolio valuation reads the durable lifecycle ledger for audit completeness');
+  assert.match(src,/derivePositionMarkToMarket\(\{position,pool,observedAt:input\.now\}\)/,'position NAV excludes claimed/withdrawn amounts already represented in wallet balances');
   assert.match(src,/positionUsdValueToSolLamports\(usd,solPriceUsd\)/,'token USD converts through the WSOL price');
   assert.match(src,/if\(!mint\|\|!amount\|\|typeof decimals!=='number'\)continue;/,'unknown or unparsable rows are skipped, not guessed');
+});
+
+test('owned positions are mandatory probe targets even when the Tier-A rotation is bounded',()=>{
+  const src=fs.readFileSync(production,'utf8');
+  assert.match(src,/ownedPoolAddresses:readonly string\[\]=\[\]/,'probe-universe helper accepts durable owned pools');
+  assert.match(src,/productionEvaluationPoolAddresses\(input\.store,input\.env,input\.cycleKey,\[\.\.\.openPools\]\)/,'one immutable cycle universe includes every open position');
+  assert.match(src,/\[\.\.\.manual,\.\.\.owned,\.\.\.selected\.map/,'owned pools cannot be rotated out behind candidate-only work');
 });
 
 test('rent locked in open position accounts is exact recoverable book-value equity and policy precedes valuation',()=>{

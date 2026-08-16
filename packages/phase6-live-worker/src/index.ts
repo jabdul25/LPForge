@@ -471,7 +471,7 @@ async function executeRequiredJupiterSwap(input: {
  * reconciliation-required state with its exact completed step/signature.
  */
 async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:AutonomousOpenPlan;signer:MainnetSignerBackend;config:LiveWorkerConfig;connection:Connection;pool:MeteoraOpenAddPoolLike;prepared:PreparedAutonomousOpen;capital:bigint;lower:number;upper:number}):Promise<LiveWorkerResult>{
-  let submittedAny=false,lastSignature='';
+  let submittedAny=false,lastSignature='',completedSteps:Array<{transactionId:string;signature:string;estimatedFeeLamports:bigint}>=[];
   try{
     for(const step of input.prepared.steps){
       const simulatedAt=new Date().toISOString(),simulation=await simulateExecutionTransaction({authority:authority('MAINNET_BUILD_SIMULATE',simulatedAt,input.config.riskPermitTtlMs),transactionId:step.transactionId,transaction:step.transaction,transport:createWeb3SimulationTransport(input.connection),simulatedAt,freshnessMs:input.config.simulationFreshnessMs});
@@ -481,9 +481,9 @@ async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:Auto
       await input.store.insertExecutionRiskPermit({permitId:`${risk.permitId}:${step.transactionId}`,planId:input.plan.planId,decision:risk.decision,issuedAt:risk.issuedAt,expiresAt:risk.expiresAt,reasonCodes:risk.reasonCodes,payload:{autonomous:true,transactionId:step.transactionId,chunked:true,feeLamports:fee.totalFeeLamports.toString()}});
       const latest=await input.connection.getLatestBlockhash('confirmed');step.transaction.recentBlockhash=latest.blockhash;step.transaction.lastValidBlockHeight=latest.lastValidBlockHeight;step.transaction.feePayer=new PublicKey(input.plan.ownerAddress);const submittedAt=new Date().toISOString(),openTicket=ticket(input.plan as unknown as AutonomousPlan,input.capital,submittedAt,input.config.riskPermitTtlMs),openAuthority={phase:'P6' as const,cluster:'mainnet-beta' as const,level:'MAINNET_CANARY_OPEN' as const,liveExecution:true,canaryOnly:true,issuedAt:submittedAt,expiresAt:openTicket.expiresAt,ticketId:openTicket.ticketId,reasonCodes:['P6_AUTONOMOUS_CHUNK_FINAL_REVALIDATION',step.kind]};
       const submitted=await executeMainnetCanaryOpen({authority:openAuthority,ticket:openTicket,transactionId:step.transactionId,idempotencyKey:`${input.plan.idempotencyKey}:${step.transactionId}`,requiredSignerAddresses:step.requiredSignerAddresses,backend:input.signer,auxiliaryBackends:auxiliaryPositionSignersForOpenStep(step,input.prepared.positionSigner),envelope:step.envelope,phase5RiskDecision:risk,lease:latest,ledger:ledger(input.store),transport:createWeb3SubmissionTransport(input.connection),submittedAt});submittedAny=true;lastSignature=submitted.signature;await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SUBMITTED',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata},submitted.signature);
-      let confirmed=false;for(let attempt=0;attempt<input.config.confirmAttempts;attempt++){await new Promise(resolve=>setTimeout(resolve,input.config.confirmPollMs));const confirmation=await observeConfirmation({attemptId:`${step.transactionId}:attempt:1`,record:{transactionId:step.transactionId,signature:submitted.signature,submittedAt,blockhash:latest.blockhash,lastValidBlockHeight:latest.lastValidBlockHeight,attempt:1},transport:createWeb3SubmissionTransport(input.connection),ledger:ledger(input.store),observedAt:new Date().toISOString()});if(confirmation.status==='CONFIRMED'||confirmation.status==='FINALIZED'){confirmed=true;break;}if(confirmation.status==='FAILED'||confirmation.status==='EXPIRED')throw new Error(`LPFORGE_P6_CHUNK_CONFIRM_${confirmation.status}`);}if(!confirmed)throw new Error('LPFORGE_P6_CHUNK_CONFIRMATION_PENDING');
+      let confirmed=false;for(let attempt=0;attempt<input.config.confirmAttempts;attempt++){await new Promise(resolve=>setTimeout(resolve,input.config.confirmPollMs));const confirmation=await observeConfirmation({attemptId:`${step.transactionId}:attempt:1`,record:{transactionId:step.transactionId,signature:submitted.signature,submittedAt,blockhash:latest.blockhash,lastValidBlockHeight:latest.lastValidBlockHeight,attempt:1},transport:createWeb3SubmissionTransport(input.connection),ledger:ledger(input.store),observedAt:new Date().toISOString()});if(confirmation.status==='CONFIRMED'||confirmation.status==='FINALIZED'){confirmed=true;break;}if(confirmation.status==='FAILED'||confirmation.status==='EXPIRED')throw new Error(`LPFORGE_P6_CHUNK_CONFIRM_${confirmation.status}`);}if(!confirmed)throw new Error('LPFORGE_P6_CHUNK_CONFIRMATION_PENDING');completedSteps.push({transactionId:step.transactionId,signature:submitted.signature,estimatedFeeLamports:fee.totalFeeLamports});
     }
-    const position=await input.pool.getPosition?.(new PublicKey(input.prepared.positionSigner.publicKeyAddress));if(!position)throw new Error('LPFORGE_P6_POSITION_RECONCILIATION_MISSING');const intent=input.plan.planPayload.intent as Record<string,unknown>,funding=input.plan.intentPayload.entryFunding as Record<string,unknown>;await input.store.insertExecutionReconciliation({reconciliationId:`${input.plan.planId}:open`,planId:input.plan.planId,observedAt:new Date().toISOString(),status:'MATCH',expected:{owner:input.plan.ownerAddress,pool:input.plan.poolAddress,lowerBinId:input.lower,upperBinId:input.upper},actual:{positionAddress:input.prepared.positionSigner.publicKeyAddress},discrepancies:[],payload:{signature:lastSignature,autonomous:true,chunked:true}});await input.store.upsertOwnedPosition({lpforgePositionId:`position-${input.prepared.positionSigner.publicKeyAddress}`,poolAddress:input.plan.poolAddress,positionAddress:input.prepared.positionSigner.publicKeyAddress,ownerAddress:input.plan.ownerAddress,strategy:String(intent.strategy??'SPOT'),orientation:String(funding.orientation??'ONE_SIDED_Y'),lowerBinId:input.lower,upperBinId:input.upper,activeBinAtEntry:Number(intent.activeBinId??input.lower),initialCapitalLamports:input.capital,entryPlanId:input.plan.planId,entrySignature:lastSignature,enteredAt:new Date().toISOString(),lifecycleState:'OPEN',lastPlanId:input.plan.planId,reconciliationStatus:'MATCH',payload:{thesisId:input.plan.thesisId,entryFunding:funding,chunked:true}});await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'RECONCILED',at:new Date().toISOString(),payload:{signature:lastSignature,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true}});return{status:'RECONCILED',planId:input.plan.planId,reasonCodes:[],transactionSubmitted:true};
+    const position=await input.pool.getPosition?.(new PublicKey(input.prepared.positionSigner.publicKeyAddress));if(!position)throw new Error('LPFORGE_P6_POSITION_RECONCILIATION_MISSING');const intent=input.plan.planPayload.intent as Record<string,unknown>,funding=input.plan.intentPayload.entryFunding as Record<string,unknown>;await input.store.insertExecutionReconciliation({reconciliationId:`${input.plan.planId}:open`,planId:input.plan.planId,observedAt:new Date().toISOString(),status:'MATCH',expected:{owner:input.plan.ownerAddress,pool:input.plan.poolAddress,lowerBinId:input.lower,upperBinId:input.upper},actual:{positionAddress:input.prepared.positionSigner.publicKeyAddress},discrepancies:[],payload:{signature:lastSignature,autonomous:true,chunked:true}});await input.store.upsertOwnedPosition({lpforgePositionId:`position-${input.prepared.positionSigner.publicKeyAddress}`,poolAddress:input.plan.poolAddress,positionAddress:input.prepared.positionSigner.publicKeyAddress,ownerAddress:input.plan.ownerAddress,strategy:String(intent.strategy??'SPOT'),orientation:String(funding.orientation??'ONE_SIDED_Y'),lowerBinId:input.lower,upperBinId:input.upper,activeBinAtEntry:Number(intent.activeBinId??input.lower),initialCapitalLamports:input.capital,entryPlanId:input.plan.planId,entrySignature:lastSignature,enteredAt:new Date().toISOString(),lifecycleState:'OPEN',lastPlanId:input.plan.planId,reconciliationStatus:'MATCH',payload:{thesisId:input.plan.thesisId,entryFunding:funding,chunked:true}});const positionAccount=await input.connection.getAccountInfo(new PublicKey(input.prepared.positionSigner.publicKeyAddress),'confirmed');await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:open-contribution`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'OPEN_CONTRIBUTION',observedAt:new Date().toISOString(),lamports:input.capital,payload:{signature:lastSignature,source:'RECONCILED_CHUNKABLE_OPEN'}});if(positionAccount?.lamports)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:rent-lock`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'RENT_LOCK',observedAt:new Date().toISOString(),lamports:BigInt(positionAccount.lamports),payload:{signature:lastSignature,recoverable:true,source:'POSITION_ACCOUNT_INFO'}});for(const child of completedSteps){const actualFee=await confirmedTransactionFeeLamports(input.connection,child.signature);await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:tx-cost:${child.transactionId}`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'TX_COST',observedAt:new Date().toISOString(),lamports:actualFee??child.estimatedFeeLamports,payload:{signature:child.signature,transactionId:child.transactionId,source:actualFee===undefined?'EXECUTION_FEE_ESTIMATE':'CHAIN_RECEIPT_META',...(actualFee===undefined?{estimatedLamports:child.estimatedFeeLamports.toString()}:{})}});}await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'RECONCILED',at:new Date().toISOString(),payload:{signature:lastSignature,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true}});return{status:'RECONCILED',planId:input.plan.planId,reasonCodes:[],transactionSubmitted:true};
   }catch(error){const reason=error instanceof Error?error.message:'LPFORGE_P6_CHUNKABLE_OPEN_UNKNOWN';if(submittedAny){await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECONCILIATION_REQUIRED',at:new Date().toISOString(),reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',reason],payload:{stage:'CHUNKABLE_OPEN',error:reason,positionAddress:input.prepared.positionSigner.publicKeyAddress,lastSignature}});return{status:'UNKNOWN',planId:input.plan.planId,reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',reason],transactionSubmitted:true};}await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'BLOCKED',at:new Date().toISOString(),payload:{stage:'CHUNKABLE_OPEN',error:reason}});return{status:'BLOCKED',planId:input.plan.planId,reasonCodes:[reason],transactionSubmitted:false};}
 }
 /** Executes one already-claimed plan. A caller must claim from storage before calling this function. */
@@ -817,6 +817,8 @@ export async function executeAutonomousOpen(input: {
         const positionAccount=await connection.getAccountInfo(new PublicKey(prepared.positionSigner.publicKeyAddress),'confirmed');
         await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:open-contribution`,positionAddress:prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'OPEN_CONTRIBUTION',observedAt:new Date().toISOString(),lamports:fields.capital,payload:{signature:submitted.signature,source:'RECONCILED_OPEN'}});
         if(positionAccount?.lamports)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:rent-lock`,positionAddress:prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'RENT_LOCK',observedAt:new Date().toISOString(),lamports:BigInt(positionAccount.lamports),payload:{signature:submitted.signature,recoverable:true,source:'POSITION_ACCOUNT_INFO'}});
+        const actualOpenFee=await confirmedTransactionFeeLamports(connection,submitted.signature);
+        await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:tx-cost:${input.plan.transactionId}`,positionAddress:prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'TX_COST',observedAt:new Date().toISOString(),lamports:actualOpenFee??fee.totalFeeLamports,payload:{signature:submitted.signature,transactionId:input.plan.transactionId,source:actualOpenFee===undefined?'EXECUTION_FEE_ESTIMATE':'CHAIN_RECEIPT_META',...(actualOpenFee===undefined?{estimatedLamports:fee.totalFeeLamports.toString()}:{})}});
         if (input.plan.swapTransactionId)
           await input.store.upsertPartialEntryRecovery({
             planId: input.plan.planId,
@@ -1169,6 +1171,10 @@ async function executeJupiterUnwindStep(input: {
       submitted: true,
       reasonCodes: [`${input.reasonPrefix}_CONFIRMATION_PENDING`],
     };
+  if(input.plan.positionAddress){
+    const actualFee=await confirmedTransactionFeeLamports(connection,record.signature);
+    await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:tx-cost:${input.transactionId}`,positionAddress:input.plan.positionAddress,planId:input.plan.planId,flowType:'TX_COST',observedAt:new Date().toISOString(),lamports:actualFee??fee.totalFeeLamports,payload:{signature:record.signature,transactionId:input.transactionId,source:actualFee===undefined?'EXECUTION_FEE_ESTIMATE':'CHAIN_RECEIPT_META',...(actualFee===undefined?{estimatedLamports:fee.totalFeeLamports.toString()}:{})}});
+  }
   return {
     ok: true,
     submitted: true,
@@ -1562,6 +1568,16 @@ function mutationCapital(plan: AutonomousPlan) {
     throw new Error("LPFORGE_P6_MUTATION_CAPITAL_INVALID");
   }
 }
+/** Receipt metadata is the accounting authority when available.  A temporary
+ * RPC read failure never changes chain truth; the durable estimate is retained
+ * and can be refreshed idempotently on a later reconciliation pass. */
+async function confirmedTransactionFeeLamports(connection:Connection,signature:string):Promise<bigint|undefined>{
+  try{
+    const receipt=await connection.getTransaction(signature,{commitment:'confirmed',maxSupportedTransactionVersion:0});
+    const fee=receipt?.meta?.fee;
+    return typeof fee==='number'&&Number.isSafeInteger(fee)&&fee>=0?BigInt(fee):undefined;
+  }catch{return undefined;}
+}
 function mutationRange(
   plan: AutonomousPlan,
   fallback?: Record<string, unknown>,
@@ -1857,8 +1873,10 @@ async function executeMeteoraMutation(input: {
     // including deferred CLOSE-settlement children. It is durable economic
     // evidence, not an excuse to send a transaction; a write failure here is
     // post-submit reconciliation debt.
-    if (input.plan.positionAddress)
-      await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:tx-cost:${transactionId}`,positionAddress:input.plan.positionAddress,planId:input.plan.planId,flowType:'TX_COST',observedAt:new Date().toISOString(),lamports:fee.totalFeeLamports,payload:{signature:submitted.signature,transactionId,source:'EXECUTION_FEE_ESTIMATE'}});
+    if (input.plan.positionAddress){
+      const actualFee=await confirmedTransactionFeeLamports(connection,submitted.signature);
+      await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:tx-cost:${transactionId}`,positionAddress:input.plan.positionAddress,planId:input.plan.planId,flowType:'TX_COST',observedAt:new Date().toISOString(),lamports:actualFee??fee.totalFeeLamports,payload:{signature:submitted.signature,transactionId,source:actualFee===undefined?'EXECUTION_FEE_ESTIMATE':'CHAIN_RECEIPT_META',...(actualFee===undefined?{estimatedLamports:fee.totalFeeLamports.toString()}:{})}});
+    }
     if(input.afterConfirmed)await input.afterConfirmed({signature:submitted.signature,estimatedFeeLamports:fee.totalFeeLamports});
     if (input.deferCompletion)
       return {
@@ -2438,21 +2456,9 @@ async function executeCloseSettlement(input: {
     attributableTokenX =
       tokenXAfter > tokenXBefore ? tokenXAfter - tokenXBefore : 0n;
     attributableTokenY=tokenYAfter>tokenYBefore?tokenYAfter-tokenYBefore:0n;
-    if (attributableTokenX > 0n)
-      await input.store.insertPositionCashflow({
-        cashflowId: `${input.plan.planId}:close-token-x`,
-        positionAddress: input.positionAddress,
-        planId: input.plan.planId,
-        flowType: "CLOSE_WITHDRAWAL",
-        observedAt: new Date().toISOString(),
-        tokenMint: poolFact.tokenXMint,
-        tokenAmountRaw: attributableTokenX.toString(),
-        payload: {
-          source: "REMOVE_PLUS_CLAIM_DELTA",
-          tokenXBefore: tokenXBefore.toString(),
-          tokenXAfter: tokenXAfter.toString(),
-        },
-      });
+    // Do not book token-X as a realized withdrawal here: when it is unwound
+    // below, the economically realized amount is Jupiter's actual token-Y
+    // output. Recording both would overstate close PnL.
     if(attributableTokenY>0n)
       await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:close-token-y`,positionAddress:input.positionAddress,planId:input.plan.planId,flowType:"CLOSE_WITHDRAWAL",observedAt:new Date().toISOString(),tokenMint:poolFact.tokenYMint,tokenAmountRaw:attributableTokenY.toString(),payload:{source:"REMOVE_PLUS_CLAIM_DELTA",tokenYBefore:tokenYBefore.toString(),tokenYAfter:tokenYAfter.toString()}});
     await persist("CLOSE_INVENTORY_MEASURED", {
@@ -2482,7 +2488,9 @@ async function executeCloseSettlement(input: {
         transactionSubmitted: true,
       };
     }
+    let swapProceedsY=0n;
     if (attributableTokenX > 0n) {
+      const tokenYBeforeUnwind=await readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenYMint});
       const unwind = await executeJupiterUnwindStep({
         store: input.store,
         plan: input.plan,
@@ -2505,6 +2513,10 @@ async function executeCloseSettlement(input: {
         }),
       });
       if (!unwind.ok) return incomplete(unwind.reasonCodes, "CLOSE_UNWIND_PENDING");
+      const tokenYPostUnwind=await readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenYMint});
+      swapProceedsY=tokenYPostUnwind>tokenYBeforeUnwind?tokenYPostUnwind-tokenYBeforeUnwind:0n;
+      if(swapProceedsY<=0n)return incomplete(['P6_CLOSE_UNWIND_OUTPUT_MISSING'],"CLOSE_UNWIND_OUTPUT_UNKNOWN");
+      await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:close-swap-proceeds-y`,positionAddress:input.positionAddress,planId:input.plan.planId,flowType:'SWAP_PROCEEDS',observedAt:new Date().toISOString(),tokenMint:poolFact.tokenYMint,tokenAmountRaw:swapProceedsY.toString(),payload:{source:'JUPITER_WALLET_DELTA',inputMint:poolFact.tokenXMint,inputAmountRaw:attributableTokenX.toString(),tokenYBeforeUnwind:tokenYBeforeUnwind.toString(),tokenYAfterUnwind:tokenYPostUnwind.toString()}});
     }
     await persist("CLOSE_INVENTORY_UNWOUND", {
       tokenXBefore: tokenXBefore.toString(),
@@ -2512,6 +2524,7 @@ async function executeCloseSettlement(input: {
       attributableTokenX: attributableTokenX.toString(),
       attributableTokenY:attributableTokenY?.toString()??"0",
       unwindTransactionId: unwindStep.transactionId,
+      swapProceedsY:swapProceedsY.toString(),
     });
     stage = "CLOSE_INVENTORY_UNWOUND";
   }

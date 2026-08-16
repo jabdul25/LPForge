@@ -36,6 +36,24 @@ export interface PositionEconomicsSnapshot {
   executionCostUsd?:number;
   reasonCodes:string[];
 }
+/**
+ * Value only the assets that are still inside PositionV2.  Portfolio NAV adds
+ * the owner wallet independently, so it must not include claimed fees or
+ * prior withdrawals again.  Lifecycle/PnL accounting belongs in
+ * derivePositionEconomics(), which consumes the durable cashflow ledger.
+ */
+export function derivePositionMarkToMarket(input:{position:PositionV2Fact;pool:DataApiPool;observedAt:string}):{evidenceState:ExitEvidenceState;observedAt:string;currentPositionValueUsd?:number;reasonCodes:string[]}{
+  const {position,pool,observedAt}=input,x=pool.token_x,y=pool.token_y;
+  const xv=tokenUsd(position.totalXAmount,x?.decimals,x?.price),yv=tokenUsd(position.totalYAmount,y?.decimals,y?.price);
+  const fux=tokenUsd(position.feeX,x?.decimals,x?.price),fuy=tokenUsd(position.feeY,y?.decimals,y?.price);
+  const reasons:string[]=[];
+  if(xv===undefined)reasons.push('EXIT_VALUATION_TOKEN_X_UNAVAILABLE');
+  if(yv===undefined)reasons.push('EXIT_VALUATION_TOKEN_Y_UNAVAILABLE');
+  if(fux===undefined)reasons.push('EXIT_VALUATION_FEE_X_UNAVAILABLE');
+  if(fuy===undefined)reasons.push('EXIT_VALUATION_FEE_Y_UNAVAILABLE');
+  if(reasons.length)return{evidenceState:'UNAVAILABLE',observedAt,reasonCodes:reasons.sort()};
+  return{evidenceState:'AVAILABLE',observedAt,currentPositionValueUsd:xv!+yv!+fux!+fuy!,reasonCodes:['EXIT_VALUATION_POSITION_MARK_TO_MARKET']};
+}
 export interface ExitHighWaterState {peakNetReturnFraction:number;peakEconomicValueUsd?:number;peakObservedAt:string;}
 export interface LiveExitGovernorInput {
   policy:LiveExitGovernorPolicy;
@@ -88,7 +106,7 @@ export function valuePositionCashflows(input:{cashflows:readonly RealizedPositio
   const sol=tokens.find(token=>token.address==='So11111111111111111111111111111111111111112');
   let contributionsUsd=0,realizedFeeUsd=0,realizedWithdrawalUsd=0,executionCostUsd=0,complete=true,hasEconomicCashflow=false,hasRealizedFeeFlow=false;const reasons:string[]=[];
   for(const flow of input.cashflows){
-    if(!['OPEN_CONTRIBUTION','ADD_CONTRIBUTION','FEE_CLAIM','REWARD_CLAIM','REDUCE_WITHDRAWAL','CLOSE_WITHDRAWAL','SWAP_COST','TX_COST'].includes(flow.flowType))continue;
+    if(!['OPEN_CONTRIBUTION','ADD_CONTRIBUTION','FEE_CLAIM','REWARD_CLAIM','REDUCE_WITHDRAWAL','CLOSE_WITHDRAWAL','SWAP_PROCEEDS','SWAP_COST','TX_COST'].includes(flow.flowType))continue;
     hasEconomicCashflow=true;
     // Legacy reductions stored an estimated capital basis in lamports. That
     // is not a wallet realization and is never treated as PnL.
@@ -100,7 +118,7 @@ export function valuePositionCashflows(input:{cashflows:readonly RealizedPositio
     if(value===undefined||!Number.isFinite(value)){complete=false;reasons.push('EXIT_CASHFLOW_VALUE_UNAVAILABLE');continue;}
     if(flow.flowType==='OPEN_CONTRIBUTION'||flow.flowType==='ADD_CONTRIBUTION')contributionsUsd+=value;
     else if(flow.flowType==='FEE_CLAIM'||flow.flowType==='REWARD_CLAIM'){realizedFeeUsd+=value;hasRealizedFeeFlow=true;}
-    else if(flow.flowType==='REDUCE_WITHDRAWAL'||flow.flowType==='CLOSE_WITHDRAWAL')realizedWithdrawalUsd+=value;
+    else if(flow.flowType==='REDUCE_WITHDRAWAL'||flow.flowType==='CLOSE_WITHDRAWAL'||flow.flowType==='SWAP_PROCEEDS')realizedWithdrawalUsd+=value;
     else executionCostUsd+=value;
   }
   return{contributionsUsd,realizedFeeUsd,realizedWithdrawalUsd,executionCostUsd,complete,hasEconomicCashflow,hasRealizedFeeFlow,reasonCodes:[...new Set(reasons)].sort()};

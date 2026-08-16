@@ -50,6 +50,9 @@ test('worker close sequence snapshots → drains → claims → unwinds only att
   assert.match(worker,/idempotencyKey:\s*`\$\{input\.plan\.idempotencyKey\}:\$\{unwindStep\.transactionId\}`/);
   assert.match(worker,/tokenXAfter > tokenXBefore \? tokenXAfter - tokenXBefore : 0n/,'only position-attributable inventory may be unwound');
   assert.match(worker,/tokenYAfter>tokenYBefore\?tokenYAfter-tokenYBefore:0n/,'the close ledger also records the position-attributable SOL-side withdrawal');
+  assert.match(worker,/flowType:'SWAP_PROCEEDS'/,'token-X close inventory is represented by its actual SOL-side Jupiter output, not a second marked token-X withdrawal');
+  assert.match(worker,/source:'JUPITER_WALLET_DELTA'/,'swap proceeds come from wallet-delta chain truth');
+  assert.match(worker,/confirmedTransactionFeeLamports/,'cashflow costs prefer confirmed receipt metadata over an estimate');
   assert.match(worker,/P6_CLOSE_TOKEN_X_RESIDUAL/,'a failed residual-inventory verification becomes reconciliation debt');
   // The drain and claim phases must defer completion: a death between phases
   // leaves a durable stage for recovery rather than marking a half-executed
@@ -60,6 +63,16 @@ test('worker close sequence snapshots → drains → claims → unwinds only att
   const verifyAt=worker.indexOf('CLOSE_CHAIN_VERIFIED');
   const stillPresentAt=worker.indexOf('P6_CLOSE_POSITION_STILL_PRESENT');
   assert.ok(verifyAt>=0&&stillPresentAt>verifyAt,'confirmed close must verify the position vanished');
+});
+
+test('chunkable 71–100-bin opens establish the same contribution, rent, and receipt-fee ledger as one-shot opens',()=>{
+  const worker=fs.readFileSync('packages/phase6-live-worker/src/index.ts','utf8');
+  const chunkAt=worker.indexOf('async function executeChunkableAutonomousOpen');
+  const chunk=worker.slice(chunkAt,worker.indexOf('/** Executes one already-claimed plan',chunkAt));
+  assert.match(chunk,/flowType:'OPEN_CONTRIBUTION'/);
+  assert.match(chunk,/flowType:'RENT_LOCK'/);
+  assert.match(chunk,/flowType:'TX_COST'/);
+  assert.match(chunk,/completedSteps\.push/,'every confirmed SDK chunk contributes a durable receipt-cost record');
 });
 
 test('a confirmed REDUCE rebases the owned cost basis with an audit trail',()=>{
