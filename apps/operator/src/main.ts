@@ -340,6 +340,7 @@ async function observeAndPlanOwnedPositions(input: {
       activeBinId,
       exitDecision,
       ...(claimExpectedValueLamports!==undefined?{claimExpectedValueLamports}:{}),
+      ...(typeof currentForwardEv==='number'?{currentForwardEv}:{}),
     });
     const managementContext = assessLiveManagementContext({
       positionPoolAddress: position.poolAddress,

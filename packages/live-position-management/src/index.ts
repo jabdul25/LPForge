@@ -140,6 +140,7 @@ export function decideLivePositionManagement(input: {
   activeBinId: number;
   exitDecision?: LiveExitGovernorDecision;
   claimExpectedValueLamports?: bigint | undefined;
+  currentForwardEv?: number | undefined;
 }): LivePositionManagementDecision {
   const { policy, owned, position, activeBinId } = input;
   if (!policy.enabled)
@@ -164,6 +165,8 @@ export function decideLivePositionManagement(input: {
     return { action, reasonCodes: input.exitDecision.reasonCodes };
   }
   if (activeBinId < position.lowerBinId || activeBinId > position.upperBinId) {
+    if(input.currentForwardEv===undefined||!Number.isFinite(input.currentForwardEv))return{action:"HOLD",reasonCodes:["POSITION_OOR_FORWARD_EV_UNAVAILABLE"]};
+    if(input.currentForwardEv<=0)return{action:"CLOSE",reasonCodes:["POSITION_OOR_FORWARD_EV_NON_POSITIVE"]};
     if (policy.outOfRangeAction === "HOLD")
       return {
         action: "HOLD",
