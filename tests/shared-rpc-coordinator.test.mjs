@@ -24,7 +24,7 @@ test('SDK governed fetch uses the same priority coordinator',async()=>{
 });
 
 test('production RPC constructors use governed connections and priority lanes',async()=>{
-  const files=['packages/phase6-live-worker/src/index.ts','packages/phase7-production-service/src/index.ts','apps/execution/src/main.ts','apps/operator/src/main.ts'];
+  const files=['packages/meteora-execution/src/index.ts','packages/phase6-live-worker/src/index.ts','packages/phase7-production-service/src/index.ts','apps/execution/src/main.ts','apps/operator/src/main.ts'];
   for(const file of files){const source=await readFile(new URL(`../${file}`,import.meta.url),'utf8');assert.doesNotMatch(source,/new Connection\(/,file);}
   const meteora=await readFile(new URL('../packages/meteora/src/index.ts',import.meta.url),'utf8');
   assert.match(meteora,/createGovernedRpcFetch/);assert.match(meteora,/acquire_rpc_permit/);

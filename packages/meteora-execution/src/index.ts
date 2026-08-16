@@ -1,4 +1,5 @@
 // LPFORGE_PHASE5_EXECUTION_MODULE
+import {createGovernedConnection} from '../../meteora/src/index.js';
 export type OpaqueTransaction = object;
 export interface OpenBuildRequest {userAddress:string;positionAddress:string;totalXAmount:string|bigint;totalYAmount:string|bigint;lowerBinId:number;upperBinId:number;strategy:'SPOT'|'CURVE'|'BID_ASK';maxPositionWidthBins?:number;/** Explicit policy cap passed to the Meteora SDK as a percent. */liquiditySlippageBps:number;}
 export interface AddBuildRequest extends Omit<OpenBuildRequest,'liquiditySlippageBps'> {}
@@ -52,13 +53,13 @@ function sdkSlippagePercent(bps:number){if(!Number.isInteger(bps)||bps<1||bps>10
 export async function createLiveMeteoraOpenPool(input:{rpcUrl:string;poolAddress:string;programId:string}):Promise<MeteoraOpenAddPoolLike>{
   if(!input.rpcUrl.trim()||!input.poolAddress.trim()||!input.programId.trim())throw new Error('LPFORGE_METEORA_LIVE_POOL_CONFIG_REQUIRED');
   const sdk=await loadMeteoraExecutionRuntime();
-  return sdk.DLMM.create(new sdk.Connection(input.rpcUrl.trim(),'confirmed'),new sdk.PublicKey(input.poolAddress.trim()),{cluster:'mainnet-beta',programId:new sdk.PublicKey(input.programId.trim())});
+  return sdk.DLMM.create(createGovernedConnection({rpcUrl:input.rpcUrl.trim(),priority:'P0_EXECUTION_CRITICAL'}),new sdk.PublicKey(input.poolAddress.trim()),{cluster:'mainnet-beta',programId:new sdk.PublicKey(input.programId.trim())});
 }
 /** Refuses an open before the SDK can create any missing bin-array account.
  * PositionV2 rent remains a refundable wallet requirement and is handled by
  * the execution preflight, never by opportunity economics. */
 export async function assertPreinitializedMeteoraBinArrays(input:{rpcUrl:string;poolAddress:string;programId:string;lowerBinId:number;upperBinId:number}):Promise<{binArrayAddresses:string[]}>{
-  validateRange(input.lowerBinId,input.upperBinId,METEORA_PROTOCOL_MAX_POSITION_WIDTH_BINS);const sdk=await loadMeteoraExecutionRuntime(),connection=new sdk.Connection(input.rpcUrl.trim(),'confirmed') as unknown as {getMultipleAccountsInfo(keys:unknown[],commitment:'confirmed'):Promise<Array<unknown|null>>},keys=sdk.getBinArrayKeysCoverage(new sdk.BN(input.lowerBinId),new sdk.BN(input.upperBinId),new sdk.PublicKey(input.poolAddress),new sdk.PublicKey(input.programId)),accounts=await connection.getMultipleAccountsInfo(keys,'confirmed'),missing=keys.filter((_,index)=>!accounts[index]);if(missing.length)throw new Error(`LPFORGE_METEORA_BIN_ARRAY_INITIALIZATION_RENT_REQUIRED:${missing.map(key=>key.toBase58()).join(',')}`);return{binArrayAddresses:keys.map(key=>key.toBase58())};
+  validateRange(input.lowerBinId,input.upperBinId,METEORA_PROTOCOL_MAX_POSITION_WIDTH_BINS);const sdk=await loadMeteoraExecutionRuntime(),connection=createGovernedConnection({rpcUrl:input.rpcUrl.trim(),priority:'P0_EXECUTION_CRITICAL'}) as unknown as {getMultipleAccountsInfo(keys:unknown[],commitment:'confirmed'):Promise<Array<unknown|null>>},keys=sdk.getBinArrayKeysCoverage(new sdk.BN(input.lowerBinId),new sdk.BN(input.upperBinId),new sdk.PublicKey(input.poolAddress),new sdk.PublicKey(input.programId)),accounts=await connection.getMultipleAccountsInfo(keys,'confirmed'),missing=keys.filter((_,index)=>!accounts[index]);if(missing.length)throw new Error(`LPFORGE_METEORA_BIN_ARRAY_INITIALIZATION_RENT_REQUIRED:${missing.map(key=>key.toBase58()).join(',')}`);return{binArrayAddresses:keys.map(key=>key.toBase58())};
 }
 export interface MeteoraStrategyDistribution {strategy:'SPOT'|'CURVE'|'BID_ASK';activeBinId:number;lowerBinId:number;upperBinId:number;bins:Array<{binId:number;xAmountBps:number;yAmountBps:number}>;sdkVersion:string;}
 export async function calculateMeteoraStrategyDistribution(input:{strategy:'SPOT'|'CURVE'|'BID_ASK';activeBinId:number;lowerBinId:number;upperBinId:number}):Promise<MeteoraStrategyDistribution>{
