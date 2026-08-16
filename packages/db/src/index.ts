@@ -81,7 +81,24 @@ export interface AutonomousPlan {
   steps: AutonomousPlanStep[];
 }
 export interface ExecutionCapitalReservationRequest {planId:string;ownerAddress:string;poolAddress:string;capitalLamports:bigint;walletLamports:bigint;reserveLamports:bigint;maxPortfolioLamports:bigint;maxPoolLamports:bigint;maxTokenLamports:bigint;maxInitialPositionLamports:bigint;now:string;}
-export interface ExecutionCapitalReservationResult {approved:boolean;reasonCodes:string[];tokenMint?:string;deployedLamports:bigint;reservedLamports:bigint;availableLamports:bigint;}
+export interface ExecutionCapitalReservationDiagnostics {walletBalanceLamports:bigint;walletReserveLamports:bigint;pendingCashReservationLamports:bigint;walletDeployableLamports:bigint;deployedPortfolioLamports:bigint;reservedPortfolioLamports:bigint;requestedLamports:bigint;projectedPortfolioLamports:bigint;poolCurrentLamports:bigint;poolReservedLamports:bigint;poolProjectedLamports:bigint;poolLimitLamports:bigint;tokenCurrentLamports:bigint;tokenReservedLamports:bigint;tokenProjectedLamports:bigint;tokenLimitLamports:bigint;}
+export interface ExecutionCapitalReservationResult {approved:boolean;reasonCodes:string[];tokenMint?:string;deployedLamports:bigint;reservedLamports:bigint;availableLamports:bigint;diagnostics?:ExecutionCapitalReservationDiagnostics;}
+export function assessExecutionCapitalReservation(input:{request:ExecutionCapitalReservationRequest;tokenMint?:string;deployedLamports:bigint;reservedLamports:bigint;poolDeployedLamports:bigint;poolReservedLamports:bigint;tokenDeployedLamports:bigint;tokenReservedLamports:bigint;}):{approved:boolean;reasonCodes:string[];diagnostics:ExecutionCapitalReservationDiagnostics}{
+  const v=input.request,zero=0n,clamp=(value:bigint)=>value>zero?value:zero;
+  // The wallet balance is current chain cash, so deployed LP capital has
+  // already left it. Deployed exposure belongs exclusively to the portfolio
+  // constraint below and must never reduce wallet liquidity a second time.
+  const walletDeployable=clamp(v.walletLamports-v.reserveLamports-input.reservedLamports),projectedPortfolio=input.deployedLamports+input.reservedLamports+v.capitalLamports,poolProjected=input.poolDeployedLamports+input.poolReservedLamports+v.capitalLamports,tokenProjected=input.tokenDeployedLamports+input.tokenReservedLamports+v.capitalLamports;
+  const diagnostics:ExecutionCapitalReservationDiagnostics={walletBalanceLamports:v.walletLamports,walletReserveLamports:v.reserveLamports,pendingCashReservationLamports:input.reservedLamports,walletDeployableLamports:walletDeployable,deployedPortfolioLamports:input.deployedLamports,reservedPortfolioLamports:input.reservedLamports,requestedLamports:v.capitalLamports,projectedPortfolioLamports:projectedPortfolio,poolCurrentLamports:input.poolDeployedLamports,poolReservedLamports:input.poolReservedLamports,poolProjectedLamports:poolProjected,poolLimitLamports:v.maxPoolLamports,tokenCurrentLamports:input.tokenDeployedLamports,tokenReservedLamports:input.tokenReservedLamports,tokenProjectedLamports:tokenProjected,tokenLimitLamports:v.maxTokenLamports};
+  const reasons:string[]=[];
+  if(!input.tokenMint)reasons.push('P6_CAPITAL_POOL_TOKEN_MISSING');
+  if(v.capitalLamports>v.maxInitialPositionLamports)reasons.push('P6_CAPITAL_MAX_INITIAL_POSITION');
+  if(v.capitalLamports>walletDeployable)reasons.push('P6_CAPITAL_WALLET_OR_PORTFOLIO_LIMIT','P6_CAPITAL_WALLET_RESERVE_LIMIT');
+  if(projectedPortfolio>v.maxPortfolioLamports)reasons.push('P6_CAPITAL_PORTFOLIO_LIMIT');
+  if(poolProjected>v.maxPoolLamports)reasons.push('P6_CAPITAL_POOL_LIMIT');
+  if(tokenProjected>v.maxTokenLamports)reasons.push('P6_CAPITAL_TOKEN_LIMIT');
+  return{approved:reasons.length===0,reasonCodes:[...new Set(reasons)].sort(),diagnostics};
+}
 export interface Phase1Store {
   health(): Promise<boolean>;
   close(): Promise<void>;
@@ -1695,20 +1712,14 @@ export async function createPostgresStore(
         // token X is the paired/risky asset used for concentration accounting.
         const tokenRow=await tx.query("SELECT token_x_mint FROM protocol.pools WHERE address=$1",[v.poolAddress]);
         const tokenMint=tokenRow.rows[0]?.token_x_mint?String(tokenRow.rows[0].token_x_mint):undefined;
-        const reasons:string[]=[]; if(!tokenMint) reasons.push('P6_CAPITAL_POOL_TOKEN_MISSING');
         const positions=await tx.query("SELECT COALESCE(sum(initial_capital_lamports),0)::text AS deployed,COALESCE(sum(initial_capital_lamports) FILTER (WHERE pool_address=$2),0)::text AS pool_deployed,COALESCE(sum(initial_capital_lamports) FILTER (WHERE p.token_x_mint=$3),0)::text AS token_deployed FROM execution.owned_positions o JOIN protocol.pools p ON p.address=o.pool_address WHERE o.owner_address=$1 AND o.lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN')",[v.ownerAddress,v.poolAddress,tokenMint??'']);
         const reservations=await tx.query("SELECT COALESCE(sum(capital_lamports),0)::text AS reserved,COALESCE(sum(capital_lamports) FILTER (WHERE pool_address=$2),0)::text AS pool_reserved,COALESCE(sum(capital_lamports) FILTER (WHERE token_mint=$3),0)::text AS token_reserved FROM execution.capital_reservations WHERE owner_address=$1 AND state IN ('RESERVED','SUBMITTED')",[v.ownerAddress,v.poolAddress,tokenMint??'']);
         const q=(row:Record<string,unknown>,key:string)=>BigInt(String(row[key]??'0'));
         const deployed=q(positions.rows[0]??{},'deployed'),poolDeployed=q(positions.rows[0]??{},'pool_deployed'),tokenDeployed=q(positions.rows[0]??{},'token_deployed'),reserved=q(reservations.rows[0]??{},'reserved'),poolReserved=q(reservations.rows[0]??{},'pool_reserved'),tokenReserved=q(reservations.rows[0]??{},'token_reserved');
-        const available=v.walletLamports-v.reserveLamports-deployed-reserved;
-        if(v.capitalLamports>v.maxInitialPositionLamports)reasons.push('P6_CAPITAL_MAX_INITIAL_POSITION');
-        if(v.capitalLamports>available)reasons.push('P6_CAPITAL_WALLET_OR_PORTFOLIO_LIMIT');
-        if(deployed+reserved+v.capitalLamports>v.maxPortfolioLamports)reasons.push('P6_CAPITAL_PORTFOLIO_LIMIT');
-        if(poolDeployed+poolReserved+v.capitalLamports>v.maxPoolLamports)reasons.push('P6_CAPITAL_POOL_LIMIT');
-        if(tokenDeployed+tokenReserved+v.capitalLamports>v.maxTokenLamports)reasons.push('P6_CAPITAL_TOKEN_LIMIT');
-        if(reasons.length){await tx.query('COMMIT');return{approved:false,reasonCodes:reasons.sort(),...(tokenMint?{tokenMint}:{}),deployedLamports:deployed,reservedLamports:reserved,availableLamports:available>0n?available:0n};}
-        await tx.query("INSERT INTO execution.capital_reservations(plan_id,owner_address,pool_address,token_mint,capital_lamports,state,reserved_at,updated_at,reason_codes,payload) VALUES($1,$2,$3,$4,$5,'RESERVED',$6,$6,'[]'::jsonb,'{}'::jsonb) ON CONFLICT(plan_id) DO UPDATE SET state='RESERVED',updated_at=EXCLUDED.updated_at,reason_codes='[]'::jsonb",[v.planId,v.ownerAddress,v.poolAddress,tokenMint,v.capitalLamports.toString(),v.now]);
-        await tx.query('COMMIT');return{approved:true,reasonCodes:['P6_CAPITAL_RESERVED'],...(tokenMint?{tokenMint}:{}),deployedLamports:deployed,reservedLamports:reserved+v.capitalLamports,availableLamports:available-v.capitalLamports};
+        const assessment=assessExecutionCapitalReservation({request:v,...(tokenMint?{tokenMint}:{}),deployedLamports:deployed,reservedLamports:reserved,poolDeployedLamports:poolDeployed,poolReservedLamports:poolReserved,tokenDeployedLamports:tokenDeployed,tokenReservedLamports:tokenReserved}),available=assessment.diagnostics.walletDeployableLamports;
+        if(!assessment.approved){await tx.query('COMMIT');return{approved:false,reasonCodes:assessment.reasonCodes,...(tokenMint?{tokenMint}:{}),deployedLamports:deployed,reservedLamports:reserved,availableLamports:available,diagnostics:assessment.diagnostics};}
+        await tx.query("INSERT INTO execution.capital_reservations(plan_id,owner_address,pool_address,token_mint,capital_lamports,state,reserved_at,updated_at,reason_codes,payload) VALUES($1,$2,$3,$4,$5,'RESERVED',$6,$6,$7::jsonb,$8::jsonb) ON CONFLICT(plan_id) DO UPDATE SET state='RESERVED',updated_at=EXCLUDED.updated_at,reason_codes=EXCLUDED.reason_codes,payload=EXCLUDED.payload",[v.planId,v.ownerAddress,v.poolAddress,tokenMint,v.capitalLamports.toString(),v.now,json(['P6_CAPITAL_RESERVED']),json({capitalReservation:assessment.diagnostics})]);
+        await tx.query('COMMIT');return{approved:true,reasonCodes:['P6_CAPITAL_RESERVED'],...(tokenMint?{tokenMint}:{}),deployedLamports:deployed,reservedLamports:reserved+v.capitalLamports,availableLamports:available-v.capitalLamports,diagnostics:assessment.diagnostics};
       } catch(error) {try{await tx.query('ROLLBACK');}catch{} throw error;}
     },
     async releaseExecutionCapital(planId,at,reasonCodes){await db.query("UPDATE execution.capital_reservations SET state='RELEASED',updated_at=$2,reason_codes=$3::jsonb WHERE plan_id=$1 AND state IN ('RESERVED','SUBMITTED')",[planId,at,json(reasonCodes)]);},
