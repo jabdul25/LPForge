@@ -18,6 +18,7 @@ git archive --format=tar "$sha" | tar \
   --exclude='SOURCE_REVISION.txt' \
   --exclude='SHA256SUMS.txt' \
   --exclude='SOURCE_GIT.bundle' \
+  --exclude='PHASE7_RUNTIME_RELEASE_EVIDENCE.json' \
   --exclude='SECURITY_SANITIZATION.txt' \
   --exclude='SECURITY_SANITIZATION.json' \
   -xf - -C "$stage"
