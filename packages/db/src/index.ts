@@ -99,6 +99,65 @@ export function assessExecutionCapitalReservation(input:{request:ExecutionCapita
   if(tokenProjected>v.maxTokenLamports)reasons.push('P6_CAPITAL_TOKEN_LIMIT');
   return{approved:reasons.length===0,reasonCodes:[...new Set(reasons)].sort(),diagnostics};
 }
+export type PositionInventoryLotSide = "X" | "Y";
+export type PositionInventoryLotSource =
+  | "OPEN_RESIDUAL"
+  | "FEE_CLAIM"
+  | "REDUCE_WITHDRAWAL"
+  | "CLOSE_WITHDRAWAL"
+  | "RECOVERY_RESIDUAL"
+  | "RESHAPE_SETTLEMENT";
+export type PositionInventoryLotStatus =
+  | "OPEN"
+  | "PARTIALLY_SETTLED"
+  | "SETTLED"
+  | "TRANSFERRED";
+export type PositionInventoryLotEventType =
+  | "CREATED"
+  | "SETTLED"
+  | "TRANSFERRED";
+export interface PositionInventoryLot {
+  lotId:string;
+  positionAddress:string;
+  planId:string;
+  ownerAddress:string;
+  poolAddress:string;
+  tokenMint:string;
+  tokenSide:PositionInventoryLotSide;
+  sourceEvent:PositionInventoryLotSource;
+  sourceCashflowId?:string;
+  rawAmount:bigint;
+  remainingRawAmount:bigint;
+  decimals:number;
+  acquiredAt:string;
+  status:PositionInventoryLotStatus;
+  payload:Record<string,unknown>;
+}
+export interface PositionInventoryLotEvent {
+  eventId:string;
+  lotId:string;
+  planId?:string;
+  eventType:PositionInventoryLotEventType;
+  rawAmount:bigint;
+  remainingRawAmount:bigint;
+  observedAt:string;
+  transactionSignature?:string;
+  payload:Record<string,unknown>;
+}
+/**
+ * The balance projection is deliberately independent of wallet balances.
+ * Wallet truth says what an owner holds; inventory lots say which portion is
+ * economically attributable to one LPForge position.
+ */
+export function attributedPositionInventoryRaw(lots:ReadonlyArray<Pick<PositionInventoryLot,"positionAddress"|"tokenMint"|"remainingRawAmount">>,positionAddress:string,tokenMint?:string):bigint{
+  return lots.reduce((total,lot)=>total+(lot.positionAddress===positionAddress&&(!tokenMint||lot.tokenMint===tokenMint)?lot.remainingRawAmount:0n),0n);
+}
+export function settlePositionInventoryLotBalance(input:{remainingRawAmount:bigint;settledRawAmount:bigint;eventType:"SETTLED"|"TRANSFERRED"}):{remainingRawAmount:bigint;status:PositionInventoryLotStatus}{
+  if(input.settledRawAmount<=0n)throw new Error("LPFORGE_INVENTORY_SETTLEMENT_AMOUNT_INVALID");
+  if(input.settledRawAmount>input.remainingRawAmount)throw new Error("LPFORGE_INVENTORY_SETTLEMENT_EXCEEDS_LOT");
+  const remainingRawAmount=input.remainingRawAmount-input.settledRawAmount;
+  return{remainingRawAmount,status:remainingRawAmount===0n?input.eventType:"PARTIALLY_SETTLED"};
+}
 export interface Phase1Store {
   health(): Promise<boolean>;
   close(): Promise<void>;
@@ -525,6 +584,9 @@ export interface Phase1Store {
   }): Promise<void>;
   insertPositionCashflow(value:{cashflowId:string;positionAddress:string;planId:string;flowType:'OPEN_CONTRIBUTION'|'ADD_CONTRIBUTION'|'FEE_CLAIM'|'REWARD_CLAIM'|'REDUCE_WITHDRAWAL'|'CLOSE_WITHDRAWAL'|'SWAP_PROCEEDS'|'SWAP_COST'|'TX_COST'|'RENT_LOCK'|'RENT_RECOVERY';observedAt:string;lamports?:bigint;tokenMint?:string;tokenAmountRaw?:string;payload:Record<string,unknown>}):Promise<void>;
   loadPositionCashflows(positionAddress:string):Promise<Array<{flowType:string;lamports?:bigint;tokenMint?:string;tokenAmountRaw?:string;payload?:Record<string,unknown>}>>;
+  createPositionInventoryLot(value:Omit<PositionInventoryLot,"remainingRawAmount"|"status">&{createdEventId:string;transactionSignature?:string}):Promise<void>;
+  settlePositionInventoryLot(value:{eventId:string;lotId:string;planId?:string;eventType:"SETTLED"|"TRANSFERRED";settledRawAmount:bigint;observedAt:string;transactionSignature?:string;payload:Record<string,unknown>}):Promise<{remainingRawAmount:bigint;status:PositionInventoryLotStatus}>;
+  loadPositionInventoryLots(positionAddress:string,tokenMint?:string):Promise<PositionInventoryLot[]>;
   upsertPartialEntryRecovery(value: {
     planId: string;
     poolAddress: string;
@@ -1896,6 +1958,42 @@ export async function createPostgresStore(
     },
     async insertPositionCashflow(v){await db.query("INSERT INTO execution.position_cashflows(cashflow_id,position_address,plan_id,flow_type,observed_at,lamports,token_mint,token_amount_raw,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) ON CONFLICT(cashflow_id) DO UPDATE SET lamports=EXCLUDED.lamports,token_mint=EXCLUDED.token_mint,token_amount_raw=EXCLUDED.token_amount_raw,payload=EXCLUDED.payload",[v.cashflowId,v.positionAddress,v.planId,v.flowType,v.observedAt,v.lamports?.toString()??null,v.tokenMint??null,v.tokenAmountRaw??null,json(v.payload)]);},
     async loadPositionCashflows(positionAddress){const r=await db.query("SELECT flow_type,lamports,token_mint,token_amount_raw,payload FROM execution.position_cashflows WHERE position_address=$1 ORDER BY observed_at ASC,cashflow_id ASC",[positionAddress]);return r.rows.map(row=>({flowType:String(row.flow_type),...(row.lamports!==null&&row.lamports!==undefined?{lamports:BigInt(String(row.lamports))}:{}),...(row.token_mint?{tokenMint:String(row.token_mint)}:{}),...(row.token_amount_raw?{tokenAmountRaw:String(row.token_amount_raw)}:{}),...(row.payload&&typeof row.payload==='object'?{payload:row.payload as Record<string,unknown>}:{})}));},
+    async createPositionInventoryLot(v){
+      const tx=db;
+      try{
+        await tx.query("BEGIN");
+        const existing=await tx.query("SELECT position_address,plan_id,token_mint,raw_amount FROM execution.position_inventory_lots WHERE lot_id=$1 FOR UPDATE",[v.lotId]);
+        if(existing.rows[0]){
+          const row=existing.rows[0];
+          if(String(row.position_address)!==v.positionAddress||String(row.plan_id)!==v.planId||String(row.token_mint)!==v.tokenMint||BigInt(String(row.raw_amount))!==v.rawAmount)throw new Error("LPFORGE_INVENTORY_LOT_ID_CONFLICT");
+          await tx.query("COMMIT");
+          return;
+        }
+        await tx.query("INSERT INTO execution.position_inventory_lots(lot_id,position_address,plan_id,owner_address,pool_address,token_mint,token_side,source_event,source_cashflow_id,raw_amount,remaining_raw_amount,decimals,acquired_at,status,payload,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10,$11,$12,'OPEN',$13::jsonb,$12,$12)",[v.lotId,v.positionAddress,v.planId,v.ownerAddress,v.poolAddress,v.tokenMint,v.tokenSide,v.sourceEvent,v.sourceCashflowId??null,v.rawAmount.toString(),v.decimals,v.acquiredAt,json(v.payload)]);
+        await tx.query("INSERT INTO execution.position_inventory_lot_events(event_id,lot_id,plan_id,event_type,raw_amount,remaining_raw_amount,observed_at,transaction_signature,payload) VALUES($1,$2,$3,'CREATED',$4,$4,$5,$6,$7::jsonb)",[v.createdEventId,v.lotId,v.planId,v.rawAmount.toString(),v.acquiredAt,v.transactionSignature??null,json({sourceEvent:v.sourceEvent,...v.payload})]);
+        await tx.query("COMMIT");
+      }catch(error){try{await tx.query("ROLLBACK");}catch{}throw error;}
+    },
+    async settlePositionInventoryLot(v){
+      const tx=db;
+      try{
+        await tx.query("BEGIN");
+        const priorEvent=await tx.query("SELECT 1 FROM execution.position_inventory_lot_events WHERE event_id=$1 FOR UPDATE",[v.eventId]);
+        const lot=await tx.query("SELECT remaining_raw_amount,status FROM execution.position_inventory_lots WHERE lot_id=$1 FOR UPDATE",[v.lotId]);
+        if(!lot.rows[0])throw new Error("LPFORGE_INVENTORY_LOT_NOT_FOUND");
+        const current={remainingRawAmount:BigInt(String(lot.rows[0].remaining_raw_amount)),status:String(lot.rows[0].status) as PositionInventoryLotStatus};
+        if(priorEvent.rows[0]){await tx.query("COMMIT");return current;}
+        const next=settlePositionInventoryLotBalance({remainingRawAmount:current.remainingRawAmount,settledRawAmount:v.settledRawAmount,eventType:v.eventType});
+        await tx.query("UPDATE execution.position_inventory_lots SET remaining_raw_amount=$2,status=$3,updated_at=$4 WHERE lot_id=$1",[v.lotId,next.remainingRawAmount.toString(),next.status,v.observedAt]);
+        await tx.query("INSERT INTO execution.position_inventory_lot_events(event_id,lot_id,plan_id,event_type,raw_amount,remaining_raw_amount,observed_at,transaction_signature,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)",[v.eventId,v.lotId,v.planId??null,v.eventType,v.settledRawAmount.toString(),next.remainingRawAmount.toString(),v.observedAt,v.transactionSignature??null,json(v.payload)]);
+        await tx.query("COMMIT");
+        return next;
+      }catch(error){try{await tx.query("ROLLBACK");}catch{}throw error;}
+    },
+    async loadPositionInventoryLots(positionAddress,tokenMint){
+      const r=await db.query("SELECT lot_id,position_address,plan_id,owner_address,pool_address,token_mint,token_side,source_event,source_cashflow_id,raw_amount,remaining_raw_amount,decimals,acquired_at,status,payload FROM execution.position_inventory_lots WHERE position_address=$1 AND ($2::text IS NULL OR token_mint=$2) ORDER BY acquired_at ASC,lot_id ASC",[positionAddress,tokenMint??null]);
+      return r.rows.map(row=>({lotId:String(row.lot_id),positionAddress:String(row.position_address),planId:String(row.plan_id),ownerAddress:String(row.owner_address),poolAddress:String(row.pool_address),tokenMint:String(row.token_mint),tokenSide:String(row.token_side) as PositionInventoryLotSide,sourceEvent:String(row.source_event) as PositionInventoryLotSource,...(row.source_cashflow_id?{sourceCashflowId:String(row.source_cashflow_id)}:{}),rawAmount:BigInt(String(row.raw_amount)),remainingRawAmount:BigInt(String(row.remaining_raw_amount)),decimals:Number(row.decimals),acquiredAt:toIsoTimestamp(row.acquired_at),status:String(row.status) as PositionInventoryLotStatus,payload:(row.payload??{}) as Record<string,unknown>}));
+    },
     async upsertPartialEntryRecovery(v) {
       await db.query(
         `INSERT INTO execution.partial_entry_recovery(plan_id,pool_address,owner_address,token_mint,funding_transaction_id,funding_signature,funded_at,paired_token_amount,intended_capital_lamports,intended_range,state,wallet_truth,payload,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12::jsonb,$13::jsonb,$14) ON CONFLICT(plan_id) DO UPDATE SET state=EXCLUDED.state,wallet_truth=EXCLUDED.wallet_truth,payload=EXCLUDED.payload,updated_at=EXCLUDED.updated_at`,
@@ -2790,6 +2888,9 @@ export function createMemoryStore(): Phase1Store {
     async adjustOwnedPositionCapital() {},
     async insertPositionCashflow() {},
     async loadPositionCashflows() { return []; },
+    async createPositionInventoryLot() {},
+    async settlePositionInventoryLot() { return {remainingRawAmount:0n,status:"SETTLED" as PositionInventoryLotStatus}; },
+    async loadPositionInventoryLots() { return []; },
     async upsertPartialEntryRecovery() {},
     async loadPartialEntryRecoveries() {
       return [];
