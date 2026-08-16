@@ -1392,6 +1392,20 @@ export async function recoverPartialEntryFunding(input: {
   for (const row of rows) {
     const planId = String(row.plan_id),
       state = String(row.state);
+    if (state === "ABORTED_SOL_SETTLED") {
+      const outcome = await input.store.createLiveEntryAbortedLearningOutcome({
+        planId,
+        at: new Date().toISOString(),
+      });
+      results.push({
+        planId,
+        action: "HOLD",
+        reasonCodes: outcome.outcome
+          ? ["P6_PARTIAL_ABORTED_SOL_SETTLED_LEARNING_RECORDED"]
+          : ["P6_PARTIAL_ABORTED_SOL_SETTLED_LEARNING_PENDING", ...outcome.reasonCodes],
+      });
+      continue;
+    }
     // A funded OPEN can finish reconciliation after an earlier failure wrote a
     // recovery row.  Reconciled chain truth wins: retaining UNWIND_REQUIRED in
     // that case would incorrectly strand the worker (or later unwind a live
@@ -2759,7 +2773,9 @@ async function executeCloseSettlement(input: {
     await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:"RECONCILIATION_REQUIRED",at:new Date().toISOString(),reasonCodes:assessment.reasonCodes,payload:{stage:"SOL_SETTLEMENT_BLOCKED",lifecycleId:settlementInput.lifecycle.lifecycleId}});
     return {status:"UNKNOWN",planId:input.plan.planId,reasonCodes:assessment.reasonCodes,transactionSubmitted:true};
   }
-  await input.store.persistLifecycleSolSettlement({assessment,input:{...settlementInput,positionAbsent:true,positionCheckedAt,positionCheckedSlot},...(process.env.LPFORGE_SOURCE_COMMIT?{sourceCommit:process.env.LPFORGE_SOURCE_COMMIT}:{}),...(process.env.LPFORGE_P7_POLICY_HASH?{policyHash:process.env.LPFORGE_P7_POLICY_HASH}:{}),migrationHead:"M0041_lifecycle_sol_settlements.sql",...(process.env.LPFORGE_BUILD_ID?{buildId:process.env.LPFORGE_BUILD_ID}:{}),at:new Date().toISOString()});
+  await input.store.persistLifecycleSolSettlement({assessment,input:{...settlementInput,positionAbsent:true,positionCheckedAt,positionCheckedSlot},...(process.env.LPFORGE_SOURCE_COMMIT?{sourceCommit:process.env.LPFORGE_SOURCE_COMMIT}:{}),...(process.env.LPFORGE_P7_POLICY_HASH?{policyHash:process.env.LPFORGE_P7_POLICY_HASH}:{}),migrationHead:"M0042_live_sol_settled_learning.sql",...(process.env.LPFORGE_BUILD_ID?{buildId:process.env.LPFORGE_BUILD_ID}:{}),at:new Date().toISOString()});
+  const outcome=await input.store.createLiveSolSettledLearningOutcome({positionAddress:input.positionAddress,at:new Date().toISOString()});
+  if(!outcome.outcome)throw new Error(`LPFORGE_LIVE_OUTCOME_MATERIALIZATION_FAILED:${outcome.reasonCodes.join(',')}`);
   return closed;
 }
 
