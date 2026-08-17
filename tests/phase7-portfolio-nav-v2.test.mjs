@@ -49,7 +49,8 @@ test('wallet token balances join the NAV through the same pool price feed',()=>{
   assert.match(src,/'POSITION_MARK_TO_MARKET_PLUS_WALLET_LIFECYCLE_V3'/, 'valuation method separates current PositionV2 value from wallet lifecycle flows');
   assert.match(src,/input\.store\.loadPositionCashflows\(positionAddress\)/,'portfolio valuation reads the durable lifecycle ledger for audit completeness');
   assert.match(src,/derivePositionMarkToMarket\(\{position,pool,observedAt:input\.now\}\)/,'position NAV excludes claimed/withdrawn amounts already represented in wallet balances');
-  assert.match(src,/positionUsdValueToSolLamports\(usd,solPriceUsd\)/,'token USD converts through the WSOL price');
+  assert.match(src,/positionUsdValueToSolLamports\(usd,valuationSolPriceUsd\)/,'token USD converts through the WSOL price after valuation coverage is established');
+  assert.match(src,/assessPortfolioValuationCoverage\(/,'a SOL-only bootstrap bypass is available only after complete portfolio coverage is proven');
   assert.match(src,/if\(!mint\|\|!amount\|\|typeof decimals!=='number'\)continue;/,'unknown or unparsable rows are skipped, not guessed');
 });
 

@@ -34,6 +34,14 @@ export function positionUsdValueToSolLamports(currentEconomicValueUsd:number,sol
   if(!Number.isFinite(currentEconomicValueUsd)||currentEconomicValueUsd<0||!Number.isFinite(solPriceUsd)||solPriceUsd<=0)throw new Error('P7_PORTFOLIO_POSITION_VALUATION_UNAVAILABLE');
   return BigInt(Math.floor(currentEconomicValueUsd/solPriceUsd*1_000_000_000));
 }
+export function assessPortfolioValuationCoverage(input:{walletBalanceLamports:bigint|undefined;walletTokenAccountCount:number;positionCount:number;inventoryLotCount:number;deployedLamports:bigint;pendingReservedLamports:bigint;pendingExecutionCount:number;unresolvedReconciliationDebt:number;poolExposureLamports:Record<string,bigint>;poolPendingLamports:Record<string,bigint>;tokenExposureLamports:Record<string,bigint>;tokenPendingLamports:Record<string,bigint>;solPriceUsd:number|undefined}){
+  if(input.walletBalanceLamports===undefined)throw new Error('P7_PORTFOLIO_WALLET_FACTS_UNAVAILABLE');
+  const allZero=(values:Record<string,bigint>)=>Object.values(values).every(value=>value===0n);
+  const solOnlyBootstrap=input.positionCount===0&&input.inventoryLotCount===0&&input.walletTokenAccountCount===0&&input.deployedLamports===0n&&input.pendingReservedLamports===0n&&input.pendingExecutionCount===0&&input.unresolvedReconciliationDebt===0&&allZero(input.poolExposureLamports)&&allZero(input.poolPendingLamports)&&allZero(input.tokenExposureLamports)&&allZero(input.tokenPendingLamports);
+  if(solOnlyBootstrap)return{mode:'SOL_ONLY_BOOTSTRAP' as const,requiresSolPrice:false};
+  if(!Number.isFinite(input.solPriceUsd)||Number(input.solPriceUsd)<=0)throw new Error('P7_PORTFOLIO_INVENTORY_VALUATION_MISSING');
+  return{mode:'CROSS_ASSET_VALUATION' as const,requiresSolPrice:true};
+}
 async function assessLivePortfolioAuthority(input:{store:Phase1Store;cfg:Phase1Config;env:NodeJS.ProcessEnv;now:string}){
   const owner=input.env.LPFORGE_OPERATOR_OWNER_ADDRESS?.trim();
   if(!owner)return{valid:false,reasonCodes:['P7_PORTFOLIO_OWNER_MISSING']};
@@ -74,14 +82,14 @@ async function assessLivePortfolioAuthority(input:{store:Phase1Store;cfg:Phase1C
     // inventory remains in NAV even when there are no open positions.
     for(const history of ownedPoolHistory)try{const pool=await api.getPool(history.poolAddress);for(const token of [pool.token_x,pool.token_y])if(token?.address&&typeof token.price==='number'&&Number.isFinite(token.price)&&token.price>0)tokenPrices.set(token.address,token.price);}catch{/* a missing historical price is excluded conservatively */}
     const solPriceUsd=tokenPrices.get(WSOL_MINT);
-    if(!solPriceUsd)throw new Error('P7_PORTFOLIO_INVENTORY_VALUATION_MISSING');
+    const coverage=assessPortfolioValuationCoverage({walletBalanceLamports:BigInt(wallet),walletTokenAccountCount:walletTokenAccounts.value.length,positionCount:positions.length,inventoryLotCount:inventoryLots.length,deployedLamports:facts.deployedLamports,pendingReservedLamports:facts.pendingReservedLamports,pendingExecutionCount:facts.pendingExecutionCount,unresolvedReconciliationDebt:facts.unresolvedReconciliationDebt,poolExposureLamports:facts.poolExposureLamports,poolPendingLamports:facts.poolPendingLamports,tokenExposureLamports:facts.tokenExposureLamports,tokenPendingLamports:facts.tokenPendingLamports,solPriceUsd}),valuationSolPriceUsd=solPriceUsd??0;
     const inventoryExposureLamports:{[mint:string]:bigint}={};
     for(const lot of inventoryLots){
       const price=tokenPrices.get(lot.tokenMint);
       if(price===undefined)throw new Error('P7_PORTFOLIO_INVENTORY_VALUATION_MISSING');
       const usd=Number(lot.remainingRawAmount)/10**lot.decimals*price;
       if(!Number.isFinite(usd)||usd<0)throw new Error('P7_PORTFOLIO_INVENTORY_VALUATION_MISSING');
-      inventoryExposureLamports[lot.tokenMint]=(inventoryExposureLamports[lot.tokenMint]??0n)+positionUsdValueToSolLamports(usd,solPriceUsd);
+      inventoryExposureLamports[lot.tokenMint]=(inventoryExposureLamports[lot.tokenMint]??0n)+positionUsdValueToSolLamports(usd,valuationSolPriceUsd);
     }
     const tokenExposureLamports={...facts.tokenExposureLamports};
     for(const [mint,lamports] of Object.entries(inventoryExposureLamports))tokenExposureLamports[mint]=(tokenExposureLamports[mint]??0n)+lamports;
@@ -94,14 +102,14 @@ async function assessLivePortfolioAuthority(input:{store:Phase1Store;cfg:Phase1C
       if(price===undefined)continue;
       const usd=Number(amount)/10**decimals*price;
       if(!Number.isFinite(usd)||usd<0)continue;
-      const lamports=positionUsdValueToSolLamports(usd,solPriceUsd);
+      const lamports=positionUsdValueToSolLamports(usd,valuationSolPriceUsd);
       walletTokenValueLamports+=lamports;
       valuedWalletTokens.push({mint,amount,usdValue:usd,lamports:lamports.toString()});
     }
     // Rent locked in open position accounts is book-value equity: it returns to
     // the operator when the position is closed.
     const rentReserveLamports=valuations.reduce((sum,value)=>sum+value.recoverableRentLamports,0n);
-    const valuationMethod='POSITION_MARK_TO_MARKET_PLUS_WALLET_LIFECYCLE_V3',priorPayload=(prior?.payload??{}) as Record<string,unknown>,dayStart=new Date(Date.UTC(new Date(input.now).getUTCFullYear(),new Date(input.now).getUTCMonth(),new Date(input.now).getUTCDate())).toISOString(),sameDay=Boolean(prior&&new Date(String(prior.day_start)).toISOString()===dayStart&&priorPayload.valuationMethod===valuationMethod),current=BigInt(wallet)+positionValueLamports+walletTokenValueLamports+rentReserveLamports,daily=sameDay?BigInt(String(prior!.daily_start_equity_lamports)):current,peak=sameDay?([BigInt(String(prior!.peak_equity_lamports)),current].reduce((a,b)=>a>b?a:b)):current;
+    const valuationMethod=coverage.mode==='SOL_ONLY_BOOTSTRAP'?'SOL_ONLY_BOOTSTRAP_V1':'POSITION_MARK_TO_MARKET_PLUS_WALLET_LIFECYCLE_V3',priorPayload=(prior?.payload??{}) as Record<string,unknown>,dayStart=new Date(Date.UTC(new Date(input.now).getUTCFullYear(),new Date(input.now).getUTCMonth(),new Date(input.now).getUTCDate())).toISOString(),sameDay=Boolean(prior&&new Date(String(prior.day_start)).toISOString()===dayStart&&priorPayload.valuationMethod===valuationMethod),current=BigInt(wallet)+positionValueLamports+walletTokenValueLamports+rentReserveLamports,daily=sameDay?BigInt(String(prior!.daily_start_equity_lamports)):current,peak=sameDay?([BigInt(String(prior!.peak_equity_lamports)),current].reduce((a,b)=>a>b?a:b)):current;
     const decision=governPhase7Portfolio({observedAt:input.now,walletBalanceLamports:BigInt(wallet),deployedLamports:facts.deployedLamports,pendingReservedLamports:facts.pendingReservedLamports,poolExposureLamports:facts.poolExposureLamports,poolPendingLamports:facts.poolPendingLamports,tokenExposureLamports,tokenPendingLamports:facts.tokenPendingLamports,dailyStartEquityLamports:daily,currentEquityLamports:current,peakEquityLamports:peak,openPositions:facts.openPositions,unresolvedReconciliationDebt:facts.unresolvedReconciliationDebt},{requestId:`p7-health-${input.now}`,pool:'__P7_HEALTH__',token:'__P7_HEALTH__',requestedLamports:1n,action:'OPEN',now:input.now},{minReserveLamports:capital.reserveLamports,maxDeployedBps:10000,maxPoolBps:10000,maxTokenBps:10000,maxDailyDrawdownBps:Number(input.env.LPFORGE_P7_MAX_DAILY_DRAWDOWN_BPS??600),maxRollingDrawdownBps:Number(input.env.LPFORGE_P7_MAX_ROLLING_DRAWDOWN_BPS??1000),maxOpenPositions:policy.maxOpenPositions,maxSnapshotAgeMs:60_000,permitTtlMs:60_000});
     await input.store.upsertPhase7PortfolioRiskState({ownerAddress:owner,dayStart,dailyStartEquityLamports:daily,peakEquityLamports:peak,currentEquityLamports:current,observedAt:input.now,valuationState:'RECONCILED',reasonCodes:[...(sameDay?[]:['P7_PORTFOLIO_VALUATION_BASELINE_RESET']),...decision.reasonCodes],payload:{valuationMethod,walletLamports:String(wallet),positionValueLamports:positionValueLamports.toString(),valuedPositions:valuations.map(value=>({positionAddress:value.positionAddress,lamports:value.lamports.toString(),recoverableRentLamports:value.recoverableRentLamports.toString(),cashflowCount:value.cashflowCount})),walletTokenValueLamports:walletTokenValueLamports.toString(),valuedWalletTokens,rentReserveLamports:rentReserveLamports.toString(),deployedLamports:facts.deployedLamports.toString(),pendingReservedLamports:facts.pendingReservedLamports.toString()}});
     return{valid:decision.decision==='APPROVE',reasonCodes:decision.reasonCodes,facts:{...facts,tokenExposureLamports}};
