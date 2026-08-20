@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {decisionTimeEconomicEvidenceAgeSeconds,evaluateOperationalCycle,hasConfirmedEvidenceMaturity,hasPhase3FreshHistoricalEvidence} from '../.build/packages/operational-runtime/src/index.js';
+import {decisionTimeEconomicEvidenceAgeSeconds,evaluateOperationalCycle,hasConfirmedEvidenceMaturity,hasPhase3FreshHistoricalEvidence,summarizePhase3RecentLiveObservations} from '../.build/packages/operational-runtime/src/index.js';
 import {fixtureBins,fixtureDataApiPool,fixturePool,fixtureSwaps} from '../.build/packages/test-fixtures/src/index.js';
 
 const at='2026-08-12T12:00:00.000Z';
@@ -16,7 +16,27 @@ test('automatic capital path fails closed when maturity evidence is absent',asyn
  assert.ok(result.reasonCodes.includes('OPERATIONAL_EVIDENCE_MATURITY_MISSING'));
 });
 
-const phase3Fresh={state:'WARMING',historicalState:'MATURE',historicalBackfillQuality:'SUFFICIENT',liveConfirmationState:'PENDING',recentLiveObservationCount:3,latestLiveObservationAgeSeconds:120};
+const phase3Fresh={state:'WARMING',historicalState:'MATURE',historicalBackfillQuality:'SUFFICIENT',liveConfirmationState:'PENDING',recentLiveObservationCount:3,latestLiveObservationAgeSeconds:120,maxRecentLiveObservationGapSeconds:449};
+
+test('Phase 3 recent-live window accepts three valid observations across fifteen minutes only',()=>{
+ const times=[
+  '2026-08-12T11:45:10.000Z',
+  '2026-08-12T11:52:35.000Z',
+  '2026-08-12T11:59:10.000Z',
+ ];
+ const summary=summarizePhase3RecentLiveObservations(at,times);
+ assert.deepEqual(summary,{recentLiveObservationCount:3,latestLiveObservationAgeSeconds:50,maxRecentLiveObservationGapSeconds:445});
+ assert.equal(hasPhase3FreshHistoricalEvidence({...phase3Fresh,...summary}),true);
+ assert.equal(hasPhase3FreshHistoricalEvidence({...phase3Fresh,...summarizePhase3RecentLiveObservations(at,['2026-08-12T11:44:59.000Z','2026-08-12T11:52:30.000Z','2026-08-12T11:59:00.000Z'])}),false);
+ assert.equal(hasPhase3FreshHistoricalEvidence({...phase3Fresh,...summarizePhase3RecentLiveObservations(at,['2026-08-12T11:52:35.000Z','2026-08-12T11:59:10.000Z'])}),false);
+});
+
+test('Phase 3 rejects exact continuity boundary and stale latest live evidence',()=>{
+ const exactGap=summarizePhase3RecentLiveObservations(at,['2026-08-12T11:45:00.000Z','2026-08-12T11:52:30.000Z','2026-08-12T11:59:10.000Z']);
+ assert.equal(exactGap.maxRecentLiveObservationGapSeconds,450);
+ assert.equal(hasPhase3FreshHistoricalEvidence({...phase3Fresh,...exactGap}),false);
+ assert.equal(hasPhase3FreshHistoricalEvidence({...phase3Fresh,...summarizePhase3RecentLiveObservations(at,['2026-08-12T11:45:10.000Z','2026-08-12T11:52:35.000Z','2026-08-12T11:56:59.000Z'])}),false);
+});
 
 test('automatic capital path permits historically sufficient evidence with a few fresh live observations',async()=>{
  assert.equal(hasConfirmedEvidenceMaturity({state:'MATURE',historicalState:'MATURE',liveConfirmationState:'CONFIRMED'}),true);
@@ -31,6 +51,7 @@ test('automatic capital path permits historically sufficient evidence with a few
 test('Phase 3 freshness admission fails closed for stale live facts or insufficient historical backfill',()=>{
  assert.equal(hasPhase3FreshHistoricalEvidence({...phase3Fresh,latestLiveObservationAgeSeconds:181}),false);
  assert.equal(hasPhase3FreshHistoricalEvidence({...phase3Fresh,historicalBackfillQuality:'PARTIAL'}),false);
+ assert.equal(hasPhase3FreshHistoricalEvidence({...phase3Fresh,historicalState:'WARMING'}),false);
  assert.equal(hasPhase3FreshHistoricalEvidence({...phase3Fresh,recentLiveObservationCount:2}),false);
 });
 

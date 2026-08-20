@@ -39,7 +39,9 @@ export interface OperationalRuntimePolicy {
 export const OPERATIONAL_COMPLETION_POLICY_V1:OperationalRuntimePolicy={id:'phase5-operational-completion-v1',minMarketObservations:12,minActiveBinObservations:12,minBinFrames:3,horizonMinutes:60,thesisTtlMinutes:5,aggregateUncertainty:.55,adverseInventoryRateFloor:.0005,repositionRatePerCapitalHour:.0005,tailRiskRatePerCapitalHour:.00035,executionCostFixed:.00001};
 export type OperationalStatus='WARMING'|'NO_TRADE'|'WAIT'|'REJECT'|'ENTRY_READY'|'PLAN_PREPARED';
 export const PHASE3_MIN_FRESH_LIVE_OBSERVATIONS=3;
+export const PHASE3_RECENT_LIVE_OBSERVATION_WINDOW_MS=15*60_000;
 export const PHASE3_MAX_LIVE_OBSERVATION_AGE_SECONDS=180;
+export const PHASE3_MAX_LIVE_OBSERVATION_GAP_SECONDS=450;
 export interface OperationalCycleInput {
   observedAt:string;
   pool:PoolStateFact;
@@ -53,7 +55,7 @@ export interface OperationalCycleInput {
   replacementPositionAddress?:string;
   swapQuoteProvider?:{quote(input:{inputMint:string;outputMint:string;inputAmount:bigint;requiredOutputAmount:bigint}):Promise<SwapQuoteAssessment>};
   economicEvidence?:{fidelity:string;effectiveSampleCount:number;feeRatePerCapitalHour:number;uncertainty:number;evidenceAgeSeconds:number;rawObservationCount:number;independentEpisodeCount:number;feeObservationCount:number;eventPathObservationCount:number;sourceHashes?:Record<string,unknown>};
-  evidenceMaturity?:{state:string;historicalState?:string;historicalBackfillQuality?:string;liveConfirmationState?:string;recentLiveObservationCount?:number;latestLiveObservationAgeSeconds?:number;reasonCodes?:string[]};
+  evidenceMaturity?:{state:string;historicalState?:string;historicalBackfillQuality?:string;liveConfirmationState?:string;recentLiveObservationCount?:number;latestLiveObservationAgeSeconds?:number;maxRecentLiveObservationGapSeconds?:number;reasonCodes?:string[]};
   /** Production-only capital envelope.  When present, Phase 4's decision is
    * not re-scored by the legacy research allocator. */
   productionCapitalPolicy?:ProductionCapitalPolicy;
@@ -101,6 +103,12 @@ export function resolvePhase4DataCompleteness(current:number,evidenceMaturity?:O
 export function hasConfirmedEvidenceMaturity(evidenceMaturity?:OperationalCycleInput['evidenceMaturity']):boolean{
  return evidenceMaturity?.state==='MATURE'&&evidenceMaturity.historicalState==='MATURE'&&evidenceMaturity.liveConfirmationState==='CONFIRMED';
 }
+export function summarizePhase3RecentLiveObservations(observedAt:string,observationTimes:readonly string[]){
+ const decisionAt=Date.parse(observedAt),windowStart=decisionAt-PHASE3_RECENT_LIVE_OBSERVATION_WINDOW_MS;
+ const times=observationTimes.map(value=>Date.parse(value)).filter(value=>Number.isFinite(value)&&value>=windowStart&&value<=decisionAt).sort((a,b)=>a-b);
+ const latest=times.at(-1),gaps=times.slice(1).map((value,index)=>(value-times[index]!)/1000);
+ return{recentLiveObservationCount:times.length,latestLiveObservationAgeSeconds:latest===undefined?Number.POSITIVE_INFINITY:Math.max(0,(decisionAt-latest)/1000),maxRecentLiveObservationGapSeconds:gaps.length===0?Number.POSITIVE_INFINITY:Math.max(...gaps)};
+}
 /**
  * Phase 3 needs trustworthy historical economics and current market facts;
  * it does not need the collector's longer continuity window to have finished.
@@ -112,7 +120,9 @@ export function hasPhase3FreshHistoricalEvidence(evidenceMaturity?:OperationalCy
   &&evidenceMaturity.historicalBackfillQuality==='SUFFICIENT'
   &&Number.isFinite(evidenceMaturity.latestLiveObservationAgeSeconds)
   &&Number(evidenceMaturity.latestLiveObservationAgeSeconds)<=PHASE3_MAX_LIVE_OBSERVATION_AGE_SECONDS
-  &&Number(evidenceMaturity.recentLiveObservationCount??0)>=PHASE3_MIN_FRESH_LIVE_OBSERVATIONS;
+  &&Number(evidenceMaturity.recentLiveObservationCount??0)>=PHASE3_MIN_FRESH_LIVE_OBSERVATIONS
+  &&Number.isFinite(evidenceMaturity.maxRecentLiveObservationGapSeconds)
+  &&Number(evidenceMaturity.maxRecentLiveObservationGapSeconds)<PHASE3_MAX_LIVE_OBSERVATION_GAP_SECONDS;
 }
 /** Stored evidence age is a fact at estimate creation, not at decision time. */
 export function decisionTimeEconomicEvidenceAgeSeconds(input:{estimateAsOf:string;storedEvidenceAgeSeconds:number;decisionAt:string}):number{

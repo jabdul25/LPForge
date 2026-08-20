@@ -14,6 +14,8 @@ import { Logger } from "../../../packages/observability/src/index.js";
 import {
   evaluateOperationalCycle,
   decisionTimeEconomicEvidenceAgeSeconds,
+  PHASE3_RECENT_LIVE_OBSERVATION_WINDOW_MS,
+  summarizePhase3RecentLiveObservations,
   type OperationalCycleResult,
 } from "../../../packages/operational-runtime/src/index.js";
 import {
@@ -683,18 +685,19 @@ async function liveOnce() {
     );
     const recentLiveObservations = await store.loadCandidateMarketObservations(
       cfg.smokePoolAddress,
-      // Count a small recent sample across the existing confirmation window;
-      // freshness itself is checked separately against the latest fact.
-      new Date(Date.parse(decisionAt) - 10 * 60_000).toISOString(),
+      // Phase 3 accepts a small recent sample over the bounded 15-minute
+      // admission window. Current-data freshness and each continuity gap are
+      // independently enforced below.
+      new Date(Date.parse(decisionAt) - PHASE3_RECENT_LIVE_OBSERVATION_WINDOW_MS).toISOString(),
       100,
     );
     const freshLiveObservations = recentLiveObservations.filter(
       row => row.sourceType === "LIVE_OBSERVED" && Date.parse(row.observedAt) <= Date.parse(decisionAt),
     );
-    const latestLiveObservationAt = freshLiveObservations.at(-1)?.observedAt;
-    const latestLiveObservationAgeSeconds = latestLiveObservationAt === undefined
-      ? Number.POSITIVE_INFINITY
-      : Math.max(0, (Date.parse(decisionAt) - Date.parse(latestLiveObservationAt)) / 1000);
+    const phase3LiveEvidence = summarizePhase3RecentLiveObservations(
+      decisionAt,
+      freshLiveObservations.map(row => row.observedAt),
+    );
     const backfillRow = await store.loadActiveCandidateBackfill(
       cfg.smokePoolAddress,
     );
@@ -704,8 +707,7 @@ async function liveOnce() {
           historicalState: String((maturityRow.payload as Record<string, unknown> | undefined)?.historicalMaturity ?? ''),
           historicalBackfillQuality: String(backfillRow?.quality ?? ''),
           liveConfirmationState: String((maturityRow.payload as Record<string, unknown> | undefined)?.liveConfirmation ?? ''),
-          recentLiveObservationCount: freshLiveObservations.length,
-          latestLiveObservationAgeSeconds,
+          ...phase3LiveEvidence,
           reasonCodes: (maturityRow.reason_codes ?? []) as string[],
         }
       : undefined;
