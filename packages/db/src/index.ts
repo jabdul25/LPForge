@@ -48,6 +48,34 @@ export function feeVolumeSelectionRank(row: FeeVolumeObservationCandidate): numb
   if (row.source === "METEORA_API_ROLLING_5M" && fees === 0 && protocolFees === 0 && volume === 0) return 4;
   return 3;
 }
+/**
+ * Select the bounded set that is allowed to consume full live-evidence
+ * collection.  A Tier-A pool that has completed historical maturity and live
+ * confirmation remains economically actionable until Phase 3 reaches its
+ * next/terminal decision, so it must retain a serviceable slot even if its
+ * discovery registry state was previously QUALIFIED.  This is deliberately
+ * admission only: it neither changes maturity nor relaxes economic freshness.
+ */
+export interface LiveEvidenceAdmissionCandidate {
+  poolAddress:string;
+  state:string;
+  priorityScore:number;
+  rank?:number|undefined;
+  firstSeenAt:string;
+  matureForPhase3:boolean;
+  phase3Terminal:boolean;
+}
+export function selectLiveEvidenceAdmissionCandidates<T extends LiveEvidenceAdmissionCandidate>(candidates:readonly T[],capacity:number):T[]{
+  const stateRank=(state:string)=>state==='ACTIVE_CANDIDATE'?0:1;
+  return candidates.filter(candidate=>!candidate.phase3Terminal).sort((a,b)=>
+    Number(b.matureForPhase3)-Number(a.matureForPhase3)
+    ||stateRank(a.state)-stateRank(b.state)
+    ||b.priorityScore-a.priorityScore
+    ||(a.rank??Number.MAX_SAFE_INTEGER)-(b.rank??Number.MAX_SAFE_INTEGER)
+    ||Date.parse(a.firstSeenAt)-Date.parse(b.firstSeenAt)
+    ||a.poolAddress.localeCompare(b.poolAddress),
+  ).slice(0,Math.max(0,Math.floor(capacity)));
+}
 export type AutonomousPlanAction =
   | "OPEN"
   | "ADD"
@@ -1583,12 +1611,12 @@ export async function createPostgresStore(
       try {
         await tx.query('BEGIN');
         await tx.query("SELECT pg_advisory_xact_lock(hashtext('LPFORGE_LIVE_EVIDENCE_ADMISSION'))");
-        const rows=await tx.query(`SELECT pool_address,current_state,last_priority_score,last_rank,first_seen_at FROM market.pool_discovery_registry WHERE current_tier='A' AND current_state IN ('ACTIVE_CANDIDATE','QUALIFIED') AND NOT(pool_address=ANY($1::text[])) ORDER BY CASE current_state WHEN 'ACTIVE_CANDIDATE' THEN 0 ELSE 1 END,last_priority_score DESC,last_rank NULLS LAST,first_seen_at ASC,pool_address FOR UPDATE`,[monitored]);
-        const targets=rows.rows.map(row=>({poolAddress:String(row.pool_address),state:String(row.current_state),priorityScore:Number(row.last_priority_score??0),rank:row.last_rank===null?undefined:Number(row.last_rank),firstSeenAt:new Date(String(row.first_seen_at)).toISOString()})),available=Math.max(0,capacity-monitored.length),retained=targets.filter(x=>x.state==='ACTIVE_CANDIDATE').slice(0,available),retainedSet=new Set(retained.map(x=>x.poolAddress)),waiting=targets.filter(x=>x.state==='QUALIFIED').sort((a,b)=>b.priorityScore-a.priorityScore||(a.rank??Number.MAX_SAFE_INTEGER)-(b.rank??Number.MAX_SAFE_INTEGER)||Date.parse(a.firstSeenAt)-Date.parse(b.firstSeenAt)||a.poolAddress.localeCompare(b.poolAddress)),promoted=waiting.slice(0,Math.max(0,available-retained.length)),demoted=targets.filter(x=>x.state==='ACTIVE_CANDIDATE'&&!retainedSet.has(x.poolAddress));
+        const rows=await tx.query(`SELECT registry.pool_address,registry.current_state,registry.last_priority_score,registry.last_rank,registry.first_seen_at,maturity.state AS maturity_state,maturity.payload->>'historicalMaturity' AS historical_maturity,maturity.payload->>'liveConfirmation' AS live_confirmation,cycle.phase3_status FROM market.pool_discovery_registry registry LEFT JOIN market.active_candidate_history_maturity maturity ON maturity.pool_address=registry.pool_address LEFT JOIN LATERAL (SELECT phase3_status FROM operations.forward_cycles WHERE pool_address=registry.pool_address ORDER BY observed_at DESC LIMIT 1) cycle ON true WHERE registry.current_tier='A' AND registry.current_state IN ('ACTIVE_CANDIDATE','QUALIFIED') AND NOT(registry.pool_address=ANY($1::text[])) FOR UPDATE OF registry`,[monitored]);
+        const targets=rows.rows.map(row=>({poolAddress:String(row.pool_address),state:String(row.current_state),priorityScore:Number(row.last_priority_score??0),rank:row.last_rank===null?undefined:Number(row.last_rank),firstSeenAt:new Date(String(row.first_seen_at)).toISOString(),matureForPhase3:String(row.maturity_state??'')==='MATURE'&&String(row.historical_maturity??'')==='MATURE'&&String(row.live_confirmation??'')==='CONFIRMED',phase3Terminal:['NO_TRADE','ENTRY_READY'].includes(String(row.phase3_status??''))})),available=Math.max(0,capacity-monitored.length),admitted=selectLiveEvidenceAdmissionCandidates(targets,available),admittedSet=new Set(admitted.map(x=>x.poolAddress)),promoted=admitted.filter(x=>x.state==='QUALIFIED'),demoted=targets.filter(x=>x.state==='ACTIVE_CANDIDATE'&&!admittedSet.has(x.poolAddress));
         if(demoted.length)await tx.query(`UPDATE market.pool_discovery_registry SET current_state='QUALIFIED',reason_codes=(reason_codes - 'LIVE_EVIDENCE_ADMITTED') || '["LIVE_EVIDENCE_WAITING_FOR_CAPACITY"]'::jsonb,payload=payload||jsonb_build_object('liveEvidenceAdmission','WAITING','liveEvidenceAdmissionAt',$2::text) WHERE pool_address=ANY($1::text[])`,[demoted.map(x=>x.poolAddress),v.observedAt]);
         if(promoted.length)await tx.query(`UPDATE market.pool_discovery_registry SET current_state='ACTIVE_CANDIDATE',reason_codes=(reason_codes - 'LIVE_EVIDENCE_WAITING_FOR_CAPACITY') || '["LIVE_EVIDENCE_ADMITTED"]'::jsonb,payload=payload||jsonb_build_object('liveEvidenceAdmission','ADMITTED','liveEvidenceAdmissionAt',$2::text) WHERE pool_address=ANY($1::text[])`,[promoted.map(x=>x.poolAddress),v.observedAt]);
         await tx.query('COMMIT');
-        return{serviceableCapacity:capacity,productionMonitoredCount:monitored.length,activeCount:retained.length+promoted.length,qualifiedWaitingCount:targets.length-retained.length-promoted.length,promotedPoolAddresses:promoted.map(x=>x.poolAddress),demotedPoolAddresses:demoted.map(x=>x.poolAddress)};
+        return{serviceableCapacity:capacity,productionMonitoredCount:monitored.length,activeCount:admitted.length,qualifiedWaitingCount:targets.length-admitted.length,promotedPoolAddresses:promoted.map(x=>x.poolAddress),demotedPoolAddresses:demoted.map(x=>x.poolAddress)};
       } catch(error) {try{await tx.query('ROLLBACK');}catch{} throw error;}
     },
     async markDiscoveryPoolsStale(cutoff, observedAt) {

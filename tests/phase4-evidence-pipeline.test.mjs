@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {assessHistoryMaturity,deriveEventPathEconomicEstimate,collectActiveCandidateEvidence,selectActiveCandidateCollectionSlice,requiredActiveCandidateCollectionCapacity,calculateServiceableActiveCandidateCapacity} from '../.build/packages/active-candidate-evidence/src/index.js';
 import {estimateOpportunityEconomics} from '../.build/packages/opportunity/src/index.js';
 import {evaluateEntry,ENTRY_RESEARCH_POLICY_V1} from '../.build/packages/entry-intelligence/src/index.js';
+import {selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
+import {decisionTimeEconomicEvidenceAgeSeconds} from '../.build/packages/operational-runtime/src/index.js';
 
 const at='2026-08-13T16:00:00.000Z',atMs=Date.parse(at);
 const history=(count=61,strideMs=60_000)=>{const market=Array.from({length:count},(_,i)=>({observedAt:new Date(atMs-(count-1-i)*strideMs).toISOString(),price:1+i*.0001,activeBinId:10+(i%2),volume:100,feeValue:1,twoWayRatio:.7,localLiquidity:100000}));return{marketObservations:market,activeBins:market.map(x=>({observedAt:x.observedAt,activeBinId:x.activeBinId})),binFrames:market.map(x=>({observedAt:x.observedAt,activeBinId:x.activeBinId,bins:[]})),swapEvents:market.map((x,i)=>({pool:'P',signature:`s${i}`,eventIndex:0,stamp:{observedAt:x.observedAt}}))};};
@@ -24,6 +26,30 @@ test('serviceable admission is bounded by measured p95 collection cadence before
  const capacity=calculateServiceableActiveCandidateCapacity({p3BudgetRps:3,estimatedP3CallsPerPool:12,p95PoolCollectionMs:90_000,maxConcurrentPoolReads:3,targetCoverageMs:180_000,serviceabilitySafetyMargin:.70,hardCap:30});
  assert.equal(capacity,6);
  assert.equal(calculateServiceableActiveCandidateCapacity({p3BudgetRps:3,estimatedP3CallsPerPool:12,p95PoolCollectionMs:90_000,maxConcurrentPoolReads:3,targetCoverageMs:180_000,serviceabilitySafetyMargin:.70,hardCap:4}),4);
+});
+
+test('confirmed mature QUALIFIED pool retains a bounded collector slot for fresh Phase-3 economics',()=>{
+ const candidates=[
+  {poolAddress:'ordinary-active',state:'ACTIVE_CANDIDATE',priorityScore:99,rank:1,firstSeenAt:'2026-08-13T15:00:00.000Z',matureForPhase3:false,phase3Terminal:false},
+  {poolAddress:'mature-qualified',state:'QUALIFIED',priorityScore:1,rank:9,firstSeenAt:'2026-08-13T14:00:00.000Z',matureForPhase3:true,phase3Terminal:false},
+  {poolAddress:'waiting-qualified',state:'QUALIFIED',priorityScore:98,rank:2,firstSeenAt:'2026-08-13T15:01:00.000Z',matureForPhase3:false,phase3Terminal:false},
+ ];
+ const admitted=selectLiveEvidenceAdmissionCandidates(candidates,1);
+ assert.deepEqual(admitted.map(x=>x.poolAddress),['mature-qualified']);
+ // With healthy serviceability the collector refreshes this slot before the
+ // unchanged 300-second Phase-3 economics freshness boundary.
+ assert.ok(decisionTimeEconomicEvidenceAgeSeconds({estimateAsOf:at,storedEvidenceAgeSeconds:0,decisionAt:'2026-08-13T16:04:59.000Z'})<=300);
+ assert.ok(decisionTimeEconomicEvidenceAgeSeconds({estimateAsOf:at,storedEvidenceAgeSeconds:0,decisionAt:'2026-08-13T16:05:01.000Z'})>300);
+});
+
+test('terminal active release promotes one waiting qualified pool without over-admitting',()=>{
+ const waiting=[
+  {poolAddress:'terminal-active',state:'ACTIVE_CANDIDATE',priorityScore:99,rank:1,firstSeenAt:'2026-08-13T13:00:00.000Z',matureForPhase3:true,phase3Terminal:true},
+  {poolAddress:'next-qualified',state:'QUALIFIED',priorityScore:20,rank:1,firstSeenAt:'2026-08-13T14:00:00.000Z',matureForPhase3:false,phase3Terminal:false},
+  {poolAddress:'later-qualified',state:'QUALIFIED',priorityScore:10,rank:2,firstSeenAt:'2026-08-13T13:00:00.000Z',matureForPhase3:false,phase3Terminal:false},
+ ];
+ assert.deepEqual(selectLiveEvidenceAdmissionCandidates(waiting,1).map(x=>x.poolAddress),['next-qualified']);
+ assert.equal(selectLiveEvidenceAdmissionCandidates(waiting,1).length,1,'waiting pools do not all become active when one slot frees');
 });
 
 test('active candidate collector has no starvation across repeated rounds',()=>{
