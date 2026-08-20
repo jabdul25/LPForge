@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {assessHistoryMaturity,deriveEventPathEconomicEstimate,collectActiveCandidateEvidence,selectActiveCandidateCollectionSlice,requiredActiveCandidateCollectionCapacity,calculateServiceableActiveCandidateCapacity} from '../.build/packages/active-candidate-evidence/src/index.js';
 import {estimateOpportunityEconomics} from '../.build/packages/opportunity/src/index.js';
 import {evaluateEntry,ENTRY_RESEARCH_POLICY_V1} from '../.build/packages/entry-intelligence/src/index.js';
-import {selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
+import {freshLiveEvidenceEconomicQuality,selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
 import {decisionTimeEconomicEvidenceAgeSeconds} from '../.build/packages/operational-runtime/src/index.js';
 
 const at='2026-08-13T16:00:00.000Z',atMs=Date.parse(at);
@@ -51,6 +51,24 @@ test('terminal active release promotes one waiting qualified pool without over-a
  ];
  assert.deepEqual(selectLiveEvidenceAdmissionCandidates(waiting,1).map(x=>x.poolAddress),['next-qualified']);
  assert.equal(selectLiveEvidenceAdmissionCandidates(waiting,1).length,1,'waiting pools do not all become active when one slot frees');
+});
+
+test('fresh comparable economics rank fee quality, inventory risk, then uncertainty without becoming an admission gate',()=>{
+ const base={state:'QUALIFIED',priorityScore:10,firstSeenAt:'2026-08-13T14:00:00.000Z',matureForPhase3:false,phase3Terminal:false};
+ const quality=(fee,inventory,uncertainty)=>({eventPathAsOf:'2026-08-13T15:59:00.000Z',forecastAsOf:'2026-08-13T15:59:30.000Z',feeRatePerCapitalHour:fee,adverseInventoryPressure:inventory,forecastUncertainty:uncertainty});
+ assert.deepEqual(selectLiveEvidenceAdmissionCandidates([{...base,poolAddress:'low-fee',economicQuality:quality(.001,.2,.2)},{...base,poolAddress:'high-fee',economicQuality:quality(.002,.9,.9)}],1).map(x=>x.poolAddress),['high-fee']);
+ assert.deepEqual(selectLiveEvidenceAdmissionCandidates([{...base,poolAddress:'higher-inventory-risk',economicQuality:quality(.002,.8,.2)},{...base,poolAddress:'lower-inventory-risk',economicQuality:quality(.002,.2,.9)}],1).map(x=>x.poolAddress),['lower-inventory-risk']);
+ assert.deepEqual(selectLiveEvidenceAdmissionCandidates([{...base,poolAddress:'higher-uncertainty',economicQuality:quality(.002,.2,.8)},{...base,poolAddress:'lower-uncertainty',economicQuality:quality(.002,.2,.3)}],1).map(x=>x.poolAddress),['lower-uncertainty']);
+});
+
+test('economic admission preserves bounded bootstrap access and rejects stale economic ranking facts',()=>{
+ const base={state:'QUALIFIED',priorityScore:10,firstSeenAt:'2026-08-13T14:00:00.000Z',matureForPhase3:false,phase3Terminal:false};
+ const quality={eventPathAsOf:'2026-08-13T15:59:00.000Z',forecastAsOf:'2026-08-13T15:59:30.000Z',feeRatePerCapitalHour:.002,adverseInventoryPressure:.2,forecastUncertainty:.3};
+ assert.equal(freshLiveEvidenceEconomicQuality(quality,at)?.feeRatePerCapitalHour,.002);
+ assert.equal(freshLiveEvidenceEconomicQuality({...quality,eventPathAsOf:'2026-08-13T15:54:59.000Z'},at),undefined,'stale event-path evidence cannot rank admission');
+ const selected=selectLiveEvidenceAdmissionCandidates([{...base,poolAddress:'bootstrap',rank:1},{...base,poolAddress:'economic',rank:2,economicQuality:quality}],2);
+ assert.deepEqual(selected.map(x=>x.poolAddress),['bootstrap','economic']);
+ assert.equal(selected.length,2,'economic preference cannot exceed bounded capacity');
 });
 
 test('active candidate collector has no starvation across repeated rounds',()=>{

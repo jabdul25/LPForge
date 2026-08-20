@@ -64,17 +64,53 @@ export interface LiveEvidenceAdmissionCandidate {
   firstSeenAt:string;
   matureForPhase3:boolean;
   phase3Terminal:boolean;
+  /**
+   * Fresh, research-only evidence used only to order otherwise serviceable
+   * live-evidence slots.  It is never an admission threshold or trade gate.
+   */
+  economicQuality?:{
+    eventPathAsOf:string;
+    forecastAsOf:string;
+    feeRatePerCapitalHour:number;
+    adverseInventoryPressure:number;
+    forecastUncertainty:number;
+  }|undefined;
+}
+export const LIVE_EVIDENCE_ECONOMIC_RANKING_FRESHNESS_SECONDS=300;
+export function freshLiveEvidenceEconomicQuality(value:LiveEvidenceAdmissionCandidate['economicQuality'],observedAt:string):LiveEvidenceAdmissionCandidate['economicQuality']|undefined{
+  if(!value)return undefined;
+  const now=Date.parse(observedAt),eventAt=Date.parse(value.eventPathAsOf),forecastAt=Date.parse(value.forecastAsOf),maxAge=LIVE_EVIDENCE_ECONOMIC_RANKING_FRESHNESS_SECONDS*1000;
+  if(!Number.isFinite(now)||!Number.isFinite(eventAt)||!Number.isFinite(forecastAt)||eventAt>now||forecastAt>now||now-eventAt>maxAge||now-forecastAt>maxAge)return undefined;
+  if(![value.feeRatePerCapitalHour,value.adverseInventoryPressure,value.forecastUncertainty].every(Number.isFinite))return undefined;
+  return value;
 }
 export function selectLiveEvidenceAdmissionCandidates<T extends LiveEvidenceAdmissionCandidate>(candidates:readonly T[],capacity:number):T[]{
   const stateRank=(state:string)=>state==='ACTIVE_CANDIDATE'?0:1;
-  return candidates.filter(candidate=>!candidate.phase3Terminal).sort((a,b)=>
+  const base=(a:T,b:T)=>
     Number(b.matureForPhase3)-Number(a.matureForPhase3)
     ||stateRank(a.state)-stateRank(b.state)
     ||b.priorityScore-a.priorityScore
     ||(a.rank??Number.MAX_SAFE_INTEGER)-(b.rank??Number.MAX_SAFE_INTEGER)
     ||Date.parse(a.firstSeenAt)-Date.parse(b.firstSeenAt)
-    ||a.poolAddress.localeCompare(b.poolAddress),
-  ).slice(0,Math.max(0,Math.floor(capacity)));
+    ||a.poolAddress.localeCompare(b.poolAddress);
+  const economic=(a:T,b:T)=>{
+    const qa=a.economicQuality,qb=b.economicQuality;
+    if(!qa||!qb)return base(a,b);
+    return qb.feeRatePerCapitalHour-qa.feeRatePerCapitalHour
+      ||qa.adverseInventoryPressure-qb.adverseInventoryPressure
+      ||qa.forecastUncertainty-qb.forecastUncertainty
+      ||base(a,b);
+  };
+  const slots=Math.max(0,Math.floor(capacity)),eligible=candidates.filter(candidate=>!candidate.phase3Terminal),protectedCandidates=eligible.filter(candidate=>candidate.matureForPhase3).sort(base),selected=protectedCandidates.slice(0,slots);
+  let remaining=slots-selected.length;
+  if(!remaining)return selected;
+  const ordinary=eligible.filter(candidate=>!candidate.matureForPhase3),bootstrap=ordinary.filter(candidate=>!candidate.economicQuality).sort(base),economicallyComparable=ordinary.filter(candidate=>candidate.economicQuality).sort(economic);
+  // Reserve one ordinary slot for a candidate that has not yet accumulated an
+  // event-path estimate.  That preserves the bounded bootstrap path and
+  // prevents economics from becoming a circular admission prerequisite.
+  if(bootstrap.length){selected.push(bootstrap.shift()!);remaining--;}
+  for(const candidate of [...economicallyComparable,...bootstrap]){if(remaining<=0)break;selected.push(candidate);remaining--;}
+  return selected;
 }
 export type AutonomousPlanAction =
   | "OPEN"
@@ -1611,8 +1647,8 @@ export async function createPostgresStore(
       try {
         await tx.query('BEGIN');
         await tx.query("SELECT pg_advisory_xact_lock(hashtext('LPFORGE_LIVE_EVIDENCE_ADMISSION'))");
-        const rows=await tx.query(`SELECT registry.pool_address,registry.current_state,registry.last_priority_score,registry.last_rank,registry.first_seen_at,maturity.state AS maturity_state,maturity.payload->>'historicalMaturity' AS historical_maturity,maturity.payload->>'liveConfirmation' AS live_confirmation,cycle.phase3_status FROM market.pool_discovery_registry registry LEFT JOIN market.active_candidate_history_maturity maturity ON maturity.pool_address=registry.pool_address LEFT JOIN LATERAL (SELECT phase3_status FROM operations.forward_cycles WHERE pool_address=registry.pool_address ORDER BY observed_at DESC LIMIT 1) cycle ON true WHERE registry.current_tier='A' AND registry.current_state IN ('ACTIVE_CANDIDATE','QUALIFIED') AND NOT(registry.pool_address=ANY($1::text[])) FOR UPDATE OF registry`,[monitored]);
-        const targets=rows.rows.map(row=>({poolAddress:String(row.pool_address),state:String(row.current_state),priorityScore:Number(row.last_priority_score??0),rank:row.last_rank===null?undefined:Number(row.last_rank),firstSeenAt:new Date(String(row.first_seen_at)).toISOString(),matureForPhase3:String(row.maturity_state??'')==='MATURE'&&String(row.historical_maturity??'')==='MATURE'&&String(row.live_confirmation??'')==='CONFIRMED',phase3Terminal:['NO_TRADE','ENTRY_READY'].includes(String(row.phase3_status??''))})),available=Math.max(0,capacity-monitored.length),admitted=selectLiveEvidenceAdmissionCandidates(targets,available),admittedSet=new Set(admitted.map(x=>x.poolAddress)),promoted=admitted.filter(x=>x.state==='QUALIFIED'),demoted=targets.filter(x=>x.state==='ACTIVE_CANDIDATE'&&!admittedSet.has(x.poolAddress));
+        const rows=await tx.query(`SELECT registry.pool_address,registry.current_state,registry.last_priority_score,registry.last_rank,registry.first_seen_at,maturity.state AS maturity_state,maturity.payload->>'historicalMaturity' AS historical_maturity,maturity.payload->>'liveConfirmation' AS live_confirmation,cycle.phase3_status,economic.as_of AS event_path_as_of,economic.fee_rate_per_capital_hour,prediction.observed_at AS forecast_as_of,(prediction.prediction#>>'{deep,toxicity,adverseInventoryPressure}') AS adverse_inventory_pressure,(prediction.prediction#>>'{strategy,strategies,0,uncertainty}') AS forecast_uncertainty FROM market.pool_discovery_registry registry LEFT JOIN market.active_candidate_history_maturity maturity ON maturity.pool_address=registry.pool_address LEFT JOIN LATERAL (SELECT phase3_status FROM operations.forward_cycles WHERE pool_address=registry.pool_address ORDER BY observed_at DESC LIMIT 1) cycle ON true LEFT JOIN LATERAL (SELECT as_of,fee_rate_per_capital_hour FROM research.economic_estimates WHERE pool_address=registry.pool_address AND fidelity='EVENT_PATH_ESTIMATE' AND as_of<=$2::timestamptz ORDER BY as_of DESC LIMIT 1) economic ON true LEFT JOIN LATERAL (SELECT observed_at,prediction FROM research.discovery_predictions WHERE pool_address=registry.pool_address AND observed_at<=$2::timestamptz ORDER BY observed_at DESC LIMIT 1) prediction ON true WHERE registry.current_tier='A' AND registry.current_state IN ('ACTIVE_CANDIDATE','QUALIFIED') AND NOT(registry.pool_address=ANY($1::text[])) FOR UPDATE OF registry`,[monitored,v.observedAt]);
+        const targets=rows.rows.map(row=>{const economicQuality=freshLiveEvidenceEconomicQuality(row.event_path_as_of&&row.forecast_as_of?{eventPathAsOf:new Date(String(row.event_path_as_of)).toISOString(),forecastAsOf:new Date(String(row.forecast_as_of)).toISOString(),feeRatePerCapitalHour:Number(row.fee_rate_per_capital_hour),adverseInventoryPressure:Number(row.adverse_inventory_pressure),forecastUncertainty:Number(row.forecast_uncertainty)}:undefined,v.observedAt);return{poolAddress:String(row.pool_address),state:String(row.current_state),priorityScore:Number(row.last_priority_score??0),rank:row.last_rank===null?undefined:Number(row.last_rank),firstSeenAt:new Date(String(row.first_seen_at)).toISOString(),matureForPhase3:String(row.maturity_state??'')==='MATURE'&&String(row.historical_maturity??'')==='MATURE'&&String(row.live_confirmation??'')==='CONFIRMED',phase3Terminal:['NO_TRADE','ENTRY_READY'].includes(String(row.phase3_status??'')),...(economicQuality?{economicQuality}:{})};}),available=Math.max(0,capacity-monitored.length),admitted=selectLiveEvidenceAdmissionCandidates(targets,available),admittedSet=new Set(admitted.map(x=>x.poolAddress)),promoted=admitted.filter(x=>x.state==='QUALIFIED'),demoted=targets.filter(x=>x.state==='ACTIVE_CANDIDATE'&&!admittedSet.has(x.poolAddress));
         if(demoted.length)await tx.query(`UPDATE market.pool_discovery_registry SET current_state='QUALIFIED',reason_codes=(reason_codes - 'LIVE_EVIDENCE_ADMITTED') || '["LIVE_EVIDENCE_WAITING_FOR_CAPACITY"]'::jsonb,payload=payload||jsonb_build_object('liveEvidenceAdmission','WAITING','liveEvidenceAdmissionAt',$2::text) WHERE pool_address=ANY($1::text[])`,[demoted.map(x=>x.poolAddress),v.observedAt]);
         if(promoted.length)await tx.query(`UPDATE market.pool_discovery_registry SET current_state='ACTIVE_CANDIDATE',reason_codes=(reason_codes - 'LIVE_EVIDENCE_WAITING_FOR_CAPACITY') || '["LIVE_EVIDENCE_ADMITTED"]'::jsonb,payload=payload||jsonb_build_object('liveEvidenceAdmission','ADMITTED','liveEvidenceAdmissionAt',$2::text) WHERE pool_address=ANY($1::text[])`,[promoted.map(x=>x.poolAddress),v.observedAt]);
         await tx.query('COMMIT');
