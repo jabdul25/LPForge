@@ -38,6 +38,8 @@ export interface OperationalRuntimePolicy {
 }
 export const OPERATIONAL_COMPLETION_POLICY_V1:OperationalRuntimePolicy={id:'phase5-operational-completion-v1',minMarketObservations:12,minActiveBinObservations:12,minBinFrames:3,horizonMinutes:60,thesisTtlMinutes:5,aggregateUncertainty:.55,adverseInventoryRateFloor:.0005,repositionRatePerCapitalHour:.0005,tailRiskRatePerCapitalHour:.00035,executionCostFixed:.00001};
 export type OperationalStatus='WARMING'|'NO_TRADE'|'WAIT'|'REJECT'|'ENTRY_READY'|'PLAN_PREPARED';
+export const PHASE3_MIN_FRESH_LIVE_OBSERVATIONS=3;
+export const PHASE3_MAX_LIVE_OBSERVATION_AGE_SECONDS=180;
 export interface OperationalCycleInput {
   observedAt:string;
   pool:PoolStateFact;
@@ -51,7 +53,7 @@ export interface OperationalCycleInput {
   replacementPositionAddress?:string;
   swapQuoteProvider?:{quote(input:{inputMint:string;outputMint:string;inputAmount:bigint;requiredOutputAmount:bigint}):Promise<SwapQuoteAssessment>};
   economicEvidence?:{fidelity:string;effectiveSampleCount:number;feeRatePerCapitalHour:number;uncertainty:number;evidenceAgeSeconds:number;rawObservationCount:number;independentEpisodeCount:number;feeObservationCount:number;eventPathObservationCount:number;sourceHashes?:Record<string,unknown>};
-  evidenceMaturity?:{state:string;historicalState?:string;liveConfirmationState?:string;reasonCodes?:string[]};
+  evidenceMaturity?:{state:string;historicalState?:string;historicalBackfillQuality?:string;liveConfirmationState?:string;recentLiveObservationCount?:number;latestLiveObservationAgeSeconds?:number;reasonCodes?:string[]};
   /** Production-only capital envelope.  When present, Phase 4's decision is
    * not re-scored by the legacy research allocator. */
   productionCapitalPolicy?:ProductionCapitalPolicy;
@@ -98,6 +100,19 @@ export function resolvePhase4DataCompleteness(current:number,evidenceMaturity?:O
  * a separate current live confirmation.  A missing DB row is not evidence. */
 export function hasConfirmedEvidenceMaturity(evidenceMaturity?:OperationalCycleInput['evidenceMaturity']):boolean{
  return evidenceMaturity?.state==='MATURE'&&evidenceMaturity.historicalState==='MATURE'&&evidenceMaturity.liveConfirmationState==='CONFIRMED';
+}
+/**
+ * Phase 3 needs trustworthy historical economics and current market facts;
+ * it does not need the collector's longer continuity window to have finished.
+ * That continuity signal is retained for Phase-4 completeness/readiness, and
+ * stale current facts remain an absolute pre-Phase-3 block.
+ */
+export function hasPhase3FreshHistoricalEvidence(evidenceMaturity?:OperationalCycleInput['evidenceMaturity']):boolean{
+ return evidenceMaturity?.historicalState==='MATURE'
+  &&evidenceMaturity.historicalBackfillQuality==='SUFFICIENT'
+  &&Number.isFinite(evidenceMaturity.latestLiveObservationAgeSeconds)
+  &&Number(evidenceMaturity.latestLiveObservationAgeSeconds)<=PHASE3_MAX_LIVE_OBSERVATION_AGE_SECONDS
+  &&Number(evidenceMaturity.recentLiveObservationCount??0)>=PHASE3_MIN_FRESH_LIVE_OBSERVATIONS;
 }
 /** Stored evidence age is a fact at estimate creation, not at decision time. */
 export function decisionTimeEconomicEvidenceAgeSeconds(input:{estimateAsOf:string;storedEvidenceAgeSeconds:number;decisionAt:string}):number{
@@ -155,10 +170,10 @@ export async function evaluateOperationalCycle(input:OperationalCycleInput):Prom
   const valuation=deriveCandidateValuationCalibration(input.pool,input.dataApiPool,input.bins);
   const reasonCodes:string[]=[];
   const ready=input.history.marketObservations.length>=p.minMarketObservations&&input.history.activeBins.length>=p.minActiveBinObservations&&input.history.binFrames.length>=p.minBinFrames;
-  const base={poolAddress:input.pool.address,observedAt:input.observedAt,poolAssessment,evidence:{history:{market:input.history.marketObservations.length,activeBins:input.history.activeBins.length,frames:input.history.binFrames.length,swaps:input.history.swapEvents.length},rateEvidence,valuation,policyId:p.id}};
+  const base={poolAddress:input.pool.address,observedAt:input.observedAt,poolAssessment,evidence:{history:{market:input.history.marketObservations.length,activeBins:input.history.activeBins.length,frames:input.history.binFrames.length,swaps:input.history.swapEvents.length},rateEvidence,valuation,policyId:p.id,...(input.evidenceMaturity?{maturity:input.evidenceMaturity}:{})}};
   const automaticCapitalPath=Boolean(input.productionCapitalPolicy||input.planPreparationEnabled);
-  if(automaticCapitalPath&&!hasConfirmedEvidenceMaturity(input.evidenceMaturity)){reasonCodes.push(input.evidenceMaturity?'OPERATIONAL_EVIDENCE_MATURITY_PENDING':'OPERATIONAL_EVIDENCE_MATURITY_MISSING',...(input.evidenceMaturity?.reasonCodes??[]));const core={...base,phase3Status:'WARMING' as const,phase4Status:'WARMING' as const,phase5Status:'NOT_REACHED' as const,...(input.evidenceMaturity?{evidenceMaturity:input.evidenceMaturity}:{}),reasonCodes:[...new Set(reasonCodes)].sort()};return{cycleId:await sha256Hex(canonicalJson(core)),...core};}
-  if(input.evidenceMaturity?.state&&input.evidenceMaturity.state!=='MATURE'){reasonCodes.push('OPERATIONAL_EVIDENCE_MATURITY_PENDING',...(input.evidenceMaturity.reasonCodes??[]));const core={...base,phase3Status:'WARMING' as const,phase4Status:'WARMING' as const,phase5Status:'NOT_REACHED' as const,evidenceMaturity:input.evidenceMaturity,reasonCodes:[...new Set(reasonCodes)].sort()};return{cycleId:await sha256Hex(canonicalJson(core)),...core};}
+  if(automaticCapitalPath&&!hasPhase3FreshHistoricalEvidence(input.evidenceMaturity)){reasonCodes.push(input.evidenceMaturity?'OPERATIONAL_EVIDENCE_MATURITY_PENDING':'OPERATIONAL_EVIDENCE_MATURITY_MISSING',...(input.evidenceMaturity?.reasonCodes??[]));const core={...base,phase3Status:'WARMING' as const,phase4Status:'WARMING' as const,phase5Status:'NOT_REACHED' as const,...(input.evidenceMaturity?{evidenceMaturity:input.evidenceMaturity}:{}),reasonCodes:[...new Set(reasonCodes)].sort()};return{cycleId:await sha256Hex(canonicalJson(core)),...core};}
+  if(input.evidenceMaturity?.state&&input.evidenceMaturity.state!=='MATURE'&&!hasPhase3FreshHistoricalEvidence(input.evidenceMaturity)){reasonCodes.push('OPERATIONAL_EVIDENCE_MATURITY_PENDING',...(input.evidenceMaturity.reasonCodes??[]));const core={...base,phase3Status:'WARMING' as const,phase4Status:'WARMING' as const,phase5Status:'NOT_REACHED' as const,evidenceMaturity:input.evidenceMaturity,reasonCodes:[...new Set(reasonCodes)].sort()};return{cycleId:await sha256Hex(canonicalJson(core)),...core};}
   if(automaticCapitalPath&&!freshEventPathEvidence){reasonCodes.push(input.economicEvidence?'OPERATIONAL_ECONOMIC_EVIDENCE_STALE':'OPERATIONAL_ECONOMIC_EVIDENCE_MISSING');const core={...base,phase3Status:'WARMING' as const,phase4Status:'WARMING' as const,phase5Status:'NOT_REACHED' as const,reasonCodes:[...new Set(reasonCodes)].sort()};return{cycleId:await sha256Hex(canonicalJson(core)),...core};}
   if(!ready){reasonCodes.push('OPERATIONAL_FORWARD_HISTORY_WARMING');const core={...base,phase3Status:'WARMING' as const,phase4Status:'WARMING' as const,phase5Status:'NOT_REACHED' as const,reasonCodes};return{cycleId:await sha256Hex(canonicalJson(core)),...core};}
   const market=[...input.history.marketObservations];const last=market.at(-1);if(!last||Date.parse(last.observedAt)<Date.parse(input.observedAt)){market.push({observedAt:input.observedAt,price:numeric(input.dataApiPool.current_price,1),activeBinId:input.pool.activeBinId,volume:numeric(input.dataApiPool.volume?.['5m']),feeValue:numeric(input.dataApiPool.fees?.['5m']),twoWayRatio:flow.twoWayRatio,localLiquidity:numeric(input.dataApiPool.tvl)});}

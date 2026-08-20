@@ -681,11 +681,31 @@ async function liveOnce() {
     const maturityRow = await store.loadActiveCandidateHistoryMaturity(
       cfg.smokePoolAddress,
     );
+    const recentLiveObservations = await store.loadCandidateMarketObservations(
+      cfg.smokePoolAddress,
+      // Count a small recent sample across the existing confirmation window;
+      // freshness itself is checked separately against the latest fact.
+      new Date(Date.parse(decisionAt) - 10 * 60_000).toISOString(),
+      100,
+    );
+    const freshLiveObservations = recentLiveObservations.filter(
+      row => row.sourceType === "LIVE_OBSERVED" && Date.parse(row.observedAt) <= Date.parse(decisionAt),
+    );
+    const latestLiveObservationAt = freshLiveObservations.at(-1)?.observedAt;
+    const latestLiveObservationAgeSeconds = latestLiveObservationAt === undefined
+      ? Number.POSITIVE_INFINITY
+      : Math.max(0, (Date.parse(decisionAt) - Date.parse(latestLiveObservationAt)) / 1000);
+    const backfillRow = await store.loadActiveCandidateBackfill(
+      cfg.smokePoolAddress,
+    );
     const evidenceMaturity = maturityRow
       ? {
           state: String(maturityRow.state),
           historicalState: String((maturityRow.payload as Record<string, unknown> | undefined)?.historicalMaturity ?? ''),
+          historicalBackfillQuality: String(backfillRow?.quality ?? ''),
           liveConfirmationState: String((maturityRow.payload as Record<string, unknown> | undefined)?.liveConfirmation ?? ''),
+          recentLiveObservationCount: freshLiveObservations.length,
+          latestLiveObservationAgeSeconds,
           reasonCodes: (maturityRow.reason_codes ?? []) as string[],
         }
       : undefined;
