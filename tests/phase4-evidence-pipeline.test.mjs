@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {assessHistoryMaturity,deriveEventPathEconomicEstimate,collectActiveCandidateEvidence,selectActiveCandidateCollectionSlice} from '../.build/packages/active-candidate-evidence/src/index.js';
+import {assessHistoryMaturity,deriveEventPathEconomicEstimate,collectActiveCandidateEvidence,selectActiveCandidateCollectionSlice,requiredActiveCandidateCollectionCapacity} from '../.build/packages/active-candidate-evidence/src/index.js';
 import {estimateOpportunityEconomics} from '../.build/packages/opportunity/src/index.js';
 import {evaluateEntry,ENTRY_RESEARCH_POLICY_V1} from '../.build/packages/entry-intelligence/src/index.js';
 
@@ -14,6 +14,11 @@ test('active candidate collector partitions twelve pools across three four-pool 
  assert.deepEqual(batches.map(batch=>batch.length),[4,4,4]);
  assert.equal(new Set(batches.flat().map(x=>x.poolAddress)).size,12);
  assert.equal(new Set(batches.flat().map(x=>x.poolAddress)).size,batches.flat().length,'no address is repeated before the round completes');
+});
+test('dynamic collector capacity preserves the 180-second coverage target',()=>{
+ assert.equal(requiredActiveCandidateCollectionCapacity(12,60_000),4);
+ assert.equal(requiredActiveCandidateCollectionCapacity(25,60_000),9);
+ assert.equal(requiredActiveCandidateCollectionCapacity(40,60_000),14);
 });
 
 test('active candidate collector has no starvation across repeated rounds',()=>{
@@ -53,7 +58,7 @@ test('bounded collector observes every active candidate and production-monitored
  let historicalRequests=0;const store={listDiscoveryCandidates:async()=>candidates,insertPoolSnapshot:async()=>{},insertBins:async()=>{},insertDataApiPool:async()=>{},insertOhlcv:async()=>{},insertFeeVolumeObservations:async()=>{},loadFeeVolumeObservations:async()=>feeBuckets(48).map(x=>({bucketAt:new Date(x.timestamp*1000).toISOString(),fees:x.fees,protocolFees:x.protocol_fees,volume:x.volume})),insertCandidateMarketObservations:async()=>{},loadCandidateMarketObservations:async()=>[],loadActiveCandidateBackfill:async()=>({last_successful_at:at}),upsertActiveCandidateBackfill:async()=>{},insertSwapEvent:async()=>{},loadOperationalHistory:async pool=>history(61),upsertActiveCandidateHistoryMaturity:async x=>writes.push(x),insertEconomicEstimate:async()=>{}};
  const api={getPool:async address=>{if(address==='B')throw new Error('slow pool failure');return{address,tvl:100000};},getHistoricalVolume:async()=>{historicalRequests++;return{data:feeBuckets(48)};},getOhlcv:async()=>({data:[]})};
  const adapter={getPool:async address=>({address,activeBinId:1}),getBinsAroundActive:async()=>[],decodeEvents:async()=>[]};const rpc={getSignaturesForAddress:async()=>[],getTransaction:async()=>null};
- const result=await collectActiveCandidateEvidence({api,adapter,rpc,store,observedAt:at,policy:{maxConcurrentPoolReads:2,supplementalPoolAddresses:['MANUAL']}});
+ const result=await collectActiveCandidateEvidence({api,adapter,rpc,store,observedAt:at,policy:{maxConcurrentPoolReads:2,liveConfirmationTargetCoverageMs:60_000,supplementalPoolAddresses:['MANUAL']}});
  assert.equal(result.results.length,4);assert.equal(result.results.filter(x=>x.status==='PASS').length,3);assert.equal(result.results.find(x=>x.poolAddress==='B').status,'DEGRADED');assert.ok(result.results.some(x=>x.poolAddress==='MANUAL'));assert.equal(writes.length,4);assert.ok(historicalRequests>0,'a prior backfill record without persisted historical price evidence is repaired');
 });
 test('collector uses its completed pool-read timestamp for both live evidence and maturity assessment',async()=>{
