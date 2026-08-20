@@ -61,6 +61,12 @@ test('partial live confirmation preserves its state while fresh historical evide
  assert.equal(result.evidence.maturity.liveConfirmationState,'PENDING');
 });
 
+test('a fresh event-path estimate with non-positive economics remains NO_TRADE',async()=>{
+ const result=await evaluateOperationalCycle({...base,history:freshHistory,evidenceMaturity:phase3Fresh,economicEvidence:{fidelity:'EVENT_PATH_ESTIMATE',effectiveSampleCount:3,feeRatePerCapitalHour:0,uncertainty:.4,evidenceAgeSeconds:30,rawObservationCount:24,independentEpisodeCount:3,feeObservationCount:12,eventPathObservationCount:12}});
+ assert.equal(result.phase3Status,'NO_TRADE');
+ assert.ok(result.reasonCodes.includes('EXPECTED_NET_VALUE_NON_POSITIVE'));
+});
+
 test('stale event-path economics still blocks Phase 3 after freshness admission',async()=>{
  const result=await evaluateOperationalCycle({...base,history:freshHistory,evidenceMaturity:phase3Fresh,economicEvidence:{fidelity:'EVENT_PATH_ESTIMATE',effectiveSampleCount:7,feeRatePerCapitalHour:.001,uncertainty:.4,evidenceAgeSeconds:301,rawObservationCount:24,independentEpisodeCount:7,feeObservationCount:12,eventPathObservationCount:12}});
  assert.equal(result.phase3Status,'WARMING');

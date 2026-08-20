@@ -9,6 +9,7 @@ import {decisionTimeEconomicEvidenceAgeSeconds} from '../.build/packages/operati
 const at='2026-08-13T16:00:00.000Z',atMs=Date.parse(at);
 const history=(count=61,strideMs=60_000)=>{const market=Array.from({length:count},(_,i)=>({observedAt:new Date(atMs-(count-1-i)*strideMs).toISOString(),price:1+i*.0001,activeBinId:10+(i%2),volume:100,feeValue:1,twoWayRatio:.7,localLiquidity:100000}));return{marketObservations:market,activeBins:market.map(x=>({observedAt:x.observedAt,activeBinId:x.activeBinId})),binFrames:market.map(x=>({observedAt:x.observedAt,activeBinId:x.activeBinId,bins:[]})),swapEvents:market.map((x,i)=>({pool:'P',signature:`s${i}`,eventIndex:0,stamp:{observedAt:x.observedAt}}))};};
 const feeBuckets=(count)=>Array.from({length:count},(_,i)=>({timestamp:Math.floor((atMs-(count-1-i)*5*60_000)/1000),fees:10,protocol_fees:1,volume:1000}));
+const episodeFeeBuckets=(episodeCount,perEpisode=4)=>Array.from({length:episodeCount*perEpisode},(_,i)=>{const episode=Math.floor(i/perEpisode),within=i%perEpisode,minutesAgo=44-episode*15-within;return{timestamp:Math.floor((atMs-minutesAgo*60_000)/1000),fees:10,protocol_fees:1,volume:1000};});
 
 test('active candidate collector partitions twelve pools across three four-pool cycles',()=>{
  const pools=Array.from({length:12},(_,i)=>({poolAddress:`P${String(i).padStart(2,'0')}`,state:'ACTIVE_CANDIDATE'})),interval=60_000;
@@ -83,6 +84,15 @@ test('event-path economics remain conservative when cold and clear uncertainty w
  assert.equal(low.fidelity,'AGGREGATE_ESTIMATE');assert.equal(mature.fidelity,'EVENT_PATH_ESTIMATE');assert.ok(mature.effectiveSampleCount<48,'effective samples are episode-aware, not raw minute counts');
  const economics=estimateOpportunityEconomics({capitalValue:1,horizonMinutes:60,rates:{feeRatePerCapitalHour:mature.feeRatePerCapitalHour,adverseInventoryRatePerCapitalHour:.0005,repositionRatePerCapitalHour:.0005,tailRiskRatePerCapitalHour:.00035,executionCostFixed:.00001,sampleCount:mature.effectiveSampleCount,uncertainty:mature.uncertainty,fidelity:'EVENT_PATH_ESTIMATE'},pool:{economicQualityScore:80,flowQualityScore:80,liquidityQualityScore:80,toxicityProbability:.1},regime:{confidence:.45,transitionRisk:.05,probabilities:[{label:'SIDEWAYS',probability:.45},{label:'CONSOLIDATION',probability:.25},{label:'RECOVERY',probability:.15},{label:'TREND_DOWN',probability:.10},{label:'UNKNOWN',probability:.05}],stability:.20},regimeHistory:{transitionRisk:.05,flappingRate:.01,stableDurationMinutes:120},structure:{structureQuality:.8,downsideAcceleration:.1}});
  assert.ok(economics.uncertainty<=.72,`mature event path uncertainty ${economics.uncertainty}`);assert.equal(economics.evidenceUncertainty,mature.uncertainty);assert.equal(economics.forecastUncertainty,economics.uncertainty);assert.equal(economics.forecastUncertaintyComponents.evidence,mature.uncertainty);assert.equal('effectiveSample' in economics.forecastUncertaintyComponents,false,'sample depth is represented only by evidence uncertainty');
+});
+test('event-path estimate requires three independent fifteen-minute episodes while retaining raw-evidence floors',async()=>{
+ const twoEpisodes=await deriveEventPathEconomicEstimate({poolAddress:'P',asOf:at,dataApiPool:{address:'P',tvl:100000},feeBuckets:episodeFeeBuckets(2,6),history:history(61)});
+ const threeEpisodes=await deriveEventPathEconomicEstimate({poolAddress:'P',asOf:at,dataApiPool:{address:'P',tvl:100000},feeBuckets:episodeFeeBuckets(3),history:history(61)});
+ const insufficientFees=await deriveEventPathEconomicEstimate({poolAddress:'P',asOf:at,dataApiPool:{address:'P',tvl:100000},feeBuckets:episodeFeeBuckets(3).slice(0,11),history:history(61)});
+ const insufficientPath=await deriveEventPathEconomicEstimate({poolAddress:'P',asOf:at,dataApiPool:{address:'P',tvl:100000},feeBuckets:episodeFeeBuckets(3),history:history(11)});
+ assert.equal(twoEpisodes.independentEpisodeCount,2);assert.equal(twoEpisodes.fidelity,'AGGREGATE_ESTIMATE');
+ assert.equal(threeEpisodes.independentEpisodeCount,3);assert.equal(threeEpisodes.fidelity,'EVENT_PATH_ESTIMATE');
+ assert.equal(insufficientFees.fidelity,'AGGREGATE_ESTIMATE');assert.equal(insufficientPath.fidelity,'AGGREGATE_ESTIMATE');
 });
 test('bounded collector observes every active candidate and production-monitored supplemental pool while one failure does not starve peers',async()=>{
  const writes=[];const candidates=['A','B','C'].map(poolAddress=>({poolAddress,state:'ACTIVE_CANDIDATE',tier:'A',priorityScore:1,lastSeenAt:at,payload:{}}));
