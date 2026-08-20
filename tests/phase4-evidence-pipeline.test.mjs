@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {assessHistoryMaturity,deriveEventPathEconomicEstimate,collectActiveCandidateEvidence,selectActiveCandidateCollectionSlice,requiredActiveCandidateCollectionCapacity} from '../.build/packages/active-candidate-evidence/src/index.js';
+import {assessHistoryMaturity,deriveEventPathEconomicEstimate,collectActiveCandidateEvidence,selectActiveCandidateCollectionSlice,requiredActiveCandidateCollectionCapacity,calculateServiceableActiveCandidateCapacity} from '../.build/packages/active-candidate-evidence/src/index.js';
 import {estimateOpportunityEconomics} from '../.build/packages/opportunity/src/index.js';
 import {evaluateEntry,ENTRY_RESEARCH_POLICY_V1} from '../.build/packages/entry-intelligence/src/index.js';
 
@@ -19,6 +19,11 @@ test('dynamic collector capacity preserves the 180-second coverage target',()=>{
  assert.equal(requiredActiveCandidateCollectionCapacity(12,60_000),4);
  assert.equal(requiredActiveCandidateCollectionCapacity(25,60_000),9);
  assert.equal(requiredActiveCandidateCollectionCapacity(40,60_000),14);
+});
+test('serviceable admission is bounded by measured p95 collection cadence before RPC headroom',()=>{
+ const capacity=calculateServiceableActiveCandidateCapacity({p3BudgetRps:3,estimatedP3CallsPerPool:12,p95PoolCollectionMs:90_000,maxConcurrentPoolReads:3,targetCoverageMs:180_000,serviceabilitySafetyMargin:.70,hardCap:30});
+ assert.equal(capacity,6);
+ assert.equal(calculateServiceableActiveCandidateCapacity({p3BudgetRps:3,estimatedP3CallsPerPool:12,p95PoolCollectionMs:90_000,maxConcurrentPoolReads:3,targetCoverageMs:180_000,serviceabilitySafetyMargin:.70,hardCap:4}),4);
 });
 
 test('active candidate collector has no starvation across repeated rounds',()=>{

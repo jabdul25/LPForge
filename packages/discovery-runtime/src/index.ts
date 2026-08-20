@@ -41,7 +41,9 @@ export function deriveDiscoveryLifecycleState(input:{deep:Pick<DeepScreenResult,
  if(eligibility==='QUARANTINED'||tier==='QUARANTINED')return{state:'QUARANTINED',tier:'QUARANTINED'};
  if(eligibility==='BLOCK'||tier==='REJECTED')return{state:'REJECTED',tier:'REJECTED'};
  if(eligibility!=='QUALIFIED')return{state:'OBSERVING',tier:'C'};
- if(tier==='A')return{state:'ACTIVE_CANDIDATE',tier:'A'};
+ // Tier-A proves a pool is qualified; durable admission into the bounded
+ // live-evidence set happens transactionally in the discovery store.
+ if(tier==='A')return{state:'QUALIFIED',tier:'A'};
  if(tier==='B')return{state:'WATCHLIST',tier:'B'};
  return{state:'QUALIFIED',tier};
 }
