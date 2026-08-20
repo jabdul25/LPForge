@@ -35,7 +35,7 @@ while :; do
   # preceding P7 decision remain fresh.  The execution claim guard repeats
   # these checks transactionally; this is merely the host admission boundary.
   plan_id=$(query "SELECT p.plan_id FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id WHERE p.state='PLANNED' AND i.action='OPEN' AND p.expires_at>now() ORDER BY p.created_at LIMIT 1" | head -n1 || true)
-  control_ok=$(query "SELECT CASE WHEN authority_mode='PRODUCTION' AND health_status='HEALTHY' AND safety_mode='NORMAL' AND drift_status<>'BLOCK' AND new_economic_action_allowed AND observed_at>now()-interval '60 seconds' THEN 'yes' ELSE 'no' END FROM governance.phase7_control_decisions WHERE runtime_id='${runtime_id//\'/\'\'}' ORDER BY observed_at DESC LIMIT 1" | head -n1 || true)
+  control_ok=$(query "SELECT CASE WHEN authority_mode='PRODUCTION' AND health_status='HEALTHY' AND safety_mode='NORMAL' AND drift_status<>'BLOCK' AND new_economic_action_allowed AND observed_at>now()-interval '60 seconds' THEN 'yes' ELSE 'no' END FROM operations.phase7_control_decisions WHERE runtime_id='${runtime_id//\'/\'\'}' ORDER BY observed_at DESC LIMIT 1" | head -n1 || true)
   if [[ -n "$plan_id" && "$control_ok" == 'yes' ]]; then
     # Mark before starting P6.  If the host/process fails during or after
     # submission, recovery and reconciliation—not another dispatch—own the
