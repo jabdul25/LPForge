@@ -8,10 +8,32 @@ const at='2026-08-13T16:00:00.000Z',atMs=Date.parse(at);
 const history=(count=61,strideMs=60_000)=>{const market=Array.from({length:count},(_,i)=>({observedAt:new Date(atMs-(count-1-i)*strideMs).toISOString(),price:1+i*.0001,activeBinId:10+(i%2),volume:100,feeValue:1,twoWayRatio:.7,localLiquidity:100000}));return{marketObservations:market,activeBins:market.map(x=>({observedAt:x.observedAt,activeBinId:x.activeBinId})),binFrames:market.map(x=>({observedAt:x.observedAt,activeBinId:x.activeBinId,bins:[]})),swapEvents:market.map((x,i)=>({pool:'P',signature:`s${i}`,eventIndex:0,stamp:{observedAt:x.observedAt}}))};};
 const feeBuckets=(count)=>Array.from({length:count},(_,i)=>({timestamp:Math.floor((atMs-(count-1-i)*5*60_000)/1000),fees:10,protocol_fees:1,volume:1000}));
 
-test('active candidate collector rotates bounded slices instead of repeatedly sweeping the first pools',()=>{
+test('active candidate collector partitions twelve pools across three four-pool cycles',()=>{
+ const pools=Array.from({length:12},(_,i)=>({poolAddress:`P${String(i).padStart(2,'0')}`,state:'ACTIVE_CANDIDATE'})),interval=60_000;
+ const batches=[0,1,2].map(offset=>selectActiveCandidateCollectionSlice(pools,4,new Date(atMs+offset*interval).toISOString(),interval));
+ assert.deepEqual(batches.map(batch=>batch.length),[4,4,4]);
+ assert.equal(new Set(batches.flat().map(x=>x.poolAddress)).size,12);
+ assert.equal(new Set(batches.flat().map(x=>x.poolAddress)).size,batches.flat().length,'no address is repeated before the round completes');
+});
+
+test('active candidate collector has no starvation across repeated rounds',()=>{
  const pools=['A','B','C','D'].map(poolAddress=>({poolAddress})),interval=60_000;
  const first=selectActiveCandidateCollectionSlice(pools,1,'2026-08-13T16:00:00.000Z',interval),second=selectActiveCandidateCollectionSlice(pools,1,'2026-08-13T16:01:00.000Z',interval),third=selectActiveCandidateCollectionSlice(pools,1,'2026-08-13T16:02:00.000Z',interval),fourth=selectActiveCandidateCollectionSlice(pools,1,'2026-08-13T16:03:00.000Z',interval);
  assert.deepEqual(new Set([...first,...second,...third,...fourth].map(x=>x.poolAddress)),new Set(['A','B','C','D']));
+});
+
+test('new active candidates join the next deterministic collection round fairly',()=>{
+ const interval=60_000,initial=Array.from({length:8},(_,i)=>({poolAddress:`P${i}`,state:'ACTIVE_CANDIDATE'})),joined=[...initial,{poolAddress:'P8',state:'ACTIVE_CANDIDATE'}];
+ const batches=[0,1,2].map(offset=>selectActiveCandidateCollectionSlice(joined,4,new Date(atMs+offset*interval).toISOString(),interval));
+ assert.ok(batches.flat().some(x=>x.poolAddress==='P8'));
+ assert.equal(new Set(batches.flat().map(x=>x.poolAddress)).size,9);
+});
+
+test('production-monitored pools lead a round without starving active candidates',()=>{
+ const interval=60_000,roundStart='1970-01-01T00:00:00.000Z',pools=[{poolAddress:'Z-monitor',state:'PRODUCTION_MONITORED'},...Array.from({length:7},(_,i)=>({poolAddress:`A${i}`,state:'ACTIVE_CANDIDATE'}))];
+ const first=selectActiveCandidateCollectionSlice(pools,4,roundStart,interval),second=selectActiveCandidateCollectionSlice(pools,4,new Date(Date.parse(roundStart)+interval).toISOString(),interval);
+ assert.equal(first[0].poolAddress,'Z-monitor');
+ assert.equal(new Set([...first,...second].map(x=>x.poolAddress)).size,8);
 });
 
 test('Phase-4 history maturity uses existing .60 threshold and can mature naturally',async()=>{

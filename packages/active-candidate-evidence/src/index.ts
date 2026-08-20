@@ -9,11 +9,19 @@ export interface ActiveCandidateEvidencePolicy { id:string;maxActiveCandidateCol
 export const DEFAULT_ACTIVE_CANDIDATE_EVIDENCE_POLICY:ActiveCandidateEvidencePolicy={id:'phase4-active-candidate-evidence-v3-multi-horizon',maxActiveCandidateCollectors:30,maxConcurrentPoolReads:2,perPoolMinIntervalMs:30_000,binRadius:35,eventScanLimit:10,historyWindowMs:4*60*60_000,staleAfterMs:180_000,recentBackfillMinutes:90,contextBackfillMinutes:240,backfillLookbackMinutes:240,backfillMinHistoryMinutes:90,liveConfirmationMinutes:10,liveConfirmationMinObservations:4,liveConfirmationMaxGapMs:240_000,backfillRetryMs:15*60_000,maxConcurrentBackfills:1,backfillEventScanLimit:100,supplementalPoolAddresses:[]};
 /** Deterministic fair rotation prevents a large candidate universe from
  * repeatedly collecting only the first addresses and bursting shared RPC. */
-export function selectActiveCandidateCollectionSlice<T extends {poolAddress:string}>(all:readonly T[],maxPools:number,observedAt:string,collectionIntervalMs:number):T[]{
- const ordered=[...all].sort((a,b)=>a.poolAddress.localeCompare(b.poolAddress));
- if(!ordered.length||maxPools<=0)return [];
- const parsed=Date.parse(observedAt),epoch=Number.isFinite(parsed)?Math.floor(parsed/Math.max(1,collectionIntervalMs)):0,offset=((epoch%ordered.length)+ordered.length)%ordered.length;
- return [...ordered.slice(offset),...ordered.slice(0,offset)].slice(0,Math.min(maxPools,ordered.length));
+export function selectActiveCandidateCollectionSlice<T extends {poolAddress:string;state?:string}>(all:readonly T[],maxPools:number,observedAt:string,collectionIntervalMs:number):T[]{
+ // Select a non-overlapping partition for each collector cycle.  Advancing a
+ // sliding window by one address looked fair, but with four slots it sampled
+ // the same pools on consecutive cycles and left later pools idle long enough
+ // to violate the live-confirmation gap.  Production-monitored pools remain
+ // first in the deterministic ordering, while every remaining active pool is
+ // guaranteed one slot in a complete round.
+ const priority=[...all].filter(x=>x.state==='PRODUCTION_MONITORED').sort((a,b)=>a.poolAddress.localeCompare(b.poolAddress));
+ const active=[...all].filter(x=>x.state!=='PRODUCTION_MONITORED').sort((a,b)=>a.poolAddress.localeCompare(b.poolAddress));
+ const ordered=[...priority,...active],limit=Math.min(Math.max(0,Math.floor(maxPools)),ordered.length);
+ if(!ordered.length||limit<=0)return [];
+ const parsed=Date.parse(observedAt),epoch=Number.isFinite(parsed)?Math.floor(parsed/Math.max(1,collectionIntervalMs)):0,rounds=Math.ceil(ordered.length/limit),round=((epoch%rounds)+rounds)%rounds,start=round*limit;
+ return ordered.slice(start,start+limit);
 }
 export interface BackfillQuality {requestedMinutes:number;coveredMinutes:number;coverageRatio:number;feeBucketCount:number;ohlcvBucketCount:number;swapEventCount:number;independent15mEpisodes:number;oldestEvidenceAt?:string;newestEvidenceAt?:string;quality:'SUFFICIENT'|'PARTIAL'|'INSUFFICIENT'|'DEGRADED';reasonCodes:string[];}
 export interface HistoryMaturity {state:'WARMING'|'MATURE'|'STALE'|'DEGRADED';historicalState:'WARMING'|'MATURE'|'DEGRADED';liveConfirmationState:'WARMING'|'CONFIRMED'|'STALE'|'DEGRADED';marketObservationCount:number;activeBinObservationCount:number;binFrameCount:number;swapEventCount:number;oldestObservationAt?:string;latestObservationAt?:string;completeness5m:number;completeness15m:number;completeness1h:number;reasonCodes:string[];}
