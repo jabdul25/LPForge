@@ -33,7 +33,7 @@ test('drift reads lagged decoder telemetry from the prior evidence snapshot, fal
 test('drift folds every probed pool while preserving raw candidate BLOCK for targeted claim admission',()=>{
   const src=fs.readFileSync(production,'utf8');
   assert.match(src,/const evaluationPoolAddresses=await productionEvaluationPoolAddresses\(input\.store,input\.env,input\.cycleKey,\[\.\.\.openPools\]\),driftPoolAddresses=\[\.\.\.new Set\(\[input\.cfg\.smokePoolAddress,\.\.\.evaluationPoolAddresses\]\)\];/,'one immutable evaluation-pool snapshot, including owned pools, feeds drift and probes');
-  assert.ok(src.includes('for(const poolAddress of evaluationPoolAddresses)'), 'operator probes reuse the same immutable evaluation-pool snapshot');
+  assert.ok(src.includes('watch.activate&&watch.authorization?[watch.authorization.poolAddress]:evaluationPoolAddresses'), 'normal probes reuse the immutable evaluation-pool snapshot; the bounded canary bridge may narrow to its single fresh authorization pool');
   assert.ok(src.includes('significant:poolAddress===input.cfg.smokePoolAddress||capitalPools.has(poolAddress)||openPools.has(poolAddress)'),'smoke pool, deployed capital and open positions are the significance criteria');
   assert.ok(src.includes("rank(p.status)>rank('WATCH')?'WATCH':p.status"),'idle pools are capped at WATCH');
   assert.ok(src.includes('`P7_LIVE_DRIFT_POOL_${p.status}`'),'non-stable pools surface a per-pool reason code');

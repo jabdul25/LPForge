@@ -474,6 +474,24 @@ export interface Phase1Store {
     reasonCodes: string[];
     payload: Record<string, unknown>;
   }): Promise<void>;
+  /**
+   * The controlled canary watch consumes only a still-live Phase-4 approval.
+   * This is deliberately a read-only lookup: it never invents an entry
+   * decision and it cannot revive an expired evaluation.
+   */
+  loadFreshPhase4EntryAuthorization(now: string): Promise<
+    | {
+        entryEvaluationId: string;
+        thesisId: string;
+        poolAddress: string;
+        observedAt: string;
+        expiresAt: string;
+        confidence: number;
+        reasonCodes: string[];
+        payload: Record<string, unknown>;
+      }
+    | undefined
+  >;
   insertRiskDecision(value: {
     riskDecisionId: string;
     observedAt: string;
@@ -1693,6 +1711,30 @@ export async function createPostgresStore(
           json(v.payload),
         ],
       );
+    },
+    async loadFreshPhase4EntryAuthorization(now) {
+      const r = await db.query(
+        `SELECT entry_evaluation_id,thesis_id,pool_address,observed_at,expires_at,confidence,reason_codes,payload
+         FROM research.entry_evaluations
+         WHERE decision='ENTRY_READY'
+           AND expires_at>$1::timestamptz
+           AND reason_codes @> '["ENTRY_TIMING_APPROVED"]'::jsonb
+         ORDER BY observed_at DESC
+         LIMIT 1`,
+        [now],
+      );
+      const row = r.rows[0];
+      if (!row) return undefined;
+      return {
+        entryEvaluationId: String(row.entry_evaluation_id),
+        thesisId: String(row.thesis_id),
+        poolAddress: String(row.pool_address),
+        observedAt: toIsoTimestamp(row.observed_at),
+        expiresAt: toIsoTimestamp(row.expires_at),
+        confidence: Number(row.confidence),
+        reasonCodes: (row.reason_codes ?? []) as string[],
+        payload: (row.payload ?? {}) as Record<string, unknown>,
+      };
     },
     async insertRiskDecision(v) {
       await db.query(
@@ -3048,6 +3090,7 @@ export function createMemoryStore(): Phase1Store {
     async insertRegimeAssessment() {},
     async insertLpThesis() {},
     async insertEntryEvaluation() {},
+    async loadFreshPhase4EntryAuthorization() { return undefined; },
     async insertRiskDecision() {},
     async upsertPaperPosition() {},
     async insertPaperPositionEvent() {},
