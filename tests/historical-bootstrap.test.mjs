@@ -54,6 +54,19 @@ test('live confirmation requires both observation density and bounded gaps, not 
  assert.equal(confirmed.liveConfirmationState,'CONFIRMED');
 });
 
+test('bounded live cadence accepts four fresh observations across ten minutes, rejects a 450-second gap, and never accepts stale current data',async()=>{
+ const historic=historicMarket();
+ const bounded=[10,6.67,3.34,0].map(minutesAgo=>({observedAt:iso(ms-Math.round(minutesAgo*60_000)),sourceType:'LIVE_OBSERVED',sourceProvider:'METEORA_API+RPC',price:1,activeBinId:110,resolutionMs:30_000}));
+ const confirmed=await assessHistoryMaturity({poolAddress:'P',assessedAt:at,history:history(),historicalMarket:historic,liveMarket:bounded,liveConfirmationMinutes:10,liveConfirmationMinObservations:4,liveConfirmationMaxGapMs:450_000,staleAfterMs:180_000});
+ assert.equal(confirmed.liveConfirmationState,'CONFIRMED');assert.equal(confirmed.state,'MATURE');
+ const exactHardGap=[10,2.5,1,0].map(minutesAgo=>({observedAt:iso(ms-minutesAgo*60_000),sourceType:'LIVE_OBSERVED',sourceProvider:'METEORA_API+RPC',price:1,activeBinId:110,resolutionMs:30_000}));
+ const gapped=await assessHistoryMaturity({poolAddress:'P',assessedAt:at,history:history(),historicalMarket:historic,liveMarket:exactHardGap,liveConfirmationMinutes:10,liveConfirmationMinObservations:4,liveConfirmationMaxGapMs:450_000,staleAfterMs:180_000});
+ assert.equal(gapped.liveConfirmationState,'WARMING');assert.ok(gapped.reasonCodes.includes('ENTRY_LIVE_CONFIRMATION_GAP'));
+ const stale=bounded.map((row,index)=>({...row,observedAt:iso(Date.parse(row.observedAt)-181_000-index)}));
+ const staleCurrent=await assessHistoryMaturity({poolAddress:'P',assessedAt:at,history:history(),historicalMarket:historic,liveMarket:stale,liveConfirmationMinutes:10,liveConfirmationMinObservations:4,liveConfirmationMaxGapMs:450_000,staleAfterMs:180_000});
+ assert.equal(staleCurrent.liveConfirmationState,'STALE');assert.notEqual(staleCurrent.state,'MATURE');
+});
+
 test('a timestamp-at-start five-minute historical bucket covers its genuine closing interval',async()=>{
  const historic=Array.from({length:13},(_,i)=>({observedAt:iso(ms-65*60_000+i*5*60_000),sourceType:'HISTORICAL_API_BACKFILL',sourceProvider:'METEORA_DATA_API',price:1+i*.01,resolutionMs:5*60_000}));
  const maturity=await assessHistoryMaturity({poolAddress:'P',assessedAt:at,history:history(),historicalMarket:historic,liveMarket:liveMarket(10),liveConfirmationMinutes:10});
