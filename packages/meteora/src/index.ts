@@ -48,9 +48,12 @@ export interface RpcCoordinator { acquire(priority:RpcPriority,method:string):Pr
 export class RpcBudgetShedError extends Error { readonly code='LPFORGE_RPC_BUDGET_SHED'; constructor(readonly priority:RpcPriority,readonly method:string){super(`LPFORGE_RPC_BUDGET_SHED:${priority}:${method}`);} }
 type PgClient={connect:()=>Promise<void>;query:(sql:string,params?:unknown[])=>Promise<{rows:Array<Record<string,unknown>>}>;end:()=>Promise<void>;on:(event:'error',listener:(error:Error)=>void)=>unknown};
 type RpcBudgetConfig={total:number;p0:number;p1:number;p2:number;p3:number;p4:number;};
-const priorityWaitMs:Record<RpcPriority,number>={P0_EXECUTION_CRITICAL:60_000,P1_RECOVERY_CRITICAL:60_000,P2_POSITION_MANAGEMENT:10_000,P3_DISCOVERY:1_500,P4_BACKFILL:250};
 const sleep=(ms:number)=>new Promise<void>(resolve=>setTimeout(resolve,ms));
 function envInt(name:string,fallback:number,min:number){const value=Number(process.env[name]??fallback);return Number.isSafeInteger(value)&&value>=min?value:fallback;}
+// P4 is intentionally bounded and lower priority, but it must wait through at
+// least one coordinator window.  A 250 ms shed timeout with a one-second lane
+// made a legitimate P4 request fail before its next permit could exist.
+const priorityWaitMs:Record<RpcPriority,number>={P0_EXECUTION_CRITICAL:60_000,P1_RECOVERY_CRITICAL:60_000,P2_POSITION_MANAGEMENT:10_000,P3_DISCOVERY:1_500,P4_BACKFILL:envInt('LPFORGE_RPC_P4_MAX_WAIT_MS',1_500,250)};
 function rpcBudgetConfig():RpcBudgetConfig{const total=envInt('LPFORGE_RPC_GLOBAL_MAX_RPS',12,3);const p0=envInt('LPFORGE_RPC_P0_RESERVED_RPS',3,0);const p1=envInt('LPFORGE_RPC_P1_RESERVED_RPS',3,0);if(p0+p1>=total)throw new Error('LPFORGE_RPC_BUDGET_INVALID');return{total,p0,p1,p2:envInt('LPFORGE_RPC_P2_MAX_RPS',Math.max(1,total-p0-p1),1),p3:envInt('LPFORGE_RPC_P3_MAX_RPS',Math.max(1,Math.floor((total-p0-p1)/2)),1),p4:envInt('LPFORGE_RPC_P4_MAX_RPS',1,1)};}
 class PostgresRpcCoordinator implements RpcCoordinator {
   private client:PgClient|undefined; private readonly providerKey:string; private readonly config=rpcBudgetConfig();

@@ -27,7 +27,7 @@ test('production RPC constructors use governed connections and priority lanes',a
   const files=['packages/meteora-execution/src/index.ts','packages/phase6-live-worker/src/index.ts','packages/phase7-production-service/src/index.ts','apps/execution/src/main.ts','apps/operator/src/main.ts'];
   for(const file of files){const source=await readFile(new URL(`../${file}`,import.meta.url),'utf8');assert.doesNotMatch(source,/new Connection\(/,file);}
   const meteora=await readFile(new URL('../packages/meteora/src/index.ts',import.meta.url),'utf8');
-  assert.match(meteora,/createGovernedRpcFetch/);assert.match(meteora,/acquire_rpc_permit/);assert.match(meteora,/client\.on\('error'/);
+  assert.match(meteora,/createGovernedRpcFetch/);assert.match(meteora,/acquire_rpc_permit/);assert.match(meteora,/client\.on\('error'/);assert.match(meteora,/LPFORGE_RPC_P4_MAX_WAIT_MS',1_500,250/);
   const migration=await readFile(new URL('../packages/db/migrations/M0043_shared_rpc_coordinator.sql',import.meta.url),'utf8');
   assert.match(migration,/FOR UPDATE/);assert.match(migration,/pressure_until/);assert.match(migration,/P0_EXECUTION_CRITICAL/);assert.match(migration,/rpc_provider_metrics/);
 });

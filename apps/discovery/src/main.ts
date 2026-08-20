@@ -5,7 +5,7 @@ import { createPostgresStore } from '../../../packages/db/src/index.js';
 import { loadPhase1Config } from '../../../packages/config/src/index.js';
 import { createMeteoraReadAdapter, createSolanaRpcClient } from '../../../packages/meteora/src/index.js';
 import { loadDeploymentPolicyFile } from '../../../packages/deployment-policy/src/index.js';
-import { DEFAULT_DISCOVERY_RUNTIME_POLICY, deriveDiscoveryLifecycleState, runDeepDiscoveryCycle } from '../../../packages/discovery-runtime/src/index.js';
+import { DEFAULT_DISCOVERY_RUNTIME_POLICY, deriveDiscoveryLifecycleState, runDeepDiscoveryCycle, selectDeepScreenSlice } from '../../../packages/discovery-runtime/src/index.js';
 import { collectActiveCandidateEvidence } from '../../../packages/active-candidate-evidence/src/index.js';
 import { discoverUniverse, parseDiscoveryPolicy, type DiscoveryPolicy, type RankedDiscoveryPool } from '../../../packages/pool-discovery/src/index.js';
 
@@ -40,7 +40,7 @@ async function once(){
       const cfg=loadPhase1Config();if(cfg.dataMode!=='LIVE_READ_ONLY')throw new Error('LPFORGE_DISCOVERY_DEEP_REQUIRES_LIVE_READ_ONLY');
       // A pool entering D3 is deliberately non-executable until the current
       // deep-screen result and D4 tier assignment have both been persisted.
-      const deepQueue=result.deepScreenQueue.slice(0,collectorNumber('LPFORGE_DISCOVERY_DEEP_MAX_POOLS',1,1,10));
+      const deepQueue=selectDeepScreenSlice(result.deepScreenQueue,collectorNumber('LPFORGE_DISCOVERY_DEEP_MAX_POOLS',1,1,10),result.observedAt,Math.max(30_000,Number(process.env.LPFORGE_DISCOVERY_INTERVAL_MS??180_000)));
       for(const r of deepQueue)await store.upsertDiscoveryPool({poolAddress:r.pool.address,observedAt:result.observedAt,sourceManual:r.source==='MANUAL'||r.source==='BOTH',sourceAuto:r.source==='AUTO'||r.source==='BOTH',tokenXMint:r.features.tokenX,tokenYMint:r.features.tokenY,pairedTokenMint:r.features.pairedTokenMint,pairedTokenSymbol:r.features.pairedTokenSymbol,marketCapCohort:r.features.marketCapCohort,state:'OBSERVING',tier:'C',priorityScore:r.priorityScore,rank:r.rank,universePercentile:r.universePercentile,reasonCodes:['DISCOVERY_DEEP_SCREEN_IN_PROGRESS'],evidenceState:r.features.evidence,payload:{policyId:policy.policyId,deepScreenInProgressAt:result.observedAt}});
       const discoveryRpcInterval=Math.max(cfg.rpcMinIntervalMs,collectorNumber('LPFORGE_DISCOVERY_RPC_MIN_INTERVAL_MS',1_000,100,10_000));
       // Deep screening replays historical chain activity. It is backfill, so

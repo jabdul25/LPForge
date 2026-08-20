@@ -21,6 +21,16 @@ export interface DiscoveryRuntimePolicy {
 export const DEFAULT_DISCOVERY_RUNTIME_POLICY:DiscoveryRuntimePolicy={id:'discovery-runtime-v2.1.1',deep:DEFAULT_DEEP_SCREEN_POLICY,universe:DEFAULT_UNIVERSE_POLICY,eventScanLimit:5,binRadius:35,capitalResearchSol:.1,predictionCohorts:['A','B','CONTROL']};
 export type DiscoveryLifecycleState='OBSERVING'|'QUALIFIED'|'WATCHLIST'|'ACTIVE_CANDIDATE'|'REJECTED'|'QUARANTINED';
 /**
+ * Deep screening is expensive P4 work. Rotate the already-ranked queue by
+ * discovery cycle so a transiently failing first pool cannot monopolize every
+ * bounded admission slot. Ranking order is preserved within each slice.
+ */
+export function selectDeepScreenSlice<T>(queue:readonly T[],maxPools:number,observedAt:string,cycleMs=180_000):T[]{
+ const limit=Math.max(0,Math.min(Math.floor(maxPools),queue.length));if(!limit)return[];
+ const at=Date.parse(observedAt),epoch=Number.isFinite(at)?Math.floor(at/Math.max(1,cycleMs)):0,offset=((epoch%queue.length)+queue.length)%queue.length;
+ const rotated=[...queue.slice(offset),...queue.slice(0,offset)];return rotated.slice(0,limit);
+}
+/**
  * D3/D4 is the only authority allowed to promote a cheap-screened pool into
  * execution eligibility.  D1/D2 priority alone must never produce an active
  * candidate state.
