@@ -80,7 +80,11 @@ export const LIVE_EVIDENCE_ECONOMIC_RANKING_FRESHNESS_SECONDS=300;
 export function freshLiveEvidenceEconomicQuality(value:LiveEvidenceAdmissionCandidate['economicQuality'],observedAt:string):LiveEvidenceAdmissionCandidate['economicQuality']|undefined{
   if(!value)return undefined;
   const now=Date.parse(observedAt),eventAt=Date.parse(value.eventPathAsOf),forecastAt=Date.parse(value.forecastAsOf),maxAge=LIVE_EVIDENCE_ECONOMIC_RANKING_FRESHNESS_SECONDS*1000;
-  if(!Number.isFinite(now)||!Number.isFinite(eventAt)||!Number.isFinite(forecastAt)||eventAt>now||forecastAt>now||now-eventAt>maxAge||now-forecastAt>maxAge)return undefined;
+  // EVENT_PATH_ESTIMATE is the economic evidence and must remain fresh.  The
+  // deep-screen inventory/forecast descriptors are secondary ordering inputs
+  // from a separate bounded collector, so requiring both collectors to land
+  // in the same five-minute window would make this ranking path inert.
+  if(!Number.isFinite(now)||!Number.isFinite(eventAt)||!Number.isFinite(forecastAt)||eventAt>now||forecastAt>now||now-eventAt>maxAge)return undefined;
   if(![value.feeRatePerCapitalHour,value.adverseInventoryPressure,value.forecastUncertainty].every(Number.isFinite))return undefined;
   return value;
 }

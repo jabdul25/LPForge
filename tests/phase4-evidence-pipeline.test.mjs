@@ -65,6 +65,7 @@ test('economic admission preserves bounded bootstrap access and rejects stale ec
  const base={state:'QUALIFIED',priorityScore:10,firstSeenAt:'2026-08-13T14:00:00.000Z',matureForPhase3:false,phase3Terminal:false};
  const quality={eventPathAsOf:'2026-08-13T15:59:00.000Z',forecastAsOf:'2026-08-13T15:59:30.000Z',feeRatePerCapitalHour:.002,adverseInventoryPressure:.2,forecastUncertainty:.3};
  assert.equal(freshLiveEvidenceEconomicQuality(quality,at)?.feeRatePerCapitalHour,.002);
+ assert.equal(freshLiveEvidenceEconomicQuality({...quality,forecastAsOf:'2026-08-13T15:00:00.000Z'},at)?.feeRatePerCapitalHour,.002,'the separately collected risk descriptor cannot make fresh event-path economics unusable');
  assert.equal(freshLiveEvidenceEconomicQuality({...quality,eventPathAsOf:'2026-08-13T15:54:59.000Z'},at),undefined,'stale event-path evidence cannot rank admission');
  const selected=selectLiveEvidenceAdmissionCandidates([{...base,poolAddress:'bootstrap',rank:1},{...base,poolAddress:'economic',rank:2,economicQuality:quality}],2);
  assert.deepEqual(selected.map(x=>x.poolAddress),['bootstrap','economic']);
