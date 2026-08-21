@@ -48,6 +48,11 @@
       "address": "EsR3gRxMtqt3bBhDDsuY3SFyYNYvYzszzG9KVYpcQfs7",
       "maxCapitalSol": "0.5",
       "maxOpenPositions": 1
+    },
+    {
+      "address": "AUvX4hEMi9t43aqovA5tEAA5AZ7yugcpHa8SkJVEoEKa",
+      "maxCapitalSol": "0.5",
+      "maxOpenPositions": 1
     }
   ]
 }
