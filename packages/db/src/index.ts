@@ -86,6 +86,14 @@ export const LIVE_EVIDENCE_ECONOMIC_RANKING_FRESHNESS_SECONDS=300;
 export const ACTIVE_EVIDENCE_LEASE_TIMEOUT_MS=3*15*60_000;
 export const ACTIVE_EVIDENCE_LEASE_MAX_FAILURES=3;
 export const ACTIVE_EVIDENCE_LEASE_RETRY_COOLDOWN_MS=15*60_000;
+/** A completed EVENT_PATH estimate is consumable only while its existing
+ * economic-freshness window remains open. This is an evaluation handoff,
+ * never an additional evidence lease or admission slot. */
+export const POST_EVIDENCE_EVALUATION_WINDOW_MS=LIVE_EVIDENCE_ECONOMIC_RANKING_FRESHNESS_SECONDS*1000;
+export function isPostEvidenceEvaluationEligible(payload:Record<string,unknown>|undefined,observedAt:string):boolean{
+ const now=Date.parse(observedAt),expires=Date.parse(String(payload?.postEvidenceEvaluationExpiresAt??''));
+ return payload?.postEvidenceEvaluationState==='ELIGIBLE'&&Number.isFinite(now)&&Number.isFinite(expires)&&expires>now;
+}
 export function liveEvidenceLeaseExpiresAt(startedAt:string):string|undefined{
  const start=Date.parse(startedAt);return Number.isFinite(start)?new Date(start+ACTIVE_EVIDENCE_LEASE_TIMEOUT_MS).toISOString():undefined;
 }
@@ -482,6 +490,7 @@ export interface Phase1Store {
   }>>;
   reconcileLiveEvidenceAdmission(value:{observedAt:string;serviceableCapacity:number;productionMonitoredPoolAddresses?:string[]}):Promise<{serviceableCapacity:number;productionMonitoredCount:number;activeCount:number;qualifiedWaitingCount:number;promotedPoolAddresses:string[];demotedPoolAddresses:string[]}>;
   recordLiveEvidenceCollectionOutcome(value:{poolAddress:string;observedAt:string;success:boolean;eventPathEstimate?:boolean}):Promise<void>;
+  recordPostEvidenceEvaluationOutcome(value:{poolAddress:string;observedAt:string;phase3Status:string}):Promise<void>;
   markDiscoveryPoolsStale(cutoff: string, observedAt: string): Promise<number>;
   insertFeeVolumeObservations(value:{poolAddress:string; observedAt:string; source:string; rows:Array<{bucketAt:string;fees?:number;protocolFees?:number;volume?:number;payload?:Record<string,unknown>}>;}):Promise<void>;
   loadFeeVolumeObservations(poolAddress:string,since:string,limit?:number):Promise<Array<{bucketAt:string;fees:number;protocolFees:number;volume:number;source:string;sourceHash:string}>>;
@@ -1704,11 +1713,15 @@ export async function createPostgresStore(
         const found=await tx.query(`SELECT current_state,payload FROM market.pool_discovery_registry WHERE pool_address=$1 FOR UPDATE`,[v.poolAddress]),row=found.rows[0];
         if(!row||row.current_state!=='ACTIVE_CANDIDATE'){await tx.query('COMMIT');return;}
         const payload=(row.payload??{}) as Record<string,unknown>,priorFailures=Math.max(0,Math.floor(Number(payload.liveEvidenceLeaseFailures??0)));
-        if(v.success&&v.eventPathEstimate){await tx.query(`UPDATE market.pool_discovery_registry SET current_state='QUALIFIED',reason_codes=(reason_codes-'LIVE_EVIDENCE_ADMITTED')||'["LIVE_EVIDENCE_LEASE_EVENT_PATH_COMPLETE"]'::jsonb,payload=payload||jsonb_build_object('liveEvidenceAdmission','WAITING','liveEvidenceLeaseReleaseReason','LIVE_EVIDENCE_LEASE_EVENT_PATH_COMPLETE','liveEvidenceLeaseReleasedAt',$2::text,'liveEvidenceLeaseNextEligibleAt',$3::text,'liveEvidenceLeaseFailures',0) WHERE pool_address=$1`,[v.poolAddress,v.observedAt,nextEligibleAt]);}
+        if(v.success&&v.eventPathEstimate){const handoffExpiresAt=new Date(now+POST_EVIDENCE_EVALUATION_WINDOW_MS).toISOString();await tx.query(`UPDATE market.pool_discovery_registry SET current_state='QUALIFIED',reason_codes=(reason_codes-'LIVE_EVIDENCE_ADMITTED')||'["LIVE_EVIDENCE_LEASE_EVENT_PATH_COMPLETE"]'::jsonb,payload=payload||jsonb_build_object('liveEvidenceAdmission','WAITING','liveEvidenceLeaseReleaseReason','LIVE_EVIDENCE_LEASE_EVENT_PATH_COMPLETE','liveEvidenceLeaseReleasedAt',$2::text,'liveEvidenceLeaseNextEligibleAt',$3::text,'liveEvidenceLeaseFailures',0,'postEvidenceEvaluationState','ELIGIBLE','postEvidenceEvaluationEligibleAt',$2::text,'postEvidenceEvaluationExpiresAt',$4::text,'postEvidenceEventPathAt',$2::text) WHERE pool_address=$1`,[v.poolAddress,v.observedAt,nextEligibleAt,handoffExpiresAt]);}
         else if(v.success){const startedAt=typeof payload.liveEvidenceLeaseStartedAt==='string'&&Number.isFinite(Date.parse(payload.liveEvidenceLeaseStartedAt))?payload.liveEvidenceLeaseStartedAt:v.observedAt,expiresAt=typeof payload.liveEvidenceLeaseExpiresAt==='string'&&Number.isFinite(Date.parse(payload.liveEvidenceLeaseExpiresAt))?payload.liveEvidenceLeaseExpiresAt:liveEvidenceLeaseExpiresAt(startedAt);await tx.query(`UPDATE market.pool_discovery_registry SET payload=payload||jsonb_build_object('liveEvidenceAdmission','ADMITTED','liveEvidenceLeaseStartedAt',$2::text,'liveEvidenceLeaseExpiresAt',$3::text,'liveEvidenceLeaseFailures',0,'liveEvidenceLastSuccessfulAt',$4::text) WHERE pool_address=$1`,[v.poolAddress,startedAt,expiresAt??v.observedAt,v.observedAt]);}
         else {const failures=priorFailures+1;if(failures>=ACTIVE_EVIDENCE_LEASE_MAX_FAILURES)await tx.query(`UPDATE market.pool_discovery_registry SET current_state='QUALIFIED',reason_codes=(reason_codes-'LIVE_EVIDENCE_ADMITTED')||'["LIVE_EVIDENCE_LEASE_COLLECTION_FAILURE_LIMIT"]'::jsonb,payload=payload||jsonb_build_object('liveEvidenceAdmission','WAITING','liveEvidenceLeaseReleaseReason','LIVE_EVIDENCE_LEASE_COLLECTION_FAILURE_LIMIT','liveEvidenceLeaseReleasedAt',$2::text,'liveEvidenceLeaseNextEligibleAt',$3::text,'liveEvidenceLeaseFailures',$4::int) WHERE pool_address=$1`,[v.poolAddress,v.observedAt,nextEligibleAt,failures]);else await tx.query(`UPDATE market.pool_discovery_registry SET payload=payload||jsonb_build_object('liveEvidenceLeaseFailures',$2::int,'liveEvidenceLastFailureAt',$3::text) WHERE pool_address=$1`,[v.poolAddress,failures,v.observedAt]);}
         await tx.query('COMMIT');
       } catch(error) {try{await tx.query('ROLLBACK');}catch{} throw error;}
+    },
+    async recordPostEvidenceEvaluationOutcome(v) {
+      if(v.phase3Status!=='ENTRY_READY'&&v.phase3Status!=='NO_TRADE')return;
+      await db.query(`UPDATE market.pool_discovery_registry SET payload=payload||jsonb_build_object('postEvidenceEvaluationState','COMPLETED','postEvidenceEvaluationCompletedAt',$2::text,'postEvidenceEvaluationClearReason',$3::text) WHERE pool_address=$1 AND payload->>'postEvidenceEvaluationState'='ELIGIBLE' AND COALESCE(NULLIF(payload->>'postEvidenceEvaluationEligibleAt','')::timestamptz,'epoch'::timestamptz)<=$2::timestamptz`,[v.poolAddress,v.observedAt,`POST_EVIDENCE_PHASE3_${v.phase3Status}`]);
     },
     async markDiscoveryPoolsStale(cutoff, observedAt) {
       const r=await db.query(`UPDATE market.pool_discovery_registry SET current_state='OBSERVING',current_tier='C',reason_codes=CASE WHEN reason_codes ? 'DISCOVERY_STALE' THEN reason_codes ELSE reason_codes || '["DISCOVERY_STALE"]'::jsonb END,evidence_state=jsonb_set(evidence_state,'{discoveryFreshness}','"STALE"'::jsonb,true),payload=jsonb_set(payload,'{staleMarkedAt}',to_jsonb($2::text),true) WHERE last_seen_at<$1::timestamptz AND current_state NOT IN ('REJECTED','QUARANTINED') RETURNING pool_address`,[cutoff,observedAt]);
@@ -3194,6 +3207,7 @@ export function createMemoryStore(): Phase1Store {
     async listDiscoveryCandidates() { return []; },
     async reconcileLiveEvidenceAdmission(v) { return {serviceableCapacity:v.serviceableCapacity,productionMonitoredCount:0,activeCount:0,qualifiedWaitingCount:0,promotedPoolAddresses:[],demotedPoolAddresses:[]}; },
     async recordLiveEvidenceCollectionOutcome() {},
+    async recordPostEvidenceEvaluationOutcome() {},
     async markDiscoveryPoolsStale() { return 0; },
     async insertFeeVolumeObservations() {},
     async loadFeeVolumeObservations() { return []; },

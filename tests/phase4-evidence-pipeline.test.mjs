@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {assessHistoryMaturity,deriveEventPathEconomicEstimate,collectActiveCandidateEvidence,selectActiveCandidateCollectionSlice,requiredActiveCandidateCollectionCapacity,calculateServiceableActiveCandidateCapacity} from '../.build/packages/active-candidate-evidence/src/index.js';
 import {estimateOpportunityEconomics} from '../.build/packages/opportunity/src/index.js';
 import {evaluateEntry,ENTRY_RESEARCH_POLICY_V1} from '../.build/packages/entry-intelligence/src/index.js';
-import {ACTIVE_EVIDENCE_LEASE_TIMEOUT_MS,dynamicLiveEvidenceAdmissionCapacity,freshLiveEvidenceEconomicQuality,isLiveEvidenceAdmissionTerminal,isLiveEvidenceLeaseActive,liveEvidenceLeaseExpiresAt,liveEvidenceLeaseReleaseReason,selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
+import {ACTIVE_EVIDENCE_LEASE_TIMEOUT_MS,POST_EVIDENCE_EVALUATION_WINDOW_MS,dynamicLiveEvidenceAdmissionCapacity,freshLiveEvidenceEconomicQuality,isLiveEvidenceAdmissionTerminal,isLiveEvidenceLeaseActive,isPostEvidenceEvaluationEligible,liveEvidenceLeaseExpiresAt,liveEvidenceLeaseReleaseReason,selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
 import {decisionTimeEconomicEvidenceAgeSeconds} from '../.build/packages/operational-runtime/src/index.js';
 
 const at='2026-08-13T16:00:00.000Z',atMs=Date.parse(at);
@@ -176,4 +176,12 @@ test('lease release reasons are bounded to completion, terminal state, failure l
  assert.equal(liveEvidenceLeaseReleaseReason({...base,phase3Status:'NO_TRADE'},'2026-08-13T16:30:00.000Z'),'LIVE_EVIDENCE_LEASE_TERMINAL_PHASE3');
  assert.equal(liveEvidenceLeaseReleaseReason({...base,failureCount:3},'2026-08-13T16:30:00.000Z'),'LIVE_EVIDENCE_LEASE_COLLECTION_FAILURE_LIMIT');
  assert.equal(liveEvidenceLeaseReleaseReason(base,'2026-08-13T16:45:00.000Z'),'LIVE_EVIDENCE_LEASE_TIMEOUT');
+});
+
+test('post-evidence handoff is bounded by existing economic freshness and does not occupy an ACTIVE slot',()=>{
+ const eligibleAt='2026-08-13T16:00:00.000Z',expires=new Date(Date.parse(eligibleAt)+POST_EVIDENCE_EVALUATION_WINDOW_MS).toISOString(),payload={postEvidenceEvaluationState:'ELIGIBLE',postEvidenceEvaluationEligibleAt:eligibleAt,postEvidenceEvaluationExpiresAt:expires};
+ assert.equal(POST_EVIDENCE_EVALUATION_WINDOW_MS,300_000);
+ assert.equal(isPostEvidenceEvaluationEligible(payload,'2026-08-13T16:04:59.999Z'),true);
+ assert.equal(isPostEvidenceEvaluationEligible(payload,expires),false);
+ assert.equal(isPostEvidenceEvaluationEligible({postEvidenceEvaluationState:'COMPLETED',postEvidenceEvaluationExpiresAt:expires},eligibleAt),false);
 });

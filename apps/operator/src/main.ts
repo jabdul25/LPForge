@@ -568,6 +568,7 @@ async function persistResult(
         : {}),
     },
   });
+  await store.recordPostEvidenceEvaluationOutcome({poolAddress:r.poolAddress,observedAt:r.observedAt,phase3Status:r.phase3Status});
 }
 async function liveOnce() {
   const cfg = loadPhase1Config();
