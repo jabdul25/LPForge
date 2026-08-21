@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {assessHistoryMaturity,deriveEventPathEconomicEstimate,collectActiveCandidateEvidence,selectActiveCandidateCollectionSlice,requiredActiveCandidateCollectionCapacity,calculateServiceableActiveCandidateCapacity} from '../.build/packages/active-candidate-evidence/src/index.js';
 import {estimateOpportunityEconomics} from '../.build/packages/opportunity/src/index.js';
 import {evaluateEntry,ENTRY_RESEARCH_POLICY_V1} from '../.build/packages/entry-intelligence/src/index.js';
-import {freshLiveEvidenceEconomicQuality,selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
+import {dynamicLiveEvidenceAdmissionCapacity,freshLiveEvidenceEconomicQuality,isLiveEvidenceAdmissionTerminal,selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
 import {decisionTimeEconomicEvidenceAgeSeconds} from '../.build/packages/operational-runtime/src/index.js';
 
 const at='2026-08-13T16:00:00.000Z',atMs=Date.parse(at);
@@ -27,6 +27,17 @@ test('serviceable admission is bounded by measured p95 collection cadence before
  const capacity=calculateServiceableActiveCandidateCapacity({p3BudgetRps:3,estimatedP3CallsPerPool:12,p95PoolCollectionMs:90_000,maxConcurrentPoolReads:3,targetCoverageMs:180_000,serviceabilitySafetyMargin:.70,hardCap:30});
  assert.equal(capacity,6);
  assert.equal(calculateServiceableActiveCandidateCapacity({p3BudgetRps:3,estimatedP3CallsPerPool:12,p95PoolCollectionMs:90_000,maxConcurrentPoolReads:3,targetCoverageMs:180_000,serviceabilitySafetyMargin:.70,hardCap:4}),4);
+});
+
+test('static policy monitoring does not consume dynamic active admission slots',()=>{
+ assert.equal(dynamicLiveEvidenceAdmissionCapacity({serviceableCapacity:2,staticPolicyPoolCount:5}),2);
+});
+
+test('economic NO_TRADE remains eligible for reserve observation and later dynamic admission',()=>{
+ assert.equal(isLiveEvidenceAdmissionTerminal('NO_TRADE'),false);
+ assert.equal(isLiveEvidenceAdmissionTerminal('ENTRY_READY'),true);
+ const candidate={poolAddress:'economic-no-trade',state:'QUALIFIED',priorityScore:1,firstSeenAt:at,matureForPhase3:false,phase3Terminal:isLiveEvidenceAdmissionTerminal('NO_TRADE')};
+ assert.deepEqual(selectLiveEvidenceAdmissionCandidates([candidate],1).map(x=>x.poolAddress),['economic-no-trade']);
 });
 
 test('confirmed mature QUALIFIED pool retains a bounded collector slot for fresh Phase-3 economics',()=>{
