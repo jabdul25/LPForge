@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {assessHistoryMaturity,deriveEventPathEconomicEstimate,collectActiveCandidateEvidence,selectActiveCandidateCollectionSlice,requiredActiveCandidateCollectionCapacity,calculateServiceableActiveCandidateCapacity} from '../.build/packages/active-candidate-evidence/src/index.js';
 import {estimateOpportunityEconomics} from '../.build/packages/opportunity/src/index.js';
 import {evaluateEntry,ENTRY_RESEARCH_POLICY_V1} from '../.build/packages/entry-intelligence/src/index.js';
-import {dynamicLiveEvidenceAdmissionCapacity,freshLiveEvidenceEconomicQuality,isLiveEvidenceAdmissionTerminal,selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
+import {ACTIVE_EVIDENCE_LEASE_TIMEOUT_MS,dynamicLiveEvidenceAdmissionCapacity,freshLiveEvidenceEconomicQuality,isLiveEvidenceAdmissionTerminal,isLiveEvidenceLeaseActive,liveEvidenceLeaseExpiresAt,liveEvidenceLeaseReleaseReason,selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
 import {decisionTimeEconomicEvidenceAgeSeconds} from '../.build/packages/operational-runtime/src/index.js';
 
 const at='2026-08-13T16:00:00.000Z',atMs=Date.parse(at);
@@ -144,4 +144,36 @@ test('Phase-4 thresholds remain unchanged and missing flow is not treated as hea
  assert.deepEqual(ENTRY_RESEARCH_POLICY_V1,{id:'entry-research-v1',minReadiness:.60,minDataCompleteness:.60,maxDownsidePressure:.72,maxDangerousRegimeMass:.48,maxToxicity:.62,maxReferenceDivergenceRisk:.60,maxImmediateOorRisk:.65,minExpectedNetValue:0,maxUncertainty:.72});
  const features={downsideDeceleration:.9,supportReclaimStrength:.8,twoWayFlowStrength:0,flowRecovery:0,regimeStability:.8,volatilityExpansionRisk:.1,immediateOorRisk:.1,dataCompleteness:1,dangerousRegimeMass:.1,poolToxicity:.1,referenceDivergenceRisk:.1,downsidePressure:.1};
  const r=evaluateEntry({features,economics:{expectedNetLpValue:.02,uncertainty:.2},thesis:{thesisId:'t'},observedAt:at,expiresAt:'2026-08-13T16:05:00.000Z'});assert.equal(r.decision,'WAIT');assert.ok(r.waitReasons.includes('WAIT_FLOW_NOT_RECOVERED'));
+});
+
+test('active evidence lease prevents incomplete evidence attempts from being preempted',()=>{
+ const started='2026-08-13T16:00:00.000Z',expires=liveEvidenceLeaseExpiresAt(started);
+ assert.equal(Date.parse(expires)-Date.parse(started),ACTIVE_EVIDENCE_LEASE_TIMEOUT_MS);
+ assert.equal(isLiveEvidenceLeaseActive({startedAt:started,expiresAt:expires,failureCount:0},'2026-08-13T16:30:00.000Z'),true);
+ assert.equal(isLiveEvidenceLeaseActive({startedAt:started,expiresAt:expires,failureCount:0},'2026-08-13T16:45:00.000Z'),false);
+ const candidates=[
+  {poolAddress:'leased-a',state:'ACTIVE_CANDIDATE',priorityScore:1,rank:99,firstSeenAt:started,matureForPhase3:false,phase3Terminal:false,evidenceLeaseActive:true},
+  {poolAddress:'leased-b',state:'ACTIVE_CANDIDATE',priorityScore:1,rank:98,firstSeenAt:started,matureForPhase3:false,phase3Terminal:false,evidenceLeaseActive:true},
+  {poolAddress:'higher-ranked-waiter',state:'QUALIFIED',priorityScore:999,rank:1,firstSeenAt:at,matureForPhase3:false,phase3Terminal:false},
+ ];
+ assert.deepEqual(new Set(selectLiveEvidenceAdmissionCandidates(candidates,2).map(x=>x.poolAddress)),new Set(['leased-a','leased-b']));
+});
+
+test('completed, terminal, failed, or timed-out leases release a bounded slot to the next eligible waiter',()=>{
+ const waiting=[
+  {poolAddress:'released',state:'QUALIFIED',priorityScore:99,rank:1,firstSeenAt:at,matureForPhase3:false,phase3Terminal:false,admissionEligible:false},
+  {poolAddress:'next-qualified',state:'QUALIFIED',priorityScore:20,rank:2,firstSeenAt:at,matureForPhase3:false,phase3Terminal:false},
+  {poolAddress:'later-qualified',state:'QUALIFIED',priorityScore:10,rank:3,firstSeenAt:at,matureForPhase3:false,phase3Terminal:false},
+ ];
+ assert.deepEqual(selectLiveEvidenceAdmissionCandidates(waiting,1).map(x=>x.poolAddress),['next-qualified']);
+ assert.equal(selectLiveEvidenceAdmissionCandidates([{...waiting[1],phase3Terminal:true},{...waiting[2]}],1)[0].poolAddress,'later-qualified');
+});
+
+test('lease release reasons are bounded to completion, terminal state, failure limit, or expiry',()=>{
+ const started='2026-08-13T16:00:00.000Z',expires=liveEvidenceLeaseExpiresAt(started),base={state:'ACTIVE_CANDIDATE',startedAt:started,expiresAt:expires,failureCount:0};
+ assert.equal(liveEvidenceLeaseReleaseReason(base,'2026-08-13T16:30:00.000Z'),undefined);
+ assert.equal(liveEvidenceLeaseReleaseReason({...base,eventPathEstimateFresh:true},'2026-08-13T16:30:00.000Z'),'LIVE_EVIDENCE_LEASE_EVENT_PATH_COMPLETE');
+ assert.equal(liveEvidenceLeaseReleaseReason({...base,phase3Status:'NO_TRADE'},'2026-08-13T16:30:00.000Z'),'LIVE_EVIDENCE_LEASE_TERMINAL_PHASE3');
+ assert.equal(liveEvidenceLeaseReleaseReason({...base,failureCount:3},'2026-08-13T16:30:00.000Z'),'LIVE_EVIDENCE_LEASE_COLLECTION_FAILURE_LIMIT');
+ assert.equal(liveEvidenceLeaseReleaseReason(base,'2026-08-13T16:45:00.000Z'),'LIVE_EVIDENCE_LEASE_TIMEOUT');
 });
