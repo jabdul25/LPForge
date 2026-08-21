@@ -30,12 +30,22 @@
   },
   "pools": [
     {
-      "address": "Cfc6zeThDv58QEQqNYN2jfTVKoLhrEevNXesPTQk5yGW",
+      "address": "2VHM9pTZEU6pqeZoiNi8ZCeyerqhRYgS5Um7U8AEKrd9",
       "maxCapitalSol": "0.5",
       "maxOpenPositions": 1
     },
     {
-      "address": "CCHw81WFvz8SE4g9YSxRPs7ndZKhAsMsi2np2M2F6trW",
+      "address": "AeUfFU6LU159YSBQvhLbXmh5bW2BqCgAFi5zUSQMnUc7",
+      "maxCapitalSol": "0.5",
+      "maxOpenPositions": 1
+    },
+    {
+      "address": "8CsgJcQ6YCE93wYiZW21gKF7a9HrTvW7WjwKaKt9cFDp",
+      "maxCapitalSol": "0.5",
+      "maxOpenPositions": 1
+    },
+    {
+      "address": "EsR3gRxMtqt3bBhDDsuY3SFyYNYvYzszzG9KVYpcQfs7",
       "maxCapitalSol": "0.5",
       "maxOpenPositions": 1
     }
