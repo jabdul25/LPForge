@@ -4,7 +4,7 @@ import {assessHistoryMaturity,deriveEventPathEconomicEstimate,collectActiveCandi
 import {estimateOpportunityEconomics} from '../.build/packages/opportunity/src/index.js';
 import {evaluateEntry,ENTRY_RESEARCH_POLICY_V1} from '../.build/packages/entry-intelligence/src/index.js';
 import {ACTIVE_EVIDENCE_LEASE_TIMEOUT_MS,POST_EVIDENCE_EVALUATION_WINDOW_MS,dynamicLiveEvidenceAdmissionCapacity,freshLiveEvidenceEconomicQuality,isLiveEvidenceAdmissionTerminal,isLiveEvidenceLeaseActive,isPostEvidenceEvaluationEligible,liveEvidenceLeaseExpiresAt,liveEvidenceLeaseReleaseReason,selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
-import {decisionTimeEconomicEvidenceAgeSeconds} from '../.build/packages/operational-runtime/src/index.js';
+import {decisionTimeEconomicEvidenceAgeSeconds,hasPhase3FreshHistoricalEvidence,summarizePhase3RecentLiveObservations} from '../.build/packages/operational-runtime/src/index.js';
 
 const at='2026-08-13T16:00:00.000Z',atMs=Date.parse(at);
 const history=(count=61,strideMs=60_000)=>{const market=Array.from({length:count},(_,i)=>({observedAt:new Date(atMs-(count-1-i)*strideMs).toISOString(),price:1+i*.0001,activeBinId:10+(i%2),volume:100,feeValue:1,twoWayRatio:.7,localLiquidity:100000}));return{marketObservations:market,activeBins:market.map(x=>({observedAt:x.observedAt,activeBinId:x.activeBinId})),binFrames:market.map(x=>({observedAt:x.observedAt,activeBinId:x.activeBinId,bins:[]})),swapEvents:market.map((x,i)=>({pool:'P',signature:`s${i}`,eventIndex:0,stamp:{observedAt:x.observedAt}}))};};
@@ -172,10 +172,26 @@ test('completed, terminal, failed, or timed-out leases release a bounded slot to
 test('lease release reasons are bounded to completion, terminal state, failure limit, or expiry',()=>{
  const started='2026-08-13T16:00:00.000Z',expires=liveEvidenceLeaseExpiresAt(started),base={state:'ACTIVE_CANDIDATE',startedAt:started,expiresAt:expires,failureCount:0};
  assert.equal(liveEvidenceLeaseReleaseReason(base,'2026-08-13T16:30:00.000Z'),undefined);
- assert.equal(liveEvidenceLeaseReleaseReason({...base,eventPathEstimateFresh:true},'2026-08-13T16:30:00.000Z'),'LIVE_EVIDENCE_LEASE_EVENT_PATH_COMPLETE');
+ assert.equal(liveEvidenceLeaseReleaseReason({...base,eventPathEstimateFresh:true},'2026-08-13T16:30:00.000Z'),undefined,'EVENT_PATH alone retains the ACTIVE lease');
+ assert.equal(liveEvidenceLeaseReleaseReason({...base,eventPathEstimateFresh:true,phase3CurrentLiveReady:true},'2026-08-13T16:30:00.000Z'),'LIVE_EVIDENCE_LEASE_PHASE3_READY');
  assert.equal(liveEvidenceLeaseReleaseReason({...base,phase3Status:'NO_TRADE'},'2026-08-13T16:30:00.000Z'),'LIVE_EVIDENCE_LEASE_TERMINAL_PHASE3');
  assert.equal(liveEvidenceLeaseReleaseReason({...base,failureCount:3},'2026-08-13T16:30:00.000Z'),'LIVE_EVIDENCE_LEASE_COLLECTION_FAILURE_LIMIT');
  assert.equal(liveEvidenceLeaseReleaseReason(base,'2026-08-13T16:45:00.000Z'),'LIVE_EVIDENCE_LEASE_TIMEOUT');
+});
+
+
+test('lease completion reuses Phase-3 live readiness rather than releasing on event-path evidence alone',()=>{
+ const assessedAt='2026-08-13T16:00:00.000Z',base={historicalState:'MATURE',historicalBackfillQuality:'SUFFICIENT'};
+ const one=summarizePhase3RecentLiveObservations(assessedAt,['2026-08-13T15:59:30.000Z']);
+ const two=summarizePhase3RecentLiveObservations(assessedAt,['2026-08-13T15:53:00.000Z','2026-08-13T15:59:30.000Z']);
+ const three=summarizePhase3RecentLiveObservations(assessedAt,['2026-08-13T15:46:00.000Z','2026-08-13T15:52:30.000Z','2026-08-13T15:59:30.000Z']);
+ const stale=summarizePhase3RecentLiveObservations(assessedAt,['2026-08-13T15:46:00.000Z','2026-08-13T15:52:30.000Z','2026-08-13T15:56:50.000Z']);
+ const badGap=summarizePhase3RecentLiveObservations(assessedAt,['2026-08-13T15:45:00.000Z','2026-08-13T15:52:30.000Z','2026-08-13T15:59:30.000Z']);
+ assert.equal(hasPhase3FreshHistoricalEvidence({...base,...one}),false);
+ assert.equal(hasPhase3FreshHistoricalEvidence({...base,...two}),false);
+ assert.equal(hasPhase3FreshHistoricalEvidence({...base,...three}),true);
+ assert.equal(hasPhase3FreshHistoricalEvidence({...base,...stale}),false);
+ assert.equal(hasPhase3FreshHistoricalEvidence({...base,...badGap}),false);
 });
 
 test('post-evidence handoff is bounded by existing economic freshness and does not occupy an ACTIVE slot',()=>{
