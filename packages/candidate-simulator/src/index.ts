@@ -26,6 +26,21 @@ export interface CandidateEconomicSimulation {
   warnings:string[];
 }
 function raw(v:string|undefined):bigint{try{return BigInt(v??'0');}catch{return 0n;}}
+/**
+ * A synthetic replay position needs enough relative share units to survive integer
+ * division against the observed pool supply.  Derive that scale from the opening
+ * frame rather than an arbitrary fixed unit count.  It is not deployed liquidity;
+ * later normalization maps the resulting inventory back to decision capital.
+ */
+const MAX_SYNTHETIC_POSITION_SHARE_RAW=BigInt(Number.MAX_SAFE_INTEGER);
+export function deriveSyntheticPositionShareRaw(frame:BinFrame):bigint{
+ let usable=0n;
+ for(const bin of frame.bins){
+  const supply=raw(bin.liquiditySupply),x=raw(bin.amountX),y=raw(bin.amountY);
+  if(supply>0n&&(x>0n||y>0n))usable+=supply;
+ }
+ return usable>MAX_SYNTHETIC_POSITION_SHARE_RAW?MAX_SYNTHETIC_POSITION_SHARE_RAW:usable;
+}
 function distributeShares(candidate:RangeStrategyCandidate,totalShareRaw:bigint,frame:BinFrame):SyntheticPosition{
  const map=new Map(frame.bins.map((b)=>[b.binId,b] as const));let assigned=0n;const bins=candidate.perBinWeights.map((w,i)=>{const share=i===candidate.perBinWeights.length-1?totalShareRaw-assigned:BigInt(Math.max(0,Math.floor(Number(totalShareRaw)*w.weight)));assigned+=share;return{binId:w.binId,positionShareRaw:share,competingSupplyRaw:raw(map.get(w.binId)?.liquiditySupply)};});return{pool:'candidate-pool',lowerBinId:candidate.lowerBinId,upperBinId:candidate.upperBinId,openedAt:frame.observedAt,bins,strategyLabel:`${candidate.strategy}:${candidate.orientation}`};
 }
