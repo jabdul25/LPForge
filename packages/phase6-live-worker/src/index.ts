@@ -5,6 +5,7 @@ import {
   Transaction,
   VersionedTransaction,
 } from "@solana/web3.js";
+import { loadConfirmedExecutionReceipt } from "../../transaction-receipt/src/index.js";
 import {
   buildAddLiquidityTransaction,
   buildClaimTransactions,
@@ -1726,11 +1727,8 @@ function mutationCapital(plan: AutonomousPlan) {
  * RPC read failure never changes chain truth; the durable estimate is retained
  * and can be refreshed idempotently on a later reconciliation pass. */
 async function confirmedTransactionFeeLamports(connection:Connection,signature:string):Promise<bigint|undefined>{
-  try{
-    const receipt=await connection.getTransaction(signature,{commitment:'confirmed',maxSupportedTransactionVersion:0});
-    const fee=receipt?.meta?.fee;
-    return typeof fee==='number'&&Number.isSafeInteger(fee)&&fee>=0?BigInt(fee):undefined;
-  }catch{return undefined;}
+  const receipt=await loadConfirmedExecutionReceipt(connection,signature);
+  return receipt.state==='CONFIRMED_SUCCESS'||receipt.state==='CONFIRMED_FAILURE'?receipt.feeLamports:undefined;
 }
 function mutationRange(
   plan: AutonomousPlan,
