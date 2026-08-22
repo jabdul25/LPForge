@@ -147,7 +147,7 @@ export function validateClaimedPlan(input: {
     // chronological control-before-plan is expected, not a rejection reason.
     if(!boundDecisionId||!boundObservedAt)reasons.push('P6_CLAIM_P7_CONTROL_BINDING_MISSING');
     else if(!control?.decisionId)reasons.push('P6_CLAIM_P7_CONTROL_ID_MISSING');
-    else if(control.decisionId!==boundDecisionId&&Date.parse(control.observedAt)<Date.parse(boundObservedAt))reasons.push('P6_CLAIM_P7_CONTROL_BINDING_MISMATCH');
+    else if(control.decisionId!==boundDecisionId)reasons.push('P6_CLAIM_P7_CONTROL_BINDING_MISMATCH');
     else if(!Number.isFinite(Date.parse(boundObservedAt))||Date.parse(boundObservedAt)>Date.parse(p.observedAt))reasons.push('P6_CLAIM_P7_CONTROL_BINDING_INVALID');
     if(control?.poolDrift?.[p.poolAddress]==='BLOCK')reasons.push('P6_CLAIM_P7_POOL_DRIFT_BLOCK');
   }
