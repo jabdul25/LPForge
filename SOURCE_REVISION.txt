@@ -1,3 +1,1 @@
-source_git_commit=dcd66a7c6f14c417e13f114a00788b82c86c56df
-release_parent_commit=2f2021aad35d3183de0a96205506941de25ce490
-release_note=live-path-wiring-canary-capabilities-script-fixed-v1.0.4.2
+source_git_commit=7bdf0b7d916624b1dcab5f936733ee48e50cd28e
