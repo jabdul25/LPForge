@@ -45,6 +45,7 @@ import {
 } from "../../../packages/test-fixtures/src/index.js";
 import { loadDeploymentPolicyFile } from "../../../packages/deployment-policy/src/index.js";
 import { assessProductionOpenPlanCapacity } from "../../../packages/production-entry-capacity/src/index.js";
+import { refreshCurrentPhase3Evidence } from "../../../packages/active-candidate-evidence/src/index.js";
 import { PublicKey } from "@solana/web3.js";
 
 function json(v: unknown) {
@@ -613,8 +614,6 @@ async function liveOnce() {
       adapter.getPool(cfg.smokePoolAddress),
       adapter.getBinsAroundActive(cfg.smokePoolAddress, 35),
     ]);
-    await store.insertPoolSnapshot(pool);
-    await store.insertBins(bins);
     const api = createMeteoraDataApi({
       baseUrl: cfg.meteoraDataApiUrl,
       maxRps: cfg.dataApiMaxRps,
@@ -625,14 +624,13 @@ async function liveOnce() {
       api.getOhlcv(cfg.smokePoolAddress, { timeframe: "5m" }),
     ]);
     const apiObservedAt = new Date().toISOString();
-    // Static production pools already have this current read. Persist it as
-    // canonical Phase-3 LIVE_OBSERVED evidence without any additional RPC.
     const deploymentPolicy=loadDeploymentPolicyFile(process.env.LPFORGE_EXECUTION_POLICY_PATH ?? "policies/live-execution-policy.json");
-    if(deploymentPolicy.pools.some(entry=>entry.address===cfg.smokePoolAddress))await store.insertCandidateMarketObservations({poolAddress:cfg.smokePoolAddress,ingestedAt:apiObservedAt,rows:[{observedAt:apiObservedAt,sourceType:'LIVE_OBSERVED',sourceProvider:'OPERATOR_METEORA_API+RPC',price:Number(apiPool.current_price),activeBinId:pool.activeBinId,resolutionMs:60_000,volume:Number(apiPool.volume?.['5m']??0),feeValue:Number(apiPool.fees?.['5m']??0),localLiquidity:Number(apiPool.tvl??0),payload:{freshPoolState:true,freshActiveBin:true,productionPolicyPool:true}}]});
-    await store.insertDataApiPool(
-      apiPool as Record<string, unknown>,
-      apiObservedAt,
-    );
+    const staticProductionPool=deploymentPolicy.pools.some(entry=>entry.address===cfg.smokePoolAddress);
+    if(!staticProductionPool){
+      await store.insertPoolSnapshot(pool);
+      await store.insertBins(bins);
+      await store.insertDataApiPool(apiPool as Record<string, unknown>,apiObservedAt);
+    }
     await store.insertOhlcv(
       cfg.smokePoolAddress,
       "5m",
@@ -678,6 +676,7 @@ async function liveOnce() {
       decodedSwapEvents,
       eventDecodeWarnings,
     });
+    if(staticProductionPool)await refreshCurrentPhase3Evidence({store,poolAddress:cfg.smokePoolAddress,apiPool,pool,bins,observedAt:apiObservedAt,sourceProvider:'OPERATOR_METEORA_API+RPC',sourcePayload:{productionPolicyPool:true},collectionTarget:'PRODUCTION_POLICY',authority:'PRODUCTION_POLICY_MONITORING'});
     const since = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString();
     const history = await store.loadOperationalHistory(
       cfg.smokePoolAddress,
