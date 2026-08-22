@@ -46,6 +46,7 @@ import {
 import { loadDeploymentPolicyFile } from "../../../packages/deployment-policy/src/index.js";
 import { assessProductionOpenPlanCapacity } from "../../../packages/production-entry-capacity/src/index.js";
 import { refreshCanonicalHistoricalBackfill, refreshCurrentPhase3Evidence } from "../../../packages/active-candidate-evidence/src/index.js";
+import { derivePhase3EvidenceWidthRequirement } from "../../../packages/rangeforge/src/index.js";
 import { PublicKey } from "@solana/web3.js";
 
 function json(v: unknown) {
@@ -610,9 +611,11 @@ async function liveOnce() {
     await store.insertCompatibility(compat);
     if (compat.state !== "VERIFIED")
       throw new Error("LPFORGE_PROTOCOL_COMPATIBILITY_HOLD");
+    const deploymentPolicy=loadDeploymentPolicyFile(process.env.LPFORGE_EXECUTION_POLICY_PATH ?? "policies/live-execution-policy.json");
+    const evidenceWidth=derivePhase3EvidenceWidthRequirement(deploymentPolicy.positionConstruction?.maxInitialPositionWidthBins ?? 100);
     const [pool, bins] = await Promise.all([
       adapter.getPool(cfg.smokePoolAddress),
-      adapter.getBinsAroundActive(cfg.smokePoolAddress, 35),
+      adapter.getBinsAroundActive(cfg.smokePoolAddress, evidenceWidth.requiredEvidenceRadius),
     ]);
     const api = createMeteoraDataApi({
       baseUrl: cfg.meteoraDataApiUrl,
@@ -624,7 +627,6 @@ async function liveOnce() {
       api.getOhlcv(cfg.smokePoolAddress, { timeframe: "5m" }),
     ]);
     const apiObservedAt = new Date().toISOString();
-    const deploymentPolicy=loadDeploymentPolicyFile(process.env.LPFORGE_EXECUTION_POLICY_PATH ?? "policies/live-execution-policy.json");
     const staticProductionPool=deploymentPolicy.pools.some(entry=>entry.address===cfg.smokePoolAddress);
     if(!staticProductionPool){
       await store.insertPoolSnapshot(pool);

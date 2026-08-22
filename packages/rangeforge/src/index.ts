@@ -15,6 +15,28 @@ function pctForOffset(binStep:number,offset:number):number{return (Math.pow(1+bi
 export const METEORA_PROTOCOL_MAX_POSITION_WIDTH_BINS=1400;
 /** LPForge's policy default. Production supplies its explicit policy cap. */
 export const DEFAULT_LPFORGE_MAX_POSITION_WIDTH_BINS=100;
+/**
+ * Phase-3 replays a fixed historical LP position, while bin snapshots are
+ * centered on the then-current active bin.  This derives the collection
+ * envelope from the same executable-width policy as RangeForge:
+ *
+ * - the effective executable width is odd (100 policy bins -> 99 bins);
+ * - ONE_SIDED_Y may reach width - 1 bins from the active bin; and
+ * - one balanced half-width is retained as the bounded historical movement
+ *   allowance.  It is policy-derived, not a second collector constant.
+ */
+export interface Phase3EvidenceWidthRequirement {maxExecutableRangeWidthBins:number;effectiveCandidateWidthBins:number;maximumCandidateReachBins:number;replayMovementMarginBins:number;requiredEvidenceRadius:number;requiredFrameWidthBins:number;}
+export function derivePhase3EvidenceWidthRequirement(maxExecutableRangeWidthBins=DEFAULT_LPFORGE_MAX_POSITION_WIDTH_BINS):Phase3EvidenceWidthRequirement{
+ if(!Number.isInteger(maxExecutableRangeWidthBins)||maxExecutableRangeWidthBins<3||maxExecutableRangeWidthBins>METEORA_PROTOCOL_MAX_POSITION_WIDTH_BINS)throw new Error('LPFORGE_PHASE3_RANGE_WIDTH_POLICY_INVALID');
+ const effective=maxExecutableRangeWidthBins%2===0?maxExecutableRangeWidthBins-1:maxExecutableRangeWidthBins;
+ const maximumCandidateReachBins=effective-1,replayMovementMarginBins=Math.floor((effective-1)/2),requiredEvidenceRadius=maximumCandidateReachBins+replayMovementMarginBins;
+ return{maxExecutableRangeWidthBins,effectiveCandidateWidthBins:effective,maximumCandidateReachBins,replayMovementMarginBins,requiredEvidenceRadius,requiredFrameWidthBins:requiredEvidenceRadius*2+1};
+}
+export function assertPhase3EvidenceWidth(input:{binRadius:number;maxExecutableRangeWidthBins?:number}):Phase3EvidenceWidthRequirement{
+ const requirement=derivePhase3EvidenceWidthRequirement(input.maxExecutableRangeWidthBins);
+ if(!Number.isInteger(input.binRadius)||input.binRadius<requirement.requiredEvidenceRadius)throw new Error(`PHASE3_EVIDENCE_WIDTH_INSUFFICIENT_FOR_RANGE_POLICY:radius=${input.binRadius}:required=${requirement.requiredEvidenceRadius}:maxWidth=${requirement.maxExecutableRangeWidthBins}`);
+ return requirement;
+}
 function boundedOddWidth(x:number,min:number,max:number){let n=clamp(Math.round(x),min,max);if(n%2===0)n=n===max?n-1:n+1;return Math.max(3,n);}
 export function generateRangeUniverse(input:{activeBinId:number;binStep:number;horizonMinutes:number;context:MarketContextSnapshot;structure:StructureFeatureVector;regime:RegimeAssessment;maxWidthBins?:number;minWidthBins?:number;}):RangeUniverse{
  const requestedMax=input.maxWidthBins??DEFAULT_LPFORGE_MAX_POSITION_WIDTH_BINS;if(!Number.isInteger(requestedMax)||requestedMax<3)throw new Error('LPFORGE_RANGE_INVALID_MAX_WIDTH');const maxWidth=Math.min(METEORA_PROTOCOL_MAX_POSITION_WIDTH_BINS,requestedMax),requestedMin=input.minWidthBins??11;if(!Number.isInteger(requestedMin))throw new Error('LPFORGE_RANGE_INVALID_MIN_WIDTH');const minWidth=Math.min(maxWidth,Math.max(3,requestedMin));if(input.binStep<=0)throw new Error('LPFORGE_RANGE_INVALID_BIN_STEP');
