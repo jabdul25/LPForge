@@ -50,8 +50,10 @@ test('worker close sequence snapshots → drains → claims → unwinds only att
   assert.match(worker,/idempotencyKey:\s*`\$\{input\.plan\.idempotencyKey\}:\$\{unwindStep\.transactionId\}`/);
   assert.match(worker,/tokenXAfter > tokenXBefore \? tokenXAfter - tokenXBefore : 0n/,'only position-attributable inventory may be unwound');
   assert.match(worker,/tokenYAfter>tokenYBefore\?tokenYAfter-tokenYBefore:0n/,'the close ledger also records the position-attributable SOL-side withdrawal');
-  assert.match(worker,/flowType:'SWAP_PROCEEDS'/,'token-X close inventory is represented by its actual SOL-side Jupiter output, not a second marked token-X withdrawal');
-  assert.match(worker,/source:'JUPITER_WALLET_DELTA'/,'swap proceeds come from wallet-delta chain truth');
+  assert.match(worker,/flowType:\s*["']SWAP_PROCEEDS["']/,'token-X close inventory is represented by its actual SOL-side Jupiter output, not a second marked token-X withdrawal');
+  assert.match(worker,/source:\s*"CONFIRMED_TRANSACTION_ASSET_EFFECTS"/,'swap proceeds come from confirmed receipt/effect chain truth');
+  assert.match(worker,/reconcileConfirmedCloseUnwind\(/,'the close uses canonical receipt/effect settlement rather than a persistent WSOL delta');
+  assert.doesNotMatch(worker,/swapProceedsY\s*=/,'persistent WSOL balance is not an authoritative close-settlement result');
   assert.match(worker,/confirmedTransactionFeeLamports/,'cashflow costs prefer confirmed receipt metadata over an estimate');
   assert.match(worker,/P6_CLOSE_TOKEN_X_RESIDUAL/,'a failed residual-inventory verification becomes reconciliation debt');
   // The drain and claim phases must defer completion: a death between phases

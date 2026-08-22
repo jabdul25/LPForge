@@ -6,6 +6,11 @@ import {
   VersionedTransaction,
 } from "@solana/web3.js";
 import { loadConfirmedExecutionReceipt } from "../../transaction-receipt/src/index.js";
+import { deriveTransactionAssetEffects } from "../../transaction-asset-effects/src/index.js";
+import {
+  closeUnwindSettlementIds,
+  deriveCloseUnwindSettlement,
+} from "../../phase6-close-settlement/src/index.js";
 import {
   buildAddLiquidityTransaction,
   buildClaimTransactions,
@@ -68,6 +73,8 @@ import {
   determineRecoveryAction,
   type ExecutionJournal,
 } from "../../execution-recovery/src/index.js";
+
+const JUPITER_SWAP_V6_PROGRAM_ID = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
 
 export interface LiveWorkerConfig {
   rpcUrl: string;
@@ -2423,6 +2430,124 @@ function closeSettlementPending(plan: AutonomousPlan): {
     : undefined;
 }
 
+function closeSettlementOutputPayload(
+  effects: ReturnType<typeof deriveTransactionAssetEffects>["swapOutputEffects"],
+): Array<Record<string, unknown>> {
+  return effects.map((effect) =>
+    "mint" in effect
+      ? {
+          classification: effect.classification,
+          accountAddress: effect.accountAddress,
+          accountIndex: effect.accountIndex,
+          mint: effect.mint,
+          rawAmount: effect.rawAmount.toString(),
+          deltaRaw: effect.deltaRaw.toString(),
+          decimals: effect.decimals,
+          evidence: effect.evidence,
+        }
+      : {
+          classification: effect.classification,
+          accountAddress: effect.accountAddress,
+          accountIndex: effect.accountIndex,
+          amountLamports: effect.amountLamports?.toString(),
+          evidence: effect.evidence,
+        },
+  );
+}
+
+function closeSettlementNativeTotal(
+  effects: ReturnType<typeof deriveTransactionAssetEffects>["rentDebits"],
+): bigint {
+  return effects.reduce((total, effect) => total + (effect.amountLamports ?? 0n), 0n);
+}
+
+/**
+ * Reconciles one confirmed Jupiter unwind from its receipt, rather than from a
+ * persistent WSOL-account delta.  Both durable writes use stable settlement
+ * identifiers, so re-running this after a process crash is safe.
+ */
+export async function reconcileConfirmedCloseUnwind(input: {
+  store: Pick<Phase1Store, "insertPositionCashflow" | "settlePositionInventoryLot">;
+  connection: Connection;
+  plan: AutonomousPlan;
+  positionAddress: string;
+  signature: string;
+  transactionId: string;
+  inputMint: string;
+  inputAmountRaw: bigint;
+  observedAt?: string;
+}): Promise<{ ok: true; swapProceedsLamports: bigint; inputCorroborated: boolean } | { ok: false; reasonCodes: string[] }> {
+  const receipt = await loadConfirmedExecutionReceipt(input.connection, input.signature);
+  const effects = deriveTransactionAssetEffects(receipt, {
+    ownerAddress: input.plan.ownerAddress,
+    // Solana message ordering defines the fee payer as the first static key;
+    // the position owner itself is still resolved independently by Stage 2.
+    ...(receipt.staticAccountKeys[0] === undefined
+      ? {}
+      : { feePayerAddress: receipt.staticAccountKeys[0] }),
+    inputMint: input.inputMint,
+    outputMint: WSOL_MINT,
+    jupiterProgramIds: [JUPITER_SWAP_V6_PROGRAM_ID],
+    positionAddress: input.positionAddress,
+  });
+  const settlement = deriveCloseUnwindSettlement({
+    receipt,
+    effects,
+    inputMint: input.inputMint,
+    outputMint: WSOL_MINT,
+  });
+  if (settlement.state !== "SETTLED" || settlement.swapProceedsLamports === undefined)
+    return { ok: false, reasonCodes: settlement.reasonCodes };
+
+  const observedAt = input.observedAt ?? new Date().toISOString(),
+    ids = closeUnwindSettlementIds(input.plan.planId);
+  await input.store.insertPositionCashflow({
+    cashflowId: ids.cashflowId,
+    positionAddress: input.positionAddress,
+    planId: input.plan.planId,
+    flowType: "SWAP_PROCEEDS",
+    observedAt,
+    lamports: settlement.swapProceedsLamports,
+    payload: {
+      source: "CONFIRMED_TRANSACTION_ASSET_EFFECTS",
+      transactionSignature: input.signature,
+      transactionId: input.transactionId,
+      settlementKind: "JUPITER_UNWIND_SOL_EQUIVALENT",
+      inputMint: input.inputMint,
+      inputAmountRaw: input.inputAmountRaw.toString(),
+      inputCorroborated: settlement.inputCorroborated,
+      receiptState: receipt.state,
+      classificationState: effects.classificationState,
+      transactionFeeLamports: effects.transactionFeeLamports?.toString(),
+      rentDebitLamports: closeSettlementNativeTotal(effects.rentDebits).toString(),
+      rentRefundLamports: closeSettlementNativeTotal(effects.rentRefunds).toString(),
+      positionRentRecoveryLamports: effects.positionRentRecoveryLamports.toString(),
+      outputEffects: closeSettlementOutputPayload(settlement.outputEffects),
+    },
+  });
+  await input.store.settlePositionInventoryLot({
+    eventId: ids.lotEventId,
+    lotId: `${input.plan.planId}:close-x:lot`,
+    planId: input.plan.planId,
+    eventType: "SETTLED",
+    settledRawAmount: input.inputAmountRaw,
+    observedAt,
+    transactionSignature: input.signature,
+    payload: {
+      disposition: "JUPITER_UNWIND",
+      transactionId: input.transactionId,
+      settlementSignature: input.signature,
+      proceedsCashflowId: ids.cashflowId,
+      source: "CONFIRMED_TRANSACTION_ASSET_EFFECTS",
+    },
+  });
+  return {
+    ok: true,
+    swapProceedsLamports: settlement.swapProceedsLamports,
+    inputCorroborated: settlement.inputCorroborated,
+  };
+}
+
 export function shouldResumeCloseSettlement(value: {
   action: string;
   stage?: string | undefined;
@@ -2676,9 +2801,8 @@ async function executeCloseSettlement(input: {
         transactionSubmitted: true,
       };
     }
-    let swapProceedsY=0n;
+    let swapProceedsLamports=0n;
     if (attributableTokenX > 0n) {
-      const tokenYBeforeUnwind=await readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenYMint});
       const unwind = await executeJupiterUnwindStep({
         store: input.store,
         plan: input.plan,
@@ -2701,11 +2825,21 @@ async function executeCloseSettlement(input: {
         }),
       });
       if (!unwind.ok) return incomplete(unwind.reasonCodes, "CLOSE_UNWIND_PENDING");
-      const tokenYPostUnwind=await readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenYMint});
-      swapProceedsY=tokenYPostUnwind>tokenYBeforeUnwind?tokenYPostUnwind-tokenYBeforeUnwind:0n;
-      if(swapProceedsY<=0n)return incomplete(['P6_CLOSE_UNWIND_OUTPUT_MISSING'],"CLOSE_UNWIND_OUTPUT_UNKNOWN");
-      await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:close-swap-proceeds-y`,positionAddress:input.positionAddress,planId:input.plan.planId,flowType:'SWAP_PROCEEDS',observedAt:new Date().toISOString(),tokenMint:poolFact.tokenYMint,tokenAmountRaw:swapProceedsY.toString(),payload:{source:'JUPITER_WALLET_DELTA',inputMint:poolFact.tokenXMint,inputAmountRaw:attributableTokenX.toString(),tokenYBeforeUnwind:tokenYBeforeUnwind.toString(),tokenYAfterUnwind:tokenYPostUnwind.toString()}});
-      await input.store.settlePositionInventoryLot({eventId:`${input.plan.planId}:close-x:lot-settled`,lotId:`${input.plan.planId}:close-x:lot`,planId:input.plan.planId,eventType:"SETTLED",settledRawAmount:attributableTokenX,observedAt:new Date().toISOString(),...(unwind.signature?{transactionSignature:unwind.signature}:{}),payload:{disposition:"JUPITER_UNWIND",transactionId:unwindStep.transactionId,proceedsCashflowId:`${input.plan.planId}:close-swap-proceeds-y`}});
+      if (!unwind.signature)
+        return incomplete(["P6_CLOSE_UNWIND_SIGNATURE_MISSING"], "CLOSE_UNWIND_SETTLEMENT_UNKNOWN");
+      const settlement = await reconcileConfirmedCloseUnwind({
+        store: input.store,
+        connection,
+        plan: input.plan,
+        positionAddress: input.positionAddress,
+        signature: unwind.signature,
+        transactionId: unwindStep.transactionId,
+        inputMint: poolFact.tokenXMint,
+        inputAmountRaw: attributableTokenX,
+      });
+      if (!settlement.ok)
+        return incomplete(settlement.reasonCodes, "CLOSE_UNWIND_SETTLEMENT_UNKNOWN");
+      swapProceedsLamports = settlement.swapProceedsLamports;
     }
     await persist("CLOSE_INVENTORY_UNWOUND", {
       tokenXBefore: tokenXBefore.toString(),
@@ -2713,7 +2847,7 @@ async function executeCloseSettlement(input: {
       attributableTokenX: attributableTokenX.toString(),
       attributableTokenY:attributableTokenY?.toString()??"0",
       unwindTransactionId: unwindStep.transactionId,
-      swapProceedsY:swapProceedsY.toString(),
+      swapProceedsLamports:swapProceedsLamports.toString(),
     });
     stage = "CLOSE_INVENTORY_UNWOUND";
   }
@@ -2935,6 +3069,8 @@ export async function recoverUnfinishedAutonomousPlans(input: {
   now: string;
   rpcUrl?: string;
   programId?: string;
+  /** Test seam; production creates its governed recovery connection below. */
+  connection?: Connection;
   /** Test seam; production uses the RPC connection below. */
   signatureStatusProvider?: (
     signature: string,
@@ -2942,9 +3078,9 @@ export async function recoverUnfinishedAutonomousPlans(input: {
 }): Promise<LiveRecoveryResult[]> {
   const plans = await input.store.loadUnresolvedAutonomousPlans(),
     results: LiveRecoveryResult[] = [];
-  const connection = input.rpcUrl
+  const connection = input.connection ?? (input.rpcUrl
     ? createGovernedConnection({rpcUrl:input.rpcUrl,priority:'P1_RECOVERY_CRITICAL'})
-    : undefined;
+    : undefined);
   const adapter =
     input.rpcUrl && input.programId
       ? createMeteoraReadAdapter({
@@ -3111,10 +3247,64 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         results.push({ planId: plan.planId, action: "HOLD_FOR_OPERATOR", reasonCodes: ["P6_CLOSE_PENDING_STAGE_RECONCILIATION_REQUIRED", closePending.stage] });
         continue;
       }
-      const completedStage: Record<CloseSettlementPendingStage, CloseSettlementStage | undefined> = {
+      if (closePending.stage === "CLOSE_UNWIND_SUBMITTED") {
+        const dispatch = closeSettlementDispatch(plan),
+          inputMint = typeof dispatch.tokenXMint === "string" ? dispatch.tokenXMint : undefined,
+          inputAmountRaw = closeSettlementAmount(dispatch.attributableTokenX),
+          unwindTransactionId = typeof dispatch.unwindTransactionId === "string"
+            ? dispatch.unwindTransactionId
+            : `${plan.planId}:unwind`;
+        if (!connection || !recoveryPositionAddress || !inputMint || inputAmountRaw === undefined) {
+          await input.store.transitionAutonomousPlan({
+            planId: plan.planId,
+            state: "RECONCILIATION_REQUIRED",
+            at: input.now,
+            reasonCodes: ["P6_CLOSE_UNWIND_RECEIPT_RECONCILIATION_REQUIRED"],
+            payload: { pendingStage: closePending.stage, pendingSignature: closePending.signature },
+          });
+          results.push({ planId: plan.planId, action: "HOLD_FOR_OPERATOR", reasonCodes: ["P6_CLOSE_UNWIND_RECEIPT_RECONCILIATION_REQUIRED"] });
+          continue;
+        }
+        const settlement = await reconcileConfirmedCloseUnwind({
+          store: input.store,
+          connection,
+          plan,
+          positionAddress: recoveryPositionAddress,
+          signature: closePending.signature,
+          transactionId: unwindTransactionId,
+          inputMint,
+          inputAmountRaw,
+          observedAt: input.now,
+        });
+        if (!settlement.ok) {
+          await input.store.transitionAutonomousPlan({
+            planId: plan.planId,
+            state: "RECONCILIATION_REQUIRED",
+            at: input.now,
+            reasonCodes: ["P6_CLOSE_UNWIND_SETTLEMENT_RECONCILIATION_REQUIRED", ...settlement.reasonCodes],
+            payload: { pendingStage: closePending.stage, pendingSignature: closePending.signature },
+          });
+          results.push({ planId: plan.planId, action: "HOLD_FOR_OPERATOR", reasonCodes: ["P6_CLOSE_UNWIND_SETTLEMENT_RECONCILIATION_REQUIRED", ...settlement.reasonCodes] });
+          continue;
+        }
+        await input.store.transitionAutonomousPlan({
+          planId: plan.planId,
+          state: "RECONCILING",
+          at: input.now,
+          reasonCodes: ["P6_CLOSE_UNWIND_SETTLEMENT_RECOVERED"],
+          payload: {
+            stage: "CLOSE_INVENTORY_UNWOUND",
+            pendingStage: null,
+            pendingSignature: null,
+            swapProceedsLamports: settlement.swapProceedsLamports.toString(),
+          },
+        });
+        results.push({ planId: plan.planId, action: "RESUME_CLOSE_SETTLEMENT", reasonCodes: ["P6_CLOSE_UNWIND_SETTLEMENT_RECOVERED"] });
+        continue;
+      }
+      const completedStage: Record<Exclude<CloseSettlementPendingStage, "CLOSE_UNWIND_SUBMITTED">, CloseSettlementStage | undefined> = {
         CLOSE_REMOVE_SUBMITTED: "CLOSE_LIQUIDITY_REMOVED",
         CLOSE_CLAIM_SUBMITTED: "CLOSE_CLAIMS_SETTLED",
-        CLOSE_UNWIND_SUBMITTED: "CLOSE_INVENTORY_UNWOUND",
         CLOSE_POSITION_SUBMITTED: undefined,
       };
       const next = completedStage[closePending.stage];

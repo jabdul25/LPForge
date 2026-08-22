@@ -73,6 +73,27 @@ test('P6 recovery status-read failure never rebuilds an expired submitted plan',
   assert.deepEqual(calls[0].reasonCodes,['P6_RECOVERY_SIGNATURE_STATUS_READ_UNKNOWN']);
 });
 
+test('P6 CLOSE recovery reconciles a confirmed native-SOL unwind exactly once before resuming',async()=>{
+  const owner='OWNER',risk='RISK',wsol='WSOL',position='POSITION',jupiter='JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4',
+    receipt={slot:1,version:0,transaction:{message:{accountKeys:[owner,risk,wsol,position],compiledInstructions:[{programId:jupiter,accountKeyIndexes:[0,1],parsed:{type:'route',info:{destination:owner}}}]}},meta:{err:null,fee:5,preBalances:[1000,0,1,0],postBalances:[1005,0,1,0],loadedAddresses:{writable:[],readonly:[]},preTokenBalances:[{accountIndex:1,mint:risk,owner,uiTokenAmount:{amount:'50',decimals:9}}],postTokenBalances:[{accountIndex:1,mint:risk,owner,uiTokenAmount:{amount:'0',decimals:9}}],innerInstructions:[]}},
+    transitions=[],cashflows=new Map(),lots=new Map(),plan={planId:'close-plan',idempotencyKey:'close-idem',action:'CLOSE',poolAddress:'pool',ownerAddress:owner,positionAddress:position,expiresAt:'2030-01-01T00:00:00.000Z',planPayload:{autonomous_dispatch:{stage:'CLOSE_INVENTORY_MEASURED',pendingStage:'CLOSE_UNWIND_SUBMITTED',pendingSignature:'unwind-sig',tokenXMint:risk,attributableTokenX:'50',unwindTransactionId:'unwind'}}},
+    store={
+      async loadUnresolvedAutonomousPlans(){return[plan];},
+      async getExecutionJournal(){return{journal_id:'journal',idempotency_key:'close-idem',plan_id:'close-plan',state:'SUBMITTED',signature:'unwind-sig',version:1,updated_at:'2026-08-22T00:00:00.000Z',payload:{}};},
+      async insertPositionCashflow(value){cashflows.set(value.cashflowId,value);},
+      async settlePositionInventoryLot(value){lots.set(value.eventId,value);},
+      async transitionAutonomousPlan(value){transitions.push(value);},
+    },
+    input={store,currentBlockHeight:1,now:'2026-08-22T00:01:00.000Z',connection:{async getTransaction(){return receipt;}},signatureStatusProvider:async()=>({err:null,confirmationStatus:'confirmed'})};
+  const first=await recoverUnfinishedAutonomousPlans(input),second=await recoverUnfinishedAutonomousPlans(input);
+  assert.equal(first[0].action,'RESUME_CLOSE_SETTLEMENT');
+  assert.equal(second[0].action,'RESUME_CLOSE_SETTLEMENT');
+  assert.equal(cashflows.size,1);
+  assert.equal(lots.size,1);
+  assert.equal(cashflows.get('close-plan:close-swap-proceeds').lamports,10n);
+  assert.ok(transitions.every(value=>!value.reasonCodes?.includes('P6_CLOSE_UNWIND_OUTPUT_MISSING')));
+});
+
 test('orphan sweep is a no-op without an owner or pool set',async()=>{
   const upserts=[];
   const store={async loadOwnedPositions(){return[];},async upsertOwnedPosition(v){upserts.push(v);}};
