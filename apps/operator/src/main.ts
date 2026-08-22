@@ -45,7 +45,7 @@ import {
 } from "../../../packages/test-fixtures/src/index.js";
 import { loadDeploymentPolicyFile } from "../../../packages/deployment-policy/src/index.js";
 import { assessProductionOpenPlanCapacity } from "../../../packages/production-entry-capacity/src/index.js";
-import { refreshCurrentPhase3Evidence } from "../../../packages/active-candidate-evidence/src/index.js";
+import { refreshCanonicalHistoricalBackfill, refreshCurrentPhase3Evidence } from "../../../packages/active-candidate-evidence/src/index.js";
 import { PublicKey } from "@solana/web3.js";
 
 function json(v: unknown) {
@@ -676,7 +676,12 @@ async function liveOnce() {
       decodedSwapEvents,
       eventDecodeWarnings,
     });
-    if(staticProductionPool)await refreshCurrentPhase3Evidence({store,poolAddress:cfg.smokePoolAddress,apiPool,pool,bins,observedAt:apiObservedAt,sourceProvider:'OPERATOR_METEORA_API+RPC',sourcePayload:{productionPolicyPool:true},collectionTarget:'PRODUCTION_POLICY',authority:'PRODUCTION_POLICY_MONITORING'});
+    if(staticProductionPool){
+      // A static pool owns no dynamic ACTIVE slot, but it uses the same
+      // bounded historical backfill lifecycle before projecting Phase-3 facts.
+      await refreshCanonicalHistoricalBackfill({api,adapter,rpc,store,poolAddress:cfg.smokePoolAddress,apiPool,observedAt:apiObservedAt,authority:'PRODUCTION_POLICY_MONITORING'});
+      await refreshCurrentPhase3Evidence({store,poolAddress:cfg.smokePoolAddress,apiPool,pool,bins,observedAt:apiObservedAt,sourceProvider:'OPERATOR_METEORA_API+RPC',sourcePayload:{productionPolicyPool:true},collectionTarget:'PRODUCTION_POLICY',authority:'PRODUCTION_POLICY_MONITORING'});
+    }
     const since = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString();
     const history = await store.loadOperationalHistory(
       cfg.smokePoolAddress,
