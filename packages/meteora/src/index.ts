@@ -154,7 +154,16 @@ export function normalizePoolFromSdk(address:string, client:Record<string,unknow
 
 export function normalizeBin(pool:string, raw:Record<string,unknown>, stamp:{slot:bigint;observedAt:string}):BinLiquidityFact {
   const id=asNumber(field(raw,['binId'],['bin_id'])); if(id===undefined)throw new Error('LPFORGE_METEORA_SDK_SHAPE:BIN_ID');
-  return {pool,binId:id,price:asString(field(raw,['price'],['pricePerToken']))||'0',amountX:asString(field(raw,['xAmount'],['amountX'],['amount_x']))||'0',amountY:asString(field(raw,['yAmount'],['amountY'],['amount_y']))||'0',...(field(raw,['liquiditySupply'],['liquidity_supply'])!==undefined?{liquiditySupply:asString(field(raw,['liquiditySupply'],['liquidity_supply']))}:{}),stamp:{source:'METEORA_SDK',chainSlot:stamp.slot,observedAt:stamp.observedAt}};
+  const amountX=asString(field(raw,['xAmount'],['amountX'],['amount_x']))||'0';
+  const amountY=asString(field(raw,['yAmount'],['amountY'],['amount_y']))||'0';
+  // Meteora SDK v1.9.10 exposes the per-bin LP/share denominator as `supply` (BN).
+  // Never infer this denominator from token amounts.
+  const supplyValue=field(raw,['supply'],['liquiditySupply'],['liquidity_supply']);
+  const supplyText=supplyValue===undefined?undefined:asString(supplyValue);
+  const liquiditySupply=supplyText!==undefined&&/^\d+$/.test(supplyText)?supplyText:undefined;
+  const hasTokenInventory=(()=>{try{return BigInt(amountX)>0n||BigInt(amountY)>0n;}catch{return false;}})();
+  const shareSupplyDiagnostic=supplyValue===undefined ? (hasTokenInventory?'BIN_SHARE_SUPPLY_MISSING_WITH_TOKEN_INVENTORY':undefined) : (!liquiditySupply?'BIN_SHARE_SUPPLY_INVALID':undefined);
+  return {pool,binId:id,price:asString(field(raw,['price'],['pricePerToken']))||'0',amountX,amountY,...(liquiditySupply!==undefined?{liquiditySupply}:{}),...(shareSupplyDiagnostic?{shareSupplyDiagnostic}:{}),stamp:{source:'METEORA_SDK',chainSlot:stamp.slot,observedAt:stamp.observedAt}};
 }
 
 export function normalizePosition(poolAddress:string, positionAddress:string, raw:Record<string,unknown>, slot:bigint):PositionV2Fact {

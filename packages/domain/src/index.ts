@@ -50,6 +50,11 @@ export interface BinLiquidityFact {
   amountX: string;
   amountY: string;
   liquiditySupply?: string;
+  /**
+   * Adapter-level data-quality signal. A missing denominator remains
+   * fail-closed; this distinguishes it from genuine zero bin supply.
+   */
+  shareSupplyDiagnostic?: 'BIN_SHARE_SUPPLY_MISSING_WITH_TOKEN_INVENTORY' | 'BIN_SHARE_SUPPLY_INVALID';
   feeAmountXPerTokenStored?: string;
   feeAmountYPerTokenStored?: string;
   stamp: SourceStamp;

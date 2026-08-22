@@ -8,7 +8,7 @@ const simulate=(overrides={})=>simulateCandidateEconomics({candidate,pool:'P',fr
 
 test('initial-frame usable liquidity derives a positive deterministic bounded synthetic share',()=>{
  const f=frame(),share=deriveSyntheticPositionShareRaw(f);
- assert.ok(share>0n);assert.equal(share,deriveSyntheticPositionShareRaw(f));assert.ok(share<=BigInt(Number.MAX_SAFE_INTEGER));
+ assert.ok(share>0n);assert.equal(share,deriveSyntheticPositionShareRaw(f));assert.ok(share<=((1n<<128n)-1n));
 });
 test('liquidity-derived share prevents valid small synthetic replay inventory from truncating to zero',()=>{
  const result=simulate();

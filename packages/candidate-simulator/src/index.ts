@@ -32,7 +32,7 @@ function raw(v:string|undefined):bigint{try{return BigInt(v??'0');}catch{return 
  * frame rather than an arbitrary fixed unit count.  It is not deployed liquidity;
  * later normalization maps the resulting inventory back to decision capital.
  */
-const MAX_SYNTHETIC_POSITION_SHARE_RAW=BigInt(Number.MAX_SAFE_INTEGER);
+const MAX_SYNTHETIC_POSITION_SHARE_RAW=(1n<<128n)-1n;
 export function deriveSyntheticPositionShareRaw(frame:BinFrame):bigint{
  let usable=0n;
  for(const bin of frame.bins){
