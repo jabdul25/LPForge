@@ -59,8 +59,35 @@ test('candidate-specific replay anchors do not leak narrow coverage to a wider c
  const input={historicalFrames:frames,decisionAt:frames[2].observedAt,horizonMinutes:30};
  const narrow=prepareCandidateReplay(input,replayCandidate('narrow',90,110));
  const wide=prepareCandidateReplay(input,replayCandidate('wide',70,130));
- assert.equal(narrow?.[0].activeBinId,30);
- assert.equal(wide?.[0].activeBinId,0);
+ assert.equal(narrow.frames?.[0].activeBinId,30);
+ assert.equal(wide.reason,'CANDIDATE_REPLAY_CONTINUITY_INSUFFICIENT');
  const uncovered=prepareCandidateReplay({historicalFrames:[replayFrame(0,0,-30,30,[-10,10]),replayFrame(60,60,30,90)],decisionAt:replayFrame(60,60,30,90).observedAt,horizonMinutes:30},replayCandidate('uncovered',90,110));
- assert.equal(uncovered,undefined);
+ assert.equal(uncovered.reason,'CANDIDATE_REPLAY_CONTINUITY_INSUFFICIENT');
+});
+test('candidate-specific preparations select the latest deterministic complete horizon for each candidate',()=>{
+ const frames=[replayFrame(0,0,-20,-10),replayFrame(15,0,-20,-10),replayFrame(30,30,20,40),replayFrame(45,30,20,40)];
+ const input={historicalFrames:frames,decisionAt:frames[3].observedAt,horizonMinutes:15};
+ const lower=prepareCandidateReplay(input,replayCandidate('lower',80,90));
+ const centered=prepareCandidateReplay(input,replayCandidate('centered',90,110));
+ assert.equal(lower.frames?.[0].activeBinId,0);
+ assert.equal(centered.frames?.[0].activeBinId,30);
+});
+
+
+const movingCandidate=(zeroFirst=false)=>({id:zeroFirst?'zero-edge':'moving-window',family:'TEST',strategy:'SPOT',orientation:'BALANCED',lowerBinId:68,upperBinId:132,centerBinId:100,widthBins:65,lowerOffsetBins:-32,upperOffsetBins:32,lowerDistancePct:0,upperDistancePct:0,reasonCodes:[],capitalFraction:1,perBinWeights:Array.from({length:65},(_,i)=>({binId:68+i,weight:zeroFirst&&i===0?0:1/(zeroFirst?64:65)}))});
+const movingFrame=(minute,active,low,high)=>({observedAt:new Date(Date.parse('2026-08-22T00:00:00Z')+minute*60000).toISOString(),activeBinId:active,bins:Array.from({length:high-low+1},(_,i)=>({binId:low+i,price:'1',amountX:'500000000',amountY:'500000000',liquiditySupply:'47593000067008977619962158185'}))});
+const replayMoving=(candidate,frames)=>simulateCandidateEconomics({candidate,pool:'moving',frames,events:[{pool:'moving',signature:'moving',eventIndex:0,stamp:{observedAt:frames[1].observedAt},startBinId:100,endBinId:101,mmFee:'1000000',feesOnTokenX:true}],totalPositionShareRaw:deriveSyntheticPositionShareRaw(frames[0]),rawUnitValueX:1e-9,rawUnitValueY:1e-9,capitalValue:.03});
+test('moving bin windows fail closed rather than manufacturing an inventory loss',()=>{
+ const frames=[movingFrame(0,100,65,135),movingFrame(15,108,73,143)];const result=replayMoving(movingCandidate(),frames);
+ assert.equal(result.evidenceActionable,false);assert.ok(result.warnings.includes('CANDIDATE_REPLAY_CONTINUITY_INSUFFICIENT'));assert.equal(result.inventoryChangeValue,0);assert.equal(result.netValue,0);assert.ok(!result.warnings.includes('CANDIDATE_VALUE_CALIBRATION_INVALID'));
+});
+test('complete replay coverage remains actionable while bins outside the candidate range are irrelevant',()=>{
+ for(const frames of [[movingFrame(0,100,65,135),movingFrame(15,108,65,135)],[movingFrame(0,100,65,135),movingFrame(15,108,68,132)]]){const result=replayMoving(movingCandidate(),frames);assert.equal(result.evidenceActionable,true);assert.ok(!result.warnings.includes('CANDIDATE_REPLAY_CONTINUITY_INSUFFICIENT'));}
+});
+test('temporary moving-window gaps and zero-weight edge bins preserve evidence semantics',()=>{
+ const temporary=replayMoving(movingCandidate(),[movingFrame(0,100,65,135),movingFrame(15,108,73,143),movingFrame(30,100,65,135)]);assert.equal(temporary.evidenceActionable,false);assert.equal(temporary.inventoryChangeValue,0);
+ const zeroEdge=replayMoving(movingCandidate(true),[movingFrame(0,100,65,135),movingFrame(15,108,69,132)]);assert.equal(zeroEdge.evidenceActionable,true);
+});
+test('AUvX, 5pg, and FxPP-shaped hydrated windows remain valid with complete continuity',()=>{
+ for(const [pool,supply] of [['AUvX','33613130275121993989002160'],['5pg','2882060171703985282476478'],['FxPP','3407759355809420208455944']]){const frames=[movingFrame(0,100,65,135),movingFrame(15,105,65,135)].map(frame=>({...frame,bins:frame.bins.map(bin=>({...bin,liquiditySupply:supply}))}));const result=replayMoving(movingCandidate(),frames);assert.equal(result.unitScaleValid,true,pool);assert.equal(result.evidenceActionable,true,pool);assert.ok(result.normalizationScale>0,pool);}
 });
