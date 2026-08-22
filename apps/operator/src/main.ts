@@ -625,6 +625,10 @@ async function liveOnce() {
       api.getOhlcv(cfg.smokePoolAddress, { timeframe: "5m" }),
     ]);
     const apiObservedAt = new Date().toISOString();
+    // Static production pools already have this current read. Persist it as
+    // canonical Phase-3 LIVE_OBSERVED evidence without any additional RPC.
+    const deploymentPolicy=loadDeploymentPolicyFile(process.env.LPFORGE_EXECUTION_POLICY_PATH ?? "policies/live-execution-policy.json");
+    if(deploymentPolicy.pools.some(entry=>entry.address===cfg.smokePoolAddress))await store.insertCandidateMarketObservations({poolAddress:cfg.smokePoolAddress,ingestedAt:apiObservedAt,rows:[{observedAt:apiObservedAt,sourceType:'LIVE_OBSERVED',sourceProvider:'OPERATOR_METEORA_API+RPC',price:Number(apiPool.current_price),activeBinId:pool.activeBinId,resolutionMs:60_000,volume:Number(apiPool.volume?.['5m']??0),feeValue:Number(apiPool.fees?.['5m']??0),localLiquidity:Number(apiPool.tvl??0),payload:{freshPoolState:true,freshActiveBin:true,productionPolicyPool:true}}]});
     await store.insertDataApiPool(
       apiPool as Record<string, unknown>,
       apiObservedAt,

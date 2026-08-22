@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {assessHistoryMaturity,deriveEventPathEconomicEstimate,collectActiveCandidateEvidence,selectActiveCandidateCollectionSlice,requiredActiveCandidateCollectionCapacity,calculateServiceableActiveCandidateCapacity} from '../.build/packages/active-candidate-evidence/src/index.js';
 import {estimateOpportunityEconomics} from '../.build/packages/opportunity/src/index.js';
 import {evaluateEntry,ENTRY_RESEARCH_POLICY_V1} from '../.build/packages/entry-intelligence/src/index.js';
-import {ACTIVE_EVIDENCE_LEASE_TIMEOUT_MS,POST_EVIDENCE_EVALUATION_WINDOW_MS,dynamicLiveEvidenceAdmissionCapacity,freshLiveEvidenceEconomicQuality,isLiveEvidenceAdmissionTerminal,isLiveEvidenceLeaseActive,isPostEvidenceEvaluationEligible,liveEvidenceLeaseExpiresAt,liveEvidenceLeaseReleaseReason,selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
+import {ACTIVE_EVIDENCE_LEASE_TIMEOUT_MS,POST_EVIDENCE_EVALUATION_WINDOW_MS,dynamicLiveEvidenceAdmissionCapacity,freshLiveEvidenceEconomicQuality,isLiveEvidenceAdmissionTerminal,isLiveEvidenceLeaseActive,isPhase3ReadyConsumptionPending,isPostEvidenceEvaluationEligible,liveEvidenceLeaseExpiresAt,liveEvidenceLeaseReleaseReason,selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
 import {decisionTimeEconomicEvidenceAgeSeconds,hasPhase3FreshHistoricalEvidence,summarizePhase3RecentLiveObservations} from '../.build/packages/operational-runtime/src/index.js';
 
 const at='2026-08-13T16:00:00.000Z',atMs=Date.parse(at);
@@ -173,7 +173,8 @@ test('lease release reasons are bounded to completion, terminal state, failure l
  const started='2026-08-13T16:00:00.000Z',expires=liveEvidenceLeaseExpiresAt(started),base={state:'ACTIVE_CANDIDATE',startedAt:started,expiresAt:expires,failureCount:0};
  assert.equal(liveEvidenceLeaseReleaseReason(base,'2026-08-13T16:30:00.000Z'),undefined);
  assert.equal(liveEvidenceLeaseReleaseReason({...base,eventPathEstimateFresh:true},'2026-08-13T16:30:00.000Z'),undefined,'EVENT_PATH alone retains the ACTIVE lease');
- assert.equal(liveEvidenceLeaseReleaseReason({...base,eventPathEstimateFresh:true,phase3CurrentLiveReady:true},'2026-08-13T16:30:00.000Z'),'LIVE_EVIDENCE_LEASE_PHASE3_READY');
+ assert.equal(liveEvidenceLeaseReleaseReason({...base,eventPathEstimateFresh:true,phase3CurrentLiveReady:true},'2026-08-13T16:30:00.000Z'),undefined,'ready evidence retains the ACTIVE lease until real economics');
+ assert.equal(isPhase3ReadyConsumptionPending({liveEvidencePhase3ConsumptionState:'PENDING',liveEvidencePhase3ReadyAt:'2026-08-13T16:20:00.000Z',liveEvidenceLeaseExpiresAt:expires},'2026-08-13T16:30:00.000Z'),true);
  assert.equal(liveEvidenceLeaseReleaseReason({...base,phase3Status:'NO_TRADE'},'2026-08-13T16:30:00.000Z'),'LIVE_EVIDENCE_LEASE_TERMINAL_PHASE3');
  assert.equal(liveEvidenceLeaseReleaseReason({...base,failureCount:3},'2026-08-13T16:30:00.000Z'),'LIVE_EVIDENCE_LEASE_COLLECTION_FAILURE_LIMIT');
  assert.equal(liveEvidenceLeaseReleaseReason(base,'2026-08-13T16:45:00.000Z'),'LIVE_EVIDENCE_LEASE_TIMEOUT');
