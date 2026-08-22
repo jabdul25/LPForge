@@ -2493,8 +2493,11 @@ export async function reconcileConfirmedCloseUnwind(input: {
   const settlement = deriveCloseUnwindSettlement({
     receipt,
     effects,
+    ownerAddress: input.plan.ownerAddress,
     inputMint: input.inputMint,
+    inputAmountRaw: input.inputAmountRaw,
     outputMint: WSOL_MINT,
+    jupiterProgramIds: [JUPITER_SWAP_V6_PROGRAM_ID],
   });
   if (settlement.state !== "SETTLED" || settlement.swapProceedsLamports === undefined)
     return { ok: false, reasonCodes: settlement.reasonCodes };
@@ -2516,6 +2519,7 @@ export async function reconcileConfirmedCloseUnwind(input: {
       inputMint: input.inputMint,
       inputAmountRaw: input.inputAmountRaw.toString(),
       inputCorroborated: settlement.inputCorroborated,
+      inputProof: settlement.inputProof,
       receiptState: receipt.state,
       classificationState: effects.classificationState,
       transactionFeeLamports: effects.transactionFeeLamports?.toString(),
