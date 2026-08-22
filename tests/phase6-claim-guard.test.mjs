@@ -25,5 +25,21 @@ test('risk-increasing claims bind to the exact authenticated P7 decision across 
  // claimed after an execution-process restart under a newer control B.
  assert.ok(validateClaimedPlan({...input,phase7Control:newer}).reasonCodes.includes('P6_CLAIM_P7_CONTROL_BINDING_MISMATCH'),'restart/recovery cannot rebind the persisted plan');
 });
+test('de-admitted dynamic pools remain closable only through owned-position protective actions',()=>{
+ const dynamicPolicy={...policy,pools:[],productionAdmission:{enabled:true,eligibleTiers:['A'],maxCandidates:1,maxCandidateAgeMs:900000,maxCapitalLamports:20_000_000n,maxOpenPositions:1}};
+ const deAdmitted=[];
+ const owned=[{lifecycle_state:'OPEN',position_address:'POS',owner_address:'OWNER',pool_address:'DYNAMIC'}];
+ const protective=action=>({...base,action,poolAddress:'DYNAMIC',positionAddress:'POS',planPayload:{...base.planPayload,provenance:{...base.planPayload.provenance,poolAddress:'DYNAMIC'},intent:{capitalLamports:'0'}}});
+ for(const action of ['CLOSE','EMERGENCY_CLOSE','REDUCE','CLAIM']){
+  const result=validateClaimedPlan({plan:protective(action),policy:dynamicPolicy,ownedPositions:owned,positionTruth:{owner:'OWNER',pool:'DYNAMIC'},productionCandidates:deAdmitted,now});
+  assert.equal(result.approved,true,`${action} remains available after dynamic de-admission`);
+  assert.ok(!result.reasonCodes.some(x=>['P6_CLAIM_POOL_NOT_ALLOWLISTED','P6_CLAIM_PRODUCTION_ADMISSION_INVALID','P6_PRODUCTION_REQUIRES_WSOL_TOKEN_Y'].includes(x)));
+ }
+ assert.ok(validateClaimedPlan({plan:protective('CLOSE'),policy:dynamicPolicy,ownedPositions:[],positionTruth:{owner:'OWNER',pool:'DYNAMIC'},productionCandidates:deAdmitted,now}).reasonCodes.includes('P6_CLAIM_POSITION_NOT_OWNED'));
+ assert.ok(validateClaimedPlan({plan:protective('CLOSE'),policy:dynamicPolicy,ownedPositions:owned,productionCandidates:deAdmitted,now}).reasonCodes.includes('P6_CLAIM_POSITION_TRUTH_MISSING'));
+ assert.ok(validateClaimedPlan({plan:protective('CLOSE'),policy:dynamicPolicy,ownedPositions:owned,positionTruth:{owner:'OTHER',pool:'DYNAMIC'},productionCandidates:deAdmitted,now}).reasonCodes.includes('P6_CLAIM_POSITION_TRUTH_MISMATCH'));
+ const deAdmittedOpen={...base,poolAddress:'DYNAMIC',planPayload:{...base.planPayload,provenance:{...base.planPayload.provenance,poolAddress:'DYNAMIC'}}};
+ for(const action of ['OPEN','ADD','RESHAPE','REBALANCE'])assert.ok(validateClaimedPlan({plan:{...deAdmittedOpen,action},policy:dynamicPolicy,ownedPositions:[],productionCandidates:deAdmitted,phase7Control:control,now}).reasonCodes.includes('P6_CLAIM_PRODUCTION_ADMISSION_INVALID'),`${action} remains admission-blocked`);
+});
 test('protective actions are exempt from the daily action cap',()=>{const owned=[{lifecycle_state:'OPEN',position_address:'POS',owner_address:'OWNER',pool_address:'POOL'}];for(const action of ['CLOSE','EMERGENCY_CLOSE','REDUCE','CLAIM']){const plan={...base,action,positionAddress:'POS',planPayload:{...base.planPayload,intent:{capitalLamports:'0'}}};assert.equal(validateClaimedPlan({plan,policy,ownedPositions:owned,positionTruth:{owner:'OWNER',pool:'POOL'},actionsToday:2,now}).approved,true,`${action} must never be starved by the daily cap`);}assert.ok(validateClaimedPlan({plan:base,policy,ownedPositions:[],phase7Control:control,actionsToday:2,now}).reasonCodes.includes('P6_CLAIM_DAILY_ACTION_LIMIT'));});
 test('operator separates risk-increasing P7 authority from protective management dispatch',async()=>{const src=await import('node:fs/promises').then(fs=>fs.readFile('apps/operator/src/main.ts','utf8'));assert.ok(src.includes('allowRiskIncreasingPlans'),'new or increased exposure requires the P7 new-economic-action permit');assert.ok(src.includes('allowProtectiveManagementPlans'),'CLOSE/REDUCE/CLAIM have their independent protective dispatch path');assert.ok(src.includes('capitalLamports: position.initialCapitalLamports'),'management plans carry their remaining economic basis for execution-cost checks');});

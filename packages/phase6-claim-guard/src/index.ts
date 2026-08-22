@@ -39,6 +39,9 @@ function capital(plan: AutonomousPlan) {
     return -1n;
   }
 }
+function isRiskIncreasingAction(action: string) {
+  return ["OPEN", "ADD", "RESHAPE", "REBALANCE"].includes(action);
+}
 function policyPoolForPlan(input:{plan:AutonomousPlan;policy:MainnetCanaryDeploymentPolicy;productionCandidates:ProductionAdmissionCandidate[];now:string},reasons:string[]){
  const staticPool=input.policy.pools.find(x=>x.address===input.plan.poolAddress);if(staticPool)return staticPool;
  const admission=input.policy.productionAdmission;
@@ -64,7 +67,10 @@ export function validateClaimedPlan(input: {
     p = input.plan,
     amount = capital(p),
     provenance = record(record(p.planPayload).provenance),
-    policyPool = policyPoolForPlan({plan:p,policy:input.policy,productionCandidates:input.productionCandidates??[],now:input.now??new Date().toISOString()},reasons);
+    riskIncreasing = isRiskIncreasingAction(p.action),
+    policyPool = riskIncreasing
+      ? policyPoolForPlan({plan:p,policy:input.policy,productionCandidates:input.productionCandidates??[],now:input.now??new Date().toISOString()},reasons)
+      : undefined;
   if (
     provenance.producer !== "LPFORGE_PRODUCTION" ||
     provenance.schemaVersion !== 1 ||
@@ -106,7 +112,7 @@ export function validateClaimedPlan(input: {
   }
   if (amount < 0n) reasons.push("P6_CLAIM_CAPITAL_INVALID");
   if (
-    ["OPEN", "ADD", "RESHAPE", "REBALANCE"].includes(p.action) &&
+    riskIncreasing &&
     amount <= 0n
   )
     reasons.push("P6_CLAIM_CAPITAL_REQUIRED");
@@ -139,7 +145,7 @@ export function validateClaimedPlan(input: {
   }
   // Risk-increasing mutations are fail-closed when P7 authority is unavailable.
   // Protective actions retain their dedicated degraded-control authorization path.
-  if(["OPEN","ADD","RESHAPE","REBALANCE"].includes(p.action)){
+  if(riskIncreasing){
     reasons.push(...validateFreshPhase7ExecutionControl(input.phase7Control,input.now??new Date().toISOString()));
     const binding=record(provenance.phase7Control),boundDecisionId=String(binding.decisionId??''),boundObservedAt=String(binding.observedAt??''),control=input.phase7Control;
     // P7 controls are persisted *before* the operator creates a plan.  A
@@ -153,7 +159,7 @@ export function validateClaimedPlan(input: {
   }
   // Protective actions (close/reduce/claim) must never be starved by the daily
   // action cap; the cap budgets only risk-increasing mutations.
-  if(input.actionsToday!==undefined&&input.actionsToday>=input.policy.maxActionsPerDay&&["OPEN","ADD","RESHAPE","REBALANCE"].includes(p.action))reasons.push('P6_CLAIM_DAILY_ACTION_LIMIT');
+  if(input.actionsToday!==undefined&&input.actionsToday>=input.policy.maxActionsPerDay&&riskIncreasing)reasons.push('P6_CLAIM_DAILY_ACTION_LIMIT');
   return {
     approved: reasons.length === 0,
     reasonCodes: reasons.sort(),
