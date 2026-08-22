@@ -59,8 +59,8 @@ export function allocateSyntheticShares(totalShareRaw:bigint,weights:Array<{weig
   return BigInt(Math.max(0,Math.round(weight*Number(SHARE_WEIGHT_SCALE))));
  });
  const denominator=numerators.reduce((a,b)=>a+b,0n);if(denominator<=0n)throw new Error('LPFORGE_CANDIDATE_WEIGHT_ZERO');
- let assigned=0n;
- return numerators.map((n,i)=>{const share=i===numerators.length-1?totalShareRaw-assigned:(totalShareRaw*n)/denominator;assigned+=share;return share;});
+ let assigned=0n;const remainderIndex=numerators.reduce((last,n,i)=>n>0n?i:last,-1);if(remainderIndex<0)throw new Error('LPFORGE_CANDIDATE_WEIGHT_ZERO');
+ return numerators.map((n,i)=>{const share=i===remainderIndex?totalShareRaw-assigned:(totalShareRaw*n)/denominator;assigned+=share;return share;});
 }
 /** Replay the current candidate's offset geometry at the historical anchor. */
 export function rebaseCandidateForReplay(candidate:RangeStrategyCandidate,anchorActiveBinId:number):RangeStrategyCandidate{

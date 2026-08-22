@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {allocateSyntheticShares,deriveSyntheticPositionShareRaw,simulateCandidateEconomics} from '../.build/packages/candidate-simulator/src/index.js';
+import {prepareCandidateReplay} from '../.build/packages/shadow/src/index.js';
 
 const candidate=(orientation)=>({id:`5pg-${orientation}`,family:'TEST',strategy:'SPOT',orientation,lowerBinId:-436,upperBinId:-436,centerBinId:-436,widthBins:1,lowerOffsetBins:0,upperOffsetBins:0,lowerDistancePct:0,upperDistancePct:0,reasonCodes:[],capitalFraction:1,perBinWeights:[{binId:-436,weight:1}]});
 const frame=(supply,amountY)=>({observedAt:'2026-08-22T00:00:00.000Z',activeBinId:-436,bins:[{binId:-436,price:'0.01305813128887906097',amountX:'0',amountY,liquiditySupply:supply}]});
@@ -42,4 +43,24 @@ test('U128 allocation is exact and a displaced current range replays at the hist
  const total=47593000067008977619962158185n,shares=allocateSyntheticShares(total,[{weight:.2},{weight:.3},{weight:.5}]);assert.equal(shares.reduce((a,b)=>a+b,0n),total);
  const bins=Array.from({length:73},(_,i)=>({binId:-456+i,price:'1',amountX:'500000000',amountY:'500000000',liquiditySupply:'47593000067008977619962158185'}));const frames=[0,15,30,45,60].map(minutes=>({observedAt:new Date(Date.parse('2026-08-22T00:00:00Z')+minutes*60000).toISOString(),activeBinId:-420,bins}));
  for(const strategy of ['SPOT','CURVE','BID_ASK'])for(const orientation of ['BALANCED','SKEWED_Y','ONE_SIDED_Y']){const c={...candidate(orientation),id:`${strategy}-${orientation}`,strategy,lowerBinId:70,upperBinId:130,centerBinId:100,widthBins:61,lowerOffsetBins:-30,upperOffsetBins:30,perBinWeights:Array.from({length:61},(_,i)=>({binId:70+i,weight:1/61}))};const r=simulateCandidateEconomics({candidate:c,pool:'P',frames,events:[{pool:'P',signature:'s',eventIndex:0,stamp:{observedAt:frames[1].observedAt},startBinId:-420,endBinId:-419,mmFee:'1000000',feesOnTokenX:true}],totalPositionShareRaw:deriveSyntheticPositionShareRaw(frames[0]),rawUnitValueX:1e-9,rawUnitValueY:1e-9,capitalValue:.03});assert.ok(r.startInventoryValue>0,`${strategy}/${orientation}`);assert.ok(r.normalizationScale>0,`${strategy}/${orientation}`);assert.equal(r.unitScaleValid,true,`${strategy}/${orientation}`);}
+});
+
+
+test('remainder never assigns a zero-weight terminal bin',()=>{
+ const shares=allocateSyntheticShares(11n,[{weight:.5},{weight:.5},{weight:0}]);
+ assert.deepEqual(shares,[5n,6n,0n]);
+ assert.equal(shares.reduce((a,b)=>a+b,0n),11n);
+});
+
+const replayCandidate=(id,lower,upper)=>({id,family:'TEST',strategy:'SPOT',orientation:'BALANCED',lowerBinId:lower,upperBinId:upper,centerBinId:100,widthBins:upper-lower+1,lowerOffsetBins:lower-100,upperOffsetBins:upper-100,lowerDistancePct:0,upperDistancePct:0,reasonCodes:[],capitalFraction:1,perBinWeights:Array.from({length:upper-lower+1},(_,i)=>({binId:lower+i,weight:1/(upper-lower+1)}))});
+const replayFrame=(minute,active,low,high,emptyRange)=>({observedAt:new Date(Date.parse('2026-08-22T00:00:00Z')+minute*60000).toISOString(),activeBinId:active,bins:Array.from({length:high-low+1},(_,i)=>{const binId=low+i,empty=emptyRange&&binId>=emptyRange[0]&&binId<=emptyRange[1];return{binId,price:'1',liquiditySupply:'1000000000000',amountX:empty?'0':'500000000',amountY:empty?'0':'500000000'};})});
+test('candidate-specific replay anchors do not leak narrow coverage to a wider candidate',()=>{
+ const frames=[replayFrame(0,0,-30,30),replayFrame(30,30,20,40),replayFrame(60,60,50,70)];
+ const input={historicalFrames:frames,decisionAt:frames[2].observedAt,horizonMinutes:30};
+ const narrow=prepareCandidateReplay(input,replayCandidate('narrow',90,110));
+ const wide=prepareCandidateReplay(input,replayCandidate('wide',70,130));
+ assert.equal(narrow?.[0].activeBinId,30);
+ assert.equal(wide?.[0].activeBinId,0);
+ const uncovered=prepareCandidateReplay({historicalFrames:[replayFrame(0,0,-30,30,[-10,10]),replayFrame(60,60,30,90)],decisionAt:replayFrame(60,60,30,90).observedAt,horizonMinutes:30},replayCandidate('uncovered',90,110));
+ assert.equal(uncovered,undefined);
 });
