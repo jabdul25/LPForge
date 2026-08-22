@@ -33,21 +33,47 @@ function raw(v:string|undefined):bigint{try{return BigInt(v??'0');}catch{return 
  * later normalization maps the resulting inventory back to decision capital.
  */
 const MAX_SYNTHETIC_POSITION_SHARE_RAW=(1n<<128n)-1n;
-export function deriveSyntheticPositionShareRaw(frame:BinFrame):bigint{
+/** Keep the simulated position in the linear, price-taking share regime. */
+export const SYNTHETIC_SHARE_DIVISOR=1_000_000n;
+export const SHARE_WEIGHT_SCALE=1_000_000_000_000n;
+const ceilDiv=(n:bigint,d:bigint)=>d>0n?(n+d-1n)/d:0n;
+export function deriveSyntheticPositionShareRaw(frame:BinFrame,divisor:bigint=SYNTHETIC_SHARE_DIVISOR):bigint{
  let usable=0n;
  for(const bin of frame.bins){
   const supply=raw(bin.liquiditySupply),x=raw(bin.amountX),y=raw(bin.amountY);
   if(supply>0n&&(x>0n||y>0n))usable+=supply;
  }
- return usable>MAX_SYNTHETIC_POSITION_SHARE_RAW?MAX_SYNTHETIC_POSITION_SHARE_RAW:usable;
+ if(usable<=0n||divisor<=0n)return 0n;
+ const scaled=ceilDiv(usable,divisor);
+ return scaled>MAX_SYNTHETIC_POSITION_SHARE_RAW?MAX_SYNTHETIC_POSITION_SHARE_RAW:scaled;
+}
+function boundedFraction(value:number):bigint{
+ if(!Number.isFinite(value)||value<=0||value>1)throw new Error('LPFORGE_CANDIDATE_CAPITAL_FRACTION_INVALID');
+ return BigInt(Math.max(1,Math.min(Number(SHARE_WEIGHT_SCALE),Math.round(value*Number(SHARE_WEIGHT_SCALE)))));
+}
+/** Exact integer allocation: no U128 principal is ever converted to Number. */
+export function allocateSyntheticShares(totalShareRaw:bigint,weights:Array<{weight:number}>):bigint[]{
+ if(totalShareRaw<0n||!weights.length)throw new Error('LPFORGE_CANDIDATE_SHARE_ALLOCATION_INVALID');
+ const numerators=weights.map(({weight})=>{
+  if(!Number.isFinite(weight)||weight<0)throw new Error('LPFORGE_CANDIDATE_WEIGHT_INVALID');
+  return BigInt(Math.max(0,Math.round(weight*Number(SHARE_WEIGHT_SCALE))));
+ });
+ const denominator=numerators.reduce((a,b)=>a+b,0n);if(denominator<=0n)throw new Error('LPFORGE_CANDIDATE_WEIGHT_ZERO');
+ let assigned=0n;
+ return numerators.map((n,i)=>{const share=i===numerators.length-1?totalShareRaw-assigned:(totalShareRaw*n)/denominator;assigned+=share;return share;});
+}
+/** Replay the current candidate's offset geometry at the historical anchor. */
+export function rebaseCandidateForReplay(candidate:RangeStrategyCandidate,anchorActiveBinId:number):RangeStrategyCandidate{
+ const rebase=(binId:number)=>anchorActiveBinId+(binId-candidate.centerBinId);
+ return {...candidate,lowerBinId:anchorActiveBinId+candidate.lowerOffsetBins,upperBinId:anchorActiveBinId+candidate.upperOffsetBins,centerBinId:anchorActiveBinId,perBinWeights:candidate.perBinWeights.map(w=>({...w,binId:rebase(w.binId)}))};
 }
 function distributeShares(candidate:RangeStrategyCandidate,totalShareRaw:bigint,frame:BinFrame):SyntheticPosition{
- const map=new Map(frame.bins.map((b)=>[b.binId,b] as const));let assigned=0n;const bins=candidate.perBinWeights.map((w,i)=>{const share=i===candidate.perBinWeights.length-1?totalShareRaw-assigned:BigInt(Math.max(0,Math.floor(Number(totalShareRaw)*w.weight)));assigned+=share;return{binId:w.binId,positionShareRaw:share,competingSupplyRaw:raw(map.get(w.binId)?.liquiditySupply)};});return{pool:'candidate-pool',lowerBinId:candidate.lowerBinId,upperBinId:candidate.upperBinId,openedAt:frame.observedAt,bins,strategyLabel:`${candidate.strategy}:${candidate.orientation}`};
+ const map=new Map(frame.bins.map((b)=>[b.binId,b] as const));const shares=allocateSyntheticShares(totalShareRaw,candidate.perBinWeights);const bins=candidate.perBinWeights.map((w,i)=>({binId:w.binId,positionShareRaw:shares[i]!,competingSupplyRaw:raw(map.get(w.binId)?.liquiditySupply)}));return{pool:'candidate-pool',lowerBinId:candidate.lowerBinId,upperBinId:candidate.upperBinId,openedAt:frame.observedAt,bins,strategyLabel:`${candidate.strategy}:${candidate.orientation}`};
 }
 const finitePositive=(n:number)=>Number.isFinite(n)&&n>0;
 export function simulateCandidateEconomics(input:{candidate:RangeStrategyCandidate;pool:string;frames:BinFrame[];events:SwapEventFact[];totalPositionShareRaw:bigint;rawUnitValueX:number;rawUnitValueY:number;capitalValue:number;costs?:SimulationCostModel;maxCapitalRelativeMove?:number;}):CandidateEconomicSimulation{
  if(!input.frames.length)throw new Error('LPFORGE_CANDIDATE_SIM_NO_FRAMES');
- const first=input.frames[0]!,position=distributeShares(input.candidate,BigInt(Math.floor(Number(input.totalPositionShareRaw)*input.candidate.capitalFraction)),first);position.pool=input.pool;
+ const first=input.frames[0]!,candidate=rebaseCandidateForReplay(input.candidate,first.activeBinId),candidateShareRaw=(input.totalPositionShareRaw*boundedFraction(input.candidate.capitalFraction))/SHARE_WEIGHT_SCALE,position=distributeShares(candidate,candidateShareRaw,first);position.pool=input.pool;
  const sim=simulateSyntheticPosition({position,frames:input.frames,events:input.events,...(input.costs?{costs:input.costs}:{})});
  const start=sim.inventory[0]!,end=sim.inventory.at(-1)!;
  const valueRaw=(x:bigint,y:bigint)=>Number(x)*input.rawUnitValueX+Number(y)*input.rawUnitValueY;
