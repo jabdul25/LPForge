@@ -17,6 +17,18 @@ poll_seconds=${LPFORGE_CANARY_POLL_SECONDS:-1}
 marker_file="$evidence_dir/controlled-canary-dispatch-attempted"
 lock_file="$evidence_dir/controlled-canary-supervisor.lock"
 
+# This supervisor can eventually launch the execution child, so it must prove
+# the mounted release before even watching for an eligible plan. The binary
+# path is deployment plumbing, not an identity source: the artifact verifier
+# checks the actual Node version against RELEASE_MANIFEST.json.
+runtime_node_bin=${LPFORGE_RUNTIME_NODE_BIN:-/opt/node-v24.19.0-linux-x64/bin/node}
+[[ -x "$runtime_node_bin" ]] || runtime_node_bin=$(command -v node)
+export PATH="$(dirname "$runtime_node_bin"):$PATH"
+(
+  cd "$release_dir"
+  LPFORGE_RUNTIME_RELEASE_VERIFY=true "$runtime_node_bin" scripts/verify-runtime-release-identity.mjs
+)
+
 mkdir -p "$evidence_dir"
 chmod 0700 "$evidence_dir"
 exec 9>"$lock_file"
