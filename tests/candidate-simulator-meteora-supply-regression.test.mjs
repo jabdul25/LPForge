@@ -54,20 +54,26 @@ test('remainder never assigns a zero-weight terminal bin',()=>{
 
 const replayCandidate=(id,lower,upper)=>({id,family:'TEST',strategy:'SPOT',orientation:'BALANCED',lowerBinId:lower,upperBinId:upper,centerBinId:100,widthBins:upper-lower+1,lowerOffsetBins:lower-100,upperOffsetBins:upper-100,lowerDistancePct:0,upperDistancePct:0,reasonCodes:[],capitalFraction:1,perBinWeights:Array.from({length:upper-lower+1},(_,i)=>({binId:lower+i,weight:1/(upper-lower+1)}))});
 const replayFrame=(minute,active,low,high,emptyRange)=>({observedAt:new Date(Date.parse('2026-08-22T00:00:00Z')+minute*60000).toISOString(),activeBinId:active,bins:Array.from({length:high-low+1},(_,i)=>{const binId=low+i,empty=emptyRange&&binId>=emptyRange[0]&&binId<=emptyRange[1];return{binId,price:'1',liquiditySupply:'1000000000000',amountX:empty?'0':'500000000',amountY:empty?'0':'500000000'};})});
-test('candidate-specific replay anchors do not leak narrow coverage to a wider candidate',()=>{
- const frames=[replayFrame(0,0,-30,30),replayFrame(30,30,20,40),replayFrame(60,60,50,70)];
+test('candidate-specific replay holds fixed historical geometry rather than following later active bins',()=>{
+ const frames=[replayFrame(0,100,65,135),replayFrame(15,105,65,135),replayFrame(30,110,65,135)];
  const input={historicalFrames:frames,decisionAt:frames[2].observedAt,horizonMinutes:30};
- const narrow=prepareCandidateReplay(input,replayCandidate('narrow',90,110));
- const wide=prepareCandidateReplay(input,replayCandidate('wide',70,130));
- assert.equal(narrow.frames?.[0].activeBinId,30);
- assert.equal(wide.reason,'CANDIDATE_REPLAY_CONTINUITY_INSUFFICIENT');
- const uncovered=prepareCandidateReplay({historicalFrames:[replayFrame(0,0,-30,30,[-10,10]),replayFrame(60,60,30,90)],decisionAt:replayFrame(60,60,30,90).observedAt,horizonMinutes:30},replayCandidate('uncovered',90,110));
- assert.equal(uncovered.reason,'CANDIDATE_REPLAY_CONTINUITY_INSUFFICIENT');
+ const fixed=prepareCandidateReplay(input,replayCandidate('fixed',68,132));
+ assert.equal(fixed.frames?.[0].activeBinId,100);
+ assert.equal(fixed.frames?.length,3);
+ assert.ok(fixed.frames?.every(frame=>frame.bins.some(bin=>bin.binId===68)&&frame.bins.some(bin=>bin.binId===132)));
 });
-test('candidate-specific preparations select the latest deterministic complete horizon for each candidate',()=>{
- const frames=[replayFrame(0,0,-20,-10),replayFrame(15,0,-20,-10),replayFrame(30,30,20,40),replayFrame(45,30,20,40)];
+test('candidate-specific replay anchors do not leak coverage to a wider fixed candidate',()=>{
+ const frames=[replayFrame(0,100,65,135),replayFrame(15,105,65,135),replayFrame(30,110,73,143)];
+ const input={historicalFrames:frames,decisionAt:frames[2].observedAt,horizonMinutes:30};
+ const narrow=prepareCandidateReplay(input,replayCandidate('narrow',80,120));
+ const wide=prepareCandidateReplay(input,replayCandidate('wide',68,132));
+ assert.equal(narrow.frames?.length,3);
+ assert.equal(wide.reason,'CANDIDATE_REPLAY_CONTINUITY_INSUFFICIENT');
+});
+test('candidate-specific preparations select the latest deterministic complete fixed-range horizon',()=>{
+ const frames=[replayFrame(0,0,-20,20),replayFrame(15,0,-20,20),replayFrame(30,30,20,80),replayFrame(45,30,20,80)];
  const input={historicalFrames:frames,decisionAt:frames[3].observedAt,horizonMinutes:15};
- const lower=prepareCandidateReplay(input,replayCandidate('lower',80,90));
+ const lower=prepareCandidateReplay(input,replayCandidate('lower',85,95));
  const centered=prepareCandidateReplay(input,replayCandidate('centered',90,110));
  assert.equal(lower.frames?.[0].activeBinId,0);
  assert.equal(centered.frames?.[0].activeBinId,30);
@@ -87,6 +93,15 @@ test('complete replay coverage remains actionable while bins outside the candida
 test('temporary moving-window gaps and zero-weight edge bins preserve evidence semantics',()=>{
  const temporary=replayMoving(movingCandidate(),[movingFrame(0,100,65,135),movingFrame(15,108,73,143),movingFrame(30,100,65,135)]);assert.equal(temporary.evidenceActionable,false);assert.equal(temporary.inventoryChangeValue,0);
  const zeroEdge=replayMoving(movingCandidate(true),[movingFrame(0,100,65,135),movingFrame(15,108,69,132)]);assert.equal(zeroEdge.evidenceActionable,true);
+});
+test('a valid prepared replay never produces a fixed-geometry coverage warning in the simulator',()=>{
+ const frames=[movingFrame(0,100,65,135),movingFrame(15,105,65,135),movingFrame(30,110,65,135)];
+ const prepared=prepareCandidateReplay({historicalFrames:frames,decisionAt:frames[2].observedAt,horizonMinutes:30},movingCandidate());
+ assert.ok(prepared.frames);
+ const result=replayMoving(movingCandidate(),prepared.frames);
+ assert.equal(result.evidenceActionable,true);
+ assert.ok(!result.warnings.includes('CANDIDATE_REPLAY_COVERAGE_INSUFFICIENT'));
+ assert.ok(!result.warnings.includes('CANDIDATE_REPLAY_CONTINUITY_INSUFFICIENT'));
 });
 test('AUvX, 5pg, and FxPP-shaped hydrated windows remain valid with complete continuity',()=>{
  for(const [pool,supply] of [['AUvX','33613130275121993989002160'],['5pg','2882060171703985282476478'],['FxPP','3407759355809420208455944']]){const frames=[movingFrame(0,100,65,135),movingFrame(15,105,65,135)].map(frame=>({...frame,bins:frame.bins.map(bin=>({...bin,liquiditySupply:supply}))}));const result=replayMoving(movingCandidate(),frames);assert.equal(result.unitScaleValid,true,pool);assert.equal(result.evidenceActionable,true,pool);assert.ok(result.normalizationScale>0,pool);}
