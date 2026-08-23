@@ -4,6 +4,7 @@ import { createPostgresStore } from '../../../packages/db/src/index.js';
 import { calibratePredictions, calibrateLiveSettledOutcomes, buildReputation, type LiveSettledLearningSample, type PredictionRecord, type OutcomeRecord } from '../../../packages/discovery-learning/src/index.js';
 import { researchProposalFromCalibration } from '../../../packages/discovery-runtime/src/index.js';
 import { buildPhase3ForwardCalibration, matureFrozenPhase3ForwardOutcome, phase3ForwardOutcomeResultHash, type FrozenPhase3ForwardDecision, type Phase3ForwardOutcome } from '../../../packages/phase3-forward-validation/src/index.js';
+import { processDueForwardMaturations, startIndependentForwardMaturationLoop } from './forward-maturation-scheduler.js';
 const json=(v:unknown)=>JSON.stringify(v,(_,x)=>typeof x==='bigint'?x.toString():x,2);
 const env=(n:string)=>{const v=process.env[n];if(!v)throw new Error(`LPFORGE_DISCOVERY_LEARNING_ENV_REQUIRED:${n}`);return v};
 const horizons=[30,60,120,240,360];
@@ -17,18 +18,17 @@ function outcomeFromRow(row:Record<string,unknown>):OutcomeRecord{
 const object=(value:unknown):Record<string,unknown>=>value&&typeof value==='object'&&!Array.isArray(value)?value as Record<string,unknown>:{};
 const finite=(value:unknown):number|undefined=>typeof value==='number'&&Number.isFinite(value)?value:undefined;
 async function maturePhase3ForwardOutcomes(store:Awaited<ReturnType<typeof createPostgresStore>>,now:string){
- const due=await store.loadDuePhase3ForwardOutcomes(now,Math.max(1,Math.min(50,Number(process.env.LPFORGE_FORWARD_VALIDATION_MAX_BATCH??12))));let finalized=0,insufficient=0,failed=0;
- for(const row of due){
-  try{
+ const due=await store.loadDuePhase3ForwardOutcomes(now,Math.max(1,Math.min(50,Number(process.env.LPFORGE_FORWARD_VALIDATION_MAX_BATCH??12))));
+ const batch=await processDueForwardMaturations({tasks:due,mature:async row=>{
    const decision=row.decisionPayload as unknown as FrozenPhase3ForwardDecision,start=Date.parse(decision.decisionTimestamp);if(!Number.isFinite(start))throw new Error('LPFORGE_FORWARD_DECISION_TIMESTAMP_INVALID');
    const history=await store.loadOperationalHistory(decision.poolAddress,new Date(start-15*60_000).toISOString(),2000);
-   const outcome=await matureFrozenPhase3ForwardOutcome({decision,horizonMinutes:row.horizonMinutes,outcomeModelVersion:row.outcomeModelVersion,frames:history.binFrames,events:history.swapEvents,now});
-   const persisted=await store.persistPhase3ForwardOutcome({recommendationId:outcome.recommendationId,horizonMinutes:outcome.horizonMinutes,outcomeModelVersion:outcome.outcomeModelVersion,state:outcome.state,...(outcome.evidenceHash?{evidenceHash:outcome.evidenceHash}:{}),resultHash:await phase3ForwardOutcomeResultHash(outcome),reasonCodes:outcome.reasonCodes,...(outcome.realized?{realized:outcome.realized as unknown as Record<string,unknown>}:{}) ,payload:{authority:'RESEARCH_ONLY_NO_POLICY_MUTATION',decisionTimestamp:decision.decisionTimestamp,sourceSha:decision.sourceSha,selectedCandidateKind:decision.selectedCandidateKind},maturedAt:now});
-   if(persisted&&outcome.state==='FINAL')finalized++;else if(persisted&&outcome.state==='INSUFFICIENT_EVIDENCE')insufficient++;
-  }catch(error){failed++;console.error(json({event:'lpforge_phase3_forward_maturation_failed',recommendationId:row.recommendationId,horizonMinutes:row.horizonMinutes,error:error instanceof Error?error.message:String(error),authority:'RESEARCH_ONLY_NO_POLICY_MUTATION'}));}
- }
+   return matureFrozenPhase3ForwardOutcome({decision,horizonMinutes:row.horizonMinutes,outcomeModelVersion:row.outcomeModelVersion,frames:history.binFrames,events:history.swapEvents,now});
+  },persist:async (row,outcome)=>{
+   const decision=row.decisionPayload as unknown as FrozenPhase3ForwardDecision;
+   return store.persistPhase3ForwardOutcome({recommendationId:outcome.recommendationId,horizonMinutes:outcome.horizonMinutes,outcomeModelVersion:outcome.outcomeModelVersion,state:outcome.state,...(outcome.evidenceHash?{evidenceHash:outcome.evidenceHash}:{}),resultHash:await phase3ForwardOutcomeResultHash(outcome),reasonCodes:outcome.reasonCodes,...(outcome.realized?{realized:outcome.realized as unknown as Record<string,unknown>}:{}) ,payload:{authority:'RESEARCH_ONLY_NO_POLICY_MUTATION',decisionTimestamp:decision.decisionTimestamp,sourceSha:decision.sourceSha,selectedCandidateKind:decision.selectedCandidateKind},maturedAt:now});
+  },emit:event=>console.log(json({...event,authority:'RESEARCH_ONLY_NO_POLICY_MUTATION'}))});
  const rows=await store.loadPhase3ForwardOutcomes(5000),calibrationRows=rows.flatMap(row=>{const decision=(row.decisionPayload??{}) as FrozenPhase3ForwardDecision,realized=row.realized as Phase3ForwardOutcome['realized']|undefined;const outcome:Phase3ForwardOutcome={recommendationId:String(row.recommendationId),horizonMinutes:Number(row.horizonMinutes) as 30|60|120,outcomeModelVersion:String(row.outcomeModelVersion),state:String(row.state) as Phase3ForwardOutcome['state'],...(row.evidenceHash?{evidenceHash:String(row.evidenceHash)}:{}),reasonCodes:Array.isArray(row.reasonCodes)?row.reasonCodes.map(String):[],...(realized?{realized}:{})};return decision.recommendationId?[{decision,outcome}]:[];});
- return{due:due.length,finalized,insufficient,failed,calibration:buildPhase3ForwardCalibration(calibrationRows)};
+ return{...batch,calibration:buildPhase3ForwardCalibration(calibrationRows)};
 }
 /** Read the immutable snapshot copied into the terminal outcome, never a newer
  * recommendation or a live token price. */
@@ -47,10 +47,10 @@ async function collectCounterfactuals(store:Awaited<ReturnType<typeof createPost
   }
  }return inserted;
 }
-async function once(){
+async function once(options:{includeForwardMaturation?:boolean}={}){
  const now=new Date().toISOString(),store=await createPostgresStore(env('DATABASE_URL')),api=createMeteoraDataApi({...((process.env.LPFORGE_METEORA_DATA_API_URL??'').trim()?{baseUrl:process.env.LPFORGE_METEORA_DATA_API_URL!}:{}),maxRps:Number(process.env.LPFORGE_DATA_API_MAX_RPS??1),timeoutMs:Number(process.env.LPFORGE_HTTP_TIMEOUT_MS??10000)});
  try{
-  const phase3ForwardValidation=await maturePhase3ForwardOutcomes(store,now);
+  const phase3ForwardValidation=options.includeForwardMaturation===false?{deferredToIndependentScheduler:true}:await maturePhase3ForwardOutcomes(store,now);
   const pendingSettlements=await store.loadPendingLiveSolSettledLearningOutcomes();let materializedLiveOutcomes=0;for(const positionAddress of pendingSettlements){const outcome=await store.createLiveSolSettledLearningOutcome({positionAddress,at:now});if(!outcome.outcome)throw new Error(`LPFORGE_LIVE_OUTCOME_MATERIALIZATION_PENDING:${outcome.reasonCodes.join(',')}`);if(outcome.created)materializedLiveOutcomes++;}
   const rows=await store.loadRecentDiscoveryPredictions(Number(process.env.LPFORGE_DISCOVERY_LEARNING_MAX_PREDICTIONS??5000));const predictions=rows.map(predictionFromRow).filter((x):x is PredictionRecord=>Boolean(x));const counterfactuals=await collectCounterfactuals(store,api,predictions,now);const outcomes=(await store.loadDiscoveryOutcomes()).map(outcomeFromRow);const calibration=calibratePredictions(predictions,outcomes);const snapshotId=`cal-${hash(`${now}:${predictions.length}:${outcomes.length}`)}`;await store.insertDiscoveryCalibration({snapshotId,observedAt:now,modelVersion:'discovery-distributional-ev-v1',sampleCount:calibration.samples,independentEpisodes:calibration.independentEpisodes,...(calibration.brierProfit!==null?{brierProfit:calibration.brierProfit}:{}),...(calibration.survivalBrier!==null?{survivalBrier:calibration.survivalBrier}:{}),...(calibration.netValueMae!==null?{netValueMae:calibration.netValueMae}:{}),...(calibration.meanBias!==null?{meanBias:calibration.meanBias}:{}),allOutcomeNet:calibration.allOutcomeNet,modelCalibrationNet:calibration.modelCalibrationNet,payload:{allOutcomeIncludesStructuralBreaks:true}});
   const liveOutcomes=(await store.loadLiveLearningOutcomes()).map(liveSettledSampleFromRow).filter((x):x is LiveSettledLearningSample=>Boolean(x));const liveCalibration=calibrateLiveSettledOutcomes(liveOutcomes);const liveSnapshotId=`live-sol-settled-cal-${hash(`${now}:${liveOutcomes.map(x=>x.outcomeId).sort().join(':')}`)}`;await store.insertLiveLearningCalibration({snapshotId:liveSnapshotId,observedAt:now,sampleCount:liveCalibration.samples,independentEpisodes:liveCalibration.independentEpisodes,...(liveCalibration.brierProfit!==null?{brierProfit:liveCalibration.brierProfit}:{}),...(liveCalibration.netPnlMaeLamports!==null?{netPnlMaeLamports:liveCalibration.netPnlMaeLamports}:{}),...(liveCalibration.meanBiasLamports!==null?{meanBiasLamports:liveCalibration.meanBiasLamports}:{}),payload:{authority:'RESEARCH_ONLY_NO_POLICY_MUTATION',terminalOutcomeKinds:['LIVE_SOL_SETTLED','LIVE_ENTRY_ABORTED_SOL_SETTLED'],cohorts:liveCalibration.byCohort,profitableCount:liveCalibration.profitableCount,lossCount:liveCalibration.lossCount,counterfactualComparison:'PRESERVED_IN_EXISTING_DISCOVERY_OUTCOMES'}});
@@ -59,4 +59,9 @@ async function once(){
   const summary={status:'PASS',authority:'RESEARCH_ONLY_NO_POLICY_MUTATION',observedAt:now,predictions:predictions.length,outcomes:outcomes.length,liveSolSettledOutcomes:liveOutcomes.length,materializedLiveOutcomes,counterfactualsUpserted:counterfactuals,calibration,liveCalibration,phase3ForwardValidation,proposal:proposal?.proposal??null};console.log(json(summary));return summary;
  }finally{await store.close()}
 }
-const cmd=process.argv[2]??'once';if(cmd==='once')await once();else if(cmd==='start'){const ms=Math.max(300_000,Number(process.env.LPFORGE_DISCOVERY_LEARNING_INTERVAL_MS??900_000));for(;;){try{await once()}catch(e){console.error(json({status:'ERROR',error:e instanceof Error?e.message:String(e)}))}await new Promise(r=>setTimeout(r,ms));}}else throw new Error(`LPFORGE_DISCOVERY_LEARNING_COMMAND:${cmd}`);
+const cmd=process.argv[2]??'once';if(cmd==='once')await once();else if(cmd==='start'){
+ const learningMs=Math.max(300_000,Number(process.env.LPFORGE_DISCOVERY_LEARNING_INTERVAL_MS??900_000));
+ const forwardMaturationMs=Math.max(30_000,Math.min(300_000,Number(process.env.LPFORGE_FORWARD_VALIDATION_INTERVAL_MS??60_000)));
+ startIndependentForwardMaturationLoop({intervalMs:forwardMaturationMs,run:async()=>{const store=await createPostgresStore(env('DATABASE_URL'));try{await maturePhase3ForwardOutcomes(store,new Date().toISOString());}finally{await store.close();}},onError:(error)=>console.error(json({event:'FORWARD_MATURATION_FAILED',error:error instanceof Error?error.message:String(error),authority:'RESEARCH_ONLY_NO_POLICY_MUTATION'}))});
+ for(;;){try{await once({includeForwardMaturation:false})}catch(error){console.error(json({status:'ERROR',error:error instanceof Error?error.message:String(error)}))}await new Promise(resolve=>setTimeout(resolve,learningMs));}
+}else throw new Error(`LPFORGE_DISCOVERY_LEARNING_COMMAND:${cmd}`);
