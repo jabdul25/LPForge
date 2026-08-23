@@ -1980,9 +1980,9 @@ export async function createPostgresStore(
           [v.recommendationId,v.decisionId,v.poolAddress,v.decisionAt,v.sourceSha,v.buildId,v.policyHash,v.migrationHead,v.capitalLamports,v.selectedCandidateKind,v.strategy??null,v.orientation??null,v.rangeFamily??null,v.activeBinIdAtDecision,v.lowerBinId??null,v.upperBinId??null,v.includedBinCount??null,json(v.candidateWeights),json(v.prediction),json(v.evidenceProvenance),v.phase3State,v.phase3Outcome,json(v.reasonCodes),v.wouldAugEraThesisSemanticsHaveCreatedThesis,json(v.payload)],
         );
         if (inserted.rows.length) {
-          for (const horizonMinutes of [30,60,120]) await db.query(
-            `INSERT INTO research.phase3_forward_outcomes(recommendation_id,horizon_minutes,outcome_model_version,state,payload) VALUES($1,$2,'phase3-forward-outcome-v1','PENDING','{}'::jsonb) ON CONFLICT(recommendation_id,horizon_minutes,outcome_model_version) DO NOTHING`,
-            [v.recommendationId,horizonMinutes],
+          for (const horizonMinutes of [30,60,120]) for (const outcomeModelVersion of ['phase3-forward-outcome-v1','phase3-forward-outcome-v2']) await db.query(
+            `INSERT INTO research.phase3_forward_outcomes(recommendation_id,horizon_minutes,outcome_model_version,state,payload) VALUES($1,$2,$3,'PENDING','{}'::jsonb) ON CONFLICT(recommendation_id,horizon_minutes,outcome_model_version) DO NOTHING`,
+            [v.recommendationId,horizonMinutes,outcomeModelVersion],
           );
         }
         await db.query('COMMIT');

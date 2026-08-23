@@ -69,7 +69,7 @@ export function deriveForwardMaturationRetryPlan(input:{priorState:ForwardMatura
   const priorRetries=Math.max(0,Math.floor(input.retryCount??0));
   if(input.resultState!=='INSUFFICIENT_EVIDENCE')return{retryCount:priorRetries,terminal:input.resultState==='FINAL'||input.resultState==='FAILED_DATA_INTEGRITY'};
   const retryCount=priorRetries+1;
-  const terminal=input.reasonCodes.includes('FORWARD_FROZEN_CANDIDATE_UNAVAILABLE')||retryCount>=FORWARD_MATURATION_RETRY_LIMIT;
+  const terminal=input.reasonCodes.includes('FORWARD_FROZEN_CANDIDATE_UNAVAILABLE')||input.reasonCodes.some(code=>['FORWARD_V2_FROZEN_WSOL_VALUATION_INVALID','FORWARD_V2_FROZEN_CAPITAL_INVALID','FORWARD_V2_CAPITAL_ALLOCATION_INVALID','FORWARD_V2_BIN_LIQUIDITY_UNAVAILABLE','FORWARD_V2_NOT_PRICE_TAKING','FORWARD_V2_POSITION_QUANTITY_UNREPRESENTABLE','FORWARD_V2_CAPITAL_REPRESENTATION_INVALID'].includes(code))||retryCount>=FORWARD_MATURATION_RETRY_LIMIT;
   if(terminal)return{retryCount,terminal:true};
   const attempted=Date.parse(input.attemptedAt);
   if(!Number.isFinite(attempted))throw new Error('LPFORGE_FORWARD_MATURATION_ATTEMPT_TIMESTAMP_INVALID');

@@ -1,9 +1,13 @@
 import { canonicalJson, sha256Hex, type SwapEventFact } from '../../domain/src/index.js';
 import { deriveSyntheticPositionShareRaw, simulateCandidateEconomics, type CandidateEconomicSimulation } from '../../candidate-simulator/src/index.js';
 import type { ShadowRecommendation } from '../../shadow/src/index.js';
-import type { BinFrame } from '../../simulator/src/index.js';
+import { simulateSyntheticPosition, type BinFrame, type SyntheticBinShare, type SyntheticPosition } from '../../simulator/src/index.js';
 
-export const PHASE3_FORWARD_OUTCOME_MODEL_VERSION = 'phase3-forward-outcome-v1';
+export const PHASE3_FORWARD_OUTCOME_MODEL_VERSION_V1 = 'phase3-forward-outcome-v1';
+export const PHASE3_FORWARD_OUTCOME_MODEL_VERSION_V2 = 'phase3-forward-outcome-v2';
+/** Compatibility alias: callers without an explicit version retain immutable V1 semantics. */
+export const PHASE3_FORWARD_OUTCOME_MODEL_VERSION = PHASE3_FORWARD_OUTCOME_MODEL_VERSION_V1;
+export const PHASE3_FORWARD_OUTCOME_MODEL_VERSIONS = [PHASE3_FORWARD_OUTCOME_MODEL_VERSION_V1, PHASE3_FORWARD_OUTCOME_MODEL_VERSION_V2] as const;
 export const PHASE3_FORWARD_HORIZONS_MINUTES = [30, 60, 120] as const;
 export type ForwardOutcomeState = 'PENDING' | 'INSUFFICIENT_EVIDENCE' | 'FINAL' | 'FAILED_DATA_INTEGRITY';
 
@@ -137,6 +141,12 @@ export interface Phase3ForwardOutcome {
     activeRatio?: number;
     rangeSurvived: boolean;
     firstOutOfRangeTimestamp?: string;
+    frozenCapitalLamports?: string;
+    allocatedCapitalLamports?: string;
+    derivedPositionValueLamports?: string;
+    maxEffectiveOwnershipBps?: number;
+    participationModel?: 'CAPITAL_CONSTRAINED_V2';
+    perBinParticipation?: Array<{binId:number;allocatedCapitalLamports:string;baselineBinValueLamports:string;competingSupplyRaw:string;positionShareRaw:string;effectiveOwnershipBps:number}>;
   };
 }
 
@@ -158,6 +168,177 @@ function inWindow(timestamp: string, start: number, end: number): boolean {
   return Number.isFinite(value) && value > start && value <= end;
 }
 
+interface CapitalConstrainedForwardPosition {
+  position: SyntheticPosition;
+  frozenCapitalLamports: bigint;
+  allocatedCapitalLamports: bigint;
+  derivedPositionValueLamports: bigint;
+  maxEffectiveOwnershipBps: number;
+  bins: Array<{
+    binId: number;
+    allocatedCapitalLamports: string;
+    baselineBinValueLamports: string;
+    competingSupplyRaw: string;
+    positionShareRaw: string;
+    effectiveOwnershipBps: number;
+  }>;
+}
+
+const FORWARD_V2_WEIGHT_SCALE = 1_000_000_000_000n;
+const FORWARD_V2_BPS_SCALE = 10_000n;
+const FORWARD_V2_MIN_CAPITAL_UTILIZATION_BPS = 9_950n;
+/** Five percent is the explicit maximum price-taking ownership of a populated bin. */
+export const FORWARD_V2_MAX_PRICE_TAKING_OWNERSHIP_BPS = 500;
+
+function forwardRaw(value: string | undefined): bigint {
+  try { return BigInt(value ?? '0'); } catch { return 0n; }
+}
+
+function forwardSafeNumber(value: bigint): number | undefined {
+  if (value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
+  return Number(value);
+}
+
+function forwardWeightNumerators(candidate: NonNullable<FrozenPhase3ForwardDecision['selectedCandidate']>): bigint[] | undefined {
+  const seen = new Set<number>();
+  const weights = candidate.perBinWeights.map(weight => {
+    if (!Number.isInteger(weight.binId) || seen.has(weight.binId) || !Number.isFinite(weight.weight) || weight.weight < 0) return undefined;
+    seen.add(weight.binId);
+    return BigInt(Math.round(weight.weight * Number(FORWARD_V2_WEIGHT_SCALE)));
+  });
+  if (weights.some(weight => weight === undefined)) return undefined;
+  return weights as bigint[];
+}
+
+function allocateForwardCapital(capitalLamports: bigint, weights: bigint[]): bigint[] | undefined {
+  const denominator = weights.reduce((sum, weight) => sum + weight, 0n);
+  const remainderIndex = weights.reduce((last, weight, index) => weight > 0n ? index : last, -1);
+  if (capitalLamports <= 0n || denominator <= 0n || remainderIndex < 0) return undefined;
+  let allocated = 0n;
+  return weights.map((weight, index) => {
+    const value = index === remainderIndex ? capitalLamports - allocated : (capitalLamports * weight) / denominator;
+    allocated += value;
+    return value;
+  });
+}
+
+/**
+ * V2 constructs actual synthetic LP-share units from the frozen capital at t0.
+ * rawUnitValueY is the frozen token-X value of one WSOL lamport, so it is also
+ * the frozen conversion from the token-X valuation contract back to lamports.
+ */
+function deriveCapitalConstrainedForwardPosition(input: {
+  decision: FrozenPhase3ForwardDecision;
+  candidate: NonNullable<FrozenPhase3ForwardDecision['selectedCandidate']>;
+  baseline: BinFrame;
+}): { position?: CapitalConstrainedForwardPosition; reasonCodes?: string[] } {
+  const rawUnitValueX = Number(input.decision.prediction.rawUnitValueX ?? 0);
+  const rawUnitValueY = Number(input.decision.prediction.rawUnitValueY ?? 0);
+  if (!Number.isFinite(rawUnitValueX) || rawUnitValueX <= 0 || !Number.isFinite(rawUnitValueY) || rawUnitValueY <= 0) {
+    return { reasonCodes: ['FORWARD_V2_FROZEN_WSOL_VALUATION_INVALID'] };
+  }
+  const frozenCapitalLamports = forwardRaw(input.decision.capitalLamports);
+  const capitalFraction = input.candidate.capitalFraction;
+  if (frozenCapitalLamports <= 0n || !Number.isFinite(capitalFraction) || capitalFraction <= 0 || capitalFraction > 1) {
+    return { reasonCodes: ['FORWARD_V2_FROZEN_CAPITAL_INVALID'] };
+  }
+  const fraction = BigInt(Math.round(capitalFraction * Number(FORWARD_V2_WEIGHT_SCALE)));
+  const allocatedCapitalLamports = (frozenCapitalLamports * fraction) / FORWARD_V2_WEIGHT_SCALE;
+  const weights = forwardWeightNumerators(input.candidate);
+  const allocations = weights ? allocateForwardCapital(allocatedCapitalLamports, weights) : undefined;
+  if (!weights || !allocations || allocations.reduce((sum, value) => sum + value, 0n) > frozenCapitalLamports) {
+    return { reasonCodes: ['FORWARD_V2_CAPITAL_ALLOCATION_INVALID'] };
+  }
+  const binMap = new Map(input.baseline.bins.map(bin => [bin.binId, bin] as const));
+  const bins: SyntheticBinShare[] = [];
+  const audit: CapitalConstrainedForwardPosition['bins'] = [];
+  for (let index = 0; index < input.candidate.perBinWeights.length; index++) {
+    const weight = input.candidate.perBinWeights[index]!;
+    const allocation = allocations[index]!;
+    if (allocation <= 0n) continue;
+    const bin = binMap.get(weight.binId);
+    const supply = forwardRaw(bin?.liquiditySupply);
+    const amountX = forwardSafeNumber(forwardRaw(bin?.amountX));
+    const amountY = forwardSafeNumber(forwardRaw(bin?.amountY));
+    if (!bin || supply <= 0n || amountX === undefined || amountY === undefined) {
+      return { reasonCodes: ['FORWARD_V2_BIN_LIQUIDITY_UNAVAILABLE'] };
+    }
+    const valueLamports = BigInt(Math.floor((amountX * rawUnitValueX + amountY * rawUnitValueY) / rawUnitValueY));
+    if (valueLamports <= 0n || allocation >= valueLamports) {
+      return { reasonCodes: ['FORWARD_V2_NOT_PRICE_TAKING'] };
+    }
+    const requestedBps = (allocation * FORWARD_V2_BPS_SCALE) / valueLamports;
+    if (requestedBps > BigInt(FORWARD_V2_MAX_PRICE_TAKING_OWNERSHIP_BPS)) {
+      return { reasonCodes: ['FORWARD_V2_NOT_PRICE_TAKING'] };
+    }
+    // p/(s+p) <= allocation/binValue: floor preserves the frozen capital cap.
+    const positionShareRaw = (supply * allocation) / (valueLamports - allocation);
+    if (positionShareRaw <= 0n) return { reasonCodes: ['FORWARD_V2_POSITION_QUANTITY_UNREPRESENTABLE'] };
+    const ownershipBps = Number((positionShareRaw * FORWARD_V2_BPS_SCALE) / (supply + positionShareRaw));
+    if (ownershipBps > FORWARD_V2_MAX_PRICE_TAKING_OWNERSHIP_BPS) return { reasonCodes: ['FORWARD_V2_NOT_PRICE_TAKING'] };
+    bins.push({ binId: weight.binId, positionShareRaw, competingSupplyRaw: supply });
+    audit.push({
+      binId: weight.binId,
+      allocatedCapitalLamports: allocation.toString(),
+      baselineBinValueLamports: valueLamports.toString(),
+      competingSupplyRaw: supply.toString(),
+      positionShareRaw: positionShareRaw.toString(),
+      effectiveOwnershipBps: ownershipBps,
+    });
+  }
+  if (!bins.length) return { reasonCodes: ['FORWARD_V2_POSITION_QUANTITY_UNREPRESENTABLE'] };
+  const position: SyntheticPosition = {
+    pool: input.decision.poolAddress,
+    lowerBinId: input.candidate.lowerBinId,
+    upperBinId: input.candidate.upperBinId,
+    openedAt: input.baseline.observedAt,
+    bins,
+    strategyLabel: `${input.candidate.strategy}:${input.candidate.orientation}`,
+  };
+  const baselineSimulation = simulateSyntheticPosition({ position, frames: [input.baseline], events: [] });
+  const baselineInventory = baselineSimulation.inventory[0];
+  if (!baselineInventory) return { reasonCodes: ['FORWARD_V2_POSITION_QUANTITY_UNREPRESENTABLE'] };
+  const derivedPositionValueLamports = forwardV2ValueLamports(baselineInventory.tokenXRaw, baselineInventory.tokenYRaw, rawUnitValueX, rawUnitValueY);
+  if (derivedPositionValueLamports === undefined || derivedPositionValueLamports <= 0n || derivedPositionValueLamports > allocatedCapitalLamports ||
+      derivedPositionValueLamports * FORWARD_V2_BPS_SCALE < allocatedCapitalLamports * FORWARD_V2_MIN_CAPITAL_UTILIZATION_BPS) {
+    return { reasonCodes: ['FORWARD_V2_CAPITAL_REPRESENTATION_INVALID'] };
+  }
+  return {
+    position: {
+      position,
+      frozenCapitalLamports,
+      allocatedCapitalLamports,
+      derivedPositionValueLamports,
+      maxEffectiveOwnershipBps: Math.max(...audit.map(row => row.effectiveOwnershipBps)),
+      bins: audit,
+    },
+  };
+}
+
+function forwardV2ValueLamports(tokenXRaw: bigint, tokenYRaw: bigint, rawUnitValueX: number, rawUnitValueY: number): bigint | undefined {
+  const x = forwardSafeNumber(tokenXRaw), y = forwardSafeNumber(tokenYRaw);
+  if (x === undefined || y === undefined || !Number.isFinite(rawUnitValueX) || rawUnitValueX <= 0 || !Number.isFinite(rawUnitValueY) || rawUnitValueY <= 0) return undefined;
+  const value = (x * rawUnitValueX + y * rawUnitValueY) / rawUnitValueY;
+  return Number.isFinite(value) && value >= 0 ? BigInt(Math.trunc(value)) : undefined;
+}
+
+function forwardInsufficient(input: {
+  decision: FrozenPhase3ForwardDecision;
+  horizon: (typeof PHASE3_FORWARD_HORIZONS_MINUTES)[number];
+  outcomeModelVersion: string;
+  reasonCodes: string[];
+  evidenceHash?: string;
+}): Phase3ForwardOutcome {
+  return {
+    recommendationId: input.decision.recommendationId,
+    horizonMinutes: input.horizon,
+    outcomeModelVersion: input.outcomeModelVersion,
+    state: 'INSUFFICIENT_EVIDENCE',
+    ...(input.evidenceHash ? { evidenceHash: input.evidenceHash } : {}),
+    reasonCodes: [...new Set(input.reasonCodes)].sort(),
+  };
+}
+
 /**
  * Mature one frozen geometry.  No RangeForge generation or candidate ranking
  * occurs here: later source changes cannot alter this historical outcome.
@@ -171,45 +352,96 @@ export async function matureFrozenPhase3ForwardOutcome(input: {
   now: string;
 }): Promise<Phase3ForwardOutcome> {
   const horizon = input.horizonMinutes;
-  const outcomeModelVersion = input.outcomeModelVersion ?? PHASE3_FORWARD_OUTCOME_MODEL_VERSION;
+  const outcomeModelVersion = input.outcomeModelVersion ?? PHASE3_FORWARD_OUTCOME_MODEL_VERSION_V1;
+  if (outcomeModelVersion !== PHASE3_FORWARD_OUTCOME_MODEL_VERSION_V1 && outcomeModelVersion !== PHASE3_FORWARD_OUTCOME_MODEL_VERSION_V2) {
+    throw new Error('LPFORGE_FORWARD_OUTCOME_MODEL_VERSION_UNSUPPORTED');
+  }
   const start = Date.parse(input.decision.decisionTimestamp);
   const now = Date.parse(input.now);
   if (!Number.isFinite(start) || !Number.isFinite(now)) throw new Error('LPFORGE_FORWARD_MATURATION_TIME_INVALID');
   const end = start + horizon * 60_000;
   if (now < end) return { recommendationId: input.decision.recommendationId, horizonMinutes: horizon, outcomeModelVersion, state: 'PENDING', reasonCodes: ['FORWARD_HORIZON_NOT_DUE'] };
   const candidate = input.decision.selectedCandidate;
-  if (!candidate) return { recommendationId: input.decision.recommendationId, horizonMinutes: horizon, outcomeModelVersion, state: 'INSUFFICIENT_EVIDENCE', reasonCodes: ['FORWARD_FROZEN_CANDIDATE_UNAVAILABLE'] };
+  if (!candidate) return forwardInsufficient({ decision: input.decision, horizon, outcomeModelVersion, reasonCodes: ['FORWARD_FROZEN_CANDIDATE_UNAVAILABLE'] });
   const orderedFrames = [...input.frames].filter(frame => Number.isFinite(Date.parse(frame.observedAt))).sort((a, b) => Date.parse(a.observedAt) - Date.parse(b.observedAt));
   const baseline = orderedFrames.filter(frame => Date.parse(frame.observedAt) <= start).at(-1);
   const futureFrames = orderedFrames.filter(frame => inWindow(frame.observedAt, start, end));
-  if (!baseline || !futureFrames.length) return { recommendationId: input.decision.recommendationId, horizonMinutes: horizon, outcomeModelVersion, state: 'INSUFFICIENT_EVIDENCE', reasonCodes: ['FORWARD_FUTURE_FRAME_COVERAGE_INSUFFICIENT'] };
+  if (!baseline || !futureFrames.length) return forwardInsufficient({ decision: input.decision, horizon, outcomeModelVersion, reasonCodes: ['FORWARD_FUTURE_FRAME_COVERAGE_INSUFFICIENT'] });
   const frames = [baseline, ...futureFrames];
   const events = input.events.filter(event => inWindow(event.stamp.observedAt, start, end));
   const evidenceHash = await sha256Hex(canonicalJson({ recommendationId: input.decision.recommendationId, horizon, frames, events }));
-  // The frozen cost contract is stored in the recommendation payload's
-  // selected simulation and global prediction.  Reconstruct its exact three
-  // economic components rather than consulting a current policy.
+  // The frozen cost contract is stored at t0. Neither V1 nor V2 may consult
+  // a current cost policy while calibrating a historical prediction.
   const prediction = input.decision.prediction;
   const execution = Number(prediction.expectedExecutionCost ?? 0);
   const reposition = Number(prediction.expectedRepositionCost ?? 0);
   const tail = Number(prediction.expectedTailRiskCost ?? 0);
-  const simulation = simulateCandidateEconomics({
-    candidate,
-    pool: input.decision.poolAddress,
-    frames,
-    events,
-    totalPositionShareRaw: deriveSyntheticPositionShareRaw(baseline),
-    rawUnitValueX: Number(input.decision.prediction.rawUnitValueX ?? 0),
-    rawUnitValueY: Number(input.decision.prediction.rawUnitValueY ?? 0),
-    capitalValue: Number(input.decision.capitalLamports) / 1_000_000_000,
-    costs: { transactionFeeValue: String(Math.max(0, execution + reposition + tail)) },
-    rebaseCandidateToFirstFrame: false,
-    horizonEnd: new Date(end).toISOString(),
-  });
-  if (!simulation.unitScaleValid || simulation.occupancyState !== 'COMPLETE' || simulation.warnings.includes('CANDIDATE_REPLAY_CONTINUITY_INSUFFICIENT')) {
-    return { recommendationId: input.decision.recommendationId, horizonMinutes: horizon, outcomeModelVersion, state: 'INSUFFICIENT_EVIDENCE', evidenceHash, reasonCodes: [...new Set(['FORWARD_FUTURE_EVIDENCE_INSUFFICIENT', ...simulation.warnings])].sort() };
-  }
   const realizedTotalCost = execution + reposition + tail;
+
+  // Immutable V1 branch retained exactly for historical comparability.
+  if (outcomeModelVersion === PHASE3_FORWARD_OUTCOME_MODEL_VERSION_V1) {
+    const simulation = simulateCandidateEconomics({
+      candidate,
+      pool: input.decision.poolAddress,
+      frames,
+      events,
+      totalPositionShareRaw: deriveSyntheticPositionShareRaw(baseline),
+      rawUnitValueX: Number(input.decision.prediction.rawUnitValueX ?? 0),
+      rawUnitValueY: Number(input.decision.prediction.rawUnitValueY ?? 0),
+      capitalValue: Number(input.decision.capitalLamports) / 1_000_000_000,
+      costs: { transactionFeeValue: String(Math.max(0, realizedTotalCost)) },
+      rebaseCandidateToFirstFrame: false,
+      horizonEnd: new Date(end).toISOString(),
+    });
+    if (!simulation.unitScaleValid || simulation.occupancyState !== 'COMPLETE' || simulation.warnings.includes('CANDIDATE_REPLAY_CONTINUITY_INSUFFICIENT')) {
+      return forwardInsufficient({ decision: input.decision, horizon, outcomeModelVersion, evidenceHash, reasonCodes: ['FORWARD_FUTURE_EVIDENCE_INSUFFICIENT', ...simulation.warnings] });
+    }
+    return {
+      recommendationId: input.decision.recommendationId,
+      horizonMinutes: horizon,
+      outcomeModelVersion,
+      state: 'FINAL',
+      evidenceHash,
+      reasonCodes: [],
+      realized: {
+        realizedFeeValue: simulation.feeValue,
+        realizedInventoryPnl: simulation.inventoryChangeValue,
+        realizedExecutionCost: execution,
+        realizedRepositionCost: reposition,
+        realizedTailRiskCost: tail,
+        realizedTotalCost,
+        realizedNetValue: simulation.feeValue + simulation.inventoryChangeValue - realizedTotalCost,
+        activeDurationMs: simulation.activeDurationMs,
+        inactiveDurationMs: simulation.inactiveDurationMs,
+        unobservedDurationMs: simulation.unobservedDurationMs,
+        coverageRatio: simulation.occupancyCoverageRatio,
+        ...(simulation.activeTimeRatio === undefined ? {} : { activeRatio: simulation.activeTimeRatio }),
+        rangeSurvived: !simulation.firstOutOfRangeAt,
+        ...(simulation.firstOutOfRangeAt ? { firstOutOfRangeTimestamp: simulation.firstOutOfRangeAt } : {}),
+      },
+    };
+  }
+
+  const constrained = deriveCapitalConstrainedForwardPosition({ decision: input.decision, candidate, baseline });
+  if (!constrained.position) return forwardInsufficient({ decision: input.decision, horizon, outcomeModelVersion, evidenceHash, reasonCodes: constrained.reasonCodes ?? ['FORWARD_V2_POSITION_UNAVAILABLE'] });
+  const rawUnitValueX = Number(input.decision.prediction.rawUnitValueX ?? 0);
+  const rawUnitValueY = Number(input.decision.prediction.rawUnitValueY ?? 0);
+  const simulation = simulateSyntheticPosition({ position: constrained.position.position, frames, events, horizonEnd: new Date(end).toISOString() });
+  const startInventory = simulation.inventory[0];
+  const endInventory = simulation.inventory.at(-1);
+  const startValueLamports = startInventory ? forwardV2ValueLamports(startInventory.tokenXRaw, startInventory.tokenYRaw, rawUnitValueX, rawUnitValueY) : undefined;
+  const endValueLamports = endInventory ? forwardV2ValueLamports(endInventory.tokenXRaw, endInventory.tokenYRaw, rawUnitValueX, rawUnitValueY) : undefined;
+  const feeValueLamports = forwardV2ValueLamports(simulation.totalAttributedFeeXRaw, simulation.totalAttributedFeeYRaw, rawUnitValueX, rawUnitValueY);
+  const replayContinuous = !simulation.inventory.some(snapshot => snapshot.missingBins.some(binId => constrained.position!.position.bins.some(bin => bin.binId === binId && bin.positionShareRaw > 0n)));
+  if (!startValueLamports || endValueLamports === undefined || feeValueLamports === undefined || !replayContinuous || simulation.occupancyState !== 'COMPLETE') {
+    return forwardInsufficient({ decision: input.decision, horizon, outcomeModelVersion, evidenceHash, reasonCodes: [
+      'FORWARD_FUTURE_EVIDENCE_INSUFFICIENT',
+      ...(replayContinuous ? [] : ['CANDIDATE_REPLAY_CONTINUITY_INSUFFICIENT']),
+      ...(simulation.occupancyState === 'COMPLETE' ? [] : ['CANDIDATE_ACTIVE_TIME_EVIDENCE_INSUFFICIENT']),
+    ] });
+  }
+  const realizedFeeValue = Number(feeValueLamports) / 1_000_000_000;
+  const realizedInventoryPnl = Number(endValueLamports - startValueLamports) / 1_000_000_000;
   return {
     recommendationId: input.decision.recommendationId,
     horizonMinutes: horizon,
@@ -218,13 +450,13 @@ export async function matureFrozenPhase3ForwardOutcome(input: {
     evidenceHash,
     reasonCodes: [],
     realized: {
-      realizedFeeValue: simulation.feeValue,
-      realizedInventoryPnl: simulation.inventoryChangeValue,
+      realizedFeeValue,
+      realizedInventoryPnl,
       realizedExecutionCost: execution,
       realizedRepositionCost: reposition,
       realizedTailRiskCost: tail,
       realizedTotalCost,
-      realizedNetValue: simulation.feeValue + simulation.inventoryChangeValue - realizedTotalCost,
+      realizedNetValue: realizedFeeValue + realizedInventoryPnl - realizedTotalCost,
       activeDurationMs: simulation.activeDurationMs,
       inactiveDurationMs: simulation.inactiveDurationMs,
       unobservedDurationMs: simulation.unobservedDurationMs,
@@ -232,10 +464,15 @@ export async function matureFrozenPhase3ForwardOutcome(input: {
       ...(simulation.activeTimeRatio === undefined ? {} : { activeRatio: simulation.activeTimeRatio }),
       rangeSurvived: !simulation.firstOutOfRangeAt,
       ...(simulation.firstOutOfRangeAt ? { firstOutOfRangeTimestamp: simulation.firstOutOfRangeAt } : {}),
+      frozenCapitalLamports: constrained.position.frozenCapitalLamports.toString(),
+      allocatedCapitalLamports: constrained.position.allocatedCapitalLamports.toString(),
+      derivedPositionValueLamports: constrained.position.derivedPositionValueLamports.toString(),
+      maxEffectiveOwnershipBps: constrained.position.maxEffectiveOwnershipBps,
+      participationModel: 'CAPITAL_CONSTRAINED_V2',
+      perBinParticipation: constrained.position.bins,
     },
   };
 }
-
 export interface CalibrationRow {
   decision: FrozenPhase3ForwardDecision;
   outcome: Phase3ForwardOutcome;
@@ -268,7 +505,8 @@ export interface Phase3ForwardCalibration {
   positiveEvProgressStateCohorts: Record<string, ForwardCalibrationStats>;
 }
 
-export function buildPhase3ForwardCalibration(rows: CalibrationRow[]): Phase3ForwardCalibration {
+export function buildPhase3ForwardCalibration(rows: CalibrationRow[], options?: { outcomeModelVersion?: string }): Phase3ForwardCalibration {
+  if (options?.outcomeModelVersion) rows = rows.filter(row => row.outcome.outcomeModelVersion === options.outcomeModelVersion);
   const final = rows.filter(row => row.outcome.state === 'FINAL' && row.outcome.realized);
   const summarize = (group: CalibrationRow[]): ForwardCalibrationStats => {
     const predicted = group.map(row => Number(row.decision.prediction.expectedNetEv));
@@ -293,4 +531,30 @@ export function buildPhase3ForwardCalibration(rows: CalibrationRow[]): Phase3For
   const positivePositive = final.filter(row => Number(row.decision.prediction.expectedNetEv) > 0 && row.outcome.realized!.realizedNetValue > 0).length;
   const positiveNegative = final.filter(row => Number(row.decision.prediction.expectedNetEv) > 0 && row.outcome.realized!.realizedNetValue <= 0).length;
   return { summary: { predictions: rows.length, final: final.length, insufficientEvidence: rows.filter(row => row.outcome.state === 'INSUFFICIENT_EVIDENCE').length, predictedNegativeRealizedNegative: negativeNegative, predictedNegativeRealizedPositive: negativePositive, predictedPositiveRealizedPositive: positivePositive, predictedPositiveRealizedNegative: positiveNegative }, evBuckets: by(final, row => evBucket(Number(row.decision.prediction.expectedNetEv))), uncertaintyBuckets: by(final, row => uncertaintyBucket(Number(row.decision.prediction.forecastUncertainty))), byHorizon, progressStateCohorts: progress(final), positiveEvProgressStateCohorts: positiveProgress(final) };
+}
+
+
+/** Deterministic episode view: within one pool/model/horizon, retain the first
+ * decision and suppress later decision windows that overlap its frozen horizon.
+ * This is reporting-only and does not change immutable decision capture. */
+export function buildPhase3ForwardEpisodeCalibration(rows: CalibrationRow[], options?: { outcomeModelVersion?: string }): Phase3ForwardCalibration {
+  const scoped = options?.outcomeModelVersion ? rows.filter(row => row.outcome.outcomeModelVersion === options.outcomeModelVersion) : rows;
+  const selected: CalibrationRow[] = [];
+  const groups = new Map<string, CalibrationRow[]>();
+  for (const row of scoped) {
+    const key = [row.decision.poolAddress, row.outcome.outcomeModelVersion, row.outcome.horizonMinutes].join(':');
+    const group = groups.get(key) ?? [];
+    group.push(row);
+    groups.set(key, group);
+  }
+  for (const group of groups.values()) {
+    let nextStart = Number.NEGATIVE_INFINITY;
+    for (const row of [...group].sort((a, b) => Date.parse(a.decision.decisionTimestamp) - Date.parse(b.decision.decisionTimestamp) || a.decision.recommendationId.localeCompare(b.decision.recommendationId))) {
+      const start = Date.parse(row.decision.decisionTimestamp);
+      if (!Number.isFinite(start) || start < nextStart) continue;
+      selected.push(row);
+      nextStart = start + row.outcome.horizonMinutes * 60_000;
+    }
+  }
+  return buildPhase3ForwardCalibration(selected, options);
 }
