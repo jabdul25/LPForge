@@ -641,8 +641,8 @@ export interface Phase1Store {
     payload: Record<string, unknown>;
   }): Promise<boolean>;
   ensurePhase3ForwardOutcome(value:{recommendationId:string;horizonMinutes:30|60|120;outcomeModelVersion:string}):Promise<boolean>;
-  loadDuePhase3ForwardOutcomes(now: string, limit: number): Promise<Array<{recommendationId:string;horizonMinutes:30|60|120;outcomeModelVersion:string;decisionPayload:Record<string,unknown>;state:string;evidenceHash?:string;resultHash?:string}>>;
-  persistPhase3ForwardOutcome(value:{recommendationId:string;horizonMinutes:30|60|120;outcomeModelVersion:string;state:'PENDING'|'INSUFFICIENT_EVIDENCE'|'FINAL'|'FAILED_DATA_INTEGRITY';evidenceHash?:string;resultHash?:string;reasonCodes:string[];realized?:Record<string,unknown>;payload:Record<string,unknown>;maturedAt:string}):Promise<boolean>;
+  loadDuePhase3ForwardOutcomes(now: string, limit: number): Promise<Array<{recommendationId:string;horizonMinutes:30|60|120;outcomeModelVersion:string;decisionPayload:Record<string,unknown>;state:'PENDING'|'INSUFFICIENT_EVIDENCE'|'FINAL'|'FAILED_DATA_INTEGRITY';retryCount:number;dueAt:string;nextRetryAt?:string;evidenceHash?:string;resultHash?:string}>>;
+  persistPhase3ForwardOutcome(value:{recommendationId:string;horizonMinutes:30|60|120;outcomeModelVersion:string;state:'PENDING'|'INSUFFICIENT_EVIDENCE'|'FINAL'|'FAILED_DATA_INTEGRITY';evidenceHash?:string;resultHash?:string;reasonCodes:string[];realized?:Record<string,unknown>;payload:Record<string,unknown>;maturedAt:string;attemptedAt:string;retryCount:number;nextRetryAt?:string;terminalAt?:string}):Promise<{writeApplied:boolean;stateTransition:boolean;retryNoProgress:boolean}>;
   loadPhase3ForwardOutcomes(limit?:number): Promise<Array<Record<string,unknown>>>;
   insertRegimeAssessment(value: {
     poolAddress: string;
@@ -1999,14 +1999,15 @@ export async function createPostgresStore(
     async loadDuePhase3ForwardOutcomes(now, limit) {
       const lim=Math.max(1,Math.min(200,Math.floor(limit)));
       const r=await db.query(
-        `SELECT o.recommendation_id,o.horizon_minutes,o.outcome_model_version,o.state,o.evidence_hash,o.result_hash,d.payload AS decision_payload FROM research.phase3_forward_outcomes o JOIN research.phase3_forward_decisions d ON d.recommendation_id=o.recommendation_id WHERE o.state IN ('PENDING','INSUFFICIENT_EVIDENCE') AND d.decision_at+(o.horizon_minutes||' minutes')::interval<=$1::timestamptz ORDER BY d.decision_at,o.horizon_minutes LIMIT $2`,
+        `SELECT o.recommendation_id,o.horizon_minutes,o.outcome_model_version,o.state,o.retry_count,o.next_retry_at,o.evidence_hash,o.result_hash,d.payload AS decision_payload,d.decision_at+(o.horizon_minutes||' minutes')::interval AS due_at FROM research.phase3_forward_outcomes o JOIN research.phase3_forward_decisions d ON d.recommendation_id=o.recommendation_id WHERE d.decision_at+(o.horizon_minutes||' minutes')::interval<=$1::timestamptz AND (o.state='PENDING' OR (o.state='INSUFFICIENT_EVIDENCE' AND o.terminal_at IS NULL AND (o.next_retry_at IS NULL OR o.next_retry_at<=$1::timestamptz))) ORDER BY CASE WHEN o.state='PENDING' THEN 0 ELSE 1 END ASC,CASE WHEN o.state='PENDING' THEN d.decision_at+(o.horizon_minutes||' minutes')::interval END ASC NULLS LAST,CASE WHEN o.state='INSUFFICIENT_EVIDENCE' THEN COALESCE(o.next_retry_at,d.decision_at+(o.horizon_minutes||' minutes')::interval) END ASC NULLS LAST,o.horizon_minutes ASC,o.recommendation_id ASC LIMIT $2`,
         [now,lim],
       );
-      return r.rows.map(row=>({recommendationId:String(row.recommendation_id),horizonMinutes:Number(row.horizon_minutes) as 30|60|120,outcomeModelVersion:String(row.outcome_model_version),decisionPayload:(row.decision_payload??{}) as Record<string,unknown>,state:String(row.state),...(row.evidence_hash?{evidenceHash:String(row.evidence_hash)}:{}),...(row.result_hash?{resultHash:String(row.result_hash)}:{})}));
+      return r.rows.map(row=>({recommendationId:String(row.recommendation_id),horizonMinutes:Number(row.horizon_minutes) as 30|60|120,outcomeModelVersion:String(row.outcome_model_version),decisionPayload:(row.decision_payload??{}) as Record<string,unknown>,state:String(row.state) as 'PENDING'|'INSUFFICIENT_EVIDENCE'|'FINAL'|'FAILED_DATA_INTEGRITY',retryCount:Math.max(0,Number(row.retry_count??0)),dueAt:toIsoTimestamp(row.due_at),...(row.next_retry_at?{nextRetryAt:toIsoTimestamp(row.next_retry_at)}:{}),...(row.evidence_hash?{evidenceHash:String(row.evidence_hash)}:{}),...(row.result_hash?{resultHash:String(row.result_hash)}:{})}));
     },
     async persistPhase3ForwardOutcome(v) {
       const computedResultHash=await sha256Hex(canonicalJson({recommendationId:v.recommendationId,horizonMinutes:v.horizonMinutes,outcomeModelVersion:v.outcomeModelVersion,state:v.state,evidenceHash:v.evidenceHash??null,reasonCodes:[...v.reasonCodes].sort(),realized:v.realized??null}));
       if(v.resultHash&&v.resultHash!==computedResultHash)throw new Error('LPFORGE_FORWARD_OUTCOME_RESULT_HASH_INVALID');
+      const terminalAt=v.terminalAt??(v.state==='FINAL'?v.attemptedAt:undefined);
       await db.query('BEGIN');
       try{
         const existing=await db.query(`SELECT state,evidence_hash,result_hash FROM research.phase3_forward_outcomes WHERE recommendation_id=$1 AND horizon_minutes=$2 AND outcome_model_version=$3 FOR UPDATE`,[v.recommendationId,v.horizonMinutes,v.outcomeModelVersion]);
@@ -2016,11 +2017,13 @@ export async function createPostgresStore(
           if(!current.result_hash)throw new Error('LPFORGE_FORWARD_OUTCOME_LEGACY_RESULT_HASH_MISSING');
           if(String(current.evidence_hash??'')!==String(v.evidenceHash??'')||String(current.result_hash)!==computedResultHash)throw new Error('LPFORGE_FORWARD_OUTCOME_EVIDENCE_OR_RESULT_HASH_CONFLICT');
           await db.query('COMMIT');
-          return false;
+          return {writeApplied:false,stateTransition:false,retryNoProgress:false};
         }
-        const r=await db.query(`UPDATE research.phase3_forward_outcomes SET state=$4,evidence_hash=$5,result_hash=$6,reason_codes=$7::jsonb,realized=$8::jsonb,payload=$9::jsonb,matured_at=$10 WHERE recommendation_id=$1 AND horizon_minutes=$2 AND outcome_model_version=$3 AND state<>'FINAL' RETURNING recommendation_id`,[v.recommendationId,v.horizonMinutes,v.outcomeModelVersion,v.state,v.evidenceHash??null,computedResultHash,json(v.reasonCodes),v.realized?json(v.realized):null,json(v.payload),v.maturedAt]);
+        const stateTransition=String(current.state)!==v.state,retryNoProgress=String(current.state)==='INSUFFICIENT_EVIDENCE'&&v.state==='INSUFFICIENT_EVIDENCE';
+        const r=await db.query(`UPDATE research.phase3_forward_outcomes SET state=$4,evidence_hash=$5,result_hash=$6,reason_codes=$7::jsonb,realized=$8::jsonb,payload=$9::jsonb,matured_at=CASE WHEN state IS DISTINCT FROM $4 THEN $10::timestamptz ELSE matured_at END,last_attempt_at=$11::timestamptz,next_retry_at=$12::timestamptz,retry_count=$13,terminal_at=CASE WHEN $14::boolean THEN COALESCE(terminal_at,$15::timestamptz) ELSE NULL END WHERE recommendation_id=$1 AND horizon_minutes=$2 AND outcome_model_version=$3 AND state<>'FINAL' RETURNING recommendation_id`,[v.recommendationId,v.horizonMinutes,v.outcomeModelVersion,v.state,v.evidenceHash??null,computedResultHash,json(v.reasonCodes),v.realized?json(v.realized):null,json(v.payload),v.maturedAt,v.attemptedAt,v.nextRetryAt??null,v.retryCount,Boolean(terminalAt),terminalAt??null]);
         await db.query('COMMIT');
-        return r.rows.length===1;
+        const writeApplied=r.rows.length===1;
+        return {writeApplied,stateTransition:writeApplied&&stateTransition,retryNoProgress:writeApplied&&retryNoProgress};
       }catch(error){try{await db.query('ROLLBACK');}catch{}throw error;}
     },
     async loadPhase3ForwardOutcomes(limit=5000) {
@@ -3438,7 +3441,7 @@ export function createMemoryStore(): Phase1Store {
     async insertPhase3ForwardDecision() { return false; },
     async ensurePhase3ForwardOutcome() { return false; },
     async loadDuePhase3ForwardOutcomes() { return []; },
-    async persistPhase3ForwardOutcome() { return false; },
+    async persistPhase3ForwardOutcome() { return {writeApplied:false,stateTransition:false,retryNoProgress:false}; },
     async loadPhase3ForwardOutcomes() { return []; },
     async insertRegimeAssessment() {},
     async insertLpThesis() {},
