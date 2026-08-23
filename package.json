@@ -12,7 +12,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "build": "tsc -p tsconfig.json",
     "test:unit": "node --test tests/*.test.mjs",
-    "test:ci": "pnpm typecheck && pnpm build && node --test tests/*.test.mjs && node scripts/verify-phase1-boundary.mjs && node scripts/verify-phase2-boundary.mjs && node scripts/verify-phase3-boundary.mjs && node scripts/verify-phase4-boundary.mjs && node scripts/verify-phase5-boundary.mjs && node scripts/verify-phase6-boundary.mjs && node scripts/verify-phase7-boundary.mjs && node scripts/verify-discovery-boundary.mjs && node scripts/verify-migrations.mjs",
+    "test:ci": "pnpm typecheck && pnpm build && node --test tests/*.test.mjs && node scripts/verify-phase1-boundary.mjs && node scripts/verify-phase2-boundary.mjs && node scripts/verify-phase3-boundary.mjs && node scripts/verify-phase4-boundary.mjs && node scripts/verify-phase5-boundary.mjs && node scripts/verify-phase6-boundary.mjs && node scripts/verify-phase7-boundary.mjs && node scripts/verify-discovery-boundary.mjs && node scripts/verify-forward-validation-boundary.mjs && node scripts/verify-migrations.mjs",
     "verify:boundary": "node scripts/verify-phase1-boundary.mjs",
     "verify:migrations": "node scripts/verify-migrations.mjs",
     "db:migrate": "node scripts/db-migrate.mjs",

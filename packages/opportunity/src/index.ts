@@ -64,6 +64,10 @@ export function estimateOpportunityEconomics(input:{capitalValue:number;horizonM
  const favorable=clamp(prob(r,'SIDEWAYS')+prob(r,'CONSOLIDATION')+prob(r,'CONTROLLED_PULLBACK')*.8+prob(r,'BREAKOUT_CONTROLLED_PULLBACK')*.65+prob(r,'RECOVERY')*.55);
  const dangerous=clamp(prob(r,'FREEFALL')+prob(r,'TREND_DOWN')*.75+prob(r,'DISTRIBUTION')*.5+prob(r,'EXHAUSTION')*.25);
  const poolEconomic=pool.economicQualityScore/100,flow=pool.flowQualityScore/100,liquidity=pool.liquidityQualityScore/100;
+ // This is the forward regime/structure forecast used by the global
+ // economics model. It is intentionally distinct from the replay and
+ // survival occupancy measurements, which are elapsed-time weighted in
+ // elapsed-occupancy. No replay count is substituted into this forecast.
  const active=clamp(.20+.38*favorable+.18*flow+.14*liquidity+.10*s.structureQuality-.32*dangerous-.12*r.transitionRisk);
  const feeMultiplier=clamp(.35+.35*poolEconomic+.20*flow+.10*active,.2,1.2);
  const riskMultiplier=clamp(.55+.75*dangerous+.35*s.downsideAcceleration+.25*r.transitionRisk+.25*pool.toxicityProbability,.4,2.2);

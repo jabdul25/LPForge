@@ -18,22 +18,22 @@ test('Phase-3 evidence width is derived from executable width and rejects the fo
 
 test('99-bin 5A15-shaped candidate needs more than a 73-bin frame and prepares with policy-derived evidence width',()=>{
  const candidate={...universe.candidates[0],id:'defensive-99-57-41-spot-balanced-1000',lowerBinId:-1127,upperBinId:-1029,centerBinId:-1070,lowerOffsetBins:-57,upperOffsetBins:41,strategy:'SPOT',orientation:'BALANCED',capitalFraction:1,perBinWeights:Array.from({length:99},(_,i)=>({binId:-1127+i,weight:1/99}))};
- const narrow=[0,15,30,45,60].map(minute=>frame(minute,-1070,35));
+ const narrow=Array.from({length:13},(_,index)=>frame(index*5,-1070,35));
  assert.equal(prepareCandidateReplay(input(narrow),candidate).reason,'CANDIDATE_REPLAY_COVERAGE_INSUFFICIENT');
- const wide=[0,15,30,45,60].map(minute=>frame(minute,-1070,147)),prepared=prepareCandidateReplay(input(wide),candidate);
- assert.equal(prepared.frames?.length,5);
+ const wide=Array.from({length:13},(_,index)=>frame(index*5,-1070,147)),prepared=prepareCandidateReplay(input(wide),candidate);
+ assert.equal(prepared.frames?.length,13);
  const simulated=simulateCandidateEconomics({candidate,pool:'5A15',frames:prepared.frames,events:[{pool:'5A15',signature:'s',eventIndex:0,stamp:{observedAt:stamp(15)},startBinId:-1070,endBinId:-1069,mmFee:'1000000',feesOnTokenX:true}],totalPositionShareRaw:deriveSyntheticPositionShareRaw(prepared.frames[0]),rawUnitValueX:1e-9,rawUnitValueY:1e-9,capitalValue:.03});
  assert.ok(simulated.normalizationScale>0);assert.equal(simulated.unitScaleValid,true);assert.equal(simulated.evidenceActionable,true);
 });
 
 test('all nine configured families are simulatable with a 99-bin fixed position and bounded policy movement',()=>{
- const requirement=derivePhase3EvidenceWidthRequirement(100),frames=[frame(0,100,requirement.requiredEvidenceRadius),frame(15,125,requirement.requiredEvidenceRadius),frame(30,75,requirement.requiredEvidenceRadius),frame(45,149,requirement.requiredEvidenceRadius),frame(60,51,requirement.requiredEvidenceRadius)];
+ const requirement=derivePhase3EvidenceWidthRequirement(100),active=[100,125,75,149,51],frames=Array.from({length:13},(_,index)=>frame(index*5,active[Math.min(active.length-1,Math.floor(index/3))],requirement.requiredEvidenceRadius));
  const candidates=generateStrategyCandidates({universe,strategyOrientations:{SPOT:['BALANCED','SKEWED_Y','ONE_SIDED_Y'],CURVE:['BALANCED','SKEWED_Y','ONE_SIDED_Y'],BID_ASK:['BALANCED','SKEWED_Y','ONE_SIDED_Y']}});
  assert.equal(candidates.length,9);
  for(const candidate of candidates){const prepared=prepareCandidateReplay(input(frames),candidate);assert.ok(prepared.frames,`${candidate.strategy}/${candidate.orientation}`);const result=simulateCandidateEconomics({candidate,pool:'P',frames:prepared.frames,events:[{pool:'P',signature:candidate.id,eventIndex:0,stamp:{observedAt:stamp(15)},startBinId:100,endBinId:101,mmFee:'1000000',feesOnTokenX:true}],totalPositionShareRaw:deriveSyntheticPositionShareRaw(prepared.frames[0]),rawUnitValueX:1e-9,rawUnitValueY:1e-9,capitalValue:.03});assert.ok(result.normalizationScale>0,`${candidate.strategy}/${candidate.orientation}`);assert.equal(result.unitScaleValid,true,`${candidate.strategy}/${candidate.orientation}`);assert.equal(result.evidenceActionable,true,`${candidate.strategy}/${candidate.orientation}`);}
 });
 
 test('movement beyond the policy-derived margin remains explicit replay continuity insufficiency',()=>{
- const requirement=derivePhase3EvidenceWidthRequirement(100),candidate=generateStrategyCandidates({universe,strategyOrientations:{SPOT:['ONE_SIDED_Y']}})[0],frames=[frame(0,100,requirement.requiredEvidenceRadius),frame(15,250,requirement.requiredEvidenceRadius),frame(30,100,requirement.requiredEvidenceRadius),frame(60,100,requirement.requiredEvidenceRadius)];
+ const requirement=derivePhase3EvidenceWidthRequirement(100),candidate=generateStrategyCandidates({universe,strategyOrientations:{SPOT:['ONE_SIDED_Y']}})[0],frames=Array.from({length:13},(_,index)=>frame(index*5,index<3?100:index<6?250:100,requirement.requiredEvidenceRadius));
  assert.equal(prepareCandidateReplay(input(frames),candidate).reason,'CANDIDATE_REPLAY_CONTINUITY_INSUFFICIENT');
 });

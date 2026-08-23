@@ -82,7 +82,8 @@ test('candidate-specific preparations select the latest deterministic complete f
 
 const movingCandidate=(zeroFirst=false)=>({id:zeroFirst?'zero-edge':'moving-window',family:'TEST',strategy:'SPOT',orientation:'BALANCED',lowerBinId:68,upperBinId:132,centerBinId:100,widthBins:65,lowerOffsetBins:-32,upperOffsetBins:32,lowerDistancePct:0,upperDistancePct:0,reasonCodes:[],capitalFraction:1,perBinWeights:Array.from({length:65},(_,i)=>({binId:68+i,weight:zeroFirst&&i===0?0:1/(zeroFirst?64:65)}))});
 const movingFrame=(minute,active,low,high)=>({observedAt:new Date(Date.parse('2026-08-22T00:00:00Z')+minute*60000).toISOString(),activeBinId:active,bins:Array.from({length:high-low+1},(_,i)=>({binId:low+i,price:'1',amountX:'500000000',amountY:'500000000',liquiditySupply:'47593000067008977619962158185'}))});
-const replayMoving=(candidate,frames)=>simulateCandidateEconomics({candidate,pool:'moving',frames,events:[{pool:'moving',signature:'moving',eventIndex:0,stamp:{observedAt:frames[1].observedAt},startBinId:100,endBinId:101,mmFee:'1000000',feesOnTokenX:true}],totalPositionShareRaw:deriveSyntheticPositionShareRaw(frames[0]),rawUnitValueX:1e-9,rawUnitValueY:1e-9,capitalValue:.03});
+const denseFrames=frames=>frames.flatMap((frame,index)=>{const next=frames[index+1];if(!next)return[frame];const start=Date.parse(frame.observedAt),end=Date.parse(next.observedAt),extra=[];for(let stamp=start+5*60000;stamp<end;stamp+=5*60000)extra.push({...frame,observedAt:new Date(stamp).toISOString()});return[frame,...extra];});
+const replayMoving=(candidate,frames)=>{const dense=denseFrames(frames);return simulateCandidateEconomics({candidate,pool:'moving',frames:dense,events:[{pool:'moving',signature:'moving',eventIndex:0,stamp:{observedAt:dense[1].observedAt},startBinId:100,endBinId:101,mmFee:'1000000',feesOnTokenX:true}],totalPositionShareRaw:deriveSyntheticPositionShareRaw(dense[0]),rawUnitValueX:1e-9,rawUnitValueY:1e-9,capitalValue:.03});};
 test('moving bin windows fail closed rather than manufacturing an inventory loss',()=>{
  const frames=[movingFrame(0,100,65,135),movingFrame(15,108,73,143)];const result=replayMoving(movingCandidate(),frames);
  assert.equal(result.evidenceActionable,false);assert.ok(result.warnings.includes('CANDIDATE_REPLAY_CONTINUITY_INSUFFICIENT'));assert.equal(result.inventoryChangeValue,0);assert.equal(result.netValue,0);assert.ok(!result.warnings.includes('CANDIDATE_VALUE_CALIBRATION_INVALID'));
@@ -95,8 +96,8 @@ test('temporary moving-window gaps and zero-weight edge bins preserve evidence s
  const zeroEdge=replayMoving(movingCandidate(true),[movingFrame(0,100,65,135),movingFrame(15,108,69,132)]);assert.equal(zeroEdge.evidenceActionable,true);
 });
 test('a valid prepared replay never produces a fixed-geometry coverage warning in the simulator',()=>{
- const frames=[movingFrame(0,100,65,135),movingFrame(15,105,65,135),movingFrame(30,110,65,135)];
- const prepared=prepareCandidateReplay({historicalFrames:frames,decisionAt:frames[2].observedAt,horizonMinutes:30},movingCandidate());
+ const frames=denseFrames([movingFrame(0,100,65,135),movingFrame(15,105,65,135),movingFrame(30,110,65,135)]);
+ const prepared=prepareCandidateReplay({historicalFrames:frames,decisionAt:frames.at(-1).observedAt,horizonMinutes:30},movingCandidate());
  assert.ok(prepared.frames);
  const result=replayMoving(movingCandidate(),prepared.frames);
  assert.equal(result.evidenceActionable,true);

@@ -1,4 +1,5 @@
 import type { BinLiquidityFact, SwapEventFact } from '../../domain/src/index.js';
+import { deriveElapsedOccupancy, type OccupancyState } from '../../elapsed-occupancy/src/index.js';
 
 export type SimulationFidelity =
   | 'ONCHAIN_POSITION'
@@ -67,7 +68,14 @@ export interface SimulationResult {
   upperBinId: number;
   fidelity: SimulationFidelity;
   inventory: InventorySnapshot[];
-  activeTimeRatio: number;
+  activeTimeRatio?: number;
+  /** Diagnostic-only legacy projection; never used for decision authority. */
+  countWeightedActiveTimeRatio?: number;
+  activeDurationMs: number;
+  inactiveDurationMs: number;
+  unobservedDurationMs: number;
+  occupancyCoverageRatio: number;
+  occupancyState: OccupancyState;
   firstOutOfRangeAt?: string;
   lowerExitCount: number;
   upperExitCount: number;
@@ -186,6 +194,8 @@ export function simulateSyntheticPosition(input: {
   frames: BinFrame[];
   events: SwapEventFact[];
   costs?: SimulationCostModel;
+  /** A forward-validation horizon may extend past the final observed frame. */
+  horizonEnd?: string;
 }): SimulationResult {
   if (input.position.lowerBinId > input.position.upperBinId) throw new Error('LPFORGE_SIM_INVALID_RANGE');
   const inventory = replaySyntheticInventory(input.position,input.frames);
@@ -205,18 +215,19 @@ export function simulateSyntheticPosition(input: {
     }
     wasInRange=s.inRange;
   }
-  const activeTimeRatio=inventory.filter((x)=>x.inRange).length/inventory.length;
+  const countWeightedActiveTimeRatio=inventory.length?inventory.filter(snapshot=>snapshot.inRange).length/inventory.length:undefined,occupancy=deriveElapsedOccupancy({observations:inventory.map(snapshot=>({observedAt:snapshot.observedAt,activeBinId:snapshot.activeBinId})),lowerBinId:input.position.lowerBinId,upperBinId:input.position.upperBinId,horizonStart:inventory[0]!.observedAt,horizonEnd:input.horizonEnd??inventory.at(-1)!.observedAt});
   const warnings = [
     'SYNTHETIC_POSITION_DOES_NOT_CHANGE_OBSERVED_MARKET_PATH',
     'SWAP2EVT_MM_FEE_IS_PATH_ALLOCATED_NOT_PER_BIN_EXACT',
   ];
   if (inventory.some((x)=>x.missingBins.length)) warnings.push('BIN_FRAME_GAPS_PRESENT');
   if (feeAttribution.some((x)=>x.feeToken==='UNKNOWN'&&x.mmFeeRaw>0n)) warnings.push('FEE_TOKEN_SIDE_UNKNOWN_FOR_SOME_EVENTS');
+  if (occupancy.state!=='COMPLETE') warnings.push('ACTIVE_TIME_OCCUPANCY_INSUFFICIENT');
   const last=inventory[inventory.length-1]!;
   return {
     pool:input.position.pool,openedAt:input.position.openedAt,endedAt:last.observedAt,
     lowerBinId:input.position.lowerBinId,upperBinId:input.position.upperBinId,
-    fidelity:'EVENT_PATH_ESTIMATE',inventory,activeTimeRatio,
+    fidelity:'EVENT_PATH_ESTIMATE',inventory,...(occupancy.activeRatio===undefined?{}:{activeTimeRatio:occupancy.activeRatio}),...(countWeightedActiveTimeRatio===undefined?{}:{countWeightedActiveTimeRatio}),activeDurationMs:occupancy.activeDurationMs,inactiveDurationMs:occupancy.inactiveDurationMs,unobservedDurationMs:occupancy.unobservedDurationMs,occupancyCoverageRatio:occupancy.coverageRatio,occupancyState:occupancy.state,
     ...(firstOutOfRangeAt?{firstOutOfRangeAt}:{}),lowerExitCount,upperExitCount,
     totalAttributedFeeXRaw:feeX,totalAttributedFeeYRaw:feeY,feeAttribution,
     costs:{compositionFeeValue:normalizeCost(input.costs?.compositionFeeValue),transactionFeeValue:normalizeCost(input.costs?.transactionFeeValue),slippageValue:normalizeCost(input.costs?.slippageValue),rebalanceCostValue:normalizeCost(input.costs?.rebalanceCostValue),otherCostValue:normalizeCost(input.costs?.otherCostValue)},
@@ -227,7 +238,12 @@ export function simulateSyntheticPosition(input: {
 export interface RangeOutcomeSummary {
   samples:number;
   inRangeSamples:number;
-  activeTimeRatio:number;
+  activeTimeRatio?:number;
+  activeDurationMs:number;
+  inactiveDurationMs:number;
+  unobservedDurationMs:number;
+  coverageRatio:number;
+  occupancyState:OccupancyState;
   firstPassageSamples:number|null;
   lowerExitCount:number;
   upperExitCount:number;
@@ -239,7 +255,8 @@ export function summarizeRangeOutcome(position:SyntheticPosition, frames:BinFram
   const inv=replaySyntheticInventory(position,frames);
   let firstPassageSamples:number|null=null,maxDistanceBins=0,revisitCount=0,lowerExitCount=0,upperExitCount=0,wasIn=true,everOut=false;
   inv.forEach((s,i)=>{maxDistanceBins=Math.max(maxDistanceBins,s.activeBinDistance); if(!s.inRange&&wasIn){firstPassageSamples??=i;everOut=true;if(s.activeBinId<position.lowerBinId)lowerExitCount++;else upperExitCount++;} if(s.inRange&&!wasIn&&everOut)revisitCount++;wasIn=s.inRange;});
-  return {samples:inv.length,inRangeSamples:inv.filter((x)=>x.inRange).length,activeTimeRatio:inv.length?inv.filter((x)=>x.inRange).length/inv.length:0,firstPassageSamples,lowerExitCount,upperExitCount,maxDistanceBins,revisitCount};
+  const occupancy=deriveElapsedOccupancy({observations:inv.map(snapshot=>({observedAt:snapshot.observedAt,activeBinId:snapshot.activeBinId})),lowerBinId:position.lowerBinId,upperBinId:position.upperBinId,horizonStart:inv[0]?.observedAt??position.openedAt,horizonEnd:inv.at(-1)?.observedAt??position.openedAt});
+  return {samples:inv.length,inRangeSamples:inv.filter((x)=>x.inRange).length,...(occupancy.activeRatio===undefined?{}:{activeTimeRatio:occupancy.activeRatio}),activeDurationMs:occupancy.activeDurationMs,inactiveDurationMs:occupancy.inactiveDurationMs,unobservedDurationMs:occupancy.unobservedDurationMs,coverageRatio:occupancy.coverageRatio,occupancyState:occupancy.state,firstPassageSamples,lowerExitCount,upperExitCount,maxDistanceBins,revisitCount};
 }
 
 export interface ActualPositionObservation {
@@ -257,7 +274,12 @@ export interface ActualPositionObservation {
 export interface ActualPositionForensics {
   fidelity:'ONCHAIN_POSITION';
   samples:number;
-  activeTimeRatio:number;
+  activeTimeRatio?:number;
+  activeDurationMs:number;
+  inactiveDurationMs:number;
+  unobservedDurationMs:number;
+  coverageRatio:number;
+  occupancyState:OccupancyState;
   firstOutOfRangeAt?:string;
   lowerExitCount:number;
   upperExitCount:number;
@@ -273,7 +295,6 @@ export function analyzeActualPosition(observations:ActualPositionObservation[]):
   if(!s.length)throw new Error('LPFORGE_FORENSICS_NO_POSITION_OBSERVATIONS');
   let lowerExitCount=0,upperExitCount=0,wasIn=true,firstOutOfRangeAt:string|undefined;
   for(const o of s){const inRange=o.activeBinId>=o.lowerBinId&&o.activeBinId<=o.upperBinId;if(!inRange&&wasIn){firstOutOfRangeAt??=o.observedAt;if(o.activeBinId<o.lowerBinId)lowerExitCount++;else upperExitCount++;}wasIn=inRange;}
-  const first=s[0]!,last=s[s.length-1]!;
-  const active=s.filter((o)=>o.activeBinId>=o.lowerBinId&&o.activeBinId<=o.upperBinId).length/s.length;
-  return{fidelity:'ONCHAIN_POSITION',samples:s.length,activeTimeRatio:active,...(firstOutOfRangeAt?{firstOutOfRangeAt}:{}),lowerExitCount,upperExitCount,feeXDeltaRaw:last.feeXRaw-first.feeXRaw,feeYDeltaRaw:last.feeYRaw-first.feeYRaw,tokenXDeltaRaw:last.totalXRaw-first.totalXRaw,tokenYDeltaRaw:last.totalYRaw-first.totalYRaw,...(first.value!==undefined&&last.value!==undefined?{absolutePnl:last.value-first.value}:{}),...(last.value!==undefined&&last.hodlBenchmarkValue!==undefined?{hodlRelativePnl:last.value-last.hodlBenchmarkValue}:{}),};
+  const first=s[0]!,last=s[s.length-1]!,occupancy=deriveElapsedOccupancy({observations:s.map(o=>({observedAt:o.observedAt,activeBinId:o.activeBinId})),lowerBinId:first.lowerBinId,upperBinId:first.upperBinId,horizonStart:first.observedAt,horizonEnd:last.observedAt});
+  return{fidelity:'ONCHAIN_POSITION',samples:s.length,...(occupancy.activeRatio===undefined?{}:{activeTimeRatio:occupancy.activeRatio}),activeDurationMs:occupancy.activeDurationMs,inactiveDurationMs:occupancy.inactiveDurationMs,unobservedDurationMs:occupancy.unobservedDurationMs,coverageRatio:occupancy.coverageRatio,occupancyState:occupancy.state,...(firstOutOfRangeAt?{firstOutOfRangeAt}:{}),lowerExitCount,upperExitCount,feeXDeltaRaw:last.feeXRaw-first.feeXRaw,feeYDeltaRaw:last.feeYRaw-first.feeYRaw,tokenXDeltaRaw:last.totalXRaw-first.totalXRaw,tokenYDeltaRaw:last.totalYRaw-first.totalYRaw,...(first.value!==undefined&&last.value!==undefined?{absolutePnl:last.value-first.value}:{}),...(last.value!==undefined&&last.hodlBenchmarkValue!==undefined?{hodlRelativePnl:last.value-last.hodlBenchmarkValue}:{}),};
 }

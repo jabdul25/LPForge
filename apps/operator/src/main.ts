@@ -48,6 +48,8 @@ import { assessProductionOpenPlanCapacity } from "../../../packages/production-e
 import { refreshCanonicalHistoricalBackfill, refreshCurrentPhase3Evidence } from "../../../packages/active-candidate-evidence/src/index.js";
 import { derivePhase3EvidenceWidthRequirement } from "../../../packages/rangeforge/src/index.js";
 import { PublicKey } from "@solana/web3.js";
+import { readFileSync } from "node:fs";
+import { freezePhase3ForwardDecision, phase3ForwardDecisionStoreValue, type RuntimeArtifactProvenance } from "../../../packages/phase3-forward-validation/src/index.js";
 
 function json(v: unknown) {
   return JSON.stringify(
@@ -57,6 +59,18 @@ function json(v: unknown) {
   );
 }
 const lamportsToSol = (value: bigint) => Number(value) / 1_000_000_000;
+function verifiedForwardArtifactProvenance():RuntimeArtifactProvenance{
+  const manifest=JSON.parse(readFileSync('RELEASE_MANIFEST.json','utf8')) as {sourceCommit?:unknown;buildIdentity?:unknown;policyHash?:unknown;migrationHead?:unknown};
+  const sourceRevision=readFileSync('SOURCE_REVISION.txt','utf8').trim().replace(/^source_git_commit=/,'');
+  const sourceSha=typeof manifest.sourceCommit==='string'?manifest.sourceCommit.trim():'';
+  const buildId=typeof manifest.buildIdentity==='string'?manifest.buildIdentity.trim():'';
+  const policyHash=typeof manifest.policyHash==='string'?manifest.policyHash.trim():'';
+  const migrationHead=typeof manifest.migrationHead==='string'?manifest.migrationHead.trim():'';
+  if(sourceRevision!==sourceSha||!/^[0-9a-f]{40}$/i.test(sourceSha)||!/^[0-9a-f]{64}$/i.test(buildId)||!/^[0-9a-f]{64}$/i.test(policyHash)||!/^M\d{4}_.+\.sql$/.test(migrationHead))throw new Error('LPFORGE_FORWARD_ARTIFACT_IDENTITY_INVALID');
+  if(process.env.LPFORGE_SOURCE_COMMIT&&process.env.LPFORGE_SOURCE_COMMIT!==sourceSha)throw new Error('LPFORGE_FORWARD_ARTIFACT_SOURCE_ASSERTION_MISMATCH');
+  if(process.env.LPFORGE_BUILD_ID&&process.env.LPFORGE_BUILD_ID!==buildId)throw new Error('LPFORGE_FORWARD_ARTIFACT_BUILD_ASSERTION_MISMATCH');
+  return{sourceSha,buildId,policyHash,migrationHead};
+}
 const WSOL_MINT="So11111111111111111111111111111111111111112";
 function claimValueLamports(input:{feeX?:string|undefined;feeY?:string|undefined;pool:DataApiPool}):bigint|undefined{
   const tokens=[input.pool.token_x,input.pool.token_y],sol=tokens.find(token=>token?.address===WSOL_MINT);
@@ -483,6 +497,15 @@ async function persistResult(
       reasonCodes: r.shadow.reasonCodes,
       payload: r.shadow as unknown as Record<string, unknown>,
     });
+    // Shadow calibration must never influence the recommendation or authority
+    // path. A capture failure is observable, but the already durable Phase-3
+    // decision remains exactly as it was before this instrumentation existed.
+    try {
+      const frozen=freezePhase3ForwardDecision({recommendation:r.shadow,artifact:verifiedForwardArtifactProvenance()});
+      await store.insertPhase3ForwardDecision(phase3ForwardDecisionStoreValue(frozen));
+    } catch (error) {
+      console.error(json({event:'lpforge_phase3_forward_capture_failed',recommendationId:r.shadow.recommendationId,error:error instanceof Error?error.message:String(error),authority:'RESEARCH_ONLY_NO_POLICY_MUTATION'}));
+    }
     await store.insertRegimeAssessment({
       poolAddress: r.poolAddress,
       decisionAt: r.shadow.decisionAt,

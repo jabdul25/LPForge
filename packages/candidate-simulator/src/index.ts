@@ -1,12 +1,20 @@
 import type { SwapEventFact } from '../../domain/src/index.js';
 import type { RangeStrategyCandidate } from '../../rangeforge/src/index.js';
 import { simulateSyntheticPosition, type BinFrame, type SimulationCostModel, type SyntheticPosition } from '../../simulator/src/index.js';
+import type { OccupancyState } from '../../elapsed-occupancy/src/index.js';
 
 export interface CandidateEconomicSimulation {
   candidateId:string;
   strategy:RangeStrategyCandidate['strategy'];
   orientation:RangeStrategyCandidate['orientation'];
-  activeTimeRatio:number;
+  activeTimeRatio?:number;
+  /** Diagnostic-only, retained to quantify the corrected elapsed-time delta. */
+  countWeightedActiveTimeRatio?:number;
+  activeDurationMs:number;
+  inactiveDurationMs:number;
+  unobservedDurationMs:number;
+  occupancyCoverageRatio:number;
+  occupancyState:OccupancyState;
   firstOutOfRangeAt?:string;
   lowerExitCount:number;
   upperExitCount:number;
@@ -71,10 +79,10 @@ function distributeShares(candidate:RangeStrategyCandidate,totalShareRaw:bigint,
  const map=new Map(frame.bins.map((b)=>[b.binId,b] as const));const shares=allocateSyntheticShares(totalShareRaw,candidate.perBinWeights);const bins=candidate.perBinWeights.map((w,i)=>({binId:w.binId,positionShareRaw:shares[i]!,competingSupplyRaw:raw(map.get(w.binId)?.liquiditySupply)}));return{pool:'candidate-pool',lowerBinId:candidate.lowerBinId,upperBinId:candidate.upperBinId,openedAt:frame.observedAt,bins,strategyLabel:`${candidate.strategy}:${candidate.orientation}`};
 }
 const finitePositive=(n:number)=>Number.isFinite(n)&&n>0;
-export function simulateCandidateEconomics(input:{candidate:RangeStrategyCandidate;pool:string;frames:BinFrame[];events:SwapEventFact[];totalPositionShareRaw:bigint;rawUnitValueX:number;rawUnitValueY:number;capitalValue:number;costs?:SimulationCostModel;maxCapitalRelativeMove?:number;}):CandidateEconomicSimulation{
+export function simulateCandidateEconomics(input:{candidate:RangeStrategyCandidate;pool:string;frames:BinFrame[];events:SwapEventFact[];totalPositionShareRaw:bigint;rawUnitValueX:number;rawUnitValueY:number;capitalValue:number;costs?:SimulationCostModel;maxCapitalRelativeMove?:number;rebaseCandidateToFirstFrame?:boolean;horizonEnd?:string;}):CandidateEconomicSimulation{
  if(!input.frames.length)throw new Error('LPFORGE_CANDIDATE_SIM_NO_FRAMES');
- const first=input.frames[0]!,candidate=rebaseCandidateForReplay(input.candidate,first.activeBinId),candidateShareRaw=(input.totalPositionShareRaw*boundedFraction(input.candidate.capitalFraction))/SHARE_WEIGHT_SCALE,position=distributeShares(candidate,candidateShareRaw,first);position.pool=input.pool;
- const sim=simulateSyntheticPosition({position,frames:input.frames,events:input.events,...(input.costs?{costs:input.costs}:{})});
+ const first=input.frames[0]!,candidate=input.rebaseCandidateToFirstFrame===false?input.candidate:rebaseCandidateForReplay(input.candidate,first.activeBinId),candidateShareRaw=(input.totalPositionShareRaw*boundedFraction(input.candidate.capitalFraction))/SHARE_WEIGHT_SCALE,position=distributeShares(candidate,candidateShareRaw,first);position.pool=input.pool;
+ const sim=simulateSyntheticPosition({position,frames:input.frames,events:input.events,...(input.costs?{costs:input.costs}:{}),...(input.horizonEnd?{horizonEnd:input.horizonEnd}:{})});
  const start=sim.inventory[0]!,end=sim.inventory.at(-1)!;
  const valueRaw=(x:bigint,y:bigint)=>Number(x)*input.rawUnitValueX+Number(y)*input.rawUnitValueY;
  const startInventoryValueRaw=valueRaw(start.tokenXRaw,start.tokenYRaw);
@@ -92,13 +100,15 @@ export function simulateCandidateEconomics(input:{candidate:RangeStrategyCandida
  const maxMove=Math.max(1,input.maxCapitalRelativeMove??5)*Math.max(targetCapital,Number.EPSILON);
  const bounded=Number.isFinite(inventoryChangeValue)&&Number.isFinite(feeValue)&&Number.isFinite(netValue)&&Math.abs(grossValueChange)<=maxMove;
  const unitScaleValid=calibrationValid&&bounded;
- const evidenceActionable=unitScaleValid&&replayContinuous&&input.events.length>0;
+ const occupancyComplete=sim.occupancyState==='COMPLETE';
+ const evidenceActionable=unitScaleValid&&replayContinuous&&occupancyComplete&&input.events.length>0;
  const adverse=Math.max(0,-inventoryChangeValue);
  const warnings=[...sim.warnings,'CANDIDATE_VALUE_USES_CAPITAL_NORMALIZED_TOKEN_X_UNITS'];
  if(input.events.length===0)warnings.push('CANDIDATE_EVENT_PATH_NO_SWAP_EVIDENCE');
  if(!replayContinuous)warnings.push('CANDIDATE_REPLAY_CONTINUITY_INSUFFICIENT');
+ if(!occupancyComplete)warnings.push('CANDIDATE_ACTIVE_TIME_EVIDENCE_INSUFFICIENT');
  if(!calibrationValid)warnings.push('CANDIDATE_VALUE_CALIBRATION_INVALID');
  if(calibrationValid&&!bounded)warnings.push('CANDIDATE_UNIT_SCALE_INVALID');
- return{candidateId:input.candidate.id,strategy:input.candidate.strategy,orientation:input.candidate.orientation,activeTimeRatio:sim.activeTimeRatio,...(sim.firstOutOfRangeAt?{firstOutOfRangeAt:sim.firstOutOfRangeAt}:{}),lowerExitCount:sim.lowerExitCount,upperExitCount:sim.upperExitCount,feeValue,inventoryChangeValue,grossValueChange,totalCostValue:costs,netValue,feeToAdverseInventoryRatio:adverse>0?feeValue/adverse:null,fidelity:'EVENT_PATH_ESTIMATE',valueUnit:'TOKEN_X',capitalValue:targetCapital,startInventoryValue:calibrationValid?startInventoryValueRaw*normalizationScale:0,normalizationScale,unitScaleValid,evidenceActionable,warnings};
+ return{candidateId:input.candidate.id,strategy:input.candidate.strategy,orientation:input.candidate.orientation,...(sim.activeTimeRatio===undefined?{}:{activeTimeRatio:sim.activeTimeRatio}),...(sim.countWeightedActiveTimeRatio===undefined?{}:{countWeightedActiveTimeRatio:sim.countWeightedActiveTimeRatio}),activeDurationMs:sim.activeDurationMs,inactiveDurationMs:sim.inactiveDurationMs,unobservedDurationMs:sim.unobservedDurationMs,occupancyCoverageRatio:sim.occupancyCoverageRatio,occupancyState:sim.occupancyState,...(sim.firstOutOfRangeAt?{firstOutOfRangeAt:sim.firstOutOfRangeAt}:{}),lowerExitCount:sim.lowerExitCount,upperExitCount:sim.upperExitCount,feeValue,inventoryChangeValue,grossValueChange,totalCostValue:costs,netValue,feeToAdverseInventoryRatio:adverse>0?feeValue/adverse:null,fidelity:'EVENT_PATH_ESTIMATE',valueUnit:'TOKEN_X',capitalValue:targetCapital,startInventoryValue:calibrationValid?startInventoryValueRaw*normalizationScale:0,normalizationScale,unitScaleValid,evidenceActionable,warnings};
 }
 export function simulateCandidateSet(input:Omit<Parameters<typeof simulateCandidateEconomics>[0],'candidate'>&{candidates:RangeStrategyCandidate[]}):CandidateEconomicSimulation[]{return input.candidates.map((candidate)=>simulateCandidateEconomics({...input,candidate}));}
