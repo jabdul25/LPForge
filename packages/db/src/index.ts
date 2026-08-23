@@ -640,8 +640,9 @@ export interface Phase1Store {
     wouldAugEraThesisSemanticsHaveCreatedThesis: boolean;
     payload: Record<string, unknown>;
   }): Promise<boolean>;
-  loadDuePhase3ForwardOutcomes(now: string, limit: number): Promise<Array<{recommendationId:string;horizonMinutes:30|60|120;outcomeModelVersion:string;decisionPayload:Record<string,unknown>;state:string;evidenceHash?:string}>>;
-  persistPhase3ForwardOutcome(value:{recommendationId:string;horizonMinutes:30|60|120;outcomeModelVersion:string;state:'PENDING'|'INSUFFICIENT_EVIDENCE'|'FINAL'|'FAILED_DATA_INTEGRITY';evidenceHash?:string;reasonCodes:string[];realized?:Record<string,unknown>;payload:Record<string,unknown>;maturedAt:string}):Promise<boolean>;
+  ensurePhase3ForwardOutcome(value:{recommendationId:string;horizonMinutes:30|60|120;outcomeModelVersion:string}):Promise<boolean>;
+  loadDuePhase3ForwardOutcomes(now: string, limit: number): Promise<Array<{recommendationId:string;horizonMinutes:30|60|120;outcomeModelVersion:string;decisionPayload:Record<string,unknown>;state:string;evidenceHash?:string;resultHash?:string}>>;
+  persistPhase3ForwardOutcome(value:{recommendationId:string;horizonMinutes:30|60|120;outcomeModelVersion:string;state:'PENDING'|'INSUFFICIENT_EVIDENCE'|'FINAL'|'FAILED_DATA_INTEGRITY';evidenceHash?:string;resultHash?:string;reasonCodes:string[];realized?:Record<string,unknown>;payload:Record<string,unknown>;maturedAt:string}):Promise<boolean>;
   loadPhase3ForwardOutcomes(limit?:number): Promise<Array<Record<string,unknown>>>;
   insertRegimeAssessment(value: {
     poolAddress: string;
@@ -1991,29 +1992,41 @@ export async function createPostgresStore(
         throw error;
       }
     },
+    async ensurePhase3ForwardOutcome(v) {
+      const r=await db.query(`INSERT INTO research.phase3_forward_outcomes(recommendation_id,horizon_minutes,outcome_model_version,state,payload) VALUES($1,$2,$3,'PENDING','{}'::jsonb) ON CONFLICT(recommendation_id,horizon_minutes,outcome_model_version) DO NOTHING RETURNING recommendation_id`,[v.recommendationId,v.horizonMinutes,v.outcomeModelVersion]);
+      return r.rows.length===1;
+    },
     async loadDuePhase3ForwardOutcomes(now, limit) {
       const lim=Math.max(1,Math.min(200,Math.floor(limit)));
       const r=await db.query(
-        `SELECT o.recommendation_id,o.horizon_minutes,o.outcome_model_version,o.state,o.evidence_hash,d.payload AS decision_payload FROM research.phase3_forward_outcomes o JOIN research.phase3_forward_decisions d ON d.recommendation_id=o.recommendation_id WHERE o.state IN ('PENDING','INSUFFICIENT_EVIDENCE') AND d.decision_at+(o.horizon_minutes||' minutes')::interval<=$1::timestamptz ORDER BY d.decision_at,o.horizon_minutes LIMIT $2`,
+        `SELECT o.recommendation_id,o.horizon_minutes,o.outcome_model_version,o.state,o.evidence_hash,o.result_hash,d.payload AS decision_payload FROM research.phase3_forward_outcomes o JOIN research.phase3_forward_decisions d ON d.recommendation_id=o.recommendation_id WHERE o.state IN ('PENDING','INSUFFICIENT_EVIDENCE') AND d.decision_at+(o.horizon_minutes||' minutes')::interval<=$1::timestamptz ORDER BY d.decision_at,o.horizon_minutes LIMIT $2`,
         [now,lim],
       );
-      return r.rows.map(row=>({recommendationId:String(row.recommendation_id),horizonMinutes:Number(row.horizon_minutes) as 30|60|120,outcomeModelVersion:String(row.outcome_model_version),decisionPayload:(row.decision_payload??{}) as Record<string,unknown>,state:String(row.state),...(row.evidence_hash?{evidenceHash:String(row.evidence_hash)}:{})}));
+      return r.rows.map(row=>({recommendationId:String(row.recommendation_id),horizonMinutes:Number(row.horizon_minutes) as 30|60|120,outcomeModelVersion:String(row.outcome_model_version),decisionPayload:(row.decision_payload??{}) as Record<string,unknown>,state:String(row.state),...(row.evidence_hash?{evidenceHash:String(row.evidence_hash)}:{}),...(row.result_hash?{resultHash:String(row.result_hash)}:{})}));
     },
     async persistPhase3ForwardOutcome(v) {
-      const existing=await db.query(`SELECT state,evidence_hash FROM research.phase3_forward_outcomes WHERE recommendation_id=$1 AND horizon_minutes=$2 AND outcome_model_version=$3`,[v.recommendationId,v.horizonMinutes,v.outcomeModelVersion]);
-      const current=existing.rows[0];
-      if(!current)throw new Error('LPFORGE_FORWARD_OUTCOME_ROW_MISSING');
-      if(String(current.state)==='FINAL'){
-        if(current.evidence_hash&&v.evidenceHash&&String(current.evidence_hash)!==v.evidenceHash)throw new Error('LPFORGE_FORWARD_OUTCOME_EVIDENCE_HASH_CONFLICT');
-        return false;
-      }
-      const r=await db.query(`UPDATE research.phase3_forward_outcomes SET state=$4,evidence_hash=$5,reason_codes=$6::jsonb,realized=$7::jsonb,payload=$8::jsonb,matured_at=$9 WHERE recommendation_id=$1 AND horizon_minutes=$2 AND outcome_model_version=$3 AND state<>'FINAL' RETURNING recommendation_id`,[v.recommendationId,v.horizonMinutes,v.outcomeModelVersion,v.state,v.evidenceHash??null,json(v.reasonCodes),v.realized?json(v.realized):null,json(v.payload),v.maturedAt]);
-      return r.rows.length===1;
+      const computedResultHash=await sha256Hex(canonicalJson({recommendationId:v.recommendationId,horizonMinutes:v.horizonMinutes,outcomeModelVersion:v.outcomeModelVersion,state:v.state,evidenceHash:v.evidenceHash??null,reasonCodes:[...v.reasonCodes].sort(),realized:v.realized??null}));
+      if(v.resultHash&&v.resultHash!==computedResultHash)throw new Error('LPFORGE_FORWARD_OUTCOME_RESULT_HASH_INVALID');
+      await db.query('BEGIN');
+      try{
+        const existing=await db.query(`SELECT state,evidence_hash,result_hash FROM research.phase3_forward_outcomes WHERE recommendation_id=$1 AND horizon_minutes=$2 AND outcome_model_version=$3 FOR UPDATE`,[v.recommendationId,v.horizonMinutes,v.outcomeModelVersion]);
+        const current=existing.rows[0];
+        if(!current)throw new Error('LPFORGE_FORWARD_OUTCOME_ROW_MISSING');
+        if(String(current.state)==='FINAL'){
+          if(!current.result_hash)throw new Error('LPFORGE_FORWARD_OUTCOME_LEGACY_RESULT_HASH_MISSING');
+          if(String(current.evidence_hash??'')!==String(v.evidenceHash??'')||String(current.result_hash)!==computedResultHash)throw new Error('LPFORGE_FORWARD_OUTCOME_EVIDENCE_OR_RESULT_HASH_CONFLICT');
+          await db.query('COMMIT');
+          return false;
+        }
+        const r=await db.query(`UPDATE research.phase3_forward_outcomes SET state=$4,evidence_hash=$5,result_hash=$6,reason_codes=$7::jsonb,realized=$8::jsonb,payload=$9::jsonb,matured_at=$10 WHERE recommendation_id=$1 AND horizon_minutes=$2 AND outcome_model_version=$3 AND state<>'FINAL' RETURNING recommendation_id`,[v.recommendationId,v.horizonMinutes,v.outcomeModelVersion,v.state,v.evidenceHash??null,computedResultHash,json(v.reasonCodes),v.realized?json(v.realized):null,json(v.payload),v.maturedAt]);
+        await db.query('COMMIT');
+        return r.rows.length===1;
+      }catch(error){try{await db.query('ROLLBACK');}catch{}throw error;}
     },
     async loadPhase3ForwardOutcomes(limit=5000) {
       const lim=Math.max(1,Math.min(10000,Math.floor(limit)));
-      const r=await db.query(`SELECT d.payload AS decision_payload,o.recommendation_id,o.horizon_minutes,o.outcome_model_version,o.state,o.evidence_hash,o.reason_codes,o.realized,o.payload,o.created_at,o.matured_at FROM research.phase3_forward_outcomes o JOIN research.phase3_forward_decisions d ON d.recommendation_id=o.recommendation_id ORDER BY d.decision_at DESC,o.horizon_minutes ASC LIMIT $1`,[lim]);
-      return r.rows.map(row=>({decisionPayload:(row.decision_payload??{}) as Record<string,unknown>,recommendationId:String(row.recommendation_id),horizonMinutes:Number(row.horizon_minutes),outcomeModelVersion:String(row.outcome_model_version),state:String(row.state),...(row.evidence_hash?{evidenceHash:String(row.evidence_hash)}:{}),reasonCodes:(row.reason_codes??[]) as string[],...(row.realized?{realized:row.realized as Record<string,unknown>}:{}) ,payload:(row.payload??{}) as Record<string,unknown>,createdAt:new Date(String(row.created_at)).toISOString(),...(row.matured_at?{maturedAt:new Date(String(row.matured_at)).toISOString()}:{})}));
+      const r=await db.query(`SELECT d.payload AS decision_payload,o.recommendation_id,o.horizon_minutes,o.outcome_model_version,o.state,o.evidence_hash,o.result_hash,o.reason_codes,o.realized,o.payload,o.created_at,o.matured_at FROM research.phase3_forward_outcomes o JOIN research.phase3_forward_decisions d ON d.recommendation_id=o.recommendation_id ORDER BY d.decision_at DESC,o.horizon_minutes ASC LIMIT $1`,[lim]);
+      return r.rows.map(row=>({decisionPayload:(row.decision_payload??{}) as Record<string,unknown>,recommendationId:String(row.recommendation_id),horizonMinutes:Number(row.horizon_minutes),outcomeModelVersion:String(row.outcome_model_version),state:String(row.state),...(row.evidence_hash?{evidenceHash:String(row.evidence_hash)}:{}),...(row.result_hash?{resultHash:String(row.result_hash)}:{}),reasonCodes:(row.reason_codes??[]) as string[],...(row.realized?{realized:row.realized as Record<string,unknown>}:{}) ,payload:(row.payload??{}) as Record<string,unknown>,createdAt:new Date(String(row.created_at)).toISOString(),...(row.matured_at?{maturedAt:new Date(String(row.matured_at)).toISOString()}:{})}));
     },
     async insertRegimeAssessment(v) {
       await db.query(
@@ -3423,6 +3436,7 @@ export function createMemoryStore(): Phase1Store {
     async insertExperimentResult() {},
     async insertShadowRecommendation() {},
     async insertPhase3ForwardDecision() { return false; },
+    async ensurePhase3ForwardOutcome() { return false; },
     async loadDuePhase3ForwardOutcomes() { return []; },
     async persistPhase3ForwardOutcome() { return false; },
     async loadPhase3ForwardOutcomes() { return []; },

@@ -116,7 +116,9 @@ export function phase3ForwardDecisionStoreValue(decision: FrozenPhase3ForwardDec
 export interface Phase3ForwardOutcome {
   recommendationId: string;
   horizonMinutes: (typeof PHASE3_FORWARD_HORIZONS_MINUTES)[number];
-  outcomeModelVersion: typeof PHASE3_FORWARD_OUTCOME_MODEL_VERSION;
+  /** A version is part of the durable outcome identity. New models coexist
+   * with, rather than rewrite, the original calibration record. */
+  outcomeModelVersion: string;
   state: ForwardOutcomeState;
   evidenceHash?: string;
   reasonCodes: string[];
@@ -138,6 +140,19 @@ export interface Phase3ForwardOutcome {
   };
 }
 
+/** Bind a durable realization to the exact result that was calculated. */
+export async function phase3ForwardOutcomeResultHash(outcome: Pick<Phase3ForwardOutcome, 'recommendationId'|'horizonMinutes'|'outcomeModelVersion'|'state'|'evidenceHash'|'reasonCodes'|'realized'>): Promise<string> {
+  return sha256Hex(canonicalJson({
+    recommendationId: outcome.recommendationId,
+    horizonMinutes: outcome.horizonMinutes,
+    outcomeModelVersion: outcome.outcomeModelVersion,
+    state: outcome.state,
+    evidenceHash: outcome.evidenceHash ?? null,
+    reasonCodes: [...outcome.reasonCodes].sort(),
+    realized: outcome.realized ?? null,
+  }));
+}
+
 function inWindow(timestamp: string, start: number, end: number): boolean {
   const value = Date.parse(timestamp);
   return Number.isFinite(value) && value > start && value <= end;
@@ -150,22 +165,24 @@ function inWindow(timestamp: string, start: number, end: number): boolean {
 export async function matureFrozenPhase3ForwardOutcome(input: {
   decision: FrozenPhase3ForwardDecision;
   horizonMinutes: (typeof PHASE3_FORWARD_HORIZONS_MINUTES)[number];
+  outcomeModelVersion?: string;
   frames: BinFrame[];
   events: SwapEventFact[];
   now: string;
 }): Promise<Phase3ForwardOutcome> {
   const horizon = input.horizonMinutes;
+  const outcomeModelVersion = input.outcomeModelVersion ?? PHASE3_FORWARD_OUTCOME_MODEL_VERSION;
   const start = Date.parse(input.decision.decisionTimestamp);
   const now = Date.parse(input.now);
   if (!Number.isFinite(start) || !Number.isFinite(now)) throw new Error('LPFORGE_FORWARD_MATURATION_TIME_INVALID');
   const end = start + horizon * 60_000;
-  if (now < end) return { recommendationId: input.decision.recommendationId, horizonMinutes: horizon, outcomeModelVersion: PHASE3_FORWARD_OUTCOME_MODEL_VERSION, state: 'PENDING', reasonCodes: ['FORWARD_HORIZON_NOT_DUE'] };
+  if (now < end) return { recommendationId: input.decision.recommendationId, horizonMinutes: horizon, outcomeModelVersion, state: 'PENDING', reasonCodes: ['FORWARD_HORIZON_NOT_DUE'] };
   const candidate = input.decision.selectedCandidate;
-  if (!candidate) return { recommendationId: input.decision.recommendationId, horizonMinutes: horizon, outcomeModelVersion: PHASE3_FORWARD_OUTCOME_MODEL_VERSION, state: 'INSUFFICIENT_EVIDENCE', reasonCodes: ['FORWARD_FROZEN_CANDIDATE_UNAVAILABLE'] };
+  if (!candidate) return { recommendationId: input.decision.recommendationId, horizonMinutes: horizon, outcomeModelVersion, state: 'INSUFFICIENT_EVIDENCE', reasonCodes: ['FORWARD_FROZEN_CANDIDATE_UNAVAILABLE'] };
   const orderedFrames = [...input.frames].filter(frame => Number.isFinite(Date.parse(frame.observedAt))).sort((a, b) => Date.parse(a.observedAt) - Date.parse(b.observedAt));
   const baseline = orderedFrames.filter(frame => Date.parse(frame.observedAt) <= start).at(-1);
   const futureFrames = orderedFrames.filter(frame => inWindow(frame.observedAt, start, end));
-  if (!baseline || !futureFrames.length) return { recommendationId: input.decision.recommendationId, horizonMinutes: horizon, outcomeModelVersion: PHASE3_FORWARD_OUTCOME_MODEL_VERSION, state: 'INSUFFICIENT_EVIDENCE', reasonCodes: ['FORWARD_FUTURE_FRAME_COVERAGE_INSUFFICIENT'] };
+  if (!baseline || !futureFrames.length) return { recommendationId: input.decision.recommendationId, horizonMinutes: horizon, outcomeModelVersion, state: 'INSUFFICIENT_EVIDENCE', reasonCodes: ['FORWARD_FUTURE_FRAME_COVERAGE_INSUFFICIENT'] };
   const frames = [baseline, ...futureFrames];
   const events = input.events.filter(event => inWindow(event.stamp.observedAt, start, end));
   const evidenceHash = await sha256Hex(canonicalJson({ recommendationId: input.decision.recommendationId, horizon, frames, events }));
@@ -190,13 +207,13 @@ export async function matureFrozenPhase3ForwardOutcome(input: {
     horizonEnd: new Date(end).toISOString(),
   });
   if (!simulation.unitScaleValid || simulation.occupancyState !== 'COMPLETE' || simulation.warnings.includes('CANDIDATE_REPLAY_CONTINUITY_INSUFFICIENT')) {
-    return { recommendationId: input.decision.recommendationId, horizonMinutes: horizon, outcomeModelVersion: PHASE3_FORWARD_OUTCOME_MODEL_VERSION, state: 'INSUFFICIENT_EVIDENCE', evidenceHash, reasonCodes: [...new Set(['FORWARD_FUTURE_EVIDENCE_INSUFFICIENT', ...simulation.warnings])].sort() };
+    return { recommendationId: input.decision.recommendationId, horizonMinutes: horizon, outcomeModelVersion, state: 'INSUFFICIENT_EVIDENCE', evidenceHash, reasonCodes: [...new Set(['FORWARD_FUTURE_EVIDENCE_INSUFFICIENT', ...simulation.warnings])].sort() };
   }
   const realizedTotalCost = execution + reposition + tail;
   return {
     recommendationId: input.decision.recommendationId,
     horizonMinutes: horizon,
-    outcomeModelVersion: PHASE3_FORWARD_OUTCOME_MODEL_VERSION,
+    outcomeModelVersion,
     state: 'FINAL',
     evidenceHash,
     reasonCodes: [],
@@ -228,19 +245,52 @@ const evBucket = (value: number): string => value < -0.0001 ? '< -100 µSOL' : v
 const uncertaintyBucket = (value: number): string => value <= .55 ? '<= 0.55' : value <= .60 ? '0.55–0.60' : value <= .65 ? '0.60–0.65' : value <= .70 ? '0.65–0.70' : value <= .75 ? '0.70–0.75' : value <= .80 ? '0.75–0.80' : value <= .90 ? '0.80–0.90' : '> 0.90';
 const median = (values: number[]): number | null => { if (!values.length) return null; const sorted = [...values].sort((a, b) => a - b); const i = Math.floor(sorted.length / 2); return sorted.length % 2 ? sorted[i]! : (sorted[i - 1]! + sorted[i]!) / 2; };
 
-export function buildPhase3ForwardCalibration(rows: CalibrationRow[]): { summary: Record<string, number>; evBuckets: Record<string, Record<string, number | null>>; uncertaintyBuckets: Record<string, Record<string, number | null>> } {
+export interface ForwardCalibrationStats {
+  count: number;
+  decisionCount: number;
+  predictedPositiveCount: number;
+  realizedPositiveCount: number;
+  medianPredictedEv: number | null;
+  meanRealizedEv: number | null;
+  medianRealizedEv: number | null;
+  medianPredictionError: number | null;
+  realizedPositiveRate: number | null;
+  falsePositiveRate: number | null;
+  falseNegativeRate: number | null;
+}
+
+export interface Phase3ForwardCalibration {
+  summary: Record<string, number>;
+  evBuckets: Record<string, ForwardCalibrationStats>;
+  uncertaintyBuckets: Record<string, ForwardCalibrationStats>;
+  byHorizon: Record<string, { summary: ForwardCalibrationStats; evBuckets: Record<string, ForwardCalibrationStats>; uncertaintyBuckets: Record<string, ForwardCalibrationStats>; progressStateCohorts: Record<string, ForwardCalibrationStats>; positiveEvProgressStateCohorts: Record<string, ForwardCalibrationStats> }>;
+  progressStateCohorts: Record<string, ForwardCalibrationStats>;
+  positiveEvProgressStateCohorts: Record<string, ForwardCalibrationStats>;
+}
+
+export function buildPhase3ForwardCalibration(rows: CalibrationRow[]): Phase3ForwardCalibration {
   const final = rows.filter(row => row.outcome.state === 'FINAL' && row.outcome.realized);
-  const summarize = (group: CalibrationRow[]) => {
+  const summarize = (group: CalibrationRow[]): ForwardCalibrationStats => {
     const predicted = group.map(row => Number(row.decision.prediction.expectedNetEv));
     const realized = group.map(row => row.outcome.realized!.realizedNetValue);
+    const errors = realized.map((value, index) => value - predicted[index]!);
+    const predictedPositiveCount = predicted.filter(value => value > 0).length;
+    const predictedNegativeCount = group.length - predictedPositiveCount;
+    const realizedPositiveCount = realized.filter(value => value > 0).length;
     const falsePositive = group.filter((row, index) => predicted[index]! > 0 && realized[index]! <= 0).length;
     const falseNegative = group.filter((row, index) => predicted[index]! <= 0 && realized[index]! > 0).length;
-    return { count: group.length, medianPredictedEv: median(predicted), meanRealizedEv: realized.length ? realized.reduce((a, b) => a + b, 0) / realized.length : null, medianRealizedEv: median(realized), realizedPositiveRate: realized.length ? realized.filter(value => value > 0).length / realized.length : null, falsePositiveRate: group.length ? falsePositive / group.length : null, falseNegativeRate: group.length ? falseNegative / group.length : null };
+    return { count: group.length, decisionCount: group.length, predictedPositiveCount, realizedPositiveCount, medianPredictedEv: median(predicted), meanRealizedEv: realized.length ? realized.reduce((a, b) => a + b, 0) / realized.length : null, medianRealizedEv: median(realized), medianPredictionError: median(errors), realizedPositiveRate: realized.length ? realizedPositiveCount / realized.length : null, falsePositiveRate: predictedPositiveCount ? falsePositive / predictedPositiveCount : null, falseNegativeRate: predictedNegativeCount ? falseNegative / predictedNegativeCount : null };
   };
-  const by = (key: (row: CalibrationRow) => string) => Object.fromEntries([...new Set(final.map(key))].sort().map(label => [label, summarize(final.filter(row => key(row) === label))]));
+  const by = (group: CalibrationRow[], key: (row: CalibrationRow) => string, required: string[] = []): Record<string, ForwardCalibrationStats> => Object.fromEntries([...new Set([...required, ...group.map(key)])].sort().map(label => [label, summarize(group.filter(row => key(row) === label))]));
+  const progress = (group: CalibrationRow[]) => by(group, row => String(row.decision.phase3State).toUpperCase(), ['QUALIFIED', 'WATCHING', 'REJECTED', 'DATA_BLOCKED']);
+  const positiveProgress = (group: CalibrationRow[]) => progress(group.filter(row => Number(row.decision.prediction.expectedNetEv) > 0));
+  const byHorizon = Object.fromEntries(PHASE3_FORWARD_HORIZONS_MINUTES.map(horizon => {
+    const group = final.filter(row => row.outcome.horizonMinutes === horizon);
+    return [String(horizon), { summary: summarize(group), evBuckets: by(group, row => evBucket(Number(row.decision.prediction.expectedNetEv))), uncertaintyBuckets: by(group, row => uncertaintyBucket(Number(row.decision.prediction.forecastUncertainty))), progressStateCohorts: progress(group), positiveEvProgressStateCohorts: positiveProgress(group) }];
+  }));
   const negativeNegative = final.filter(row => Number(row.decision.prediction.expectedNetEv) <= 0 && row.outcome.realized!.realizedNetValue <= 0).length;
   const negativePositive = final.filter(row => Number(row.decision.prediction.expectedNetEv) <= 0 && row.outcome.realized!.realizedNetValue > 0).length;
   const positivePositive = final.filter(row => Number(row.decision.prediction.expectedNetEv) > 0 && row.outcome.realized!.realizedNetValue > 0).length;
   const positiveNegative = final.filter(row => Number(row.decision.prediction.expectedNetEv) > 0 && row.outcome.realized!.realizedNetValue <= 0).length;
-  return { summary: { predictions: rows.length, final: final.length, insufficientEvidence: rows.filter(row => row.outcome.state === 'INSUFFICIENT_EVIDENCE').length, predictedNegativeRealizedNegative: negativeNegative, predictedNegativeRealizedPositive: negativePositive, predictedPositiveRealizedPositive: positivePositive, predictedPositiveRealizedNegative: positiveNegative }, evBuckets: by(row => evBucket(Number(row.decision.prediction.expectedNetEv))), uncertaintyBuckets: by(row => uncertaintyBucket(Number(row.decision.prediction.forecastUncertainty))) };
+  return { summary: { predictions: rows.length, final: final.length, insufficientEvidence: rows.filter(row => row.outcome.state === 'INSUFFICIENT_EVIDENCE').length, predictedNegativeRealizedNegative: negativeNegative, predictedNegativeRealizedPositive: negativePositive, predictedPositiveRealizedPositive: positivePositive, predictedPositiveRealizedNegative: positiveNegative }, evBuckets: by(final, row => evBucket(Number(row.decision.prediction.expectedNetEv))), uncertaintyBuckets: by(final, row => uncertaintyBucket(Number(row.decision.prediction.forecastUncertainty))), byHorizon, progressStateCohorts: progress(final), positiveEvProgressStateCohorts: positiveProgress(final) };
 }
