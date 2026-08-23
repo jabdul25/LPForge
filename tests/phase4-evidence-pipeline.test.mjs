@@ -188,6 +188,13 @@ test('active evidence lease prevents incomplete evidence attempts from being pre
  assert.deepEqual(new Set(selectLiveEvidenceAdmissionCandidates(candidates,2).map(x=>x.poolAddress)),new Set(['leased-a','leased-b']));
 });
 
+test('a newly admitted active candidate receives a bounded lease before its first collection',()=>{
+ const started='2026-08-13T16:00:00.000Z',expires=liveEvidenceLeaseExpiresAt(started);
+ assert.ok(expires);
+ assert.equal(isLiveEvidenceLeaseActive({startedAt:started,expiresAt:expires,failureCount:0},'2026-08-13T16:00:01.000Z'),true);
+ assert.equal(liveEvidenceLeaseReleaseReason({state:'ACTIVE_CANDIDATE',startedAt:started,expiresAt:expires,failureCount:0},'2026-08-13T16:00:01.000Z'),undefined);
+});
+
 test('completed, terminal, failed, or timed-out leases release a bounded slot to the next eligible waiter',()=>{
  const waiting=[
   {poolAddress:'released',state:'QUALIFIED',priorityScore:99,rank:1,firstSeenAt:at,matureForPhase3:false,phase3Terminal:false,admissionEligible:false},
