@@ -1410,6 +1410,52 @@ export function swapEventFromDbRow(r: Record<string, unknown>): SwapEventFact {
   };
 }
 
+/**
+ * Project a durable operational market row without manufacturing bin-motion
+ * evidence. Historical OHLCV rows may be valid price/volume evidence while
+ * having no active-bin observation; SQL NULL must remain absent here because
+ * Number(null) would fabricate active bin zero.
+ */
+export function operationalActiveBinIdFromDbValue(value: unknown): number | undefined {
+  if (value === null || value === undefined) return undefined;
+  const activeBinId = Number(value);
+  return Number.isFinite(activeBinId) ? activeBinId : undefined;
+}
+
+function optionalFiniteDbNumber(value: unknown): number | undefined {
+  if (value === null || value === undefined) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+export function operationalMarketObservationFromDbRow(r: Record<string, unknown>): {
+  observedAt: string;
+  price: number;
+  activeBinId?: number;
+  resolutionMs: number;
+  volume?: number;
+  feeValue?: number;
+  localLiquidity?: number;
+} | undefined {
+  const price = Number(r.price);
+  if (!(price > 0)) return undefined;
+  const activeBinId = operationalActiveBinIdFromDbValue(r.active_bin_id);
+  const localLiquidity = optionalFiniteDbNumber(r.tvl);
+  return {
+    observedAt: new Date(String(r.observed_at)).toISOString(),
+    price,
+    ...(activeBinId !== undefined ? { activeBinId } : {}),
+    resolutionMs: Number(r.resolution_ms),
+    ...(Number.isFinite(Number(r.volume_5m))
+      ? { volume: Number(r.volume_5m) }
+      : {}),
+    ...(Number.isFinite(Number(r.fee_5m))
+      ? { feeValue: Number(r.fee_5m) }
+      : {}),
+    ...(localLiquidity !== undefined ? { localLiquidity } : {}),
+  };
+}
+
 export async function createPostgresStore(
   databaseUrl: string,
 ): Promise<Phase1Store> {
@@ -2626,8 +2672,8 @@ export async function createPostgresStore(
           [poolAddress, stamp],
         );
         if (!rows.rows.length) continue;
-        const a = Number(rows.rows[0]!.active_bin_id);
-        if (!Number.isFinite(a)) continue;
+        const a = operationalActiveBinIdFromDbValue(rows.rows[0]!.active_bin_id);
+        if (a === undefined) continue;
         frames.push({
           observedAt: new Date(String(stamp)).toISOString(),
           activeBinId: a,
@@ -2648,33 +2694,15 @@ export async function createPostgresStore(
       );
       return {
         marketObservations: market.rows.flatMap((r) => {
-          const price = Number(r.price),
-            activeBinId = Number(r.active_bin_id);
-          if (!(price > 0)) return [];
-          return [
-            {
-              observedAt: new Date(String(r.observed_at)).toISOString(),
-              price,
-              ...(Number.isFinite(activeBinId) ? { activeBinId } : {}),
-              resolutionMs: Number(r.resolution_ms),
-              ...(Number.isFinite(Number(r.volume_5m))
-                ? { volume: Number(r.volume_5m) }
-                : {}),
-              ...(Number.isFinite(Number(r.fee_5m))
-                ? { feeValue: Number(r.fee_5m) }
-                : {}),
-              ...(Number.isFinite(Number(r.tvl))
-                ? { localLiquidity: Number(r.tvl) }
-                : {}),
-            },
-          ];
+          const observation = operationalMarketObservationFromDbRow(r);
+          return observation ? [observation] : [];
         }),
-        activeBins: active.rows
-          .map((r) => ({
-            observedAt: new Date(String(r.observed_at)).toISOString(),
-            activeBinId: Number(r.active_bin_id),
-          }))
-          .filter((r) => Number.isFinite(r.activeBinId)),
+        activeBins: active.rows.flatMap((r) => {
+          const activeBinId = operationalActiveBinIdFromDbValue(r.active_bin_id);
+          return activeBinId === undefined
+            ? []
+            : [{ observedAt: new Date(String(r.observed_at)).toISOString(), activeBinId }];
+        }),
         binFrames: frames,
         swapEvents: swaps.rows.map(swapEventFromDbRow),
       };
