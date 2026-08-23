@@ -4,7 +4,7 @@ import {WSOL_MINT,cheapScreen,discoverUniverse,extractCheapFeatures,parseDiscove
 
 const now='2026-08-13T12:00:00.000Z';
 const token=(address,symbol,market_cap=5_000_000,holders=2000)=>({address,symbol,market_cap,holders,price:1,total_supply:market_cap,is_verified:true,freeze_authority_disabled:true});
-const pool=(address,{tvl=150_000,v30=20_000,v1=45_000,v24=500_000,f30=150,f1=400,f24=5_000,mc=5_000_000,holders=2000,blacklisted=false,x=WSOL_MINT,y='TOKEN'}={})=>({address,name:`${address}-SOL`,created_at:Date.parse(now)/1000-24*3600,tvl,is_blacklisted:blacklisted,token_x:token(x,'SOL',100_000_000_000,10_000_000),token_y:token(y,'MEME',mc,holders),volume:{'30m':v30,'1h':v1,'24h':v24},fees:{'30m':f30,'1h':f1,'24h':f24},fee_tvl_ratio:{'30m':f30/tvl,'1h':f1/tvl,'24h':f24/tvl}});
+const pool=(address,{tvl=150_000,v30=20_000,v1=45_000,v24=500_000,f30=150,f1=400,f24=5_000,mc=5_000_000,holders=2000,blacklisted=false,x=WSOL_MINT,y='TOKEN'}={})=>({address,name:`${address}-SOL`,created_at:Date.parse(now)/1000-24*3600,tvl,is_blacklisted:blacklisted,token_x:token(x,'SOL',100_000_000_000,10_000_000),token_y:token(y,'MEME',mc,holders),volume:{'30m':v30,'1h':v1,'24h':v24},fees:{'30m':f30,'1h':f1,'24h':f24},fee_tvl_ratio:{'30m':f30/tvl*100,'1h':f1/tvl*100,'24h':f24/tvl*100}});
 const policy=(over={})=>parseDiscoveryPolicy({schemaVersion:1,policyId:'test',sourceMode:'HYBRID',requireWsolForAuto:true,manualPools:[],maxUniverse:250,pageSize:100,maxDeepScreen:4,maxActiveCandidates:2,maxWatchlist:2,minTvlUsd:25_000,minVolume30mUsd:2_500,minVolume1hUsd:7_500,minVolume24hUsd:50_000,minPoolAgeHours:3,minKnownHolders:250,activeMinPriority:62,qualifiedMinPriority:45,...over});
 
 test('market cap is contextual and produces cohort/fragility ratios rather than a naive hard reject',()=>{const p=pool('MICRO',{mc:500_000,tvl:100_000});const f=extractCheapFeatures(p,now);assert.equal(f.marketCapCohort,'MICRO');assert.equal(f.marketCapUsd,500_000);assert.equal(f.liquidityToMarketCap,.2);const r=cheapScreen(p,'AUTO',policy(),now);assert.notEqual(r.decision,'REJECT');assert.ok(r.selectionReasons.includes('DISCOVERY_HIGHER_FRAGILITY_COHORT'));});
@@ -20,3 +20,15 @@ test('HYBRID deduplicates manual and auto pools and bounds the expensive deep-sc
 test('missing short-window data is explicit and conservative rather than silently converted to zero',()=>{const p=pool('MISS');delete p.volume['30m'];delete p.fees['30m'];delete p.token_y.market_cap;const r=cheapScreen(p,'AUTO',policy(),now);assert.equal(r.features.evidence.marketCap,'UNAVAILABLE');assert.equal(r.features.evidence.volume30m,'UNAVAILABLE');assert.ok(r.warnings.includes('DISCOVERY_MARKET_CAP_UNAVAILABLE'));assert.ok(r.warnings.includes('DISCOVERY_VOLUME_30M_UNAVAILABLE'));});
 
 test('manual pool with weak cheap economics is observed rather than silently excluded by AUTO budget thresholds',()=>{const weak=pool('WEAK',{tvl:1000,v24:1000,v1:100,v30:50});const r=cheapScreen(weak,'MANUAL',policy(),now);assert.notEqual(r.decision,'REJECT');assert.ok(r.warnings.includes('DISCOVERY_TVL_BELOW_MINIMUM'));assert.ok(r.selectionReasons.includes('DISCOVERY_MANUAL_PRIORITY'));});
+
+test('canonical active-TVL priority distinguishes otherwise-safe high-fee pools without bypassing hard safety gates',()=>{
+ const high=pool('9nfz',{tvl:160_000,f30:2_800,f1:5_000,f24:35_000,v30:35_000,v1:70_000,v24:600_000});
+ const weak=pool('H1FW',{tvl:160_000,f30:30,f1:80,f24:900,v30:20_000,v1:40_000,v24:400_000});
+ const highMetrics=[{ratioUnit:'PERCENTAGE_POINTS',source:'METEORA_DISCOVERY_API',ingestedAt:now,activeTvlUsd:22_000,feeActiveTvlRatio30mPct:12.49,feeActiveTvlRatio1hPct:25.36,feeActiveTvlRatio24hPct:15,feeTotalTvlRatio30mPct:1.75,feeTotalTvlRatio1hPct:3.12,feeTotalTvlRatio24hPct:2.2}];
+ const weakMetrics=[{ratioUnit:'PERCENTAGE_POINTS',source:'METEORA_DISCOVERY_API',ingestedAt:now,activeTvlUsd:75_000,feeActiveTvlRatio30mPct:.18,feeActiveTvlRatio1hPct:.25,feeActiveTvlRatio24hPct:.2,feeTotalTvlRatio30mPct:.02,feeTotalTvlRatio1hPct:.05,feeTotalTvlRatio24hPct:.03}];
+ const highResult=cheapScreen(high,'AUTO',policy(),now,highMetrics),weakResult=cheapScreen(weak,'AUTO',policy(),now,weakMetrics);
+ assert.ok(highResult.economicPriority>weakResult.economicPriority);
+ assert.equal(rankDiscovery([weakResult,highResult],policy())[0].pool.address,'9nfz');
+ const dust=cheapScreen(pool('dust',{tvl:700,v24:1000,v1:100,v30:50}),'AUTO',policy(),now,[{ratioUnit:'PERCENTAGE_POINTS',source:'METEORA_DISCOVERY_API',ingestedAt:now,activeTvlUsd:700,feeActiveTvlRatio30mPct:42,feeActiveTvlRatio1hPct:70,feeActiveTvlRatio24hPct:30}]);
+ assert.ok(dust.hardReasons.includes('DISCOVERY_TVL_BELOW_MINIMUM'));
+});

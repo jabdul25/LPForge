@@ -2,6 +2,7 @@ import type { DataApiPool, HistoricalVolumePoint } from '../../data-api/src/inde
 import type { BinLiquidityFact, SwapEventFact } from '../../domain/src/index.js';
 import { computeBinWindowFeatures, computeSwapFlowFeatures, computeActiveBinMovement, type ActiveBinMovementFeatures, type SwapFlowFeatures, type BinWindowFeatures } from '../../features/src/index.js';
 import { computeSustainability, type SustainabilityFeatures } from '../../pool-intelligence/src/index.js';
+import { feeEfficiencyScorePct, type CanonicalDiscoveryMetrics } from '../../discovery-metrics/src/index.js';
 export type DeepEligibility='QUALIFIED'|'WATCHLIST'|'BLOCK'|'QUARANTINED';
 export interface DeepScreenPolicy {
   id:string;
@@ -28,6 +29,8 @@ export interface DeepScreenInput {
   marketFragility?:number;
   dataFresh:boolean;
   missingEvidence?:string[];
+  /** D1's canonical percentage-point contract; optional for historic fixtures. */
+  discoveryMetrics?:CanonicalDiscoveryMetrics;
 }
 export interface ToxicityFeatures {
   directionalDominance:number;
@@ -100,7 +103,9 @@ export function deepScreenPool(input:DeepScreenInput,policy:DeepScreenPolicy=DEF
   for(const m of input.missingEvidence??[])availability[m]='UNAVAILABLE';
   const protocol=input.protocolCompatible?1:0;
   const liquidity=clamp(.30*bin.nonEmptyRatio+.20*(1-clamp(bin.maxConsecutiveEmpty/Math.max(1,bin.binCount)))+.20*(1-clamp(Math.abs(bin.liquiditySkew)))+.15*(1-clamp(bin.activeBinLiquidityShare/.75))+.15*logScale(finite(input.pool.tvl),250_000));
-  const feeDensity=clamp(.45*clamp((finite(input.pool.fee_tvl_ratio?.['1h'])??0)/.006)+.30*clamp((finite(input.pool.fee_tvl_ratio?.['24h'])??0)/.025)+.25*feeSustainability.persistenceScore);
+  const feeDensity=input.discoveryMetrics
+    ?clamp(.45*feeEfficiencyScorePct(input.discoveryMetrics.feeTotalTvlRatio1hPct)+.30*feeEfficiencyScorePct(input.discoveryMetrics.feeTotalTvlRatio24hPct)+.25*feeSustainability.persistenceScore)
+    :clamp(.45*clamp((finite(input.pool.fee_tvl_ratio?.['1h'])??0)/.006)+.30*clamp((finite(input.pool.fee_tvl_ratio?.['24h'])??0)/.025)+.25*feeSustainability.persistenceScore);
   const flowQuality=clamp(.50*flow.twoWayRatio+.25*(1-clamp(Math.abs(flow.netDirection)))+.25*(1-clamp(flow.meanBinsCrossed/10)));
   const tokenQuality=clamp(((input.pool.token_x?.freeze_authority_disabled===false||input.pool.token_y?.freeze_authority_disabled===false)?.25:1)*((input.pool.is_blacklisted===true)?0:1));
   const fragility=clamp(input.marketFragility??.35);
@@ -119,5 +124,5 @@ export function deepScreenPool(input:DeepScreenInput,policy:DeepScreenPolicy=DEF
   if(!input.protocolCompatible||reasons.includes('DEEP_REFERENCE_DIVERGENCE')||reasons.includes('DEEP_LIQUIDITY_COLLAPSE'))eligibility='BLOCK';
   else if(!input.dataFresh||input.bins.length===0)eligibility='QUARANTINED';
   else if(reasons.length)eligibility='WATCHLIST';
-  return{policyId:policy.id,poolAddress:input.pool.address,observedAt:input.observedAt,eligibility,poolQualityScore:poolQuality,currentOpportunityScore:currentOpportunity,executableLiquidityScore:score100(liquidity),feeQualityScore:score100(feeDensity),flowQualityScore:score100(flowQuality),toxicity,feeSustainability,bin,movement,flow,opportunityHalfLifeMinutes:estimateOpportunityHalfLife({fee:feeSustainability,movement,flow}),reasonCodes:reasons.sort(),evidenceAvailability:availability,evidence:{marketFragility:fragility,referenceDivergenceBps:input.referenceDivergenceBps??null,recentLiquidityChangePct:input.recentLiquidityChangePct??null,tvl:input.pool.tvl??null,currentPrice:input.pool.current_price??null,feeTvl1h:input.pool.fee_tvl_ratio?.['1h']??null,feeTvl24h:input.pool.fee_tvl_ratio?.['24h']??null}};
+  return{policyId:policy.id,poolAddress:input.pool.address,observedAt:input.observedAt,eligibility,poolQualityScore:poolQuality,currentOpportunityScore:currentOpportunity,executableLiquidityScore:score100(liquidity),feeQualityScore:score100(feeDensity),flowQualityScore:score100(flowQuality),toxicity,feeSustainability,bin,movement,flow,opportunityHalfLifeMinutes:estimateOpportunityHalfLife({fee:feeSustainability,movement,flow}),reasonCodes:reasons.sort(),evidenceAvailability:availability,evidence:{marketFragility:fragility,referenceDivergenceBps:input.referenceDivergenceBps??null,recentLiquidityChangePct:input.recentLiquidityChangePct??null,tvl:input.pool.tvl??null,currentPrice:input.pool.current_price??null,feeTvl1h:input.discoveryMetrics?.feeTotalTvlRatio1hPct??input.pool.fee_tvl_ratio?.['1h']??null,feeTvl24h:input.discoveryMetrics?.feeTotalTvlRatio24hPct??input.pool.fee_tvl_ratio?.['24h']??null,feeRatioUnit:input.discoveryMetrics?.ratioUnit??'SOURCE_UNSPECIFIED'}};
 }

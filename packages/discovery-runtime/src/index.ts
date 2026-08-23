@@ -27,8 +27,15 @@ export type DiscoveryLifecycleState='OBSERVING'|'QUALIFIED'|'WATCHLIST'|'ACTIVE_
  */
 export function selectDeepScreenSlice<T>(queue:readonly T[],maxPools:number,observedAt:string,cycleMs=180_000):T[]{
  const limit=Math.max(0,Math.min(Math.floor(maxPools),queue.length));if(!limit)return[];
- const at=Date.parse(observedAt),epoch=Number.isFinite(at)?Math.floor(at/Math.max(1,cycleMs)):0,offset=((epoch%queue.length)+queue.length)%queue.length;
- const rotated=[...queue.slice(offset),...queue.slice(0,offset)];return rotated.slice(0,limit);
+ const at=Date.parse(observedAt),epoch=Number.isFinite(at)?Math.floor(at/Math.max(1,cycleMs)):0;
+ // Two out of every three bounded D3 rounds preserve priority.  The third
+ // round reserves one slot for the ranked tail, giving a durable fairness
+ // bound without allowing a lower-quality incumbent to dominate the queue.
+ if(queue.length<=limit)return[...queue];
+ const fairnessRound=((epoch%3)+3)%3===2;
+ if(!fairnessRound)return queue.slice(0,limit);
+ const prioritySlots=Math.max(0,limit-1),tail=queue.slice(prioritySlots),offset=((Math.floor((epoch+1)/3)%tail.length)+tail.length)%tail.length;
+ return[...queue.slice(0,prioritySlots),tail[offset]!];
 }
 /**
  * D3/D4 is the only authority allowed to promote a cheap-screened pool into
@@ -68,7 +75,7 @@ export async function runDeepDiscoveryCycle(input:{api:MeteoraDataApi;adapter:Me
    const hist=await input.api.getHistoricalVolume(cheap.pool.address,{timeframe:'5m'});
    const txs=await scanAddressTransactions({rpc:input.rpc,address:cheap.pool.address,limit:p.eventScanLimit,programId:EXPECTED_DLMM_PROGRAM_ID});
    const events=[];for(const tx of txs)events.push(...await input.adapter.decodeEvents(cheap.pool.address,tx.signature,tx.slot,tx.blockTime,tx.logs,tx.cpiInstructionData));
-   const result=deepScreenPool({pool,protocolCompatible:compat.state==='VERIFIED',observedAt:input.observedAt,activeBinId:active.binId,bins,activeBinHistory:movementHistory(events,active.binId,input.observedAt),swaps:events,historicalFees:hist.data,marketFragility:fragility(cheap),dataFresh:true});
+   const result=deepScreenPool({pool,protocolCompatible:compat.state==='VERIFIED',observedAt:input.observedAt,activeBinId:active.binId,bins,activeBinHistory:movementHistory(events,active.binId,input.observedAt),swaps:events,historicalFees:hist.data,marketFragility:fragility(cheap),dataFresh:true,discoveryMetrics:cheap.features.metrics});
    deep.push(result);await input.store.insertDeepScreenObservation({poolAddress:result.poolAddress,observedAt:result.observedAt,policyId:result.policyId,eligibility:result.eligibility,poolQualityScore:result.poolQualityScore,currentOpportunityScore:result.currentOpportunityScore,executableLiquidityScore:result.executableLiquidityScore,feeQualityScore:result.feeQualityScore,flowQualityScore:result.flowQualityScore,toxicityProbability:result.toxicity.toxicityProbability,...(result.opportunityHalfLifeMinutes!==null?{opportunityHalfLifeMinutes:result.opportunityHalfLifeMinutes}:{}),reasonCodes:result.reasonCodes,evidenceAvailability:result.evidenceAvailability,payload:{bin:result.bin,movement:result.movement,flow:result.flow,feeSustainability:result.feeSustainability,evidence:result.evidence}});
   }catch(error){
    const fallback=deepScreenPool({pool,protocolCompatible:false,observedAt:input.observedAt,activeBinId:0,bins:[],activeBinHistory:[],swaps:[],historicalFees:[],marketFragility:fragility(cheap),dataFresh:false,missingEvidence:['deepRead'],});

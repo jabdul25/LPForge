@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {assessHistoryMaturity,deriveEventPathEconomicEstimate,collectActiveCandidateEvidence,selectActiveCandidateCollectionSlice,requiredActiveCandidateCollectionCapacity,calculateServiceableActiveCandidateCapacity} from '../.build/packages/active-candidate-evidence/src/index.js';
 import {estimateOpportunityEconomics} from '../.build/packages/opportunity/src/index.js';
 import {evaluateEntry,ENTRY_RESEARCH_POLICY_V1} from '../.build/packages/entry-intelligence/src/index.js';
-import {ACTIVE_EVIDENCE_LEASE_TIMEOUT_MS,POST_EVIDENCE_EVALUATION_WINDOW_MS,dynamicLiveEvidenceAdmissionCapacity,freshLiveEvidenceEconomicQuality,isLiveEvidenceAdmissionTerminal,isLiveEvidenceLeaseActive,isPhase3ReadyConsumptionPending,isPostEvidenceEvaluationEligible,liveEvidenceLeaseExpiresAt,liveEvidenceLeaseReleaseReason,selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
+import {ACTIVE_EVIDENCE_LEASE_TIMEOUT_MS,LIVE_EVIDENCE_MIN_ACTIVE_DWELL_MS,POST_EVIDENCE_EVALUATION_WINDOW_MS,dynamicLiveEvidenceAdmissionCapacity,freshDiscoveryEconomicPriority,freshLiveEvidenceEconomicQuality,isLiveEvidenceAdmissionTerminal,isLiveEvidenceLeaseActive,isPhase3ReadyConsumptionPending,isPostEvidenceEvaluationEligible,liveEvidenceLeaseExpiresAt,liveEvidenceLeaseReleaseReason,selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
 import {decisionTimeEconomicEvidenceAgeSeconds,hasPhase3FreshHistoricalEvidence,summarizePhase3RecentLiveObservations} from '../.build/packages/operational-runtime/src/index.js';
 
 const at='2026-08-13T16:00:00.000Z',atMs=Date.parse(at);
@@ -82,6 +82,35 @@ test('economic admission preserves bounded bootstrap access and rejects stale ec
  const selected=selectLiveEvidenceAdmissionCandidates([{...base,poolAddress:'bootstrap',rank:1},{...base,poolAddress:'economic',rank:2,economicQuality:quality}],2);
  assert.deepEqual(selected.map(x=>x.poolAddress),['bootstrap','economic']);
  assert.equal(selected.length,2,'economic preference cannot exceed bounded capacity');
+});
+
+test('fresh discovery economics can safely replace a sufficiently old lower-priority active lease',()=>{
+ const base={priorityScore:10,firstSeenAt:'2026-08-13T14:00:00.000Z',matureForPhase3:false,phase3Terminal:false};
+ const selected=selectLiveEvidenceAdmissionCandidates([
+  {...base,poolAddress:'incumbent',state:'ACTIVE_CANDIDATE',evidenceLeaseActive:true,activeDwellMs:LIVE_EVIDENCE_MIN_ACTIVE_DWELL_MS+1,economicPriority:30,evidencePriority:30},
+  {...base,poolAddress:'challenger',state:'QUALIFIED',economicPriority:60,evidencePriority:60},
+ ],1);
+ assert.deepEqual(selected.map(x=>x.poolAddress),['challenger']);
+});
+
+test('live-evidence replacement honors hysteresis, dwell, and critical-consumption protection',()=>{
+ const base={priorityScore:10,firstSeenAt:'2026-08-13T14:00:00.000Z',matureForPhase3:false,phase3Terminal:false};
+ const near=selectLiveEvidenceAdmissionCandidates([
+  {...base,poolAddress:'incumbent',state:'ACTIVE_CANDIDATE',evidenceLeaseActive:true,activeDwellMs:LIVE_EVIDENCE_MIN_ACTIVE_DWELL_MS+1,evidencePriority:50},
+  {...base,poolAddress:'near',state:'QUALIFIED',evidencePriority:61},
+ ],1);
+ assert.deepEqual(near.map(x=>x.poolAddress),['incumbent']);
+ const protectedSelected=selectLiveEvidenceAdmissionCandidates([
+  {...base,poolAddress:'critical',state:'ACTIVE_CANDIDATE',evidenceLeaseActive:true,activeDwellMs:LIVE_EVIDENCE_MIN_ACTIVE_DWELL_MS+1,protectedCriticalConsumption:true,evidencePriority:10},
+  {...base,poolAddress:'high',state:'QUALIFIED',evidencePriority:99},
+ ],1);
+ assert.deepEqual(protectedSelected.map(x=>x.poolAddress),['critical']);
+});
+
+test('discovery economic priority has explicit bounded freshness',()=>{
+ assert.equal(freshDiscoveryEconomicPriority({priority:75,observedAt:'2026-08-13T15:55:00.000Z'},at),75);
+ assert.equal(freshDiscoveryEconomicPriority({priority:75,observedAt:'2026-08-13T15:49:59.999Z'},at),undefined);
+ assert.equal(freshDiscoveryEconomicPriority({priority:75,observedAt:'not-a-date'},at),undefined);
 });
 
 test('active candidate collector has no starvation across repeated rounds',()=>{
