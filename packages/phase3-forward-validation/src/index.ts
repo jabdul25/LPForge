@@ -58,6 +58,17 @@ export function freezePhase3ForwardDecision(input: { recommendation: ShadowRecom
   requireArtifact(input.artifact);
   const recommendation = input.recommendation;
   const forward = recommendation.forwardValidation;
+  // Older frozen-fixture callers predate the qualification record. Retain
+  // their global-primary interpretation; new runtime records always carry it.
+  const qualification=recommendation.qualification??{policyId:'global-primary-v1' as const,economicAuthority:'GLOBAL_PRIMARY' as const,globalExpectedNetEV:recommendation.economics.expectedNetLpValue,globalAdjustmentWeight:0,globalRiskAdjustment:0,riskAdjustedExpectedNetEV:recommendation.economics.expectedNetLpValue,uncertaintyAuthority:'HARD_VETO' as const,hardBlockReasons:[],softRiskReasons:[]};
+  const candidateSimulation=forward.selectedSimulation;
+  const thesisEconomics=recommendation.thesis?.expectedEconomics;
+  const candidatePrimary=qualification.economicAuthority==='CANDIDATE_PRIMARY';
+  const candidateExpectedFeeValue=thesisEconomics?.candidateExpectedFees??candidateSimulation?.feeValue??recommendation.economics.expectedFeeValue;
+  const candidateExpectedInventoryPnl=thesisEconomics?.candidateExpectedInventoryPnl??candidateSimulation?.inventoryChangeValue??recommendation.economics.expectedInventoryPnl;
+  const candidateExecutionCosts=thesisEconomics?.candidateExecutionCosts??candidateSimulation?.totalCostValue??recommendation.economics.expectedExecutionCost;
+  const candidateRepositionCosts=thesisEconomics?.candidateRepositionCosts??0;
+  const candidateTailCosts=thesisEconomics?.candidateTailCosts??0;
   const outcome: FrozenPhase3ForwardDecision['phase3Outcome'] = recommendation.thesis ? 'ENTRY_READY' : recommendation.state === 'WATCHING' ? 'WATCHING' : 'NO_TRADE';
   return copy({
     recommendationId: recommendation.recommendationId,
@@ -70,16 +81,33 @@ export function freezePhase3ForwardDecision(input: { recommendation: ShadowRecom
     phase3Outcome: outcome,
     reasonCodes: recommendation.reasonCodes,
     prediction: {
-      expectedFeeValue: recommendation.economics.expectedFeeValue,
-      expectedInventoryPnl: recommendation.economics.expectedInventoryPnl,
-      expectedExecutionCost: recommendation.economics.expectedExecutionCost,
-      expectedRepositionCost: recommendation.economics.expectedRepositionCost,
-      expectedTailRiskCost: recommendation.economics.expectedTailRiskCharge,
-      expectedNetEv: recommendation.economics.expectedNetLpValue,
+      expectedFeeValue: candidatePrimary?candidateExpectedFeeValue:recommendation.economics.expectedFeeValue,
+      expectedInventoryPnl: candidatePrimary?candidateExpectedInventoryPnl:recommendation.economics.expectedInventoryPnl,
+      expectedExecutionCost: candidatePrimary?candidateExecutionCosts:recommendation.economics.expectedExecutionCost,
+      expectedRepositionCost: candidatePrimary?candidateRepositionCosts:recommendation.economics.expectedRepositionCost,
+      expectedTailRiskCost: candidatePrimary?candidateTailCosts:recommendation.economics.expectedTailRiskCharge,
+      // expectedNetEv is the decision's actual policy authority. Raw global
+      // and candidate values are retained separately for later calibration.
+      expectedNetEv: recommendation.thesis?.expectedEconomics?.netLpValue ?? qualification.riskAdjustedExpectedNetEV ?? recommendation.economics.expectedNetLpValue,
+      qualificationPolicy: qualification.policyId,
+      economicAuthority: qualification.economicAuthority,
+      candidateExpectedFeeValue,
+      candidateExpectedInventoryPnl,
+      candidateExecutionCosts,
+      candidateRepositionCosts,
+      candidateTailCosts,
+      candidateExpectedNetEV: qualification.candidateExpectedNetEV ?? candidateSimulation?.netValue ?? null,
+      globalExpectedNetEV: qualification.globalExpectedNetEV,
+      globalAdjustmentWeight: qualification.globalAdjustmentWeight,
+      globalRiskAdjustment: qualification.globalRiskAdjustment ?? null,
+      riskAdjustedExpectedNetEV: qualification.riskAdjustedExpectedNetEV ?? null,
+      uncertaintyAuthority: qualification.uncertaintyAuthority,
+      hardBlockReasons: qualification.hardBlockReasons,
+      softRiskReasons: qualification.softRiskReasons,
       expectedActiveTimeRatio: recommendation.economics.expectedActiveTimeRatio,
       predictedSurvivalProbability: forward.selectedSurvival?.survivalProbability ?? null,
       forecastUncertainty: recommendation.economics.forecastUncertainty,
-      transitionRisk: recommendation.regime.transitionRisk,
+      transitionRisk: recommendation.regime?.transitionRisk ?? null,
       evidenceFidelity: recommendation.economics.evidenceFidelity,
       evidenceActionable: forward.selectedSimulation?.evidenceActionable ?? false,
       normalizationScale: forward.selectedSimulation?.normalizationScale ?? 0,
@@ -89,7 +117,7 @@ export function freezePhase3ForwardDecision(input: { recommendation: ShadowRecom
       rawUnitValueX: forward.rawUnitValueX,
       rawUnitValueY: forward.rawUnitValueY,
       activeBinIdAtDecision: forward.activeBinIdAtDecision,
-      uncertaintyLineage: recommendation.uncertaintyLineage,
+      uncertaintyLineage: recommendation.uncertaintyLineage ?? null,
     },
     evidenceProvenance: {
       ...forward.evidence,

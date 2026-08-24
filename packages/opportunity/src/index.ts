@@ -28,6 +28,47 @@ export interface OpportunityEconomics extends Phase3OpportunityEconomicsContract
   economicallyPositive:boolean;
   reasonCodes:string[];
 }
+/**
+ * Qualification authority is versioned deliberately. Historical decisions
+ * retain global-primary meaning, while new decisions can make the selected,
+ * replayed candidate the economic authority without changing the opportunity
+ * model itself.
+ */
+export type Phase3QualificationPolicyId='global-primary-v1'|'candidate-primary-risk-adjusted-v1';
+export interface Phase3QualificationPolicy {
+  id:Phase3QualificationPolicyId;
+  economicAuthority:'GLOBAL_PRIMARY'|'CANDIDATE_PRIMARY';
+  globalAdjustmentWeight:number;
+  globalEconomicHardVeto:boolean;
+  globalUncertaintyHardVeto:boolean;
+}
+export const GLOBAL_PRIMARY_QUALIFICATION_POLICY_V1:Phase3QualificationPolicy={id:'global-primary-v1',economicAuthority:'GLOBAL_PRIMARY',globalAdjustmentWeight:0,globalEconomicHardVeto:true,globalUncertaintyHardVeto:true};
+/** Candidate EV plus exactly one half of the independent global forecast. */
+export const CANDIDATE_PRIMARY_RISK_ADJUSTED_QUALIFICATION_POLICY_V1:Phase3QualificationPolicy={id:'candidate-primary-risk-adjusted-v1',economicAuthority:'CANDIDATE_PRIMARY',globalAdjustmentWeight:.50,globalEconomicHardVeto:false,globalUncertaintyHardVeto:false};
+/** New runtime default. Callers can explicitly request global-primary-v1 for
+ * deterministic rollback and historical comparison. */
+export const DEFAULT_PHASE3_QUALIFICATION_POLICY=CANDIDATE_PRIMARY_RISK_ADJUSTED_QUALIFICATION_POLICY_V1;
+export function resolvePhase3QualificationPolicy(value?:Phase3QualificationPolicyId|string):Phase3QualificationPolicy{
+ if(value===undefined||value==='candidate-primary-risk-adjusted-v1')return CANDIDATE_PRIMARY_RISK_ADJUSTED_QUALIFICATION_POLICY_V1;
+ if(value==='global-primary-v1')return GLOBAL_PRIMARY_QUALIFICATION_POLICY_V1;
+ throw new Error(`LPFORGE_PHASE3_QUALIFICATION_POLICY_INVALID:${value}`);
+}
+export interface CandidatePrimaryQualificationEconomics {
+  candidateExpectedNetEV?:number|undefined;
+  globalExpectedNetEV:number;
+  globalAdjustmentWeight:number;
+  globalRiskAdjustment?:number|undefined;
+  riskAdjustedCandidateEV?:number|undefined;
+}
+/** This deliberately applies no additional uncertainty/regime/liquidity
+ * haircut: those remain in the existing candidate utility/global models. */
+export function deriveQualificationEconomics(policy:Phase3QualificationPolicy,economics:OpportunityEconomics,candidateExpectedNetEV?:number):CandidatePrimaryQualificationEconomics{
+ const globalExpectedNetEV=economics.expectedNetLpValue;
+ if(policy.economicAuthority==='GLOBAL_PRIMARY')return{candidateExpectedNetEV,globalExpectedNetEV,globalAdjustmentWeight:policy.globalAdjustmentWeight,globalRiskAdjustment:0,riskAdjustedCandidateEV:globalExpectedNetEV};
+ if(candidateExpectedNetEV===undefined||!Number.isFinite(candidateExpectedNetEV))return{candidateExpectedNetEV,globalExpectedNetEV,globalAdjustmentWeight:policy.globalAdjustmentWeight};
+ const globalRiskAdjustment=policy.globalAdjustmentWeight*globalExpectedNetEV;
+ return{candidateExpectedNetEV,globalExpectedNetEV,globalAdjustmentWeight:policy.globalAdjustmentWeight,globalRiskAdjustment,riskAdjustedCandidateEV:candidateExpectedNetEV+globalRiskAdjustment};
+}
 const clamp=(x:number,min=0,max=1)=>Math.max(min,Math.min(max,x));
 function prob(r:RegimeAssessment,label:string){return r.probabilities.find((x)=>x.label===label)?.probability??0;}
 export interface RegimeAmbiguity {normalizedEntropy:number;topTwoMargin:number;transitionRisk:number;historyTransitionRisk:number;flappingRate:number;shortStability:number;penalty:number;}
@@ -100,6 +141,36 @@ export interface OpportunityTransition {from:Phase3OpportunityState;to:Phase3Opp
 export function transitionOpportunity(state:Phase3OpportunityState,event:OpportunityEvent,at:string,reasonCodes:string[]=[]):OpportunityTransition{
  const to=transitionMap[state][event];if(!to)throw new Error(`LPFORGE_OPPORTUNITY_ILLEGAL_TRANSITION:${state}:${event}`);return{from:state,to,event,at,reasonCodes:[...new Set(reasonCodes)].sort(),recommendationOnly:true};
 }
-export function deriveOpportunityProgress(input:{pool:PoolAssessment;economics:OpportunityEconomics;regime:RegimeAssessment;now:string;expiresAt:string;}):{state:Phase3OpportunityState;reasonCodes:string[]}{
- const reasons:string[]=[];if(input.pool.dataQuality==='BAD'){reasons.push('DATA_QUALITY_BAD');return{state:'DATA_BLOCKED',reasonCodes:reasons};}if(input.pool.eligibility==='BLOCK'){reasons.push(...input.pool.blockers);return{state:'REJECTED',reasonCodes:[...new Set(reasons)].sort()};}if(Date.parse(input.now)>=Date.parse(input.expiresAt)){reasons.push('OPPORTUNITY_EXPIRED');return{state:'EXPIRED',reasonCodes:reasons};}if(!input.economics.economicallyPositive){reasons.push(...input.economics.reasonCodes);return{state:'REJECTED',reasonCodes:[...new Set(reasons)].sort()};}if(input.regime.transitionRisk>.65){reasons.push('REGIME_TRANSITION_RISK_HIGH');return{state:'WATCHING',reasonCodes:reasons};}if(input.economics.forecastUncertainty>.65){reasons.push('ECONOMIC_UNCERTAINTY_HIGH','ECONOMIC_FORECAST_UNCERTAINTY_HIGH');return{state:'WATCHING',reasonCodes:reasons};}if(input.economics.expectedActiveTimeRatio<.5){reasons.push('ACTIVE_TIME_NOT_READY');return{state:'WATCHING',reasonCodes:reasons};}return{state:'QUALIFIED',reasonCodes:['POSITIVE_LP_OPPORTUNITY']};
+export function deriveOpportunityProgress(input:{pool:PoolAssessment;economics:OpportunityEconomics;regime:RegimeAssessment;now:string;expiresAt:string;qualificationPolicy?:Phase3QualificationPolicy;candidateQualification?:CandidatePrimaryQualificationEconomics;locallyActionableWinner?:boolean;}):{state:Phase3OpportunityState;reasonCodes:string[]}{
+ const policy=input.qualificationPolicy??GLOBAL_PRIMARY_QUALIFICATION_POLICY_V1;
+ const reasons:string[]=[];
+ if(input.pool.dataQuality==='BAD'){reasons.push('DATA_QUALITY_BAD');return{state:'DATA_BLOCKED',reasonCodes:reasons};}
+ if(input.pool.eligibility==='BLOCK'){reasons.push(...input.pool.blockers);return{state:'REJECTED',reasonCodes:[...new Set(reasons)].sort()};}
+ if(Date.parse(input.now)>=Date.parse(input.expiresAt)){reasons.push('OPPORTUNITY_EXPIRED');return{state:'EXPIRED',reasonCodes:reasons};}
+ if(policy.globalEconomicHardVeto){
+  if(!input.economics.economicallyPositive){reasons.push(...input.economics.reasonCodes);return{state:'REJECTED',reasonCodes:[...new Set(reasons)].sort()};}
+  if(input.regime.transitionRisk>.65){reasons.push('REGIME_TRANSITION_RISK_HIGH');return{state:'WATCHING',reasonCodes:reasons};}
+  if(input.economics.forecastUncertainty>.65){reasons.push('ECONOMIC_UNCERTAINTY_HIGH','ECONOMIC_FORECAST_UNCERTAINTY_HIGH');return{state:'WATCHING',reasonCodes:reasons};}
+  if(input.economics.expectedActiveTimeRatio<.5){reasons.push('ACTIVE_TIME_NOT_READY');return{state:'WATCHING',reasonCodes:reasons};}
+  return{state:'QUALIFIED',reasonCodes:['POSITIVE_LP_OPPORTUNITY']};
+ }
+ // Candidate-primary keeps only data and upstream pool-safety blocks above.
+ // Global economics/context adjusts and diagnoses the selected candidate; it
+ // cannot independently recreate the global-primary veto.
+ if(input.locallyActionableWinner!==true)return{state:'REJECTED',reasonCodes:['CANDIDATE_PRIMARY_NO_LOCALLY_ACTIONABLE_WINNER']};
+ const adjusted=input.candidateQualification?.riskAdjustedCandidateEV;
+ if(!Number.isFinite(adjusted))return{state:'REJECTED',reasonCodes:['CANDIDATE_PRIMARY_ECONOMICS_INVALID']};
+ if(!(adjusted!>0)){
+  reasons.push('CANDIDATE_PRIMARY_RISK_ADJUSTED_EV_NON_POSITIVE');
+  if(input.economics.expectedNetLpValue<0)reasons.push('GLOBAL_EV_NEGATIVE_RISK_ADJUSTED');
+  return{state:'REJECTED',reasonCodes:reasons};
+ }
+ reasons.push('CANDIDATE_PRIMARY_POSITIVE_RISK_ADJUSTED_EV');
+ if(input.economics.expectedNetLpValue<0)reasons.push('GLOBAL_EV_NEGATIVE_RISK_ADJUSTED');
+ if(input.regime.transitionRisk>.65)reasons.push('REGIME_TRANSITION_RISK_HIGH_SOFT');
+ if(input.economics.forecastUncertainty>.65)reasons.push('FORECAST_UNCERTAINTY_HIGH_SOFT');
+ if(input.economics.expectedActiveTimeRatio<.5)reasons.push('EXPECTED_ACTIVE_TIME_LOW_SOFT');
+ if(input.economics.dangerousRegimeMass>.35)reasons.push('DANGEROUS_REGIME_MASS_HIGH_SOFT');
+ if(input.pool.toxicityProbability>.55)reasons.push('FLOW_TOXICITY_HIGH_SOFT');
+ return{state:'QUALIFIED',reasonCodes:reasons};
 }

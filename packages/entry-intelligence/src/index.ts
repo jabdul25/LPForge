@@ -8,10 +8,10 @@ export const ENTRY_RESEARCH_POLICY_V1:EntryPolicy={id:'entry-research-v1',minRea
 export interface EntryRecommendation extends Phase4EntryRecommendationContract {policyId:string;readinessScore:number;thesisId:string;expectedNetLpValue:number;hardBlocks:string[];waitReasons:string[];}
 const clamp=(x:number,min=0,max=1)=>Math.max(min,Math.min(max,x));
 export function evaluateEntry(input:{features:EntryTimingFeatureVector;economics:OpportunityEconomics;thesis:MachineReadableLpThesis;observedAt:string;expiresAt:string;policy?:EntryPolicy;}):EntryRecommendation{
- const p=input.policy??ENTRY_RESEARCH_POLICY_V1,f=input.features,e=input.economics;
- if(Date.parse(input.observedAt)>=Date.parse(input.expiresAt))return{phase:'P4',paperOnly:true,liveSigning:false,decision:'REJECT',observedAt:input.observedAt,expiresAt:input.expiresAt,reasonCodes:['ENTRY_RECOMMENDATION_EXPIRED'],confidence:0,policyId:p.id,readinessScore:0,thesisId:input.thesis.thesisId,expectedNetLpValue:e.expectedNetLpValue,hardBlocks:['ENTRY_RECOMMENDATION_EXPIRED'],waitReasons:[]};
+ const p=input.policy??ENTRY_RESEARCH_POLICY_V1,f=input.features,e=input.economics,primaryExpectedNetLpValue=input.thesis.expectedEconomics?.netLpValue??e.expectedNetLpValue;
+ if(Date.parse(input.observedAt)>=Date.parse(input.expiresAt))return{phase:'P4',paperOnly:true,liveSigning:false,decision:'REJECT',observedAt:input.observedAt,expiresAt:input.expiresAt,reasonCodes:['ENTRY_RECOMMENDATION_EXPIRED'],confidence:0,policyId:p.id,readinessScore:0,thesisId:input.thesis.thesisId,expectedNetLpValue:primaryExpectedNetLpValue,hardBlocks:['ENTRY_RECOMMENDATION_EXPIRED'],waitReasons:[]};
  const hard:string[]=[];
- if(e.expectedNetLpValue<=p.minExpectedNetValue)hard.push('ENTRY_NET_VALUE_NON_POSITIVE');
+ if(primaryExpectedNetLpValue<=p.minExpectedNetValue)hard.push('ENTRY_NET_VALUE_NON_POSITIVE');
  if(f.dataCompleteness<p.minDataCompleteness)hard.push('ENTRY_DATA_QUALITY_BLOCK');
  if(f.dangerousRegimeMass>p.maxDangerousRegimeMass)hard.push('ENTRY_DANGEROUS_REGIME_BLOCK');
  if(f.poolToxicity>p.maxToxicity)hard.push('ENTRY_TOXICITY_BLOCK');
@@ -29,5 +29,5 @@ export function evaluateEntry(input:{features:EntryTimingFeatureVector;economics
  const decision=hard.length?'REJECT':wait.length?'WAIT':'ENTRY_READY';
  const reasonCodes=decision==='ENTRY_READY'?['ENTRY_TIMING_APPROVED']:[...new Set([...hard,...wait])].sort();
  const confidence=clamp(readiness*(1-e.uncertainty)*(1-f.dangerousRegimeMass));
- return{phase:'P4',paperOnly:true,liveSigning:false,decision,observedAt:input.observedAt,expiresAt:input.expiresAt,reasonCodes,confidence,policyId:p.id,readinessScore:readiness,thesisId:input.thesis.thesisId,expectedNetLpValue:e.expectedNetLpValue,hardBlocks:hard,waitReasons:wait};
+ return{phase:'P4',paperOnly:true,liveSigning:false,decision,observedAt:input.observedAt,expiresAt:input.expiresAt,reasonCodes,confidence,policyId:p.id,readinessScore:readiness,thesisId:input.thesis.thesisId,expectedNetLpValue:primaryExpectedNetLpValue,hardBlocks:hard,waitReasons:wait};
 }

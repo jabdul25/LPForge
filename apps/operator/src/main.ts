@@ -50,6 +50,7 @@ import { derivePhase3EvidenceWidthRequirement } from "../../../packages/rangefor
 import { PublicKey } from "@solana/web3.js";
 import { readFileSync } from "node:fs";
 import { freezePhase3ForwardDecision, phase3ForwardDecisionStoreValue, type RuntimeArtifactProvenance } from "../../../packages/phase3-forward-validation/src/index.js";
+import type { Phase3QualificationPolicyId } from "../../../packages/opportunity/src/index.js";
 
 function json(v: unknown) {
   return JSON.stringify(
@@ -59,6 +60,11 @@ function json(v: unknown) {
   );
 }
 const lamportsToSol = (value: bigint) => Number(value) / 1_000_000_000;
+function phase3QualificationPolicyFromEnvironment():Phase3QualificationPolicyId{
+  const value=process.env.LPFORGE_PHASE3_QUALIFICATION_POLICY??'candidate-primary-risk-adjusted-v1';
+  if(value==='global-primary-v1'||value==='candidate-primary-risk-adjusted-v1')return value;
+  throw new Error(`LPFORGE_PHASE3_QUALIFICATION_POLICY_INVALID:${value}`);
+}
 function verifiedForwardArtifactProvenance():RuntimeArtifactProvenance{
   const manifest=JSON.parse(readFileSync('RELEASE_MANIFEST.json','utf8')) as {sourceCommit?:unknown;buildIdentity?:unknown;policyHash?:unknown;migrationHead?:unknown};
   const sourceRevision=readFileSync('SOURCE_REVISION.txt','utf8').trim().replace(/^source_git_commit=/,'');
@@ -804,6 +810,7 @@ async function liveOnce() {
       priorRegimeAssessments,
       protocolCompatible: true,
       walletCapital,
+      qualificationPolicy: phase3QualificationPolicyFromEnvironment(),
       ...productionCapital,
       planPreparationEnabled: allowRiskIncreasingPlans && openPlanCapacity.approved,
       ...(!openPlanCapacity.approved
@@ -952,6 +959,7 @@ async function fixtureOnce() {
     },
     protocolCompatible: true,
     walletCapital: 1,
+    qualificationPolicy: phase3QualificationPolicyFromEnvironment(),
   });
   console.log(json(result));
   return result;

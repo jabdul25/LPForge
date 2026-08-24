@@ -24,7 +24,7 @@ module.exports = {
     merge_logs: true,
     out_file: path.join(__dirname, 'logs', 'lpforge-production.out.log'),
     error_file: path.join(__dirname, 'logs', 'lpforge-production.err.log'),
-    env: { NODE_ENV: 'production', PATH: runtimePath }
+    env: { NODE_ENV: 'production', PATH: runtimePath, LPFORGE_PHASE3_QUALIFICATION_POLICY: 'candidate-primary-risk-adjusted-v1' }
   },{
     name: 'lpforge-execution',
     cwd: __dirname,
