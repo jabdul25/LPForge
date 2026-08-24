@@ -82,3 +82,9 @@ test('discovery-learning start wiring keeps forward maturation outside the long 
   assert.match(source,/startIndependentForwardMaturationLoop/);assert.match(source,/includeForwardMaturation:false/);assert.match(source,/deriveForwardMaturationRetryPlan/);assert.match(source,/FORWARD_MATURATION_FAILED/);
   assert.match(source,/LPFORGE_FORWARD_VALIDATION_PRIORITY_SOURCE_SHA/);
 });
+
+test('discovery-learning launcher honors an explicit validation cohort priority',async()=>{
+  const launcher=await readFile('scripts/start-lpforge-service.sh','utf8');
+  assert.match(launcher,/\[\[ -z "\$\{LPFORGE_FORWARD_VALIDATION_PRIORITY_SOURCE_SHA:-\}" \]\]/);
+  assert.match(launcher,/export LPFORGE_FORWARD_VALIDATION_PRIORITY_SOURCE_SHA=/);
+});

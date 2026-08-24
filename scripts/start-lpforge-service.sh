@@ -9,7 +9,9 @@ case "$service" in
   discovery) target='.build/apps/discovery/src/main.js' ;;
   discovery-learning)
     target='.build/apps/discovery-learning/src/main.js'
-    export LPFORGE_FORWARD_VALIDATION_PRIORITY_SOURCE_SHA="$(node -e 'const manifest=require("./RELEASE_MANIFEST.json");if(typeof manifest.sourceCommit!=="string"||!/^[0-9a-f]{40}$/i.test(manifest.sourceCommit))process.exit(1);process.stdout.write(manifest.sourceCommit)')"
+    if [[ -z "${LPFORGE_FORWARD_VALIDATION_PRIORITY_SOURCE_SHA:-}" ]]; then
+      export LPFORGE_FORWARD_VALIDATION_PRIORITY_SOURCE_SHA="$(node -e 'const manifest=require("./RELEASE_MANIFEST.json");if(typeof manifest.sourceCommit!=="string"||!/^[0-9a-f]{40}$/i.test(manifest.sourceCommit))process.exit(1);process.stdout.write(manifest.sourceCommit)')"
+    fi
     ;;
   execution)
     [[ -f .env.execution ]] || { echo 'LPFORGE_EXECUTION_ENV_REQUIRED' >&2; exit 1; }
