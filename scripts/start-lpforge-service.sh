@@ -10,7 +10,7 @@ case "$service" in
   discovery-learning)
     target='.build/apps/discovery-learning/src/main.js'
     if [[ -z "${LPFORGE_FORWARD_VALIDATION_PRIORITY_SOURCE_SHA:-}" ]]; then
-      export LPFORGE_FORWARD_VALIDATION_PRIORITY_SOURCE_SHA="$(node -e 'const manifest=require("./RELEASE_MANIFEST.json");if(typeof manifest.sourceCommit!=="string"||!/^[0-9a-f]{40}$/i.test(manifest.sourceCommit))process.exit(1);process.stdout.write(manifest.sourceCommit)')"
+      export LPFORGE_FORWARD_VALIDATION_PRIORITY_SOURCE_SHA="$(node --env-file=.env -e 'const configured=process.env.LPFORGE_FORWARD_VALIDATION_PRIORITY_SOURCE_SHA?.trim();if(configured){if(!/^[0-9a-f]{40}$/i.test(configured))process.exit(1);process.stdout.write(configured)}else{const manifest=require("./RELEASE_MANIFEST.json");if(typeof manifest.sourceCommit!=="string"||!/^[0-9a-f]{40}$/i.test(manifest.sourceCommit))process.exit(1);process.stdout.write(manifest.sourceCommit)}')"
     fi
     ;;
   execution)
