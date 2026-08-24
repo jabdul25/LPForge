@@ -61,8 +61,8 @@ test('partial live confirmation preserves its state while fresh historical evide
  assert.equal(result.evidence.maturity.liveConfirmationState,'PENDING');
 });
 
-test('a fresh event-path estimate with non-positive economics remains NO_TRADE',async()=>{
- const result=await evaluateOperationalCycle({...base,history:freshHistory,evidenceMaturity:phase3Fresh,economicEvidence:{fidelity:'EVENT_PATH_ESTIMATE',effectiveSampleCount:3,feeRatePerCapitalHour:0,uncertainty:.4,evidenceAgeSeconds:30,rawObservationCount:24,independentEpisodeCount:3,feeObservationCount:12,eventPathObservationCount:12}});
+test('global-primary-v1 preserves non-positive global economics as NO_TRADE',async()=>{
+ const result=await evaluateOperationalCycle({...base,qualificationPolicy:'global-primary-v1',history:freshHistory,evidenceMaturity:phase3Fresh,economicEvidence:{fidelity:'EVENT_PATH_ESTIMATE',effectiveSampleCount:3,feeRatePerCapitalHour:0,uncertainty:.4,evidenceAgeSeconds:30,rawObservationCount:24,independentEpisodeCount:3,feeObservationCount:12,eventPathObservationCount:12}});
  assert.equal(result.phase3Status,'NO_TRADE');
  assert.ok(result.reasonCodes.includes('EXPECTED_NET_VALUE_NON_POSITIVE')||result.reasonCodes.includes('CANDIDATE_REPLAY_ANCHOR_UNAVAILABLE'));
 });
