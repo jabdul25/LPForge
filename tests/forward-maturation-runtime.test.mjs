@@ -26,6 +26,15 @@ test('queue starvation regression: due PENDING rows outrank old INSUFFICIENT_EVI
   assert.equal(firstBatch.length,12);assert.ok(firstBatch.every(row=>row.state==='PENDING'));assert.deepEqual(firstBatch.map(row=>row.recommendationId),pending.slice(0,12).map(row=>row.recommendationId));
 });
 
+test('current release due PENDING rows outrank legacy due PENDING backlog without promoting retries',()=>{
+  const legacy=Array.from({length:20},(_,index)=>task(`legacy-${index}`,30,'PENDING',{sourceSha:'legacy',dueAt:new Date(Date.parse('2026-08-23T00:00:00.000Z')+index*60_000).toISOString()}));
+  const current=Array.from({length:4},(_,index)=>task(`current-${index}`,30,'PENDING',{sourceSha:'current',dueAt:new Date(Date.parse('2026-08-23T01:00:00.000Z')+index*60_000).toISOString()}));
+  const retry=task('current-retry',30,'INSUFFICIENT_EVIDENCE',{sourceSha:'current',nextRetryAt:'2026-08-23T00:00:00.000Z'});
+  const firstBatch=prioritizeForwardMaturationTasks([...legacy,...current,retry],'current').slice(0,12);
+  assert.deepEqual(firstBatch.slice(0,4).map(row=>row.recommendationId),current.map(row=>row.recommendationId));
+  assert.ok(firstBatch.slice(4).every(row=>row.state==='PENDING'));assert.equal(firstBatch.includes(retry),false);
+});
+
 test('INSUFFICIENT_EVIDENCE retries are bounded; terminal frozen-candidate gaps never retry',()=>{
   const at='2026-08-23T00:00:00.000Z';
   const retry=deriveForwardMaturationRetryPlan({priorState:'PENDING',resultState:'INSUFFICIENT_EVIDENCE',reasonCodes:['FORWARD_FUTURE_EVIDENCE_INSUFFICIENT'],retryCount:0,attemptedAt:at});
@@ -64,10 +73,12 @@ test('durable SQL queue gives due PENDING first priority and records explicit re
   const source=await readFile('packages/db/src/index.ts','utf8'),migration=await readFile('packages/db/migrations/M0047_phase3_forward_maturation_queue.sql','utf8');
   assert.match(source,/o\.state='PENDING' OR \(o\.state='INSUFFICIENT_EVIDENCE' AND o\.terminal_at IS NULL/);
   assert.match(source,/ORDER BY CASE WHEN o\.state='PENDING' THEN 0 ELSE 1 END ASC/);
+  assert.match(source,/CASE WHEN \$3::text<>'' AND d\.source_sha=\$3 THEN 0 ELSE 1 END ASC/);
   assert.match(source,/next_retry_at/);assert.match(source,/retryNoProgress/);assert.match(migration,/next_retry_at/);assert.match(migration,/terminal_at/);
 });
 
 test('discovery-learning start wiring keeps forward maturation outside the long learning loop',async()=>{
   const source=await readFile('apps/discovery-learning/src/main.ts','utf8');
   assert.match(source,/startIndependentForwardMaturationLoop/);assert.match(source,/includeForwardMaturation:false/);assert.match(source,/deriveForwardMaturationRetryPlan/);assert.match(source,/FORWARD_MATURATION_FAILED/);
+  assert.match(source,/LPFORGE_FORWARD_VALIDATION_PRIORITY_SOURCE_SHA/);
 });

@@ -8,6 +8,7 @@ export interface ForwardMaturationTask {
   retryCount?: number;
   dueAt?: string;
   nextRetryAt?: string;
+  sourceSha?: string;
 }
 
 export interface ForwardMaturationTaskResult {
@@ -79,13 +80,15 @@ export function deriveForwardMaturationRetryPlan(input:{priorState:ForwardMatura
 
 /** Defense-in-depth ordering mirrors the durable SQL queue: newly due PENDING
  * work first, oldest due first; only then eligible insufficient-evidence retries. */
-export function prioritizeForwardMaturationTasks<T extends ForwardMaturationTask>(tasks:readonly T[]):T[]{
+export function prioritizeForwardMaturationTasks<T extends ForwardMaturationTask>(tasks:readonly T[],prioritySourceSha?:string):T[]{
   const state=(task:T):ForwardMaturationState=>task.state??'PENDING';
   const time=(value:string|undefined)=>{const parsed=Date.parse(value??'');return Number.isFinite(parsed)?parsed:Number.POSITIVE_INFINITY;};
   return [...tasks].sort((a,b)=>{
     const priority=(state(a)==='PENDING'?0:1)-(state(b)==='PENDING'?0:1);
     if(priority)return priority;
     const aAt=state(a)==='PENDING'?time(a.dueAt):time(a.nextRetryAt??a.dueAt),bAt=state(b)==='PENDING'?time(b.dueAt):time(b.nextRetryAt??b.dueAt);
+    const sourcePriority=(a.sourceSha===prioritySourceSha?0:1)-(b.sourceSha===prioritySourceSha?0:1);
+    if(prioritySourceSha&&sourcePriority)return sourcePriority;
     return aAt-bAt||a.horizonMinutes-b.horizonMinutes||a.recommendationId.localeCompare(b.recommendationId);
   });
 }
@@ -96,8 +99,9 @@ export async function processDueForwardMaturations<T extends ForwardMaturationTa
   mature(task: T): Promise<R>;
   persist(task: T, result: R): Promise<ForwardMaturationPersistence>;
   emit?(event: ForwardMaturationLogEvent): void;
+  prioritySourceSha?: string;
 }): Promise<ForwardMaturationBatchSummary> {
-  const tasks=prioritizeForwardMaturationTasks(input.tasks);
+  const tasks=prioritizeForwardMaturationTasks(input.tasks,input.prioritySourceSha);
   const summary: ForwardMaturationBatchSummary = { selected:tasks.length,attempted:0,stateTransitions:0,newFinal:0,newInsufficient:0,retryNoProgress:0,persistedWrites:0,due:tasks.length,processed:0,finalized:0,insufficient:0,failed:0,persisted:0 };
   if(summary.selected)input.emit?.({event:'FORWARD_MATURATION_DUE',due:summary.selected});
   for(const task of tasks){

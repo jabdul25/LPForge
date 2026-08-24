@@ -7,7 +7,10 @@ env_args=(--env-file=.env)
 case "$service" in
   production) target='.build/apps/production/src/main.js' ;;
   discovery) target='.build/apps/discovery/src/main.js' ;;
-  discovery-learning) target='.build/apps/discovery-learning/src/main.js' ;;
+  discovery-learning)
+    target='.build/apps/discovery-learning/src/main.js'
+    export LPFORGE_FORWARD_VALIDATION_PRIORITY_SOURCE_SHA="$(node -e 'const manifest=require("./RELEASE_MANIFEST.json");if(typeof manifest.sourceCommit!=="string"||!/^[0-9a-f]{40}$/i.test(manifest.sourceCommit))process.exit(1);process.stdout.write(manifest.sourceCommit)')"
+    ;;
   execution)
     [[ -f .env.execution ]] || { echo 'LPFORGE_EXECUTION_ENV_REQUIRED' >&2; exit 1; }
     env_args+=(--env-file=.env.execution)

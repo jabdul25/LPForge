@@ -17,9 +17,10 @@ function outcomeFromRow(row:Record<string,unknown>):OutcomeRecord{
 }
 const object=(value:unknown):Record<string,unknown>=>value&&typeof value==='object'&&!Array.isArray(value)?value as Record<string,unknown>:{};
 const finite=(value:unknown):number|undefined=>typeof value==='number'&&Number.isFinite(value)?value:undefined;
+const forwardMaturationPrioritySourceSha=(process.env.LPFORGE_FORWARD_VALIDATION_PRIORITY_SOURCE_SHA??'').trim();
 async function maturePhase3ForwardOutcomes(store:Awaited<ReturnType<typeof createPostgresStore>>,now:string){
- const due=await store.loadDuePhase3ForwardOutcomes(now,Math.max(1,Math.min(50,Number(process.env.LPFORGE_FORWARD_VALIDATION_MAX_BATCH??12))));
- const batch=await processDueForwardMaturations({tasks:due,mature:async row=>{
+ const due=await store.loadDuePhase3ForwardOutcomes(now,Math.max(1,Math.min(50,Number(process.env.LPFORGE_FORWARD_VALIDATION_MAX_BATCH??12))),forwardMaturationPrioritySourceSha||undefined);
+ const batch=await processDueForwardMaturations({tasks:due,...(forwardMaturationPrioritySourceSha?{prioritySourceSha:forwardMaturationPrioritySourceSha}:{}),mature:async row=>{
    const decision=row.decisionPayload as unknown as FrozenPhase3ForwardDecision,start=Date.parse(decision.decisionTimestamp);if(!Number.isFinite(start))throw new Error('LPFORGE_FORWARD_DECISION_TIMESTAMP_INVALID');
    const history=await store.loadOperationalHistory(decision.poolAddress,new Date(start-15*60_000).toISOString(),2000);
    return matureFrozenPhase3ForwardOutcome({decision,horizonMinutes:row.horizonMinutes,outcomeModelVersion:row.outcomeModelVersion,frames:history.binFrames,events:history.swapEvents,now});
