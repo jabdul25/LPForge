@@ -507,7 +507,7 @@ async function persistResult(
     // path. A capture failure is observable, but the already durable Phase-3
     // decision remains exactly as it was before this instrumentation existed.
     try {
-      const frozen=freezePhase3ForwardDecision({recommendation:r.shadow,artifact:verifiedForwardArtifactProvenance()});
+      const frozen=freezePhase3ForwardDecision({recommendation:r.shadow,artifact:verifiedForwardArtifactProvenance(),...(r.entry?{phase4:{result:r.entry.decision,readinessScore:r.entry.readinessScore,timingConfidence:r.entry.confidence,reasonCodes:[...r.entry.reasonCodes],diagnostics:{phase4EconomicUncertainty:r.entry.phase4EconomicUncertainty,phase4TimingConfidence:r.entry.phase4TimingConfidence,uncertaintyNoLongerBlocking:r.entry.uncertaintyNoLongerBlocking,removedBlockerReason:r.entry.removedBlockerReason,hardBlocks:[...r.entry.hardBlocks],waitReasons:[...r.entry.waitReasons]}}}:{})});
       await store.insertPhase3ForwardDecision(phase3ForwardDecisionStoreValue(frozen));
     } catch (error) {
       console.error(json({event:'lpforge_phase3_forward_capture_failed',recommendationId:r.shadow.recommendationId,error:error instanceof Error?error.message:String(error),authority:'RESEARCH_ONLY_NO_POLICY_MUTATION'}));

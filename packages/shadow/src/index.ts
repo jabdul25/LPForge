@@ -22,12 +22,46 @@ export interface ShadowRecommendationInput {
   priorRegimeAssessments?:RegimeHistorySample[];totalPositionShareRaw?:bigint;rawUnitValueX:number;rawUnitValueY:number;costs?:SimulationCostModel;
   orientations?:RangeStrategyCandidate['orientation'][];strategies?:RangeStrategyCandidate['strategy'][];strategyOrientations?:Partial<Record<RangeStrategyCandidate['strategy'],RangeStrategyCandidate['orientation'][]>>;capitalFractions?:number[];maxRangeWidthBins?:number;qualificationPolicy?:Phase3QualificationPolicyId;
 }
+/**
+ * Immutable, reporting-only pool-quality experiment. These labels are derived
+ * solely from the assessment already available to Phase 3. They are never
+ * supplied to qualification, candidate ranking, Phase 4, or execution.
+ */
+export interface PoolQualityProspectiveShadowSnapshot {
+  version:'pool-quality-prospective-shadow-v1';
+  membership:{CONTROL:true;A:boolean;B:boolean;C:boolean};
+  poolQualityScore:number;
+  economicQualityScore:number;
+  liquidityQualityScore:number;
+  flowQualityScore:number;
+  toxicityProbability:number;
+  fee1hTvl:number|null;
+  fee24hTvl:number|null;
+}
+const finiteOrNull=(value:unknown):number|null=>typeof value==='number'&&Number.isFinite(value)?value:null;
+export function derivePoolQualityProspectiveShadowSnapshot(pool:PoolAssessment):PoolQualityProspectiveShadowSnapshot {
+  const fee1hTvl=finiteOrNull(pool.evidence.fee1hTvl),fee24hTvl=finiteOrNull(pool.evidence.fee24hTvl);
+  const a=fee1hTvl!==null&&fee1hTvl>=.02;
+  const b=a&&pool.economicQualityScore>=75;
+  return {
+    version:'pool-quality-prospective-shadow-v1',
+    membership:{CONTROL:true,A:a,B:b,C:b&&pool.toxicityProbability<=.30},
+    poolQualityScore:pool.poolQualityScore,
+    economicQualityScore:pool.economicQualityScore,
+    liquidityQualityScore:pool.liquidityQualityScore,
+    flowQualityScore:pool.flowQualityScore,
+    toxicityProbability:pool.toxicityProbability,
+    fee1hTvl,
+    fee24hTvl,
+  };
+}
+
 export interface ShadowRecommendation {
   recommendationId:string;phase:'P3';recommendationOnly:true;decisionAt:string;expiresAt:string;pool:string;state:string;noTrade:boolean;
   marketContextHash:string;regime:RegimeAssessment;regimeHistory:ReturnType<typeof analyzeRegimeHistory>;pullback?:ReturnType<typeof assessControlledPullback>;breakoutPullback?:ReturnType<typeof assessBreakoutControlledPullback>;
   economics:ReturnType<typeof estimateOpportunityEconomics>;qualification:{policyId:Phase3QualificationPolicyId;economicAuthority:'GLOBAL_PRIMARY'|'CANDIDATE_PRIMARY';candidateExpectedNetEV?:number|undefined;globalExpectedNetEV:number;globalAdjustmentWeight:number;globalRiskAdjustment?:number|undefined;riskAdjustedExpectedNetEV?:number|undefined;uncertainty:number;uncertaintyAuthority:'HARD_VETO'|'SOFT_CONTEXT';hardBlockReasons:string[];softRiskReasons:string[];};uncertaintyLineage:{evidenceUncertainty:number;forecastUncertainty:number;components:ReturnType<typeof estimateOpportunityEconomics>['forecastUncertaintyComponents'];};candidateCount:number;simulations:CandidateEconomicSimulation[];ranking:CandidateRankingResult;
   /** Immutable, compact decision-time material for shadow-only forward validation. */
-  forwardValidation:{version:'phase3-forward-decision-v1';horizonMinutes:number;capitalValue:number;capitalLamports:string;activeBinIdAtDecision:number;rawUnitValueX:number;rawUnitValueY:number;costs:Required<SimulationCostModel>;selectedCandidateKind:'RANKING_WINNER'|'TOP_RANKED_COUNTERFACTUAL'|'NONE';selectedCandidate?:RangeStrategyCandidate;selectedSimulation?:CandidateEconomicSimulation;selectedSurvival?:SurvivalForecast;evidence:{replayAnchorAt?:string;replayEvidenceWatermark:string;historicalFrameHash:string;historicalEventHash:string;latestFrameAt?:string;latestEventAt?:string;};wouldAugEraThesisSemanticsHaveCreatedThesis:boolean;};
+  forwardValidation:{version:'phase3-forward-decision-v1';horizonMinutes:number;capitalValue:number;capitalLamports:string;activeBinIdAtDecision:number;rawUnitValueX:number;rawUnitValueY:number;costs:Required<SimulationCostModel>;selectedCandidateKind:'RANKING_WINNER'|'TOP_RANKED_COUNTERFACTUAL'|'NONE';selectedCandidate?:RangeStrategyCandidate;selectedSimulation?:CandidateEconomicSimulation;selectedSurvival?:SurvivalForecast;evidence:{replayAnchorAt?:string;replayEvidenceWatermark:string;historicalFrameHash:string;historicalEventHash:string;latestFrameAt?:string;latestEventAt?:string;};poolQualityShadow:PoolQualityProspectiveShadowSnapshot;wouldAugEraThesisSemanticsHaveCreatedThesis:boolean;};
   thesis?:MachineReadableLpThesis;reasonCodes:string[];
 }
 function assertFramesHistorical(decisionAt:string,frames:BinFrame[],events:SwapEventFact[]){const t=Date.parse(decisionAt);for(const f of frames)if(Date.parse(f.observedAt)>t)throw new Error(`LPFORGE_SHADOW_LOOKAHEAD_FRAME:${f.observedAt}`);for(const e of events)if(Date.parse(e.stamp.observedAt)>t)throw new Error(`LPFORGE_SHADOW_LOOKAHEAD_EVENT:${e.stamp.observedAt}`);}
@@ -80,6 +114,6 @@ export async function buildShadowRecommendation(input:ShadowRecommendationInput)
  const frameRows=input.historicalFrames.filter(frame=>Date.parse(frame.observedAt)<=Date.parse(input.decisionAt));
  const eventRows=input.historicalEvents.filter(event=>Date.parse(event.stamp.observedAt)<=Date.parse(input.decisionAt));
  const selectedCandidateKind=(selectedCandidate?(winner?'RANKING_WINNER':'TOP_RANKED_COUNTERFACTUAL'):'NONE') as 'RANKING_WINNER'|'TOP_RANKED_COUNTERFACTUAL'|'NONE';
- const forwardValidation={version:'phase3-forward-decision-v1' as const,horizonMinutes:input.horizonMinutes,capitalValue:input.capitalValue,capitalLamports:String(Math.max(0,Math.round(input.capitalValue*1_000_000_000))),activeBinIdAtDecision:input.activeBinId,rawUnitValueX:input.rawUnitValueX,rawUnitValueY:input.rawUnitValueY,costs:{compositionFeeValue:input.costs?.compositionFeeValue??'0',transactionFeeValue:input.costs?.transactionFeeValue??'0',slippageValue:input.costs?.slippageValue??'0',rebalanceCostValue:input.costs?.rebalanceCostValue??'0',otherCostValue:input.costs?.otherCostValue??'0'},selectedCandidateKind,...(selectedCandidate?{selectedCandidate}:{}),...(selectedSimulation?{selectedSimulation}:{}),...(selectedSurvival?{selectedSurvival}:{}),evidence:{replayEvidenceWatermark:input.decisionAt,historicalFrameHash:await sha256Hex(canonicalJson(frameRows)),historicalEventHash:await sha256Hex(canonicalJson(eventRows)),...(frameRows.at(-1)?{latestFrameAt:frameRows.at(-1)!.observedAt}:{}),...(eventRows.at(-1)?{latestEventAt:eventRows.at(-1)!.stamp.observedAt}:{}),...(selectedCandidateId&&replayAnchorByCandidate.get(selectedCandidateId)?{replayAnchorAt:replayAnchorByCandidate.get(selectedCandidateId)!}:{})},wouldAugEraThesisSemanticsHaveCreatedThesis:Boolean(selectedCandidate&&economics.economicallyPositive&&!['REJECTED','EXPIRED','DATA_BLOCKED'].includes(progress.state))};
+ const forwardValidation={version:'phase3-forward-decision-v1' as const,horizonMinutes:input.horizonMinutes,capitalValue:input.capitalValue,capitalLamports:String(Math.max(0,Math.round(input.capitalValue*1_000_000_000))),activeBinIdAtDecision:input.activeBinId,rawUnitValueX:input.rawUnitValueX,rawUnitValueY:input.rawUnitValueY,costs:{compositionFeeValue:input.costs?.compositionFeeValue??'0',transactionFeeValue:input.costs?.transactionFeeValue??'0',slippageValue:input.costs?.slippageValue??'0',rebalanceCostValue:input.costs?.rebalanceCostValue??'0',otherCostValue:input.costs?.otherCostValue??'0'},selectedCandidateKind,...(selectedCandidate?{selectedCandidate}:{}),...(selectedSimulation?{selectedSimulation}:{}),...(selectedSurvival?{selectedSurvival}:{}),evidence:{replayEvidenceWatermark:input.decisionAt,historicalFrameHash:await sha256Hex(canonicalJson(frameRows)),historicalEventHash:await sha256Hex(canonicalJson(eventRows)),...(frameRows.at(-1)?{latestFrameAt:frameRows.at(-1)!.observedAt}:{}),...(eventRows.at(-1)?{latestEventAt:eventRows.at(-1)!.stamp.observedAt}:{}),...(selectedCandidateId&&replayAnchorByCandidate.get(selectedCandidateId)?{replayAnchorAt:replayAnchorByCandidate.get(selectedCandidateId)!}:{})},poolQualityShadow:derivePoolQualityProspectiveShadowSnapshot(input.poolAssessment),wouldAugEraThesisSemanticsHaveCreatedThesis:Boolean(selectedCandidate&&economics.economicallyPositive&&!['REJECTED','EXPIRED','DATA_BLOCKED'].includes(progress.state))};
  const core={phase:'P3' as const,recommendationOnly:true as const,decisionAt:input.decisionAt,expiresAt:input.expiresAt,pool:input.pool,state:noTrade?progress.state:'ENTRY_READY',noTrade,marketContextHash:context.hash,regime,regimeHistory,pullback,breakoutPullback,economics,qualification,uncertaintyLineage,candidateCount:candidates.length,simulations,ranking,forwardValidation,...(thesis?{thesis}:{}),reasonCodes};return{recommendationId:await sha256Hex(canonicalJson(core)),...core};
 }

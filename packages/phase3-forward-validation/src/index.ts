@@ -18,6 +18,14 @@ export interface RuntimeArtifactProvenance {
   migrationHead: string;
 }
 
+export interface FrozenPhase4ForwardSnapshot {
+  result:string;
+  readinessScore:number|null;
+  timingConfidence:number|null;
+  reasonCodes:string[];
+  diagnostics:Record<string,unknown>;
+}
+
 export interface FrozenPhase3ForwardDecision {
   recommendationId: string;
   decisionId: string;
@@ -38,6 +46,8 @@ export interface FrozenPhase3ForwardDecision {
   selectedSurvival?: ShadowRecommendation['forwardValidation']['selectedSurvival'];
   selectedCandidateKind: ShadowRecommendation['forwardValidation']['selectedCandidateKind'];
   wouldAugEraThesisSemanticsHaveCreatedThesis: boolean;
+  poolQualityShadow?: ShadowRecommendation['forwardValidation']['poolQualityShadow'];
+  phase4: FrozenPhase4ForwardSnapshot;
 }
 
 function copy<T>(value: T): T {
@@ -54,7 +64,7 @@ function requireArtifact(value: RuntimeArtifactProvenance): void {
  * Snapshot only facts already computed at decision time.  This has no import
  * path into Phase 3, Phase 4, P7, discovery ranking, or execution.
  */
-export function freezePhase3ForwardDecision(input: { recommendation: ShadowRecommendation; artifact: RuntimeArtifactProvenance }): FrozenPhase3ForwardDecision {
+export function freezePhase3ForwardDecision(input: { recommendation: ShadowRecommendation; artifact: RuntimeArtifactProvenance; phase4?: FrozenPhase4ForwardSnapshot }): FrozenPhase3ForwardDecision {
   requireArtifact(input.artifact);
   const recommendation = input.recommendation;
   const forward = recommendation.forwardValidation;
@@ -68,6 +78,7 @@ export function freezePhase3ForwardDecision(input: { recommendation: ShadowRecom
   const candidateExpectedInventoryPnl=thesisEconomics?.candidateExpectedInventoryPnl??candidateSimulation?.inventoryChangeValue??recommendation.economics.expectedInventoryPnl;
   const candidateExecutionCosts=thesisEconomics?.candidateExecutionCosts??candidateSimulation?.totalCostValue??recommendation.economics.expectedExecutionCost;
   const candidateRepositionCosts=thesisEconomics?.candidateRepositionCosts??0;
+  const phase4=input.phase4??{result:'NOT_EVALUATED',readinessScore:null,timingConfidence:null,reasonCodes:[],diagnostics:{}};
   const candidateTailCosts=thesisEconomics?.candidateTailCosts??0;
   const outcome: FrozenPhase3ForwardDecision['phase3Outcome'] = recommendation.thesis ? 'ENTRY_READY' : recommendation.state === 'WATCHING' ? 'WATCHING' : 'NO_TRADE';
   return copy({
@@ -77,6 +88,8 @@ export function freezePhase3ForwardDecision(input: { recommendation: ShadowRecom
     decisionTimestamp: recommendation.decisionAt,
     ...input.artifact,
     capitalLamports: forward.capitalLamports,
+    phase4,
+    ...(forward.poolQualityShadow?{poolQualityShadow:forward.poolQualityShadow}:{}),
     phase3State: recommendation.state,
     phase3Outcome: outcome,
     reasonCodes: recommendation.reasonCodes,
@@ -561,6 +574,57 @@ export function buildPhase3ForwardCalibration(rows: CalibrationRow[], options?: 
   return { summary: { predictions: rows.length, final: final.length, insufficientEvidence: rows.filter(row => row.outcome.state === 'INSUFFICIENT_EVIDENCE').length, predictedNegativeRealizedNegative: negativeNegative, predictedNegativeRealizedPositive: negativePositive, predictedPositiveRealizedPositive: positivePositive, predictedPositiveRealizedNegative: positiveNegative }, evBuckets: by(final, row => evBucket(Number(row.decision.prediction.expectedNetEv))), uncertaintyBuckets: by(final, row => uncertaintyBucket(Number(row.decision.prediction.forecastUncertainty))), byHorizon, progressStateCohorts: progress(final), positiveEvProgressStateCohorts: positiveProgress(final) };
 }
 
+
+export type PoolQualityProspectiveClassification='GENERALIZING'|'PROMISING_BUT_CONCENTRATED'|'NO_IMPROVEMENT'|'TOO_EARLY';
+export interface PoolQualityProspectivePoolStats {
+  final:number; wins:number; losses:number; winRate:number|null;
+  realizedFees:number; realizedInventoryPnl:number; realizedEv:number; expectancy:number|null; profitFactor:number|null;
+}
+export interface PoolQualityProspectiveCohortStats extends PoolQualityProspectivePoolStats {
+  decisions:number; pending:number; insufficientEvidence:number; failedDataIntegrity:number;
+  uniquePoolCount:number; profitableUniquePoolCount:number; losingUniquePoolCount:number;
+  largestProfitablePool:{poolAddress:string;realizedEv:number;grossProfitShare:number}|null;
+  largestLosingPool:{poolAddress:string;realizedEv:number;grossLossShare:number}|null;
+  byPool:Record<string,PoolQualityProspectivePoolStats>;
+  classification:PoolQualityProspectiveClassification;
+}
+export interface PoolQualityProspectiveShadowReport {
+  experimentVersion:'pool-quality-prospective-shadow-v1';
+  outcomeModelVersion:string;
+  frozenDecisionCount:number;
+  byHorizon:Record<string,Record<'CONTROL'|'A'|'B'|'C',PoolQualityProspectiveCohortStats>>;
+}
+type PoolQualityMembership={CONTROL:true;A:boolean;B:boolean;C:boolean};
+type PoolQualityDecision=FrozenPhase3ForwardDecision&{poolQualityShadow?:{version?:string;membership?:PoolQualityMembership}};
+const poolQualityCohorts=['CONTROL','A','B','C'] as const;
+const value=(input:unknown):number=>typeof input==='number'&&Number.isFinite(input)?input:0;
+function poolQualityClassification(stats:PoolQualityProspectiveCohortStats):PoolQualityProspectiveClassification {
+  if(stats.final===0||stats.uniquePoolCount<3)return'TOO_EARLY';
+  if(stats.expectancy===null||stats.expectancy<=0)return'NO_IMPROVEMENT';
+  if((stats.largestProfitablePool?.grossProfitShare??1)>.5)return'PROMISING_BUT_CONCENTRATED';
+  return'GENERALIZING';
+}
+function poolQualityStats(rows:CalibrationRow[]):PoolQualityProspectiveCohortStats {
+  const final=rows.filter(row=>row.outcome.state==='FINAL'&&row.outcome.realized),profits=final.map(row=>value(row.outcome.realized?.realizedNetValue));
+  const wins=profits.filter(x=>x>0).length,losses=profits.length-wins,grossProfit=profits.filter(x=>x>0).reduce((a,b)=>a+b,0),grossLoss=-profits.filter(x=>x<0).reduce((a,b)=>a+b,0);
+  const raw={final:final.length,wins,losses,winRate:final.length?wins/final.length:null,realizedFees:final.reduce((sum,row)=>sum+value(row.outcome.realized?.realizedFeeValue),0),realizedInventoryPnl:final.reduce((sum,row)=>sum+value(row.outcome.realized?.realizedInventoryPnl),0),realizedEv:profits.reduce((a,b)=>a+b,0),expectancy:profits.length?profits.reduce((a,b)=>a+b,0)/profits.length:null,profitFactor:grossLoss?grossProfit/grossLoss:grossProfit?Infinity:null};
+  const pools=[...new Set(rows.map(row=>row.decision.poolAddress))].sort();
+  const byPool=Object.fromEntries(pools.map(pool=>[pool,poolQualityStatsFlat(rows.filter(row=>row.decision.poolAddress===pool))]));
+  const finalPools=Object.entries(byPool).filter(([,stats])=>stats.final>0),positive=[...finalPools].filter(([,stats])=>stats.realizedEv>0).sort((a,b)=>b[1].realizedEv-a[1].realizedEv),negative=[...finalPools].filter(([,stats])=>stats.realizedEv<0).sort((a,b)=>a[1].realizedEv-b[1].realizedEv);
+  const stats:PoolQualityProspectiveCohortStats={decisions:rows.length,pending:rows.filter(row=>row.outcome.state==='PENDING').length,insufficientEvidence:rows.filter(row=>row.outcome.state==='INSUFFICIENT_EVIDENCE').length,failedDataIntegrity:rows.filter(row=>row.outcome.state==='FAILED_DATA_INTEGRITY').length,...raw,uniquePoolCount:pools.length,profitableUniquePoolCount:positive.length,losingUniquePoolCount:negative.length,largestProfitablePool:positive[0]?{poolAddress:positive[0][0],realizedEv:positive[0][1].realizedEv,grossProfitShare:grossProfit?positive[0][1].realizedEv/grossProfit:0}:null,largestLosingPool:negative[0]?{poolAddress:negative[0][0],realizedEv:negative[0][1].realizedEv,grossLossShare:grossLoss?-negative[0][1].realizedEv/grossLoss:0}:null,byPool,classification:'TOO_EARLY'};
+  return{...stats,classification:poolQualityClassification(stats)};
+}
+function poolQualityStatsFlat(rows:CalibrationRow[]):PoolQualityProspectivePoolStats {
+  const final=rows.filter(row=>row.outcome.state==='FINAL'&&row.outcome.realized),values=final.map(row=>value(row.outcome.realized?.realizedNetValue)),wins=values.filter(x=>x>0).length,grossProfit=values.filter(x=>x>0).reduce((a,b)=>a+b,0),grossLoss=-values.filter(x=>x<0).reduce((a,b)=>a+b,0);
+  return{final:final.length,wins,losses:values.length-wins,winRate:values.length?wins/values.length:null,realizedFees:final.reduce((sum,row)=>sum+value(row.outcome.realized?.realizedFeeValue),0),realizedInventoryPnl:final.reduce((sum,row)=>sum+value(row.outcome.realized?.realizedInventoryPnl),0),realizedEv:values.reduce((a,b)=>a+b,0),expectancy:values.length?values.reduce((a,b)=>a+b,0)/values.length:null,profitFactor:grossLoss?grossProfit/grossLoss:grossProfit?Infinity:null};
+}
+/** Reporting-only pool-quality experiment. It consumes immutable snapshots and
+ * V2 outcomes; no decision or execution module imports this report. */
+export function buildPoolQualityProspectiveShadowReport(rows:CalibrationRow[],options?:{outcomeModelVersion?:string}):PoolQualityProspectiveShadowReport {
+  const scoped=rows.filter(row=>(!options?.outcomeModelVersion||row.outcome.outcomeModelVersion===options.outcomeModelVersion)&&(row.decision as PoolQualityDecision).poolQualityShadow?.version==='pool-quality-prospective-shadow-v1');
+  const byHorizon=Object.fromEntries(PHASE3_FORWARD_HORIZONS_MINUTES.map(horizon=>[String(horizon),Object.fromEntries(poolQualityCohorts.map(cohort=>[cohort,poolQualityStats(scoped.filter(row=>row.outcome.horizonMinutes===horizon&&(row.decision as PoolQualityDecision).poolQualityShadow?.membership?.[cohort]===true))]))])) as PoolQualityProspectiveShadowReport['byHorizon'];
+  return{experimentVersion:'pool-quality-prospective-shadow-v1',outcomeModelVersion:options?.outcomeModelVersion??'ALL',frozenDecisionCount:new Set(scoped.map(row=>row.decision.recommendationId)).size,byHorizon};
+}
 
 /** Deterministic episode view: within one pool/model/horizon, retain the first
  * decision and suppress later decision windows that overlap its frozen horizon.
