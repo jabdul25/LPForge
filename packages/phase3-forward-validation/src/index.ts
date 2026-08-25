@@ -209,7 +209,12 @@ function inWindow(timestamp: string, start: number, end: number): boolean {
   return Number.isFinite(value) && value > start && value <= end;
 }
 
-interface CapitalConstrainedForwardPosition {
+/**
+ * The V2 capital representation is also consumed by the downstream,
+ * research-only telemetry recorder.  Exporting this pure representation does
+ * not give telemetry any authority over maturation or Phase-3 decisions.
+ */
+export interface CapitalConstrainedForwardPosition {
   position: SyntheticPosition;
   frozenCapitalLamports: bigint;
   allocatedCapitalLamports: bigint;
@@ -268,7 +273,7 @@ function allocateForwardCapital(capitalLamports: bigint, weights: bigint[]): big
  * rawUnitValueY is the frozen token-X value of one WSOL lamport, so it is also
  * the frozen conversion from the token-X valuation contract back to lamports.
  */
-function deriveCapitalConstrainedForwardPosition(input: {
+export function deriveCapitalConstrainedForwardPosition(input: {
   decision: FrozenPhase3ForwardDecision;
   candidate: NonNullable<FrozenPhase3ForwardDecision['selectedCandidate']>;
   baseline: BinFrame;
@@ -356,7 +361,7 @@ function deriveCapitalConstrainedForwardPosition(input: {
   };
 }
 
-function forwardV2ValueLamports(tokenXRaw: bigint, tokenYRaw: bigint, rawUnitValueX: number, rawUnitValueY: number): bigint | undefined {
+export function forwardV2ValueLamports(tokenXRaw: bigint, tokenYRaw: bigint, rawUnitValueX: number, rawUnitValueY: number): bigint | undefined {
   const x = forwardSafeNumber(tokenXRaw), y = forwardSafeNumber(tokenYRaw);
   if (x === undefined || y === undefined || !Number.isFinite(rawUnitValueX) || rawUnitValueX <= 0 || !Number.isFinite(rawUnitValueY) || rawUnitValueY <= 0) return undefined;
   const value = (x * rawUnitValueX + y * rawUnitValueY) / rawUnitValueY;

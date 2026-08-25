@@ -644,6 +644,15 @@ export interface Phase1Store {
   loadDuePhase3ForwardOutcomes(now: string, limit: number, prioritySourceSha?: string): Promise<Array<{recommendationId:string;horizonMinutes:30|60|120;outcomeModelVersion:string;sourceSha?:string;decisionPayload:Record<string,unknown>;state:'PENDING'|'INSUFFICIENT_EVIDENCE'|'FINAL'|'FAILED_DATA_INTEGRITY';retryCount:number;dueAt:string;nextRetryAt?:string;evidenceHash?:string;resultHash?:string}>>;
   persistPhase3ForwardOutcome(value:{recommendationId:string;horizonMinutes:30|60|120;outcomeModelVersion:string;state:'PENDING'|'INSUFFICIENT_EVIDENCE'|'FINAL'|'FAILED_DATA_INTEGRITY';evidenceHash?:string;resultHash?:string;reasonCodes:string[];realized?:Record<string,unknown>;payload:Record<string,unknown>;maturedAt:string;attemptedAt:string;retryCount:number;nextRetryAt?:string;terminalAt?:string}):Promise<{writeApplied:boolean;stateTransition:boolean;retryNoProgress:boolean}>;
   loadPhase3ForwardOutcomes(limit?:number): Promise<Array<Record<string,unknown>>>;
+  /** Prospective-only research telemetry. No Phase-3/4 consumer calls these. */
+  preparePostEntryTelemetryEpisodes(capturedAt:string):Promise<{created:number}>;
+  loadDuePostEntryTelemetryCheckpoints(now:string,limit:number):Promise<Array<{
+    telemetryEpisodeId:string;checkpointKey:string;observationType:'ENTRY'|'CHECKPOINT'|'FINALIZATION';targetAt:string;decisionAt:string;sourceVersion:string;frozenHeader:Record<string,unknown>;decisionPayload:Record<string,unknown>;decisionCheckpointContent?:Record<string,unknown>;previousCheckpointContent?:Record<string,unknown>;terminalOutcomes?:Array<Record<string,unknown>>;
+  }>>;
+  appendPostEntryTelemetryObservation(value:{
+    telemetryEpisodeId:string;checkpointKey:string;observationType:'ENTRY'|'CHECKPOINT'|'FINALIZATION';targetAt:string;observedAt?:string;capturedAt:string;checkpointStatus:'OBSERVED'|'MISSED'|'DELAYED'|'SOURCE_UNAVAILABLE'|'DUPLICATE_REJECTED'|'INTEGRITY_CONFLICT';sourceVersion:string;collectorVersion:string;valuationContractVersion:string;content:Record<string,unknown>;
+  }):Promise<{status:'INSERTED'|'DUPLICATE_REJECTED'|'INTEGRITY_CONFLICT';observationId?:string;sequenceNumber?:number;contentHash:string;currentHash?:string}>;
+  loadPostEntryTelemetryEpisode(telemetryEpisodeId:string):Promise<{headerHash:string;observations:Array<Record<string,unknown>>;manifest:Array<Record<string,unknown>>}|undefined>;
   insertRegimeAssessment(value: {
     poolAddress: string;
     decisionAt: string;
@@ -2030,6 +2039,73 @@ export async function createPostgresStore(
       const lim=Math.max(1,Math.min(10000,Math.floor(limit)));
       const r=await db.query(`SELECT d.payload AS decision_payload,o.recommendation_id,o.horizon_minutes,o.outcome_model_version,o.state,o.evidence_hash,o.result_hash,o.reason_codes,o.realized,o.payload,o.created_at,o.matured_at FROM research.phase3_forward_outcomes o JOIN research.phase3_forward_decisions d ON d.recommendation_id=o.recommendation_id ORDER BY d.decision_at DESC,o.horizon_minutes ASC LIMIT $1`,[lim]);
       return r.rows.map(row=>({decisionPayload:(row.decision_payload??{}) as Record<string,unknown>,recommendationId:String(row.recommendation_id),horizonMinutes:Number(row.horizon_minutes),outcomeModelVersion:String(row.outcome_model_version),state:String(row.state),...(row.evidence_hash?{evidenceHash:String(row.evidence_hash)}:{}),...(row.result_hash?{resultHash:String(row.result_hash)}:{}),reasonCodes:(row.reason_codes??[]) as string[],...(row.realized?{realized:row.realized as Record<string,unknown>}:{}) ,payload:(row.payload??{}) as Record<string,unknown>,createdAt:new Date(String(row.created_at)).toISOString(),...(row.matured_at?{maturedAt:new Date(String(row.matured_at)).toISOString()}:{})}));
+    },
+    async preparePostEntryTelemetryEpisodes(capturedAt) {
+      const activation=await db.query(`SELECT activated_at FROM research.post_entry_telemetry_activation WHERE activation_id='post-entry-state-telemetry-v2'`);
+      const activatedAt=activation.rows[0]?.activated_at;
+      if(!activatedAt)throw new Error('LPFORGE_POST_ENTRY_TELEMETRY_ACTIVATION_MISSING');
+      const rows=await db.query(`SELECT d.*,p.token_x_mint,p.token_y_mint,p.bin_step,tx.decimals AS token_x_decimals,tx.symbol AS token_x_symbol,ty.decimals AS token_y_decimals,ty.symbol AS token_y_symbol FROM research.phase3_forward_decisions d JOIN protocol.pools p ON p.address=d.pool_address LEFT JOIN protocol.tokens tx ON tx.mint=p.token_x_mint LEFT JOIN protocol.tokens ty ON ty.mint=p.token_y_mint WHERE d.decision_at >= $1::timestamptz AND NOT EXISTS(SELECT 1 FROM research.post_entry_telemetry_episodes e WHERE e.recommendation_id=d.recommendation_id) ORDER BY d.decision_at ASC`,[activatedAt]);
+      let created=0;
+      for(const row of rows.rows){
+        const payload=(row.payload??{}) as Record<string,unknown>,phase4=(payload.phase4&&typeof payload.phase4==='object'&&!Array.isArray(payload.phase4)?payload.phase4:{}) as Record<string,unknown>,prediction=(row.prediction??{}) as Record<string,unknown>,evidence=(row.evidence_provenance??{}) as Record<string,unknown>,recommendationId=String(row.recommendation_id),telemetryEpisodeId=`post-entry-v2:${recommendationId}`;
+        const phase4Diagnostics=phase4.diagnostics&&typeof phase4.diagnostics==='object'&&!Array.isArray(phase4.diagnostics)?phase4.diagnostics as Record<string,unknown>:{};
+        const phase4EvaluatedAt=typeof phase4.evaluatedAt==='string'?phase4.evaluatedAt:(typeof phase4Diagnostics.evaluatedAt==='string'?phase4Diagnostics.evaluatedAt:null);
+        const frozenHeader={authority:'RESEARCH_ONLY_NO_POLICY_MUTATION',telemetrySchemaVersion:'post-entry-state-telemetry-v2',outcomeModelVersion:'phase3-forward-outcome-v2',identity:{telemetryEpisodeId,recommendationId,decisionId:String(row.decision_id),poolAddress:String(row.pool_address),decisionAt:toIsoTimestamp(row.decision_at),...(phase4EvaluatedAt?{phase4EvaluatedAt}:{}),sourceSha:String(row.source_sha),buildId:String(row.build_id),migrationHead:String(row.migration_head)},decision:{phase3State:String(row.phase3_state),phase3Outcome:String(row.phase3_outcome),phase4State:typeof phase4.result==='string'?phase4.result:'NOT_EVALUATED',waitReasons:Array.isArray(phase4.reasonCodes)?phase4.reasonCodes.map(String):[],rejectReasons:Array.isArray(phase4.reasonCodes)?phase4.reasonCodes.map(String):[],reasonCodes:Array.isArray(row.reason_codes)?row.reason_codes.map(String):[]},economics:{candidateExpectedNetEV:prediction.candidateExpectedNetEV??null,riskAdjustedExpectedNetEV:prediction.riskAdjustedExpectedNetEV??prediction.expectedNetEv??null,candidateUtility:prediction.candidateUtility??null,expectedFees:prediction.candidateExpectedFeeValue??prediction.expectedFeeValue??null,expectedInventoryPnl:prediction.candidateExpectedInventoryPnl??prediction.expectedInventoryPnl??null,uncertainty:prediction.forecastUncertainty??null,timingConfidence:phase4.timingConfidence??null},position:{strategy:row.strategy??null,orientation:row.orientation??null,rangeFamily:row.range_family??null,lowerBinId:row.lower_bin_id??null,upperBinId:row.upper_bin_id??null,activeBinIdAtDecision:Number(row.active_bin_id_at_decision),width:row.included_bin_count??null,capitalLamports:String(row.capital_lamports),binWeights:row.candidate_weights??[]},provenance:{evidenceWatermark:evidence.replayEvidenceWatermark??evidence.historicalEventHash??null,policyHash:String(row.policy_hash),predictionSnapshotVersion:payload.forwardValidation&&typeof payload.forwardValidation==='object'?(payload.forwardValidation as Record<string,unknown>).version??null:null,tokenXMint:String(row.token_x_mint),tokenYMint:String(row.token_y_mint),tokenXDecimals:row.token_x_decimals??null,tokenYDecimals:row.token_y_decimals??null,tokenXSymbol:row.token_x_symbol??null,tokenYSymbol:row.token_y_symbol??null,binStep:Number(row.bin_step)},valuationContract:{version:'phase3-forward-v2-frozen-valuation-v1',quoteAsset:'SOL_LAMPORTS',rawUnitValueX:prediction.rawUnitValueX??null,rawUnitValueY:prediction.rawUnitValueY??null,conversionRule:'frozen-token-X-value-over-frozen-WSOL-lamport-value',precisionRule:'bigint-raw-units-floor',roundingRule:'truncation',calculationVersion:'phase3-forward-outcome-v2'},frozenDecisionPayload:payload};
+        const headerHash=await sha256Hex(canonicalJson(frozenHeader));
+        const inserted=await db.query(`INSERT INTO research.post_entry_telemetry_episodes(telemetry_episode_id,recommendation_id,decision_id,pool_address,decision_at,phase4_evaluated_at,source_sha,build_id,migration_head,telemetry_schema_version,outcome_model_version,frozen_position_status,frozen_header,header_hash,captured_at,authority) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'post-entry-state-telemetry-v2','phase3-forward-outcome-v2',$10,$11::jsonb,$12,$13,'RESEARCH_ONLY_NO_POLICY_MUTATION') ON CONFLICT(recommendation_id) DO NOTHING RETURNING telemetry_episode_id`,[telemetryEpisodeId,recommendationId,String(row.decision_id),String(row.pool_address),toIsoTimestamp(row.decision_at),phase4EvaluatedAt,String(row.source_sha),String(row.build_id),String(row.migration_head),String(row.selected_candidate_kind)==='NONE'?'FROZEN_POSITION_UNAVAILABLE':'AVAILABLE_FOR_RESEARCH_REPLAY',json(frozenHeader),headerHash,capturedAt]);
+        if(inserted.rows.length)created++;
+      }
+      return{created};
+    },
+    async loadDuePostEntryTelemetryCheckpoints(now,limit) {
+      const lim=Math.max(1,Math.min(500,Math.floor(limit)));
+      const r=await db.query(`WITH scheduled AS (
+        SELECT e.telemetry_episode_id,e.recommendation_id,e.decision_at,e.source_sha,e.frozen_header,checkpoint.checkpoint_key,checkpoint.observation_type,e.decision_at+(checkpoint.offset_minutes||' minutes')::interval AS target_at,NULL::jsonb AS terminal_outcomes
+        FROM research.post_entry_telemetry_episodes e
+        CROSS JOIN (VALUES ('DECISION','ENTRY',0),('M1','CHECKPOINT',1),('M5','CHECKPOINT',5),('M10','CHECKPOINT',10),('M15','CHECKPOINT',15),('M30','CHECKPOINT',30),('M60','CHECKPOINT',60),('M120','CHECKPOINT',120)) AS checkpoint(checkpoint_key,observation_type,offset_minutes)
+        WHERE e.decision_at+(checkpoint.offset_minutes||' minutes')::interval <= $1::timestamptz
+          AND NOT EXISTS(SELECT 1 FROM research.post_entry_telemetry_observations o WHERE o.telemetry_episode_id=e.telemetry_episode_id AND o.checkpoint_key=checkpoint.checkpoint_key)
+      ), finalization AS (
+        SELECT e.telemetry_episode_id,e.recommendation_id,e.decision_at,e.source_sha,e.frozen_header,'FINALIZATION'::text AS checkpoint_key,'FINALIZATION'::text AS observation_type,COALESCE(o.terminal_at,o.matured_at,o.created_at) AS target_at,
+          (SELECT jsonb_agg(jsonb_build_object('horizonMinutes',all_o.horizon_minutes,'state',all_o.state,'evidenceHash',all_o.evidence_hash,'resultHash',all_o.result_hash,'reasonCodes',all_o.reason_codes,'realized',all_o.realized,'maturedAt',all_o.matured_at,'terminalAt',all_o.terminal_at) ORDER BY all_o.horizon_minutes) FROM research.phase3_forward_outcomes all_o WHERE all_o.recommendation_id=e.recommendation_id AND all_o.outcome_model_version='phase3-forward-outcome-v2') AS terminal_outcomes
+        FROM research.post_entry_telemetry_episodes e
+        JOIN research.phase3_forward_outcomes o ON o.recommendation_id=e.recommendation_id AND o.horizon_minutes=120 AND o.outcome_model_version='phase3-forward-outcome-v2'
+        WHERE o.state IN ('FINAL','INSUFFICIENT_EVIDENCE','FAILED_DATA_INTEGRITY')
+          AND NOT EXISTS(SELECT 1 FROM research.post_entry_telemetry_observations obs WHERE obs.telemetry_episode_id=e.telemetry_episode_id AND obs.checkpoint_key='FINALIZATION')
+      ), due AS (SELECT * FROM scheduled UNION ALL SELECT * FROM finalization)
+      SELECT due.*,d.payload AS decision_payload,decision_obs.content AS decision_checkpoint_content,previous_obs.content AS previous_checkpoint_content
+      FROM due JOIN research.phase3_forward_decisions d ON d.recommendation_id=due.recommendation_id
+      LEFT JOIN research.post_entry_telemetry_observations decision_obs ON decision_obs.telemetry_episode_id=due.telemetry_episode_id AND decision_obs.checkpoint_key='DECISION'
+      LEFT JOIN LATERAL(SELECT content FROM research.post_entry_telemetry_observations prior WHERE prior.telemetry_episode_id=due.telemetry_episode_id AND prior.checkpoint_key<>'FINALIZATION' ORDER BY prior.target_at DESC,prior.sequence_number DESC LIMIT 1) previous_obs ON true
+      ORDER BY due.target_at ASC,due.telemetry_episode_id ASC LIMIT $2`,[now,lim]);
+      return r.rows.map(row=>({telemetryEpisodeId:String(row.telemetry_episode_id),checkpointKey:String(row.checkpoint_key),observationType:String(row.observation_type) as 'ENTRY'|'CHECKPOINT'|'FINALIZATION',targetAt:toIsoTimestamp(row.target_at),decisionAt:toIsoTimestamp(row.decision_at),sourceVersion:String(row.source_sha),frozenHeader:(row.frozen_header??{}) as Record<string,unknown>,decisionPayload:(row.decision_payload??{}) as Record<string,unknown>,...(row.decision_checkpoint_content?{decisionCheckpointContent:row.decision_checkpoint_content as Record<string,unknown>}:{}),...(row.previous_checkpoint_content?{previousCheckpointContent:row.previous_checkpoint_content as Record<string,unknown>}:{}),...(Array.isArray(row.terminal_outcomes)?{terminalOutcomes:row.terminal_outcomes as Array<Record<string,unknown>>}:{})}));
+    },
+    async appendPostEntryTelemetryObservation(v) {
+      const contentHash=await sha256Hex(canonicalJson(v.content));
+      await db.query('BEGIN');
+      try{
+        const episode=await db.query(`SELECT header_hash FROM research.post_entry_telemetry_episodes WHERE telemetry_episode_id=$1 FOR UPDATE`,[v.telemetryEpisodeId]);
+        const header=episode.rows[0];if(!header)throw new Error('LPFORGE_POST_ENTRY_TELEMETRY_EPISODE_MISSING');
+        const existing=await db.query(`SELECT observation_id,content_hash FROM research.post_entry_telemetry_observations WHERE telemetry_episode_id=$1 AND checkpoint_key=$2`,[v.telemetryEpisodeId,v.checkpointKey]);
+        if(existing.rows[0]){
+          const status=String(existing.rows[0].content_hash)===contentHash?'DUPLICATE_REJECTED':'INTEGRITY_CONFLICT';
+          await db.query(`INSERT INTO research.post_entry_telemetry_capture_audit(telemetry_episode_id,checkpoint_key,attempted_at,capture_status,attempted_content_hash,detail,authority) VALUES($1,$2,$3,$4,$5,$6::jsonb,'RESEARCH_ONLY_NO_POLICY_MUTATION')`,[v.telemetryEpisodeId,v.checkpointKey,v.capturedAt,status,contentHash,json({existingObservationId:String(existing.rows[0].observation_id),existingContentHash:String(existing.rows[0].content_hash)})]);
+          await db.query('COMMIT');return{status,contentHash};
+        }
+        const prior=await db.query(`SELECT sequence_number,current_hash FROM research.telemetry_manifest WHERE telemetry_episode_id=$1 ORDER BY sequence_number DESC LIMIT 1 FOR UPDATE`,[v.telemetryEpisodeId]);
+        const sequenceNumber=prior.rows[0]?Number(prior.rows[0].sequence_number)+1:1,previousHash=prior.rows[0]?String(prior.rows[0].current_hash):String(header.header_hash),observationId=`telemetry-observation:${await sha256Hex(canonicalJson({telemetryEpisodeId:v.telemetryEpisodeId,checkpointKey:v.checkpointKey,contentHash}))}`;
+        const currentHash=await sha256Hex(canonicalJson({telemetryEpisodeId:v.telemetryEpisodeId,sequenceNumber,observationId,observationType:v.observationType,observedAt:v.observedAt??null,capturedAt:v.capturedAt,sourceVersion:v.sourceVersion,collectorVersion:v.collectorVersion,contentHash,previousHash,captureStatus:v.checkpointStatus}));
+        await db.query(`INSERT INTO research.post_entry_telemetry_observations(observation_id,telemetry_episode_id,sequence_number,checkpoint_key,observation_type,target_at,observed_at,captured_at,checkpoint_status,source_version,collector_version,valuation_contract_version,content_hash,content) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb)`,[observationId,v.telemetryEpisodeId,sequenceNumber,v.checkpointKey,v.observationType,v.targetAt,v.observedAt??null,v.capturedAt,v.checkpointStatus,v.sourceVersion,v.collectorVersion,v.valuationContractVersion,contentHash,json(v.content)]);
+        await db.query(`INSERT INTO research.telemetry_manifest(telemetry_episode_id,sequence_number,observation_id,observation_type,observed_at,captured_at,source_version,collector_version,content_hash,previous_hash,current_hash,capture_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,[v.telemetryEpisodeId,sequenceNumber,observationId,v.observationType,v.observedAt??null,v.capturedAt,v.sourceVersion,v.collectorVersion,contentHash,previousHash,currentHash,v.checkpointStatus]);
+        await db.query(`INSERT INTO research.post_entry_telemetry_capture_audit(telemetry_episode_id,checkpoint_key,attempted_at,capture_status,attempted_content_hash,detail,authority) VALUES($1,$2,$3,'INSERTED',$4,$5::jsonb,'RESEARCH_ONLY_NO_POLICY_MUTATION')`,[v.telemetryEpisodeId,v.checkpointKey,v.capturedAt,contentHash,json({observationId,sequenceNumber,currentHash})]);
+        await db.query('COMMIT');return{status:'INSERTED' as const,observationId,sequenceNumber,contentHash,currentHash};
+      }catch(error){try{await db.query('ROLLBACK');}catch{}throw error;}
+    },
+    async loadPostEntryTelemetryEpisode(telemetryEpisodeId) {
+      const episode=await db.query(`SELECT header_hash FROM research.post_entry_telemetry_episodes WHERE telemetry_episode_id=$1`,[telemetryEpisodeId]);
+      if(!episode.rows[0])return undefined;
+      const [observations,manifest]=await Promise.all([db.query(`SELECT observation_id,sequence_number,checkpoint_key,observation_type,target_at,observed_at,captured_at,checkpoint_status,source_version,collector_version,valuation_contract_version,content_hash,content FROM research.post_entry_telemetry_observations WHERE telemetry_episode_id=$1 ORDER BY sequence_number ASC`,[telemetryEpisodeId]),db.query(`SELECT sequence_number,observation_id,observation_type,observed_at,captured_at,source_version,collector_version,content_hash,previous_hash,current_hash,capture_status FROM research.telemetry_manifest WHERE telemetry_episode_id=$1 ORDER BY sequence_number ASC`,[telemetryEpisodeId])]);
+      return{headerHash:String(episode.rows[0].header_hash),observations:observations.rows,manifest:manifest.rows};
     },
     async insertRegimeAssessment(v) {
       await db.query(
@@ -3443,6 +3519,10 @@ export function createMemoryStore(): Phase1Store {
     async loadDuePhase3ForwardOutcomes() { return []; },
     async persistPhase3ForwardOutcome() { return {writeApplied:false,stateTransition:false,retryNoProgress:false}; },
     async loadPhase3ForwardOutcomes() { return []; },
+    async preparePostEntryTelemetryEpisodes() { return {created:0}; },
+    async loadDuePostEntryTelemetryCheckpoints() { return []; },
+    async appendPostEntryTelemetryObservation(v) { return {status:'INSERTED' as const,contentHash:await sha256Hex(canonicalJson(v.content))}; },
+    async loadPostEntryTelemetryEpisode() { return undefined; },
     async insertRegimeAssessment() {},
     async insertLpThesis() {},
     async insertEntryEvaluation() {},
