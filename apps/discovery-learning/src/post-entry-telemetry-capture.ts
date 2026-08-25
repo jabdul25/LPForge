@@ -69,6 +69,8 @@ export function startIndependentPostEntryTelemetryLoop(input:{intervalMs:number;
     running=true;
     try{await input.run();}catch(error){input.onError(error);}finally{running=false;}
   };
-  void tick();
+  // Startup once() performs the first capture. Delay this independent loop so
+  // the same due checkpoint cannot be concurrently captured twice.
+  setTimeout(()=>void tick(),interval).unref();
   setInterval(()=>void tick(),interval).unref();
 }
