@@ -68,7 +68,7 @@ assert.equal(assess([], {positionAbsent:false}).ready,false);
   const executionSource=fs.readFileSync('apps/execution/src/main.ts','utf8');
   assert.match(dbSource,/loadPendingPositionManagementDecisionAuditCompactions/);
   assert.match(dbSource,/l\.status='SOL_SETTLED' AND summary\.position_address IS NULL/);
-  assert.match(dbSource,/GREATEST\(0::bigint,EXTRACT\(EPOCH FROM \(\$4-\$3\)\)::bigint\)/);
+  assert.match(dbSource,/GREATEST\(0::bigint,EXTRACT\(EPOCH FROM \(\$4::timestamptz-\$3::timestamptz\)\)::bigint\)/);
   assert.match(executionSource,/compactionCandidates=await store\.loadPendingPositionManagementDecisionAuditCompactions\(16\)/);
   assert.match(executionSource,/compactedPositionAddresses/);
 }
