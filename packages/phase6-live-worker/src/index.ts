@@ -2069,6 +2069,44 @@ async function confirmedTransactionFeeLamports(connection:Connection,signature:s
   const receipt=await loadConfirmedExecutionReceipt(connection,signature);
   return receipt.state==='CONFIRMED_SUCCESS'||receipt.state==='CONFIRMED_FAILURE'?receipt.feeLamports:undefined;
 }
+/**
+ * PositionV2 rent is an attributable lifecycle asset, not an inferred owner
+ * wallet delta. The closing receipt must prove that the exact position
+ * account fell from a positive lamport balance to zero.
+ */
+async function persistConfirmedPositionRentRecovery(input:{
+  store:Pick<Phase1Store,"insertPositionCashflow">;
+  connection:Connection;
+  plan:AutonomousPlan;
+  positionAddress:string;
+  signature:string;
+  transactionId:string;
+  observedAt?:string;
+}):Promise<{ok:true;lamports:bigint}|{ok:false;reasonCodes:string[]}>{
+  const receipt=await loadConfirmedExecutionReceipt(input.connection,input.signature);
+  if(receipt.state!=="CONFIRMED_SUCCESS")return{ok:false,reasonCodes:[`P6_CLOSE_POSITION_RENT_RECEIPT_${receipt.state}`]};
+  const index=receipt.resolvedAccountKeys.indexOf(input.positionAddress),before=index>=0?receipt.preBalancesLamports[index]:undefined,after=index>=0?receipt.postBalancesLamports[index]:undefined;
+  if(index<0||before===undefined||after===undefined||before<=0n||after!==0n)return{ok:false,reasonCodes:["P6_CLOSE_POSITION_RENT_RECOVERY_UNPROVEN"]};
+  const observedAt=input.observedAt??new Date().toISOString();
+  await input.store.insertPositionCashflow({
+    cashflowId:`${input.plan.planId}:position-rent-recovery:${input.transactionId}`,
+    positionAddress:input.positionAddress,
+    planId:input.plan.planId,
+    flowType:"RENT_RECOVERY",
+    observedAt,
+    lamports:before,
+    payload:{
+      source:"CONFIRMED_POSITION_ACCOUNT_CLOSE_RECEIPT",
+      transactionSignature:input.signature,
+      transactionId:input.transactionId,
+      positionAddress:input.positionAddress,
+      preBalanceLamports:before.toString(),
+      postBalanceLamports:after.toString(),
+      transactionFeeLamports:(receipt.feeLamports??0n).toString(),
+    },
+  });
+  return{ok:true,lamports:before};
+}
 function mutationRange(
   plan: AutonomousPlan,
   fallback?: Record<string, unknown>,
@@ -3438,6 +3476,17 @@ async function executeCloseSettlement(input: {
       pendingStage: "CLOSE_POSITION_SUBMITTED",
       pendingSignature: signature,
     }),
+    afterConfirmed: async ({ signature }) => {
+      const rent=await persistConfirmedPositionRentRecovery({
+        store:input.store,
+        connection,
+        plan:input.plan,
+        positionAddress:input.positionAddress,
+        signature,
+        transactionId:closeStep.transactionId,
+      });
+      if(!rent.ok)throw new Error(rent.reasonCodes.join(","));
+    },
   });
   if(closed.status!=="RECONCILED")return incomplete(closed.reasonCodes,"CLOSE_POSITION_PENDING");
   // CLOSED is chain-account absence only.  Make the lifecycle terminal only
@@ -3452,6 +3501,10 @@ async function executeCloseSettlement(input: {
 async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:AutonomousPlan;positionAddress:string;connection:Connection;config:Pick<LiveWorkerConfig,"rpcUrl">}):Promise<{ready:boolean;reasonCodes:string[]}>{
   const positionCheck=await input.connection.getAccountInfoAndContext(new PublicKey(input.positionAddress),"confirmed");
   if(positionCheck.value!==null)return{ready:false,reasonCodes:["SETTLEMENT_POSITION_STILL_EXISTS"]};
+  const dispatch=closeSettlementDispatch(input.plan),closeSignature=typeof dispatch.signature==="string"?dispatch.signature:typeof dispatch.pendingSignature==="string"?dispatch.pendingSignature:undefined,closeTransactionId=typeof dispatch.transactionId==="string"?dispatch.transactionId:undefined;
+  if(!closeSignature||!closeTransactionId)return{ready:false,reasonCodes:["SETTLEMENT_CLOSE_RECEIPT_MISSING"]};
+  const rent=await persistConfirmedPositionRentRecovery({store:input.store,connection:input.connection,plan:input.plan,positionAddress:input.positionAddress,signature:closeSignature,transactionId:closeTransactionId,observedAt:new Date().toISOString()});
+  if(!rent.ok)return{ready:false,reasonCodes:rent.reasonCodes};
   const settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
   if(!settlementInput)return{ready:false,reasonCodes:["SETTLEMENT_LIFECYCLE_MISSING"]};
   const at=new Date().toISOString(),positionCheckedAt=at,positionCheckedSlot=BigInt(positionCheck.context.slot),settlementEvidence={positionCheckedAt,positionCheckedSlot:positionCheckedSlot.toString(),rpcUrl:input.config.rpcUrl,commitment:"confirmed"};
@@ -3467,10 +3520,14 @@ async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:Au
     await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:"RECONCILIATION_REQUIRED",at,reasonCodes:assessment.reasonCodes,payload:{stage:"SOL_SETTLEMENT_BLOCKED",lifecycleId:settlementInput.lifecycle.lifecycleId}});
     return{ready:false,reasonCodes:assessment.reasonCodes};
   }
-  await input.store.persistLifecycleSolSettlement({assessment,input:{...settlementInput,positionAbsent:true,positionCheckedAt,positionCheckedSlot},...(process.env.LPFORGE_SOURCE_COMMIT?{sourceCommit:process.env.LPFORGE_SOURCE_COMMIT}:{}),...(process.env.LPFORGE_P7_POLICY_HASH?{policyHash:process.env.LPFORGE_P7_POLICY_HASH}:{}),migrationHead:"M0042_live_sol_settled_learning.sql",...(process.env.LPFORGE_BUILD_ID?{buildId:process.env.LPFORGE_BUILD_ID}:{}),at});
+  const persisted=await input.store.persistLifecycleSolSettlement({assessment,input:{...settlementInput,positionAbsent:true,positionCheckedAt,positionCheckedSlot},...(process.env.LPFORGE_SOURCE_COMMIT?{sourceCommit:process.env.LPFORGE_SOURCE_COMMIT}:{}),...(process.env.LPFORGE_P7_POLICY_HASH?{policyHash:process.env.LPFORGE_P7_POLICY_HASH}:{}),migrationHead:"M0042_live_sol_settled_learning.sql",...(process.env.LPFORGE_BUILD_ID?{buildId:process.env.LPFORGE_BUILD_ID}:{}),at});
   await input.store.compactPositionManagementDecisionAudit({positionAddress:input.positionAddress,at});
-  const outcome=await input.store.createLiveSolSettledLearningOutcome({positionAddress:input.positionAddress,at});
-  if(!outcome.outcome)throw new Error(`LPFORGE_LIVE_OUTCOME_MATERIALIZATION_FAILED:${outcome.reasonCodes.join(',')}`);
+  // Existing research outcomes are immutable. A settlement supersession fixes
+  // the accounting authority without mutating or duplicating V3 evidence.
+  if(!persisted.superseded){
+    const outcome=await input.store.createLiveSolSettledLearningOutcome({positionAddress:input.positionAddress,at});
+    if(!outcome.outcome)throw new Error(`LPFORGE_LIVE_OUTCOME_MATERIALIZATION_FAILED:${outcome.reasonCodes.join(',')}`);
+  }
   return{ready:true,reasonCodes:[]};
 }
 
@@ -4525,6 +4582,18 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       action,
       reasonCodes: [`P6_RECOVERY_${action}`],
     });
+  }
+  // A close receipt can arrive before a process has persisted its exact
+  // PositionV2 rent refund. Reconcile only terminal close plans that have no
+  // such cashflow; this is receipt-backed accounting repair, never an
+  // economic action or transaction resend.
+  if(connection&&input.rpcUrl){
+    for(const candidate of await input.store.loadTerminalCloseRentRecoveryCandidates(16)){
+      const plan=await input.store.loadAutonomousPlan(candidate.planId);
+      if(!plan||!plan.positionAddress||plan.positionAddress!==candidate.positionAddress)continue;
+      const settlement=await finalizeClosedPositionSettlement({store:input.store,plan,positionAddress:candidate.positionAddress,connection,config:{rpcUrl:input.rpcUrl}});
+      results.push({planId:plan.planId,action:settlement.ready?"MARK_RECONCILED":"HOLD_FOR_OPERATOR",reasonCodes:settlement.ready?["P6_CLOSE_POSITION_RENT_RECOVERY_RECONCILED"]:settlement.reasonCodes});
+    }
   }
   return results;
 }

@@ -67,7 +67,7 @@ assert.equal(assess([], {positionAbsent:false}).ready,false);
   const dbSource=fs.readFileSync('packages/db/src/index.ts','utf8');
   const executionSource=fs.readFileSync('apps/execution/src/main.ts','utf8');
   assert.match(dbSource,/loadPendingPositionManagementDecisionAuditCompactions/);
-  assert.match(dbSource,/l\.status='SOL_SETTLED' AND summary\.position_address IS NULL/);
+  assert.match(dbSource,/l\.status='SOL_SETTLED' AND summary\.position_address IS NULL AND EXISTS\(SELECT 1 FROM execution\.position_management_decision_audit/);
   assert.match(dbSource,/GREATEST\(0::bigint,EXTRACT\(EPOCH FROM \(\$4::timestamptz-\$3::timestamptz\)\)::bigint\)/);
   assert.match(executionSource,/compactionCandidates=await store\.loadPendingPositionManagementDecisionAuditCompactions\(16\)/);
   assert.match(executionSource,/compactedPositionAddresses/);
@@ -78,5 +78,24 @@ assert.match(migration,/CREATE TABLE IF NOT EXISTS execution\.position_lifecycle
 assert.match(migration,/UNIQUE\(lifecycle_id,settlement_version\)/);
 assert.match(migration,/prevent_lifecycle_settlement_mutation/);
 assert.match(migration,/SOL_SETTLED/);
+
+// A confirmed PositionV2 account close must persist the account's exact
+// pre-close lamports as RENT_RECOVERY. The proof is account-specific receipt
+// evidence, not an owner-wallet delta that could include unrelated activity.
+{
+  const worker=fs.readFileSync('packages/phase6-live-worker/src/index.ts','utf8');
+  const dbSource=fs.readFileSync('packages/db/src/index.ts','utf8');
+  assert.match(worker,/persistConfirmedPositionRentRecovery/);
+  assert.match(worker,/receipt\.resolvedAccountKeys\.indexOf\(input\.positionAddress\)/);
+  assert.match(worker,/before<=0n\|\|after!==0n/);
+  assert.match(worker,/flowType:"RENT_RECOVERY"/);
+  assert.match(worker,/loadTerminalCloseRentRecoveryCandidates\(16\)/);
+  assert.match(worker,/P6_CLOSE_POSITION_RENT_RECOVERY_RECONCILED/);
+  // Settlement versions are immutable. A later receipt-backed cashflow
+  // supersedes the accounting evidence instead of mutating settlement v1.
+  assert.match(dbSource,/ORDER BY settlement_version DESC LIMIT 1 FOR UPDATE/);
+  assert.match(dbSource,/ADDITIONAL_CONFIRMED_ATTRIBUTABLE_CASHFLOW/);
+  assert.match(dbSource,/loadTerminalCloseRentRecoveryCandidates/);
+}
 
 console.log('LIFECYCLE_SOL_SETTLEMENT_OK');
