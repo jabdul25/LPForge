@@ -96,6 +96,8 @@ assert.match(migration,/SOL_SETTLED/);
   assert.match(dbSource,/ORDER BY settlement_version DESC LIMIT 1 FOR UPDATE/);
   assert.match(dbSource,/ADDITIONAL_CONFIRMED_ATTRIBUTABLE_CASHFLOW/);
   assert.match(dbSource,/loadTerminalCloseRentRecoveryCandidates/);
+  assert.match(dbSource,/EXISTS\(SELECT 1 FROM execution\.position_management_decision_audit audit WHERE audit\.position_address=l\.position_address\)/);
+  assert.match(dbSource,/audit WHERE audit\.position_address=\$1/);
 }
 
 console.log('LIFECYCLE_SOL_SETTLEMENT_OK');
