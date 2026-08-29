@@ -3454,7 +3454,14 @@ async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:Au
   if(positionCheck.value!==null)return{ready:false,reasonCodes:["SETTLEMENT_POSITION_STILL_EXISTS"]};
   const settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
   if(!settlementInput)return{ready:false,reasonCodes:["SETTLEMENT_LIFECYCLE_MISSING"]};
-  const at=new Date().toISOString(),positionCheckedAt=at,positionCheckedSlot=BigInt(positionCheck.context.slot),settlementEvidence={positionCheckedAt,positionCheckedSlot:positionCheckedSlot.toString(),rpcUrl:input.config.rpcUrl,commitment:"confirmed"},assessment=assessLifecycleSettlement({...settlementInput,positionAbsent:true,positionCheckedAt,positionCheckedSlot});
+  const at=new Date().toISOString(),positionCheckedAt=at,positionCheckedSlot=BigInt(positionCheck.context.slot),settlementEvidence={positionCheckedAt,positionCheckedSlot:positionCheckedSlot.toString(),rpcUrl:input.config.rpcUrl,commitment:"confirmed"};
+  // A close is intentionally marked RECONCILIATION_REQUIRED until this
+  // terminal boundary proves it can become SOL_SETTLED. Once the PositionV2
+  // account is authoritatively absent, that marker is self-referential: its
+  // own transaction ledger, inventory, cashflows, and reservations are still
+  // assessed below and remain hard blockers, but the transitional marker must
+  // not prevent the operation that clears it.
+  const assessment=assessLifecycleSettlement({...settlementInput,reconciliationClean:true,positionAbsent:true,positionCheckedAt,positionCheckedSlot});
   if(!assessment.ready){
     await input.store.markOwnedPositionLifecycle({positionAddress:input.positionAddress,lifecycleState:"RECONCILIATION_REQUIRED",reconciliationStatus:"SETTLEMENT_BLOCKED",lastPlanId:input.plan.planId,at,payload:{stage:"SOL_SETTLEMENT_BLOCKED",reasonCodes:assessment.reasonCodes,lifecycleId:settlementInput.lifecycle.lifecycleId,settlementEvidence}});
     await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:"RECONCILIATION_REQUIRED",at,reasonCodes:assessment.reasonCodes,payload:{stage:"SOL_SETTLEMENT_BLOCKED",lifecycleId:settlementInput.lifecycle.lifecycleId}});

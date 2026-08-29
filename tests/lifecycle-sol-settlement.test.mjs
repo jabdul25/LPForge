@@ -38,6 +38,19 @@ assert.equal(assess([], {transactions:[{transactionId:'unwind',signature:'sig',s
 // Fixture G: a missing PositionV2 absence proof is a hard terminal boundary.
 assert.equal(assess([], {positionAbsent:false}).ready,false);
 
+// Final close terminalization must not be circularly blocked by the position's
+// own temporary RECONCILIATION_REQUIRED marker. The worker may ignore only
+// that marker after chain account absence; every child transaction, inventory
+// lot, cashflow, and capital reservation remains assessed by this authority.
+{
+  const worker=fs.readFileSync("packages/phase6-live-worker/src/index.ts","utf8");
+  assert.match(worker,/reconciliationClean:true,positionAbsent:true/);
+  assert.match(worker,/self-referential/);
+  const blocked=assess([], {reconciliationClean:false});
+  assert.equal(blocked.ready,false);
+  assert.match(blocked.reasonCodes.join(","),/SETTLEMENT_RECONCILIATION_REQUIRED/);
+}
+
 // Repeated recovery uses immutable economic evidence, not a new wall-clock
 // timestamp, so it can return the single stored settlement deterministically.
 {
