@@ -715,6 +715,8 @@ export interface Phase1Store {
   loadReset3cValidationUniverse(recommendationId:string):Promise<Record<string,unknown>|undefined>;
   markTerminalEligibleReset3cValidationUniverses(now:string,limit:number):Promise<number>;
   purgeTerminalEligibleReset3cValidationEvidence(now:string,limit:number):Promise<number>;
+  insertCandidateUniverseRerankRetention(value:{recommendationId:string;decisionId:string;decisionAt:string;poolAddress:string;calibrationVersion:string;expectedCandidateCount:number;universeManifestHash:string;candidateFacts:Record<string,unknown>;compactSummary:Record<string,unknown>;retentionUntil:string;contentHash:string;}):Promise<'INSERTED'|'IDEMPOTENT'>;
+  compactEligibleCandidateUniverseRerankRetention(now:string,limit:number):Promise<number>;
   insertVariableCapitalEvaluation(value:{capitalEvaluationId:string;recommendationId:string;decisionId:string;candidateId:string;proposedCapitalLamports:string;allocatedCapitalLamports?:string;capitalContractHash:string;positionContractHash?:string;capitalFeasibilityStatus:string;bindingConstraint:string;sourceSha:string;buildId:string;policyHash:string;migrationHead:string;evidenceManifestHash?:string;provenance:Record<string,unknown>;rawContract:Record<string,unknown>;contentHash:string;}):Promise<'INSERTED'|'IDEMPOTENT'>;
   insertPhase3ForwardDecision(value: {
     recommendationId: string;
@@ -2190,6 +2192,18 @@ export async function createPostgresStore(
       // destructive lifecycle action. A stale TERMINAL_ELIGIBLE row cannot
       // block newer safe rows because the batch is bounded after revalidation.
       const r=await db.query(`WITH eligible AS (SELECT u.recommendation_id FROM research.reset3c_validation_universes u WHERE u.lifecycle_state='TERMINAL_ELIGIBLE' AND u.universe_complete AND u.temporary_shared_evidence IS NOT NULL AND (SELECT COUNT(*) FROM research.variable_capital_evaluations e WHERE e.recommendation_id=u.recommendation_id AND e.evaluation_schema_version='reset3c-universe-v3-decision-relevant')=u.detailed_candidate_count AND (SELECT COUNT(*) FROM research.candidate_counterfactual_forward_outcomes o JOIN research.variable_capital_evaluations e ON e.capital_evaluation_id=o.capital_evaluation_id WHERE e.recommendation_id=u.recommendation_id AND e.evaluation_schema_version='reset3c-universe-v3-decision-relevant')=u.expected_outcome_count AND NOT EXISTS(SELECT 1 FROM research.candidate_counterfactual_forward_outcomes o JOIN research.variable_capital_evaluations e ON e.capital_evaluation_id=o.capital_evaluation_id WHERE e.recommendation_id=u.recommendation_id AND e.evaluation_schema_version='reset3c-universe-v3-decision-relevant' AND (o.result_hash IS NULL OR NOT (o.state='FINAL' OR (o.state='INSUFFICIENT_EVIDENCE' AND o.terminal_at IS NOT NULL)))) ORDER BY u.terminal_eligible_at,u.recommendation_id LIMIT $2) UPDATE research.reset3c_validation_universes u SET lifecycle_state='PURGED',temporary_shared_evidence=NULL,purged_at=$1::timestamptz FROM eligible e WHERE u.recommendation_id=e.recommendation_id RETURNING u.recommendation_id`,[now,lim]);
+      return r.rows.length;
+    },
+    async insertCandidateUniverseRerankRetention(v) {
+      const r=await db.query(`INSERT INTO research.candidate_universe_rerank_retention(recommendation_id,decision_id,decision_at,pool_address,calibration_version,expected_candidate_count,persisted_candidate_count,universe_manifest_hash,candidate_facts,compact_summary,retention_until,content_hash) VALUES($1,$2,$3::timestamptz,$4,$5,$6,$6,$7,$8::jsonb,$9::jsonb,$10::timestamptz,$11) ON CONFLICT DO NOTHING RETURNING recommendation_id`,[v.recommendationId,v.decisionId,v.decisionAt,v.poolAddress,v.calibrationVersion,v.expectedCandidateCount,v.universeManifestHash,json(v.candidateFacts),json(v.compactSummary),v.retentionUntil,v.contentHash]);
+      if(r.rows.length)return 'INSERTED';
+      const existing=await db.query('SELECT content_hash FROM research.candidate_universe_rerank_retention WHERE recommendation_id=$1',[v.recommendationId]);
+      if(String(existing.rows[0]?.content_hash??'')===v.contentHash)return 'IDEMPOTENT';
+      throw new Error('LPFORGE_CANDIDATE_UNIVERSE_RERANK_RETENTION_CONFLICT');
+    },
+    async compactEligibleCandidateUniverseRerankRetention(now,limit) {
+      const lim=Math.max(1,Math.min(50,Math.floor(limit)));
+      const r=await db.query(`WITH eligible AS (SELECT u.recommendation_id FROM research.candidate_universe_rerank_retention u WHERE u.lifecycle_state='ACTIVE' AND u.retention_until<=$1::timestamptz AND (SELECT COUNT(*) FROM research.phase3_forward_outcomes o WHERE o.recommendation_id=u.recommendation_id AND o.outcome_model_version='phase3-forward-outcome-v2' AND o.horizon_minutes IN (30,60,120))=3 AND NOT EXISTS(SELECT 1 FROM research.phase3_forward_outcomes o WHERE o.recommendation_id=u.recommendation_id AND o.outcome_model_version='phase3-forward-outcome-v2' AND o.horizon_minutes IN (30,60,120) AND NOT (o.state='FINAL' OR (o.state='INSUFFICIENT_EVIDENCE' AND o.terminal_at IS NOT NULL))) ORDER BY u.retention_until,u.recommendation_id LIMIT $2) UPDATE research.candidate_universe_rerank_retention u SET lifecycle_state='COMPACTED',candidate_facts=NULL,compacted_at=$1::timestamptz FROM eligible e WHERE u.recommendation_id=e.recommendation_id RETURNING u.recommendation_id`,[now,lim]);
       return r.rows.length;
     },
     async insertVariableCapitalEvaluation(v) {
@@ -4143,6 +4157,8 @@ export function createMemoryStore(): Phase1Store {
     async loadReset3cValidationUniverse() { return undefined; },
     async markTerminalEligibleReset3cValidationUniverses() { return 0; },
     async purgeTerminalEligibleReset3cValidationEvidence() { return 0; },
+    async insertCandidateUniverseRerankRetention() { return 'INSERTED' as const; },
+    async compactEligibleCandidateUniverseRerankRetention() { return 0; },
     async insertVariableCapitalEvaluation() { return 'INSERTED' as const; },
     async loadDueCandidateCounterfactualOutcomes() { return []; },
     async persistCandidateCounterfactualOutcome() { return 'APPLIED' as const; },
