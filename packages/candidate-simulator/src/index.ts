@@ -29,6 +29,19 @@ export interface CandidateEconomicSimulation {
   capitalValue:number;
   startInventoryValue:number;
   normalizationScale:number;
+  /** Raw simulator evidence remains immutable when production calibration applies. */
+  rawReplayFeeValue?:number;
+  rawReplayGrossValueChange?:number;
+  rawReplayNetValue?:number;
+  feeEvidenceCalibration?:{
+    version:string;
+    status:'CALIBRATED'|'EVIDENCE_INSUFFICIENT'|'NOT_APPLIED';
+    rawReplayFeeValue:number;
+    calibratedFeeValue:number;
+    credibility:number|null;
+    normalizationScale:number|null;
+    reasonCodes:string[];
+  };
   unitScaleValid:boolean;
   evidenceActionable:boolean;
   warnings:string[];
