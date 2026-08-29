@@ -97,7 +97,42 @@ test('P6 expires an absent close child without resending and releases the manage
   assert.equal(calls.length,0,'source-level contract check does not execute a live RPC path');
 });
 
+
+test('P6 reconciles an expired no-effect close only through an exact SOL_SETTLED lifecycle identity',async()=>{
+  const calls=[];
+  const plan={planId:'historical-close',idempotencyKey:'historical-close-idem',action:'CLOSE',poolAddress:'pool',ownerAddress:'owner',positionAddress:'8HU47vhj6ciFv7nhHsby4iQD68s8NpBKSNZbb9C81Pzw',positionIdentitySource:'LIFECYCLE_SOL_SETTLED',expiresAt:'2030-01-01T00:00:00.000Z',planPayload:{autonomous_dispatch:{pendingStage:'CLOSE_REMOVE_SUBMITTED',pendingSignature:'expired-remove'}}};
+  const store={
+    async loadUnresolvedAutonomousPlans(){return[plan];},
+    async getExecutionJournal(){return{journal_id:'journal-historical',idempotency_key:plan.idempotencyKey,plan_id:plan.planId,state:'SUBMITTED',signature:'expired-remove',last_valid_block_height:1,version:1,updated_at:'2026-08-29T00:00:00.000Z',payload:{action:'CLOSE'}};},
+    async markSubmissionExpired(...value){calls.push(['expired',value]);},
+    async updateExecutionJournal(value){calls.push(['journal',value]);return true;},
+    async completeAutonomousPlan(value){calls.push(['complete',value]);},
+    async loadTerminalCloseRentRecoveryCandidates(){return[];},
+    async loadPendingPositionManagementDecisionAuditCompactions(){return[];},
+  };
+  const result=await recoverUnfinishedAutonomousPlans({
+    store,currentBlockHeight:2,now:'2026-08-29T05:00:00.000Z',rpcUrl:'http://127.0.0.1:1',programId:'LBUZKhRxPF3XUpBCjp4YzTKgLccM7D8QgbDnWn3YF3R',
+    connection:{getAccountInfo:async()=>null},
+    adapter:{},
+    signatureStatusProvider:async()=>null,
+  });
+  assert.equal(result[0].action,'MARK_RECONCILED');
+  assert.equal(calls.find(([kind])=>kind==='expired')[1][0],'expired-remove');
+  assert.equal(calls.find(([kind])=>kind==='complete')[1].state,'COMPLETED');
+  assert.match(calls.find(([kind])=>kind==='complete')[1].payload.recovery,/POSITION_ABSENT/);
+  assert.equal(calls.filter(([kind])=>kind==='transition').length,0);
+});
+
+test('P6 keeps unknown or non-lifecycle identity close children reconciliation-required',async()=>{
+  const fs=await import('node:fs/promises');
+  const worker=await fs.readFile('packages/phase6-live-worker/src/index.ts','utf8');
+  const db=await fs.readFile('packages/db/src/index.ts','utf8');
+  assert.match(worker,/plan\.positionIdentitySource === "LIFECYCLE_SOL_SETTLED"/);
 test('P6 CLOSE recovery reconciles a confirmed native-SOL unwind exactly once before resuming',async()=>{
+  assert.match(db,/l\.status='SOL_SETTLED'/);
+  assert.match(db,/position_identity_source/);
+  assert.match(db,/count\(DISTINCT l\.position_address\)=1/);
+});
   const owner='OWNER',risk='RISK',wsol='WSOL',position='POSITION',jupiter='JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4',
     receipt={slot:1,version:0,transaction:{message:{accountKeys:[owner,risk,wsol,position],compiledInstructions:[{programId:jupiter,accountKeyIndexes:[0,1],parsed:{type:'route',info:{destination:owner}}}]}},meta:{err:null,fee:5,preBalances:[1000,0,1,0],postBalances:[1005,0,1,0],loadedAddresses:{writable:[],readonly:[]},preTokenBalances:[{accountIndex:1,mint:risk,owner,uiTokenAmount:{amount:'50',decimals:9}}],postTokenBalances:[{accountIndex:1,mint:risk,owner,uiTokenAmount:{amount:'0',decimals:9}}],innerInstructions:[]}},
     transitions=[],cashflows=new Map(),lots=new Map(),plan={planId:'close-plan',idempotencyKey:'close-idem',action:'CLOSE',poolAddress:'pool',ownerAddress:owner,positionAddress:position,expiresAt:'2030-01-01T00:00:00.000Z',planPayload:{autonomous_dispatch:{stage:'CLOSE_INVENTORY_MEASURED',pendingStage:'CLOSE_UNWIND_SUBMITTED',pendingSignature:'unwind-sig',tokenXMint:risk,attributableTokenX:'50',unwindTransactionId:'unwind'}}},

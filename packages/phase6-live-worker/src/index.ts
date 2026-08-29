@@ -4151,7 +4151,17 @@ export async function recoverUnfinishedAutonomousPlans(input: {
           });
           continue;
         }
-        // A known signature with no chain status after its blockhash has
+        // A durable lifecycle SOL_SETTLED link plus absence proves later settlement of
+        // this exact PositionV2; retire the expired no-effect child only.
+        if (!signatureStatusReadUnknown && (confirmationStatus === "EXPIRED" || confirmationStatus === "FAILED") && plan.positionIdentitySource === "LIFECYCLE_SOL_SETTLED" && positionTruth.exists === false && recoveryPositionAddress) {
+          const reason = "P6_CLOSE_PENDING_STAGE_EXPIRED_NO_CHAIN_EFFECT_POSITION_ABSENT";
+          await input.store.markSubmissionExpired(closePending.signature, input.now, reason);
+          await input.store.updateExecutionJournal({ idempotencyKey: plan.idempotencyKey, expectedVersion: journal.version, state: "FAILED", updatedAt: input.now, payload: { ...journal.payload, recovery: reason, confirmationStatus, pendingStage: closePending.stage, pendingSignature: closePending.signature, positionTruth } });
+          await input.store.completeAutonomousPlan({ planId: plan.planId, state: "COMPLETED", at: input.now, payload: { action: plan.action, recovery: reason, pendingStage: closePending.stage, pendingSignature: closePending.signature, positionAddress: recoveryPositionAddress } });
+          results.push({ planId: plan.planId, action: "MARK_RECONCILED", reasonCodes: [reason, closePending.stage] });
+          continue;
+        }
+
         // expired is a terminal no-effect close child only when the
         // PositionV2 is independently still present.  Retire that exact
         // signature and plan; a later management cycle may build a *new*
