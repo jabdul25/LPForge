@@ -379,6 +379,17 @@ async function recoverOnce() {
           reasonCodes: result.reasonCodes,
         });
     }
+    // M0061 detail is retained until every linked plan has reached a terminal
+    // state. A close may become SOL_SETTLED in the same recovery pass that
+    // completes its final plan, so perform this bounded, non-economic sweep
+    // afterwards. The compactor independently rechecks terminal settlement,
+    // zero pending work, and summary durability before deleting any HOLD rows.
+    const compactionCandidates=await store.loadPendingPositionManagementDecisionAuditCompactions(16),
+      compactedPositionAddresses:string[]=[];
+    for(const positionAddress of compactionCandidates){
+      const result=await store.compactPositionManagementDecisionAudit({positionAddress,at:new Date().toISOString()});
+      if(result.compacted)compactedPositionAddresses.push(positionAddress);
+    }
     const walletSweep = await reconcileWalletSweep({
       store,
       rpcUrl: config.rpcUrl,
@@ -386,7 +397,7 @@ async function recoverOnce() {
       ownerAddress: (process.env.LPFORGE_OPERATOR_OWNER_ADDRESS ?? "").trim(),
       now: new Date().toISOString(),
     });
-    return { partial, plans: unresolvedPlans, resumed, walletSweep };
+    return { partial, plans: unresolvedPlans, resumed, walletSweep, compaction:{candidates:compactionCandidates,compactedPositionAddresses} };
   } finally {
     await store.close();
   }

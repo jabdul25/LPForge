@@ -60,6 +60,18 @@ assert.equal(assess([], {positionAbsent:false}).ready,false);
   const h2=await lifecycleSettlementEvidenceHash({...input,positionCheckedAt:'2026-08-16T00:01:00.000Z'},r);
   assert.equal(h1,h2);
 }
+// A terminal close that completes during recovery is compacted only in a
+// subsequent bounded sweep. The selector admits SOL_SETTLED lifecycle rows
+// without an existing summary; compaction itself rechecks every linked plan.
+{
+  const dbSource=fs.readFileSync('packages/db/src/index.ts','utf8');
+  const executionSource=fs.readFileSync('apps/execution/src/main.ts','utf8');
+  assert.match(dbSource,/loadPendingPositionManagementDecisionAuditCompactions/);
+  assert.match(dbSource,/l\.status='SOL_SETTLED' AND summary\.position_address IS NULL/);
+  assert.match(executionSource,/compactionCandidates=await store\.loadPendingPositionManagementDecisionAuditCompactions\(16\)/);
+  assert.match(executionSource,/compactedPositionAddresses/);
+}
+
 const migration=fs.readFileSync('packages/db/migrations/M0041_lifecycle_sol_settlements.sql','utf8');
 assert.match(migration,/CREATE TABLE IF NOT EXISTS execution\.position_lifecycles/);
 assert.match(migration,/UNIQUE\(lifecycle_id,settlement_version\)/);
