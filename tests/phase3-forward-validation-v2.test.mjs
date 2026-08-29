@@ -60,6 +60,8 @@ test('V2 capital-constrained position uses the frozen 0.03 SOL exactly once for 
   assert.notDeepEqual(v1.realized, v2.realized, 'V1 remains a distinct immutable model');
 });
 
+
+
 test('V2 rejects a narrow frozen range that would exceed the price-taking participation cap', async () => {
   const { v2 } = await mature('5a4e0873-reproduction', candidate(1), { amountX: '100000000' });
   assert.equal(v2.state, 'INSUFFICIENT_EVIDENCE');
@@ -94,4 +96,15 @@ test('V2 rejects bigint values outside exact valuation precision instead of sile
   const { v2 } = await mature('490bd97e-reproduction', candidate(33), { amountX: '9007199254740992' });
   assert.equal(v2.state, 'INSUFFICIENT_EVIDENCE');
   assert.ok(v2.reasonCodes.includes('FORWARD_V2_BIN_LIQUIDITY_UNAVAILABLE'));
+});
+
+test('counterfactual V2 preserves an ownership-limited constructible position without clipping', async () => {
+  const c=candidate(1), decision=freezePhase3ForwardDecision({recommendation:recommendation('counterfactual-policy',c),artifact});
+  const frames=Array.from({length:121},(_,minute)=>frame(minute,c,'1000000000000000000','100000000'));
+  const events=[{signature:'counterfactual-event',eventIndex:0,pool:'pool-v2',startBinId:c.lowerBinId,endBinId:c.lowerBinId,mmFee:'1000000',feesOnTokenX:true,stamp:{source:'FIXTURE',observedAt:at(1)},raw:{}}];
+  const strict=await matureFrozenPhase3ForwardOutcome({decision,horizonMinutes:30,outcomeModelVersion:PHASE3_FORWARD_OUTCOME_MODEL_VERSION_V2,frames,events,now:at(121)});
+  const outcomes=await Promise.all([30,60,120].map(horizonMinutes=>matureFrozenPhase3ForwardOutcome({decision,horizonMinutes, outcomeModelVersion:PHASE3_FORWARD_OUTCOME_MODEL_VERSION_V2,frames,events,now:at(121),enforcePriceTakingOwnershipCap:false})));
+  assert.equal(strict.state,'INSUFFICIENT_EVIDENCE');
+  assert.deepEqual(outcomes.map(x=>x.state),['FINAL','FINAL','FINAL']);
+  assert.ok(outcomes.every(x=>x.realized.frozenCapitalLamports==='30000000'&&x.realized.maxEffectiveOwnershipBps>500));
 });

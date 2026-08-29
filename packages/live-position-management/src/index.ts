@@ -38,6 +38,10 @@ export interface OwnedLivePosition {
   lowerBinId: number;
   upperBinId: number;
   initialCapitalLamports: bigint;
+  /** Actual attributable asset debit, when a chunked entry measured it. */
+  actualEconomicCapitalLamports?: bigint;
+  /** A partial entry is never eligible for ordinary reshaping/rebalancing. */
+  partialEntry?: boolean;
   thesisId: string;
   enteredAt?: string;
 }
@@ -160,6 +164,14 @@ export function decideLivePositionManagement(input: {
       action: "HOLD",
       reasonCodes: ["OWNED_POSITION_IDENTITY_MISMATCH"],
     };
+  if (owned.partialEntry) {
+    if (input.exitDecision?.action === "EMERGENCY_CLOSE")
+      return { action: "EMERGENCY_CLOSE", reasonCodes: [...input.exitDecision.reasonCodes, "PARTIAL_ENTRY_PROTECTIVE_CLOSE"] };
+    // An expired or chain-proven missing liquidity child cannot be recreated
+    // under an old entry authorization. Keep the partial position and its
+    // attributed wallet inventory in one protective settlement path instead.
+    return { action: "CLOSE", reasonCodes: ["PARTIAL_ENTRY_PROTECTIVE_CLOSE_REQUIRED"] };
+  }
   if (input.exitDecision && input.exitDecision.action !== "HOLD") {
     const action = input.exitDecision.action === "EMERGENCY_CLOSE" ? "EMERGENCY_CLOSE" : input.exitDecision.action === "CLOSE" ? "CLOSE" : "REDUCE";
     return { action, reasonCodes: input.exitDecision.reasonCodes };

@@ -1,7 +1,7 @@
 import { canonicalJson, sha256Hex, type SwapEventFact } from '../../domain/src/index.js';
 import { assertNoLookahead } from '../../research/src/index.js';
-import { buildMarketContext, type MarketObservation } from '../../market-context/src/index.js';
-import { computeStructureFeatures } from '../../structure-features/src/index.js';
+import { buildMarketContext, type MarketContextSnapshot, type MarketObservation } from '../../market-context/src/index.js';
+import { computeStructureFeatures, type StructureFeatureVector } from '../../structure-features/src/index.js';
 import { classifyRegime, analyzeRegimeHistory, type RegimeAssessment, type RegimeHistorySample } from '../../regime/src/index.js';
 import { assessControlledPullback, assessBreakoutControlledPullback } from '../../setup-specialists/src/index.js';
 import { deriveQualificationEconomics, estimateOpportunityEconomics, deriveOpportunityProgress, deriveOutcomeDispersion, resolvePhase3QualificationPolicy, type CandidatePrimaryQualificationEconomics, type OpportunityRateEvidence, type Phase3QualificationPolicyId } from '../../opportunity/src/index.js';
@@ -56,6 +56,39 @@ export function derivePoolQualityProspectiveShadowSnapshot(pool:PoolAssessment):
   };
 }
 
+/**
+ * Immutable decision-time evidence only. This is deliberately outside the
+ * recommendation-id core below: it is observability metadata and must never
+ * alter candidate generation, qualification, ranking, or recommendation
+ * identity. M0050 freezes this payload prospectively in research storage.
+ */
+export interface DecisionTimeMarketContextEvidence {
+  schemaVersion:'phase3-decision-market-context-v1';
+  decisionContextCutoff:string;
+  /** Mirrors the existing Phase-3 live-observation freshness boundary. */
+  sourceFreshnessBoundaryMs:number;
+  raw:{
+    marketObservations:MarketObservation[];
+    binFeatures?:BinWindowFeatures;
+    flowFeatures?:SwapFlowFeatures;
+    poolAssessmentEvidence:Record<string,unknown>;
+  };
+  derived:{
+    marketContext:MarketContextSnapshot;
+    structure:StructureFeatureVector;
+    regime:RegimeAssessment;
+    regimeHistory:ReturnType<typeof analyzeRegimeHistory>;
+    poolQualityShadow:PoolQualityProspectiveShadowSnapshot;
+  };
+  provenance:{
+    marketContextModelVersion:string;
+    structureModelVersion:string;
+    regimeModelVersion:string;
+    sourceObservationCount:number;
+    sourceObservedAtMax?:string;
+  };
+}
+
 export interface ShadowRecommendation {
   recommendationId:string;phase:'P3';recommendationOnly:true;decisionAt:string;expiresAt:string;pool:string;state:string;noTrade:boolean;
   marketContextHash:string;regime:RegimeAssessment;regimeHistory:ReturnType<typeof analyzeRegimeHistory>;pullback?:ReturnType<typeof assessControlledPullback>;breakoutPullback?:ReturnType<typeof assessBreakoutControlledPullback>;
@@ -63,6 +96,10 @@ export interface ShadowRecommendation {
   /** Immutable, compact decision-time material for shadow-only forward validation. */
   forwardValidation:{version:'phase3-forward-decision-v1';horizonMinutes:number;capitalValue:number;capitalLamports:string;activeBinIdAtDecision:number;rawUnitValueX:number;rawUnitValueY:number;costs:Required<SimulationCostModel>;selectedCandidateKind:'RANKING_WINNER'|'TOP_RANKED_COUNTERFACTUAL'|'NONE';selectedCandidate?:RangeStrategyCandidate;selectedSimulation?:CandidateEconomicSimulation;selectedSurvival?:SurvivalForecast;evidence:{replayAnchorAt?:string;replayEvidenceWatermark:string;historicalFrameHash:string;historicalEventHash:string;latestFrameAt?:string;latestEventAt?:string;};poolQualityShadow:PoolQualityProspectiveShadowSnapshot;wouldAugEraThesisSemanticsHaveCreatedThesis:boolean;};
   thesis?:MachineReadableLpThesis;reasonCodes:string[];
+  /** Research-only decision-time evidence; excluded from recommendation ID. */
+  decisionTimeMarketContext?:DecisionTimeMarketContextEvidence;
+  /** RESET-3C immutable sidecar input; excluded from recommendation identity and authority. */
+  candidateUniverseEvidence?:{version:'reset3c-universe-v1';capitalLamports:string;frames:BinFrame[];events:SwapEventFact[];costs:Required<SimulationCostModel>;candidates:RangeStrategyCandidate[];simulations:CandidateEconomicSimulation[];ranking:CandidateRankingResult;qualification:Record<string,unknown>;economics:Record<string,unknown>;};
 }
 function assertFramesHistorical(decisionAt:string,frames:BinFrame[],events:SwapEventFact[]){const t=Date.parse(decisionAt);for(const f of frames)if(Date.parse(f.observedAt)>t)throw new Error(`LPFORGE_SHADOW_LOOKAHEAD_FRAME:${f.observedAt}`);for(const e of events)if(Date.parse(e.stamp.observedAt)>t)throw new Error(`LPFORGE_SHADOW_LOOKAHEAD_EVENT:${e.stamp.observedAt}`);}
 function assertRegimeHistoryHistorical(decisionAt:string,history:RegimeHistorySample[]){const t=Date.parse(decisionAt);for(const r of history){const observed=Date.parse(r.observedAt);if(!Number.isFinite(observed))throw new Error(`LPFORGE_SHADOW_REGIME_HISTORY_TIME_INVALID:${r.observedAt}`);if(observed>t)throw new Error(`LPFORGE_SHADOW_LOOKAHEAD_REGIME:${r.observedAt}`);}}
@@ -114,6 +151,11 @@ export async function buildShadowRecommendation(input:ShadowRecommendationInput)
  const frameRows=input.historicalFrames.filter(frame=>Date.parse(frame.observedAt)<=Date.parse(input.decisionAt));
  const eventRows=input.historicalEvents.filter(event=>Date.parse(event.stamp.observedAt)<=Date.parse(input.decisionAt));
  const selectedCandidateKind=(selectedCandidate?(winner?'RANKING_WINNER':'TOP_RANKED_COUNTERFACTUAL'):'NONE') as 'RANKING_WINNER'|'TOP_RANKED_COUNTERFACTUAL'|'NONE';
- const forwardValidation={version:'phase3-forward-decision-v1' as const,horizonMinutes:input.horizonMinutes,capitalValue:input.capitalValue,capitalLamports:String(Math.max(0,Math.round(input.capitalValue*1_000_000_000))),activeBinIdAtDecision:input.activeBinId,rawUnitValueX:input.rawUnitValueX,rawUnitValueY:input.rawUnitValueY,costs:{compositionFeeValue:input.costs?.compositionFeeValue??'0',transactionFeeValue:input.costs?.transactionFeeValue??'0',slippageValue:input.costs?.slippageValue??'0',rebalanceCostValue:input.costs?.rebalanceCostValue??'0',otherCostValue:input.costs?.otherCostValue??'0'},selectedCandidateKind,...(selectedCandidate?{selectedCandidate}:{}),...(selectedSimulation?{selectedSimulation}:{}),...(selectedSurvival?{selectedSurvival}:{}),evidence:{replayEvidenceWatermark:input.decisionAt,historicalFrameHash:await sha256Hex(canonicalJson(frameRows)),historicalEventHash:await sha256Hex(canonicalJson(eventRows)),...(frameRows.at(-1)?{latestFrameAt:frameRows.at(-1)!.observedAt}:{}),...(eventRows.at(-1)?{latestEventAt:eventRows.at(-1)!.stamp.observedAt}:{}),...(selectedCandidateId&&replayAnchorByCandidate.get(selectedCandidateId)?{replayAnchorAt:replayAnchorByCandidate.get(selectedCandidateId)!}:{})},poolQualityShadow:derivePoolQualityProspectiveShadowSnapshot(input.poolAssessment),wouldAugEraThesisSemanticsHaveCreatedThesis:Boolean(selectedCandidate&&economics.economicallyPositive&&!['REJECTED','EXPIRED','DATA_BLOCKED'].includes(progress.state))};
- const core={phase:'P3' as const,recommendationOnly:true as const,decisionAt:input.decisionAt,expiresAt:input.expiresAt,pool:input.pool,state:noTrade?progress.state:'ENTRY_READY',noTrade,marketContextHash:context.hash,regime,regimeHistory,pullback,breakoutPullback,economics,qualification,uncertaintyLineage,candidateCount:candidates.length,simulations,ranking,forwardValidation,...(thesis?{thesis}:{}),reasonCodes};return{recommendationId:await sha256Hex(canonicalJson(core)),...core};
+ const poolQualityShadow=derivePoolQualityProspectiveShadowSnapshot(input.poolAssessment);
+ const forwardValidation={version:'phase3-forward-decision-v1' as const,horizonMinutes:input.horizonMinutes,capitalValue:input.capitalValue,capitalLamports:String(Math.max(0,Math.round(input.capitalValue*1_000_000_000))),activeBinIdAtDecision:input.activeBinId,rawUnitValueX:input.rawUnitValueX,rawUnitValueY:input.rawUnitValueY,costs:{compositionFeeValue:input.costs?.compositionFeeValue??'0',transactionFeeValue:input.costs?.transactionFeeValue??'0',slippageValue:input.costs?.slippageValue??'0',rebalanceCostValue:input.costs?.rebalanceCostValue??'0',otherCostValue:input.costs?.otherCostValue??'0'},selectedCandidateKind,...(selectedCandidate?{selectedCandidate}:{}),...(selectedSimulation?{selectedSimulation}:{}),...(selectedSurvival?{selectedSurvival}:{}),evidence:{replayEvidenceWatermark:input.decisionAt,historicalFrameHash:await sha256Hex(canonicalJson(frameRows)),historicalEventHash:await sha256Hex(canonicalJson(eventRows)),...(frameRows.at(-1)?{latestFrameAt:frameRows.at(-1)!.observedAt}:{}),...(eventRows.at(-1)?{latestEventAt:eventRows.at(-1)!.stamp.observedAt}:{}),...(selectedCandidateId&&replayAnchorByCandidate.get(selectedCandidateId)?{replayAnchorAt:replayAnchorByCandidate.get(selectedCandidateId)!}:{})},poolQualityShadow,wouldAugEraThesisSemanticsHaveCreatedThesis:Boolean(selectedCandidate&&economics.economicallyPositive&&!['REJECTED','EXPIRED','DATA_BLOCKED'].includes(progress.state))};
+ const marketRows=input.currentObservations.filter(row=>Date.parse(row.observedAt)<=Date.parse(input.decisionAt)).map(row=>({...row}));
+ const decisionTimeMarketContext:DecisionTimeMarketContextEvidence={schemaVersion:'phase3-decision-market-context-v1',decisionContextCutoff:input.decisionAt,sourceFreshnessBoundaryMs:180_000,raw:{marketObservations:marketRows,...(input.binFeatures?{binFeatures:{...input.binFeatures}}:{}),...(input.flowFeatures?{flowFeatures:{...input.flowFeatures}}:{}),poolAssessmentEvidence:JSON.parse(canonicalJson(input.poolAssessment.evidence)) as Record<string,unknown>},derived:{marketContext:context,structure,regime,regimeHistory,poolQualityShadow},provenance:{marketContextModelVersion:context.schemaVersion,structureModelVersion:'phase3-structure-features-v1',regimeModelVersion:'phase3-regime-v1',sourceObservationCount:marketRows.length,...(marketRows.at(-1)?{sourceObservedAtMax:marketRows.at(-1)!.observedAt}:{})}};
+ // Keep the evidence attachment out of core, so the recommendation ID and
+ // all decision semantics remain byte-for-byte based on the pre-M0050 core.
+ const core={phase:'P3' as const,recommendationOnly:true as const,decisionAt:input.decisionAt,expiresAt:input.expiresAt,pool:input.pool,state:noTrade?progress.state:'ENTRY_READY',noTrade,marketContextHash:context.hash,regime,regimeHistory,pullback,breakoutPullback,economics,qualification,uncertaintyLineage,candidateCount:candidates.length,simulations,ranking,forwardValidation,...(thesis?{thesis}:{}),reasonCodes};const recommendationId=await sha256Hex(canonicalJson(core));const candidateUniverseEvidence={version:'reset3c-universe-v1' as const,capitalLamports:forwardValidation.capitalLamports,frames:frameRows.map(frame=>({...frame,bins:frame.bins.map(bin=>({...bin}))})),events:eventRows.map(event=>({...event,stamp:{...event.stamp}})),costs:forwardValidation.costs,candidates:candidates.map(candidate=>({...candidate,perBinWeights:candidate.perBinWeights.map(weight=>({...weight}))})),simulations:simulations.map(simulation=>({...simulation,warnings:[...simulation.warnings]})),ranking,qualification:JSON.parse(canonicalJson(qualification)) as Record<string,unknown>,economics:JSON.parse(canonicalJson(economics)) as Record<string,unknown>};return{recommendationId,...core,decisionTimeMarketContext,candidateUniverseEvidence};
 }

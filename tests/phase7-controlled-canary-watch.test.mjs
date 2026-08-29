@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {resolveControlledCanaryWatch} from '../.build/packages/phase7-production-service/src/index.js';
+import {P7_CONTROLLED_CANARY_CLAIM_FRESHNESS_BUDGET_MS,controlledCanaryRevokedApprovalIds,phase7BoundedDecisionHealthProbePoolAddresses,phase7DecisionHealthPoolAddress,phase7DecisionHealthProbePoolAddresses,phase7NextDecisionHealthPoolAddress,phase7VerifiedDecisionHealthPoolAddress,resolveControlledCanaryWatch} from '../.build/packages/phase7-production-service/src/index.js';
 
 const now='2026-08-20T12:00:00.000Z';
 const env={
@@ -29,11 +29,41 @@ test('controlled canary watch refuses expired or waiting Phase-4 records',()=>{
 });
 
 test('controlled canary watch promotes only one clean fresh authorization with the fixed envelope',()=>{
-  const result=resolveControlledCanaryWatch({env,now,portfolio,authorization:authorized});
+  const result=resolveControlledCanaryWatch({env,now,portfolio,authorization:authorized,decisionObservedAt:'2026-08-20T11:59:30.000Z'});
   assert.equal(result.activate,true);
   assert.equal(result.approval?.action,'PROMOTE_PRODUCTION');
   assert.equal(result.approval?.approvalId,'canary-watch-entry-live');
   assert.equal(result.approval?.expiresAt,'2026-08-20T12:01:00.000Z');
+});
+
+test('controlled canary watch refuses source evidence that cannot survive the bounded claim path',()=>{
+  const nearExpiry=new Date(Date.parse(now)-(120_000-P7_CONTROLLED_CANARY_CLAIM_FRESHNESS_BUDGET_MS+1)).toISOString();
+  const result=resolveControlledCanaryWatch({env,now,portfolio,authorization:authorized,decisionObservedAt:nearExpiry});
+  assert.equal(result.activate,false);
+  assert.ok(result.reasonCodes.includes('P7_CONTROLLED_CANARY_DECISION_FRESHNESS_INSUFFICIENT'));
+});
+
+test('P7 decision freshness follows the prior probe target and carries the next target forward',()=>{
+  assert.equal(phase7DecisionHealthPoolAddress({smokePoolAddress:'smoke',priorControlPayload:{decisionHealthPoolAddress:'canary-pool'}}),'canary-pool');
+  assert.equal(phase7DecisionHealthPoolAddress({smokePoolAddress:'smoke',priorControlPayload:{}}),'smoke');
+  assert.equal(phase7NextDecisionHealthPoolAddress({fallbackPoolAddress:'smoke',probePoolAddresses:['first','last']}),'last');
+  assert.equal(phase7NextDecisionHealthPoolAddress({fallbackPoolAddress:'smoke',probePoolAddresses:[]}),'smoke');
+});
+
+test('P7 bounds a serialized decision producer to one deterministic pool per cycle',()=>{
+  const pools=['pool-a','pool-b','pool-c'];
+  assert.deepEqual(phase7BoundedDecisionHealthProbePoolAddresses({fallbackPoolAddress:'smoke',evaluationPoolAddresses:pools}),['pool-a']);
+  assert.deepEqual(phase7BoundedDecisionHealthProbePoolAddresses({fallbackPoolAddress:'smoke',priorControlPayload:{decisionHealthPoolAddress:'pool-a'},evaluationPoolAddresses:pools}),['pool-b']);
+  assert.deepEqual(phase7BoundedDecisionHealthProbePoolAddresses({fallbackPoolAddress:'smoke',priorControlPayload:{decisionHealthPoolAddress:'pool-c'},evaluationPoolAddresses:pools}),['pool-a']);
+  assert.deepEqual(phase7BoundedDecisionHealthProbePoolAddresses({fallbackPoolAddress:'smoke',evaluationPoolAddresses:[]}),['smoke']);
+});
+
+test('P7 health uses the newest persisted decision from the exact prior probe set, never a merely scheduled target',()=>{
+  const base={smokePoolAddress:'smoke',priorControlPayload:{decisionHealthPoolAddress:'missing',decisionHealthProbePoolAddresses:['early','late','missing']},priorControlObservedAt:'2026-08-20T12:00:00.000Z'};
+  assert.deepEqual(phase7DecisionHealthProbePoolAddresses(base),['early','late','missing']);
+  assert.deepEqual(phase7VerifiedDecisionHealthPoolAddress({...base,latestDecisionAtByPool:{early:'2026-08-20T12:00:00.001Z',late:'2026-08-20T12:00:20.000Z',missing:'2026-08-20T11:59:59.999Z'}}),{poolAddress:'late',targetPoolAddress:'late',targetVerified:true});
+  assert.deepEqual(phase7VerifiedDecisionHealthPoolAddress({...base,latestDecisionAtByPool:{missing:'2026-08-20T11:59:59.999Z'}}),{poolAddress:'smoke',targetPoolAddress:'missing',targetVerified:false});
+  assert.deepEqual(phase7VerifiedDecisionHealthPoolAddress({smokePoolAddress:'smoke',priorControlPayload:{decisionHealthPoolAddress:'smoke'}}),{poolAddress:'smoke',targetPoolAddress:'smoke',targetVerified:true});
 });
 
 test('controlled canary watch fails closed for open, pending, or reconciliating portfolios',()=>{
@@ -47,4 +77,8 @@ test('controlled canary watch fails closed for open, pending, or reconciliating 
     assert.equal(result.activate,false);
     assert.ok(result.reasonCodes.includes('P7_CONTROLLED_CANARY_PORTFOLIO_NOT_EMPTY'));
   }
+});
+test('explicit canary approval revocations are deterministic and auditable control facts',()=>{
+ assert.deepEqual(controlledCanaryRevokedApprovalIds({LPFORGE_P7_CONTROLLED_CANARY_REVOKED_APPROVAL_IDS:' approval-b,approval-a,approval-b '}),['approval-a','approval-b']);
+ assert.deepEqual(controlledCanaryRevokedApprovalIds({}),[]);
 });

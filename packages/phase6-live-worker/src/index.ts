@@ -63,14 +63,19 @@ import {
   readJupiterMetisQuote,
 } from "../../phase6-swap-quote/src/index.js";
 import { createGovernedConnection, createMeteoraReadAdapter, type MeteoraReadAdapter } from "../../meteora/src/index.js";
+import type { ControlledCanaryDeploymentPolicy } from "../../deployment-policy/src/index.js";
 import { assessLifecycleSettlement } from "../../db/src/index.js";
 import type {
   AutonomousPlan,
   AutonomousPlanAction,
+  OpenChunkDispositionRecord,
   Phase1Store,
+  WalletPositionClassification,
 } from "../../db/src/index.js";
 import {
+  assertExecutionJournalTransition,
   determineRecoveryAction,
+  type ExecutionJournalState,
   type ExecutionJournal,
 } from "../../execution-recovery/src/index.js";
 
@@ -90,6 +95,8 @@ export interface LiveWorkerConfig {
   maxPresignReferenceDivergenceBps: number;
   confirmPollMs: number;
   confirmAttempts: number;
+  /** Present only while the explicitly approved controlled canary is armed. */
+  controlledCanary?: ControlledCanaryDeploymentPolicy;
 }
 export interface LiveWorkerResult {
   status: "IDLE" | "BLOCKED" | "SUBMITTED" | "RECONCILED" | "UNKNOWN";
@@ -155,6 +162,26 @@ export function deriveOpenResidualInventory(input:{
     ?input.pairedTokenRawBeforeOpen-input.pairedTokenRawBeforeFunding:0n;
   return [walletIncrease,availableBeforeOpen,input.pairedTokenReceivedRaw].reduce((least,value)=>value<least?value:least);
 }
+
+/**
+ * A chunked OPEN may confirm only part of its planned liquidity instructions.
+ * Recover wallet inventory only when the original pre-funding balance and the
+ * pre-close snapshot prove that the remaining token-X is still the funded
+ * canary asset.  Any unexpected wallet movement fails closed (undefined), so
+ * this path can never sell an unrelated wallet balance.
+ */
+export function deriveRecoveredOpenResidualInventory(input:{
+  pairedTokenRawBeforeFunding:bigint;
+  pairedTokenRawBeforeClose:bigint;
+  pairedTokenRawAfterPriorUnwind:bigint;
+  pairedTokenReceivedRaw:bigint;
+}):bigint|undefined{
+  if(input.pairedTokenRawAfterPriorUnwind!==input.pairedTokenRawBeforeClose)return undefined;
+  const residual=input.pairedTokenRawBeforeClose>input.pairedTokenRawBeforeFunding
+    ? input.pairedTokenRawBeforeClose-input.pairedTokenRawBeforeFunding
+    : 0n;
+  return residual<=input.pairedTokenReceivedRaw?residual:undefined;
+}
 type EntryFundingMeasurement={
   tokenMint:string;
   pairedTokenReceivedRaw:bigint;
@@ -162,6 +189,18 @@ type EntryFundingMeasurement={
   pairedTokenRawBeforeOpen:bigint;
   fundingSignature:string;
 };
+/** A chunked OPEN becomes ordinary OPEN only after every planned economic add
+ * has authoritative chain confirmation. Position-account existence alone is
+ * deliberately insufficient because the extension and first chunk can land. */
+export function assessOpenChunkConstruction(input:{planned:ReadonlyArray<{transactionId:string;sequence:number;kind:string}>;dispositions:ReadonlyArray<Pick<OpenChunkDispositionRecord,"transactionId"|"disposition">>}):{fullyConstructed:boolean;partial:boolean;reasonCodes:string[]}{
+  const economic=input.planned.filter(step=>step.kind==='METEORA_OPEN'||step.kind==='METEORA_OPEN_CHUNK');
+  const byId=new Map(input.dispositions.map(row=>[row.transactionId,row.disposition]));
+  const missing=economic.filter(step=>byId.get(step.transactionId)!=='CONFIRMED');
+  if(missing.length===0)return{fullyConstructed:true,partial:false,reasonCodes:['P6_OPEN_ALL_ECONOMIC_CHUNKS_CONFIRMED']};
+  const terminal=missing.some(step=>['PROVEN_NOT_LANDED','FAILED_PRE_SIGN','EXPIRED_PRE_SUBMISSION'].includes(String(byId.get(step.transactionId))));
+  const unknown=missing.some(step=>['UNKNOWN_SUBMISSION','SUBMITTED','SIGNING','SIGNED','PENDING'].includes(String(byId.get(step.transactionId))));
+  return{fullyConstructed:false,partial:terminal,reasonCodes:[terminal?'P6_OPEN_PARTIAL_CONSTRUCTION':'P6_OPEN_CHUNK_DISPOSITION_PENDING',...(unknown?['P6_OPEN_CHUNK_CHAIN_TRUTH_UNRESOLVED']:[]),...missing.map(step=>`P6_OPEN_CHUNK_NOT_CONFIRMED:${step.transactionId}`)]};
+}
 function nestedGeneratedPositionAddress(value:unknown):string|undefined{
  if(!value||typeof value!=="object")return undefined;
  const row=value as Record<string,unknown>,direct=row.generatedPositionAddress??row.positionAddress;
@@ -180,6 +219,11 @@ function planFields(plan: AutonomousOpenPlan) {
   if (capital <= 0n || !Number.isInteger(lower) || !Number.isInteger(upper)||!Number.isInteger(plannedActiveBinId)||!Number.isInteger(binStep)||binStep<=0)
     throw new Error("LPFORGE_P6_PLAN_FIELDS_INVALID");
   return { capital, lower, upper, plannedActiveBinId, binStep };
+}
+export function assertControlledCanaryOpen(config:LiveWorkerConfig,capital:bigint):void{
+  const canary=config.controlledCanary;
+  if(!canary)return;
+  if(capital!==canary.exactLiquidityCapitalLamports)throw new Error('LPFORGE_P6_CONTROLLED_CANARY_EXACT_CAPITAL_REQUIRED');
 }
 async function recordPositionTokenXLot(input:{store:Phase1Store;connection:Connection;plan:AutonomousPlan;positionAddress:string;tokenMint:string;sourceEvent:"FEE_CLAIM"|"REDUCE_WITHDRAWAL"|"CLOSE_WITHDRAWAL";sourceCashflowId:string;rawAmount:bigint;observedAt:string;signature:string}){
   if(input.rawAmount<=0n)return;
@@ -253,7 +297,7 @@ function ledger(store: Phase1Store): SubmissionLedger {
 async function recordJournal(
   store: Phase1Store,
   plan: AutonomousPlan,
-  state: string,
+  state: ExecutionJournalState,
   payload: Record<string, unknown>,
   signature?: string,
 ) {
@@ -272,6 +316,7 @@ async function recordJournal(
     });
     return;
   }
+  assertExecutionJournalTransition(String(existing.state) as ExecutionJournalState, state);
   await store.updateExecutionJournal({
     idempotencyKey: plan.idempotencyKey,
     expectedVersion: Number(existing.version),
@@ -316,6 +361,31 @@ function ticket(
     autonomousScaling: false as const,
   };
 }
+
+/**
+ * An entry-plan deadline never authorizes new risk after it expires.  It must
+ * also not strand capital that was already deployed: a CLOSE/EMERGENCY_CLOSE
+ * against a known PositionV2 receives only a fresh, short-lived protective
+ * execution permit and remains subject to simulation, RPC, wallet and
+ * protocol checks.  OPEN and every risk-increasing action retain the original
+ * plan deadline exactly.
+ */
+export function mutationRiskPlanExpiry(input: {
+  action: AutonomousPlanAction;
+  positionAddress?: string;
+  planExpiresAt: string;
+  now: string;
+  protectivePermitTtlMs: number;
+}): string {
+  if (
+    (input.action === "CLOSE" || input.action === "EMERGENCY_CLOSE") &&
+    input.positionAddress
+  )
+    return new Date(
+      Date.parse(input.now) + input.protectivePermitTtlMs,
+    ).toISOString();
+  return input.planExpiresAt;
+}
 async function awaitConfirmation(input: {
   connection: Connection;
   store: Phase1Store;
@@ -347,11 +417,11 @@ async function awaitConfirmation(input: {
       confirmation.status === "CONFIRMED" ||
       confirmation.status === "FINALIZED"
     )
-      return true;
+      return confirmation;
     if (confirmation.status === "FAILED" || confirmation.status === "EXPIRED")
       throw new Error(`LPFORGE_P6_CONFIRM_${confirmation.status}`);
   }
-  return false;
+  return undefined;
 }
 async function executeRequiredJupiterSwap(input: {
   store: Phase1Store;
@@ -584,20 +654,42 @@ async function executeRequiredJupiterSwap(input: {
  * reconciliation-required state with its exact completed step/signature.
  */
 async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:AutonomousOpenPlan;signer:MainnetSignerBackend;config:LiveWorkerConfig;connection:Connection;pool:MeteoraOpenAddPoolLike;prepared:PreparedAutonomousOpen;fields:ReturnType<typeof planFields>;entryFundingMeasurement?:EntryFundingMeasurement}):Promise<LiveWorkerResult>{
-  let submittedAny=false,lastSignature='',completedSteps:Array<{transactionId:string;signature:string;estimatedFeeLamports:bigint}>=[];
+  let submittedAny=false,lastSignature='',confirmedEntrySlot:bigint|undefined,completedSteps:Array<{transactionId:string;signature:string;estimatedFeeLamports:bigint}>=[],currentStep:{transactionId:string;sequence:number;kind:string;lastValidBlockHeight?:bigint;signature?:string;submitted:boolean}|undefined,confirmedLiquiditySolAssetOut=0n;
   try{
-    for(const step of input.prepared.steps){
+    for(const [stepIndex,step] of input.prepared.steps.entries()){
+      currentStep={transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,submitted:false};
+      await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'PENDING',observedAt:new Date().toISOString(),payload:{chunked:true,metadata:step.metadata}});
       const simulatedAt=new Date().toISOString(),simulation=await simulateExecutionTransaction({authority:authority('MAINNET_BUILD_SIMULATE',simulatedAt,input.config.riskPermitTtlMs),transactionId:step.transactionId,transaction:step.transaction,transport:createWeb3SimulationTransport(input.connection),simulatedAt,freshnessMs:input.config.simulationFreshnessMs});
       await input.store.insertExecutionSimulation({transactionId:step.transactionId,simulatedAt:simulation.simulatedAt,freshUntil:simulation.simulationFreshUntil,ok:simulation.ok,...(simulation.unitsConsumed!==undefined?{unitsConsumed:simulation.unitsConsumed}:{}),logs:simulation.logs,...(simulation.error?{error:simulation.error}:{}),payload:{planId:input.plan.planId,positionAddress:input.prepared.positionSigner.publicKeyAddress,operation:step.kind,chunked:true}});
       const fee=estimateExecutionFee({signatureCount:step.requiredSignerAddresses.length,computeUnitLimit:simulation.recommendedComputeUnitLimit??0,computeUnitPriceMicroLamports:0n}),cost=assessExecutionCost(fee,input.fields.capital,{maxAbsoluteFeeLamports:input.config.maxFeeLamports,maxFeeFractionOfCapital:input.config.maxFeeFraction}),risk=await governFreshOpenRisk({plan:input.plan,config:input.config,simulation,costApproved:cost.approved,fields:input.fields});
       if(risk.decision!=='APPROVE'||!risk.permitId||!risk.expiresAt)throw new Error(`LPFORGE_P6_CHUNK_SIMULATE_RISK:${risk.reasonCodes.join(',')}`);
       await input.store.insertExecutionRiskPermit({permitId:`${risk.permitId}:${step.transactionId}`,planId:input.plan.planId,decision:risk.decision,issuedAt:risk.issuedAt,expiresAt:risk.expiresAt,reasonCodes:risk.reasonCodes,payload:{autonomous:true,transactionId:step.transactionId,chunked:true,feeLamports:fee.totalFeeLamports.toString()}});
-      const latest=await input.connection.getLatestBlockhash('confirmed');step.transaction.recentBlockhash=latest.blockhash;step.transaction.lastValidBlockHeight=latest.lastValidBlockHeight;step.transaction.feePayer=new PublicKey(input.plan.ownerAddress);const submittedAt=new Date().toISOString(),openTicket=ticket(input.plan as unknown as AutonomousPlan,input.fields.capital,submittedAt,input.config.riskPermitTtlMs),openAuthority={phase:'P6' as const,cluster:'mainnet-beta' as const,level:'MAINNET_CANARY_OPEN' as const,liveExecution:true,canaryOnly:true,issuedAt:submittedAt,expiresAt:openTicket.expiresAt,ticketId:openTicket.ticketId,reasonCodes:['P6_AUTONOMOUS_CHUNK_FINAL_REVALIDATION',step.kind]};
-      const submitted=await executeMainnetCanaryOpen({authority:openAuthority,ticket:openTicket,transactionId:step.transactionId,idempotencyKey:`${input.plan.idempotencyKey}:${step.transactionId}`,requiredSignerAddresses:step.requiredSignerAddresses,backend:input.signer,auxiliaryBackends:auxiliaryPositionSignersForOpenStep(step,input.prepared.positionSigner),envelope:step.envelope,phase5RiskDecision:risk,lease:latest,ledger:ledger(input.store),transport:createWeb3SubmissionTransport(input.connection),submittedAt});submittedAny=true;lastSignature=submitted.signature;await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SUBMITTED',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata},submitted.signature);
-      let confirmed=false;for(let attempt=0;attempt<input.config.confirmAttempts;attempt++){await new Promise(resolve=>setTimeout(resolve,input.config.confirmPollMs));const confirmation=await observeConfirmation({attemptId:`${step.transactionId}:attempt:1`,record:{transactionId:step.transactionId,signature:submitted.signature,submittedAt,blockhash:latest.blockhash,lastValidBlockHeight:latest.lastValidBlockHeight,attempt:1},transport:createWeb3SubmissionTransport(input.connection),ledger:ledger(input.store),observedAt:new Date().toISOString()});if(confirmation.status==='CONFIRMED'||confirmation.status==='FINALIZED'){confirmed=true;break;}if(confirmation.status==='FAILED'||confirmation.status==='EXPIRED')throw new Error(`LPFORGE_P6_CHUNK_CONFIRM_${confirmation.status}`);}if(!confirmed)throw new Error('LPFORGE_P6_CHUNK_CONFIRMATION_PENDING');completedSteps.push({transactionId:step.transactionId,signature:submitted.signature,estimatedFeeLamports:fee.totalFeeLamports});
+      const latest=await input.connection.getLatestBlockhash('confirmed');currentStep!.lastValidBlockHeight=BigInt(latest.lastValidBlockHeight);step.transaction.recentBlockhash=latest.blockhash;step.transaction.lastValidBlockHeight=latest.lastValidBlockHeight;step.transaction.feePayer=new PublicKey(input.plan.ownerAddress);const submittedAt=new Date().toISOString(),openTicket=ticket(input.plan as unknown as AutonomousPlan,input.fields.capital,submittedAt,input.config.riskPermitTtlMs),openAuthority={phase:'P6' as const,cluster:'mainnet-beta' as const,level:'MAINNET_CANARY_OPEN' as const,liveExecution:true,canaryOnly:true,issuedAt:submittedAt,expiresAt:openTicket.expiresAt,ticketId:openTicket.ticketId,reasonCodes:['P6_AUTONOMOUS_CHUNK_FINAL_REVALIDATION',step.kind]};
+      await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SIGNING',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata});
+      const economicChunk=step.kind==='METEORA_OPEN'||step.kind==='METEORA_OPEN_CHUNK';
+      const [chunkNativeBefore,chunkWsolBefore]=economicChunk?await Promise.all([input.connection.getBalance(new PublicKey(input.plan.ownerAddress),'confirmed').then(value=>BigInt(value)),readWalletTokenBalance({connection:input.connection,ownerAddress:input.plan.ownerAddress,mint:WSOL_MINT})]):[0n,0n];
+      await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'SIGNING',lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:submittedAt,payload:{chunked:true}});
+      const submitted=await executeMainnetCanaryOpen({authority:openAuthority,ticket:openTicket,transactionId:step.transactionId,idempotencyKey:`${input.plan.idempotencyKey}:${step.transactionId}`,requiredSignerAddresses:step.requiredSignerAddresses,backend:input.signer,auxiliaryBackends:auxiliaryPositionSignersForOpenStep(step,input.prepared.positionSigner),envelope:step.envelope,phase5RiskDecision:risk,lease:latest,ledger:ledger(input.store),transport:createWeb3SubmissionTransport(input.connection),submittedAt,onSigned:async({signerBackendId})=>{await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SIGNED',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata,signerBackendId});await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'SIGNED',lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true,signerBackendId}});},onSubmissionUnknown:async({error})=>{await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'UNKNOWN_SUBMISSION',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata,error});await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'UNKNOWN_SUBMISSION',lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true,error}});}});submittedAny=true;currentStep!.signature=submitted.signature;currentStep!.submitted=true;lastSignature=submitted.signature;await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SUBMITTED',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata},submitted.signature);await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'SUBMITTED',signature:submitted.signature,lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true}});
+      let confirmed=false;for(let attempt=0;attempt<input.config.confirmAttempts;attempt++){await new Promise(resolve=>setTimeout(resolve,input.config.confirmPollMs));const confirmation=await observeConfirmation({attemptId:`${step.transactionId}:attempt:1`,record:{transactionId:step.transactionId,signature:submitted.signature,submittedAt,blockhash:latest.blockhash,lastValidBlockHeight:latest.lastValidBlockHeight,attempt:1},transport:createWeb3SubmissionTransport(input.connection),ledger:ledger(input.store),observedAt:new Date().toISOString()});if(confirmation.status==='CONFIRMED'||confirmation.status==='FINALIZED'){confirmed=true;if(confirmation.slot!==undefined)confirmedEntrySlot=confirmation.slot;let economicSolAssetOut=0n;if(economicChunk){const [chunkNativeAfter,chunkWsolAfter]=await Promise.all([input.connection.getBalance(new PublicKey(input.plan.ownerAddress),'confirmed').then(value=>BigInt(value)),readWalletTokenBalance({connection:input.connection,ownerAddress:input.plan.ownerAddress,mint:WSOL_MINT})]);const totalBefore=chunkNativeBefore+chunkWsolBefore,totalAfter=chunkNativeAfter+chunkWsolAfter,actualFee=await confirmedTransactionFeeLamports(input.connection,submitted.signature)??fee.totalFeeLamports;economicSolAssetOut=totalBefore>totalAfter+actualFee?totalBefore-totalAfter-actualFee:0n;confirmedLiquiditySolAssetOut+=economicSolAssetOut;}await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'CONFIRMED',signature:submitted.signature,lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true,confirmation:confirmation.status,economicSolAssetOutLamports:economicSolAssetOut.toString()}});break;}if(confirmation.status==='FAILED'||confirmation.status==='EXPIRED'){await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'PROVEN_NOT_LANDED',signature:submitted.signature,lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true,confirmation:confirmation.status}});throw new Error(`LPFORGE_P6_CHUNK_CONFIRM_${confirmation.status}`);}}if(!confirmed)throw new Error('LPFORGE_P6_CHUNK_CONFIRMATION_PENDING');completedSteps.push({transactionId:step.transactionId,signature:submitted.signature,estimatedFeeLamports:fee.totalFeeLamports});
     }
-    const position=await input.pool.getPosition?.(new PublicKey(input.prepared.positionSigner.publicKeyAddress));if(!position)throw new Error('LPFORGE_P6_POSITION_RECONCILIATION_MISSING');const intent=input.plan.planPayload.intent as Record<string,unknown>,funding=input.plan.intentPayload.entryFunding as Record<string,unknown>;await input.store.insertExecutionReconciliation({reconciliationId:`${input.plan.planId}:open`,planId:input.plan.planId,observedAt:new Date().toISOString(),status:'MATCH',expected:{owner:input.plan.ownerAddress,pool:input.plan.poolAddress,lowerBinId:input.fields.lower,upperBinId:input.fields.upper},actual:{positionAddress:input.prepared.positionSigner.publicKeyAddress},discrepancies:[],payload:{signature:lastSignature,autonomous:true,chunked:true}});await input.store.upsertOwnedPosition({lpforgePositionId:`position-${input.prepared.positionSigner.publicKeyAddress}`,poolAddress:input.plan.poolAddress,positionAddress:input.prepared.positionSigner.publicKeyAddress,ownerAddress:input.plan.ownerAddress,strategy:String(intent.strategy??'SPOT'),orientation:String(funding.orientation??'ONE_SIDED_Y'),lowerBinId:input.fields.lower,upperBinId:input.fields.upper,activeBinAtEntry:input.fields.plannedActiveBinId,initialCapitalLamports:input.fields.capital,entryPlanId:input.plan.planId,entrySignature:lastSignature,enteredAt:new Date().toISOString(),lifecycleState:'OPEN',lastPlanId:input.plan.planId,reconciliationStatus:'MATCH',payload:{thesisId:input.plan.thesisId,entryFunding:funding,chunked:true}});const positionAccount=await input.connection.getAccountInfo(new PublicKey(input.prepared.positionSigner.publicKeyAddress),'confirmed');await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:open-contribution`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'OPEN_CONTRIBUTION',observedAt:new Date().toISOString(),lamports:input.fields.capital,payload:{signature:lastSignature,source:'RECONCILED_CHUNKABLE_OPEN'}});if(positionAccount?.lamports)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:rent-lock`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'RENT_LOCK',observedAt:new Date().toISOString(),lamports:BigInt(positionAccount.lamports),payload:{signature:lastSignature,recoverable:true,source:'POSITION_ACCOUNT_INFO'}});for(const child of completedSteps){const actualFee=await confirmedTransactionFeeLamports(input.connection,child.signature);await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:tx-cost:${child.transactionId}`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'TX_COST',observedAt:new Date().toISOString(),lamports:actualFee??child.estimatedFeeLamports,payload:{signature:child.signature,transactionId:child.transactionId,source:actualFee===undefined?'EXECUTION_FEE_ESTIMATE':'CHAIN_RECEIPT_META',...(actualFee===undefined?{estimatedLamports:child.estimatedFeeLamports.toString()}:{})}});}await persistOpenResidualInventory({store:input.store,connection:input.connection,plan:input.plan,positionAddress:input.prepared.positionSigner.publicKeyAddress,funding:input.entryFundingMeasurement,signature:lastSignature});await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'RECONCILED',at:new Date().toISOString(),payload:{signature:lastSignature,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true}});return{status:'RECONCILED',planId:input.plan.planId,reasonCodes:[],transactionSubmitted:true,positionAddress:input.prepared.positionSigner.publicKeyAddress};
-  }catch(error){const reason=error instanceof Error?error.message:'LPFORGE_P6_CHUNKABLE_OPEN_UNKNOWN';if(submittedAny){await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECONCILIATION_REQUIRED',at:new Date().toISOString(),reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',reason],payload:{stage:'CHUNKABLE_OPEN',error:reason,positionAddress:input.prepared.positionSigner.publicKeyAddress,lastSignature}});return{status:'UNKNOWN',planId:input.plan.planId,reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',reason],transactionSubmitted:true};}await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'BLOCKED',at:new Date().toISOString(),payload:{stage:'CHUNKABLE_OPEN',error:reason}});return{status:'BLOCKED',planId:input.plan.planId,reasonCodes:[reason],transactionSubmitted:false};}
+    const construction=assessOpenChunkConstruction({planned:input.prepared.steps.map((step,index)=>({transactionId:step.transactionId,sequence:index+1,kind:step.kind})),dispositions:await input.store.loadOpenChunkDispositions(input.plan.planId)});if(!construction.fullyConstructed)throw new Error(`LPFORGE_P6_OPEN_CONSTRUCTION_INCOMPLETE:${construction.reasonCodes.join(',')}`);
+    await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'CONFIRMED',{action:'OPEN',positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,lastSignature},lastSignature);
+    const position=await input.pool.getPosition?.(new PublicKey(input.prepared.positionSigner.publicKeyAddress));
+    if(!position)throw new Error('LPFORGE_P6_POSITION_RECONCILIATION_MISSING');
+    const intent=input.plan.planPayload.intent as Record<string,unknown>;
+    const funding=input.plan.intentPayload.entryFunding as Record<string,unknown>;
+    const planFundingLamports=(await input.store.loadPlanCashflows(input.plan.planId)).filter(flow=>flow.flowType==='ENTRY_FUNDING_SOL_OUT').reduce((total,flow)=>total+(flow.lamports??0n),0n);
+    const actualEconomicCapitalLamports=planFundingLamports+confirmedLiquiditySolAssetOut;
+    await input.store.insertExecutionReconciliation({reconciliationId:`${input.plan.planId}:open`,planId:input.plan.planId,observedAt:new Date().toISOString(),status:'MATCH',expected:{owner:input.plan.ownerAddress,pool:input.plan.poolAddress,lowerBinId:input.fields.lower,upperBinId:input.fields.upper},actual:{positionAddress:input.prepared.positionSigner.publicKeyAddress},discrepancies:[],payload:{signature:lastSignature,autonomous:true,chunked:true}});
+    await input.store.upsertOwnedPosition({lpforgePositionId:`position-${input.prepared.positionSigner.publicKeyAddress}`,poolAddress:input.plan.poolAddress,positionAddress:input.prepared.positionSigner.publicKeyAddress,ownerAddress:input.plan.ownerAddress,strategy:String(intent.strategy??'SPOT'),orientation:String(funding.orientation??'ONE_SIDED_Y'),lowerBinId:input.fields.lower,upperBinId:input.fields.upper,activeBinAtEntry:input.fields.plannedActiveBinId,initialCapitalLamports:input.fields.capital,entryPlanId:input.plan.planId,entrySignature:lastSignature,...(confirmedEntrySlot!==undefined?{entrySlot:confirmedEntrySlot}:{}),enteredAt:new Date().toISOString(),lifecycleState:'OPEN',lastPlanId:input.plan.planId,reconciliationStatus:'MATCH',payload:{thesisId:input.plan.thesisId,entryFunding:funding,chunked:true,actualEconomicCapitalLamports:actualEconomicCapitalLamports.toString()}});
+    const positionAccount=await input.connection.getAccountInfo(new PublicKey(input.prepared.positionSigner.publicKeyAddress),'confirmed');
+    await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:open-contribution`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'OPEN_CONTRIBUTION',observedAt:new Date().toISOString(),lamports:actualEconomicCapitalLamports,payload:{signature:lastSignature,source:'RECONCILED_CHUNKABLE_OPEN',requestedLiquidityCapitalLamports:input.fields.capital.toString()}});
+    if(positionAccount?.lamports)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:rent-lock`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'RENT_LOCK',observedAt:new Date().toISOString(),lamports:BigInt(positionAccount.lamports),payload:{signature:lastSignature,recoverable:true,source:'POSITION_ACCOUNT_INFO'}});
+    for(const child of completedSteps){const actualFee=await confirmedTransactionFeeLamports(input.connection,child.signature);await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:tx-cost:${child.transactionId}`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'TX_COST',observedAt:new Date().toISOString(),lamports:actualFee??child.estimatedFeeLamports,payload:{signature:child.signature,transactionId:child.transactionId,source:actualFee===undefined?'EXECUTION_FEE_ESTIMATE':'CHAIN_RECEIPT_META',...(actualFee===undefined?{estimatedLamports:child.estimatedFeeLamports.toString()}:{})}});}
+    await persistOpenResidualInventory({store:input.store,connection:input.connection,plan:input.plan,positionAddress:input.prepared.positionSigner.publicKeyAddress,funding:input.entryFundingMeasurement,signature:lastSignature});
+    await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'RECONCILED',at:new Date().toISOString(),payload:{signature:lastSignature,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,actualEconomicCapitalLamports:actualEconomicCapitalLamports.toString()}});
+    return{status:'RECONCILED',planId:input.plan.planId,reasonCodes:[],transactionSubmitted:true,positionAddress:input.prepared.positionSigner.publicKeyAddress};
+  }catch(error){const reason=error instanceof Error?error.message:'LPFORGE_P6_CHUNKABLE_OPEN_UNKNOWN';if(currentStep&&!currentStep.submitted)await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:currentStep.transactionId,sequence:currentStep.sequence,kind:currentStep.kind,disposition:'FAILED_PRE_SIGN',...(currentStep.lastValidBlockHeight!==undefined?{lastValidBlockHeight:currentStep.lastValidBlockHeight}:{}),observedAt:new Date().toISOString(),payload:{chunked:true,error:reason}});if(currentStep?.submitted&&currentStep.signature&&reason==='LPFORGE_P6_CHUNK_CONFIRMATION_PENDING')await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:currentStep.transactionId,sequence:currentStep.sequence,kind:currentStep.kind,disposition:'UNKNOWN_SUBMISSION',signature:currentStep.signature,...(currentStep.lastValidBlockHeight!==undefined?{lastValidBlockHeight:currentStep.lastValidBlockHeight}:{}),observedAt:new Date().toISOString(),payload:{chunked:true,error:reason}});if(submittedAny){if(input.entryFundingMeasurement){await input.store.upsertPartialEntryRecovery({planId:input.plan.planId,poolAddress:input.plan.poolAddress,ownerAddress:input.plan.ownerAddress,tokenMint:input.entryFundingMeasurement.tokenMint,fundingTransactionId:input.plan.swapTransactionId??'P6_CHUNKABLE_OPEN',fundingSignature:input.entryFundingMeasurement.fundingSignature,fundedAt:new Date().toISOString(),pairedTokenAmount:input.entryFundingMeasurement.pairedTokenReceivedRaw.toString(),intendedCapitalLamports:input.fields.capital,intendedRange:{lowerBinId:input.fields.lower,upperBinId:input.fields.upper},state:'RECONCILIATION_REQUIRED',walletTruth:{refreshRequired:true,confirmedLiquiditySolAssetOutLamports:confirmedLiquiditySolAssetOut.toString(),entryFundingMeasurement:{tokenMint:input.entryFundingMeasurement.tokenMint,pairedTokenReceivedRaw:input.entryFundingMeasurement.pairedTokenReceivedRaw.toString(),pairedTokenRawBeforeFunding:input.entryFundingMeasurement.pairedTokenRawBeforeFunding.toString(),pairedTokenRawBeforeOpen:input.entryFundingMeasurement.pairedTokenRawBeforeOpen.toString(),fundingSignature:input.entryFundingMeasurement.fundingSignature}},payload:{partialEntry:true,reasonCodes:['P6_PARTIAL_OPEN_CHUNK_DISPOSITION_REQUIRED',reason],positionAddress:input.prepared.positionSigner.publicKeyAddress},updatedAt:new Date().toISOString()});}await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'RECONCILIATION_REQUIRED',{action:'OPEN',chunked:true,error:reason,positionAddress:input.prepared.positionSigner.publicKeyAddress,lastSignature,postSubmission:true},lastSignature||undefined);await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECONCILIATION_REQUIRED',at:new Date().toISOString(),reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',reason],payload:{stage:'CHUNKABLE_OPEN',error:reason,positionAddress:input.prepared.positionSigner.publicKeyAddress,lastSignature,partialEntry:true}});return{status:'UNKNOWN',planId:input.plan.planId,reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',reason],transactionSubmitted:true};}await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'BLOCKED',at:new Date().toISOString(),payload:{stage:'CHUNKABLE_OPEN',error:reason}});return{status:'BLOCKED',planId:input.plan.planId,reasonCodes:[reason],transactionSubmitted:false};}
 }
 /** Executes one already-claimed plan. A caller must claim from storage before calling this function. */
 export async function executeAutonomousOpen(input: {
@@ -608,6 +700,9 @@ export async function executeAutonomousOpen(input: {
 }): Promise<LiveWorkerResult> {
   const now = new Date().toISOString(),
     fields = planFields(input.plan);
+  // Check before route construction and again at the signing boundary. A
+  // rebuilt transaction may never change the canary liquidity amount.
+  assertControlledCanaryOpen(input.config,fields.capital);
   // A signature that has left the wallet means the position may exist on-chain
   // even if post-submit bookkeeping fails; recovery must adopt, never resend.
   let submittedAny = false,
@@ -778,6 +873,7 @@ export async function executeAutonomousOpen(input: {
       },
     });
     const latest = await connection.getLatestBlockhash("confirmed");
+    assertControlledCanaryOpen(input.config,fields.capital);
     prepared.transaction.recentBlockhash = latest.blockhash;
     prepared.transaction.lastValidBlockHeight = latest.lastValidBlockHeight;
     prepared.transaction.feePayer = new PublicKey(input.plan.ownerAddress);
@@ -819,6 +915,30 @@ export async function executeAutonomousOpen(input: {
       ledger: ledger(input.store),
       transport: createWeb3SubmissionTransport(connection),
       submittedAt: signedAt,
+      onSigned: async ({ signerBackendId }) =>
+        recordJournal(
+          input.store,
+          input.plan as unknown as AutonomousPlan,
+          "SIGNED",
+          {
+            action: "OPEN",
+            transactionId: input.plan.transactionId,
+            generatedPositionAddress: openPositionAddress,
+            signerBackendId,
+          },
+        ),
+      onSubmissionUnknown: async ({ error }) =>
+        recordJournal(
+          input.store,
+          input.plan as unknown as AutonomousPlan,
+          "UNKNOWN_SUBMISSION",
+          {
+            action: "OPEN",
+            transactionId: input.plan.transactionId,
+            generatedPositionAddress: openPositionAddress,
+            error,
+          },
+        ),
     });
     submittedAny = true;
     lastSignature = submitted.signature;
@@ -864,6 +984,18 @@ export async function executeAutonomousOpen(input: {
         confirmation.status === "CONFIRMED" ||
         confirmation.status === "FINALIZED"
       ) {
+        await recordJournal(
+          input.store,
+          input.plan as unknown as AutonomousPlan,
+          "CONFIRMED",
+          {
+            action: "OPEN",
+            transactionId: input.plan.transactionId,
+            positionAddress: prepared.positionSigner.publicKeyAddress,
+            confirmation: confirmation.status,
+          },
+          submitted.signature,
+        );
         const position = await pool.getPosition?.(
           new PublicKey(prepared.positionSigner.publicKeyAddress),
         );
@@ -902,6 +1034,7 @@ export async function executeAutonomousOpen(input: {
           initialCapitalLamports: fields.capital,
           entryPlanId: input.plan.planId,
           entrySignature: submitted.signature,
+          ...(confirmation.slot !== undefined ? { entrySlot: confirmation.slot } : {}),
           enteredAt: new Date().toISOString(),
           lifecycleState: "OPEN",
           lastPlanId: input.plan.planId,
@@ -958,6 +1091,17 @@ export async function executeAutonomousOpen(input: {
         confirmation.status === "FAILED" ||
         confirmation.status === "EXPIRED"
       ) {
+        await recordJournal(
+          input.store,
+          input.plan as unknown as AutonomousPlan,
+          "FAILED",
+          {
+            action: "OPEN",
+            transactionId: input.plan.transactionId,
+            confirmation: confirmation.status,
+          },
+          submitted.signature,
+        );
         await input.store.completeAutonomousPlan({
           planId: input.plan.planId,
           state: "FAILED",
@@ -987,6 +1131,19 @@ export async function executeAutonomousOpen(input: {
     if (submittedAny) {
       // One-shot opens get the same post-submit parity as the chunkable path:
       // never FAILED after a signature left the wallet, never resent blindly.
+      await recordJournal(
+        input.store,
+        input.plan as unknown as AutonomousPlan,
+        "RECONCILIATION_REQUIRED",
+        {
+          action: "OPEN",
+          error: reason,
+          positionAddress: openPositionAddress,
+          lastSignature,
+          postSubmission: true,
+        },
+        lastSignature || undefined,
+      );
       await input.store.transitionAutonomousPlan({
         planId: input.plan.planId,
         state: "RECONCILIATION_REQUIRED",
@@ -1081,6 +1238,93 @@ async function persistOpenResidualInventory(input:{
   });
 }
 
+type RecoveredOpenResidual={
+  entryPlanId:string;
+  lotId:string;
+  tokenMint:string;
+  rawAmount:bigint;
+  recoveryRow:Record<string,unknown>;
+};
+
+/**
+ * Backfill the normal inventory ledger for an OPEN that was reconciled after
+ * only a subset of its chunked add-liquidity children confirmed.  The lot is
+ * deliberately created before account close, so SOL settlement cannot become
+ * terminal until this separately wallet-held, canary-attributable asset has
+ * an exact disposition receipt.
+ */
+async function ensureRecoveredOpenResidualInventory(input:{
+  store:Phase1Store;
+  connection:Connection;
+  plan:AutonomousPlan;
+  positionAddress:string;
+  tokenMint:string;
+  pairedTokenRawBeforeClose:bigint;
+}):Promise<RecoveredOpenResidual|undefined>{
+  const settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
+  const entryPlanId=settlementInput?.lifecycle.entryPlanId;
+  if(!entryPlanId)return undefined;
+  // OPEN_RECOVERED is terminal for the recurring entry-recovery queue, but
+  // not for lifecycle settlement: an already-open position can still carry a
+  // canary-attributable wallet residual.  Query this exact entry plan rather
+  // than widening the recurring queue and accidentally reprocessing it.
+  const recoveryRow=await input.store.loadPartialEntryRecovery(entryPlanId);
+  if(
+    !recoveryRow||
+    String(recoveryRow.state)!=="OPEN_RECOVERED"||
+    String(recoveryRow.owner_address)!==input.plan.ownerAddress||
+    String(recoveryRow.pool_address)!==input.plan.poolAddress||
+    String(recoveryRow.token_mint)!==input.tokenMint
+  )return undefined;
+  const truth=(recoveryRow.wallet_truth??{}) as Record<string,unknown>,
+    funding=(truth.entryFundingMeasurement??{}) as Record<string,unknown>;
+  let pairedTokenRawBeforeFunding:bigint,pairedTokenReceivedRaw:bigint;
+  try{
+    pairedTokenRawBeforeFunding=BigInt(String(funding.pairedTokenRawBeforeFunding??""));
+    pairedTokenReceivedRaw=BigInt(String(recoveryRow.paired_token_amount??""));
+  }catch{
+    throw new Error("LPFORGE_P6_RECOVERED_OPEN_RESIDUAL_PROVENANCE_MISSING");
+  }
+  const pairedTokenRawAfterPriorUnwind=await readWalletTokenBalance({connection:input.connection,ownerAddress:input.plan.ownerAddress,mint:input.tokenMint});
+  // Keep the proof calculation explicit: a current balance other than the
+  // pre-close snapshot could include an operator transfer and must never be
+  // attributed automatically.
+  const attributable=deriveRecoveredOpenResidualInventory({
+    pairedTokenRawBeforeFunding,
+    pairedTokenRawBeforeClose:input.pairedTokenRawBeforeClose,
+    pairedTokenRawAfterPriorUnwind,
+    pairedTokenReceivedRaw,
+  });
+  if(attributable===undefined)throw new Error("LPFORGE_P6_RECOVERED_OPEN_RESIDUAL_WALLET_MISMATCH");
+  if(attributable<=0n)return undefined;
+  const lotId=`${entryPlanId}:recovered-open-residual:${input.tokenMint}`,
+    supply=await input.connection.getTokenSupply(new PublicKey(input.tokenMint),"confirmed");
+  await input.store.createPositionInventoryLot({
+    lotId,
+    createdEventId:`${entryPlanId}:recovered-open-residual-created`,
+    positionAddress:input.positionAddress,
+    planId:entryPlanId,
+    ownerAddress:input.plan.ownerAddress,
+    poolAddress:input.plan.poolAddress,
+    tokenMint:input.tokenMint,
+    tokenSide:"X",
+    sourceEvent:"RECOVERY_RESIDUAL",
+    rawAmount:attributable,
+    decimals:supply.value.decimals,
+    acquiredAt:new Date().toISOString(),
+    transactionSignature:String(recoveryRow.funding_signature),
+    payload:{
+      source:"PARTIAL_CHUNKED_OPEN_CHAIN_RECONSTRUCTION",
+      fundingSignature:String(recoveryRow.funding_signature),
+      pairedTokenRawBeforeFunding:pairedTokenRawBeforeFunding.toString(),
+      pairedTokenRawBeforeClose:input.pairedTokenRawBeforeClose.toString(),
+      pairedTokenRawAfterPriorUnwind:pairedTokenRawAfterPriorUnwind.toString(),
+      pairedTokenReceivedRaw:pairedTokenReceivedRaw.toString(),
+    },
+  });
+  return{entryPlanId,lotId,tokenMint:input.tokenMint,rawAmount:attributable,recoveryRow};
+}
+
 /**
  * Executes one Jupiter token-X→token-Y swap with the full simulation, cost,
  * risk, signing and confirmation chain. Shared by partial-entry recovery and
@@ -1097,8 +1341,8 @@ async function executeJupiterUnwindStep(input: {
   action: "CLOSE" | "EMERGENCY_CLOSE";
   transactionId: string;
   idempotencyKey: string;
-  stage: "PARTIAL_ENTRY_UNWIND" | "CLOSE_TOKEN_X_UNWIND";
-  reasonPrefix: "P6_PARTIAL_UNWIND" | "P6_CLOSE_UNWIND";
+  stage: "PARTIAL_ENTRY_UNWIND" | "CLOSE_TOKEN_X_UNWIND" | "CLOSE_RECOVERED_OPEN_RESIDUAL_UNWIND";
+  reasonPrefix: "P6_PARTIAL_UNWIND" | "P6_CLOSE_UNWIND" | "P6_CLOSE_RECOVERED_OPEN_RESIDUAL_UNWIND";
   fundingTransactionId?: string;
   afterSubmit?: (submitted: { signature: string }) => Promise<void>;
 }): Promise<{ ok: boolean; submitted: boolean; reasonCodes: string[]; signature?:string }> {
@@ -1416,12 +1660,18 @@ export async function recoverPartialEntryFunding(input: {
       });
       continue;
     }
-    // A funded OPEN can finish reconciliation after an earlier failure wrote a
-    // recovery row.  Reconciled chain truth wins: retaining UNWIND_REQUIRED in
-    // that case would incorrectly strand the worker (or later unwind a live
-    // LP position).  This is deliberately limited to a reconciled OPEN plan.
+    if (state === "RESOLVED") {
+      results.push({planId,action:"HOLD",reasonCodes:["P6_PARTIAL_OPEN_RESIDUAL_SETTLED"]});
+      continue;
+    }
+    // A reconciled plan is not by itself proof of a full entry: an extended
+    // PositionV2 can exist after only its first liquidity child.  Every
+    // economic child must be chain-confirmed before this recovery row may be
+    // retired as an ordinary open.
     const plan = await input.store.loadAutonomousPlan(planId);
-    if (plan?.action === "OPEN" && plan.state === "RECONCILED") {
+    const plannedChunks=plan?.action==='OPEN'?plan.steps.filter(step=>step.kind==='METEORA_OPEN'||step.kind==='METEORA_OPEN_CHUNK').map((step,index)=>({transactionId:step.transactionId,sequence:index+1,kind:step.kind})):[];
+    const construction=plan?.action==='OPEN'&&plannedChunks.length>1?assessOpenChunkConstruction({planned:plannedChunks,dispositions:await input.store.loadOpenChunkDispositions(planId)}):undefined;
+    if (plan?.action === "OPEN" && plan.state === "RECONCILED" && construction?.fullyConstructed) {
       await input.store.upsertPartialEntryRecovery({
         planId,
         poolAddress: String(row.pool_address),
@@ -1444,6 +1694,11 @@ export async function recoverPartialEntryFunding(input: {
         updatedAt: new Date().toISOString(),
       });
       results.push({ planId, action: "HOLD", reasonCodes: ["P6_PARTIAL_OPEN_RECONCILED_AFTER_RECOVERY"] });
+      continue;
+    }
+    if(plan?.action==='OPEN'&&construction&&!construction.fullyConstructed){
+      await input.store.upsertPartialEntryRecovery({planId,poolAddress:String(row.pool_address),ownerAddress:String(row.owner_address),tokenMint:String(row.token_mint),fundingTransactionId:String(row.funding_transaction_id),fundingSignature:String(row.funding_signature),fundedAt:new Date(String(row.funded_at)).toISOString(),pairedTokenAmount:String(row.paired_token_amount),intendedCapitalLamports:BigInt(String(row.intended_capital_lamports)),intendedRange:(row.intended_range??{}) as Record<string,unknown>,state:'RECONCILIATION_REQUIRED',walletTruth:{...(row.wallet_truth??{}),refreshRequired:true},payload:{partialEntry:true,reasonCodes:construction.reasonCodes},updatedAt:new Date().toISOString()});
+      results.push({planId,action:'HOLD',reasonCodes:['P6_PARTIAL_ENTRY_REQUIRES_POSITION_RECOVERY',...construction.reasonCodes]});
       continue;
     }
     if (state === "UNWIND_SUBMITTED") {
@@ -1860,7 +2115,13 @@ async function executeMeteoraMutation(input: {
       at: new Date().toISOString(),
       payload: { ok: simulation.ok },
     });
-    const fee = estimateExecutionFee({
+    const riskPlanExpiresAt=mutationRiskPlanExpiry({
+      action:input.action,
+      ...(input.plan.positionAddress?{positionAddress:input.plan.positionAddress}:{}),
+      planExpiresAt:input.plan.expiresAt,
+      now,
+      protectivePermitTtlMs:input.config.riskPermitTtlMs,
+    }),fee = estimateExecutionFee({
         signatureCount: 1,
         computeUnitLimit: simulation.recommendedComputeUnitLimit ?? 0,
         computeUnitPriceMicroLamports: 0n,
@@ -1879,7 +2140,7 @@ async function executeMeteoraMutation(input: {
           planId: input.plan.planId,
           now: new Date().toISOString(),
           thesisExpiresAt: input.plan.expiresAt,
-          planExpiresAt: input.plan.expiresAt,
+          planExpiresAt: riskPlanExpiresAt,
           simulationOk: simulation.ok,
           simulationFreshUntil: simulation.simulationFreshUntil,
           walletTruthConsistent: true,
@@ -1901,6 +2162,36 @@ async function executeMeteoraMutation(input: {
         },
       );
     if (risk.decision !== "APPROVE" || !risk.permitId || !risk.expiresAt) {
+      const sequencedProtectiveClose =
+        (input.action === "CLOSE" || input.action === "EMERGENCY_CLOSE") &&
+        input.plan.positionAddress !== undefined &&
+        closeSettlementStage(input.plan) !== undefined;
+      // Earlier confirmed close children are parent-level chain truth.  A
+      // temporary pre-sign block for the *next* protective child must remain
+      // reconciliation debt, not terminalize the shared journal and erase the
+      // ability to retry after fresh simulation/RPC facts arrive.
+      if (sequencedProtectiveClose) {
+        await input.store.transitionAutonomousPlan({
+          planId: input.plan.planId,
+          state: "RECONCILIATION_REQUIRED",
+          at: new Date().toISOString(),
+          reasonCodes: ["P6_PROTECTIVE_CLOSE_CHILD_RISK_RETRY", ...risk.reasonCodes],
+          payload: {
+            action: input.action,
+            stage: closeSettlementDispatch(input.plan).stage ?? "CLOSE_UNKNOWN_STAGE",
+            protectiveChildRiskRetry: true,
+          },
+        });
+        return {
+          status: "UNKNOWN",
+          planId: input.plan.planId,
+          reasonCodes: ["P6_PROTECTIVE_CLOSE_CHILD_RISK_RETRY", ...risk.reasonCodes],
+          // An earlier child is already confirmed.  This reports parent-level
+          // economic truth and prevents upper layers from treating the close
+          // workflow as an unsent, safely disposable plan.
+          transactionSubmitted: true,
+        };
+      }
       await input.store.transitionAutonomousPlan({
         planId: input.plan.planId,
         state: "BLOCKED",
@@ -1960,6 +2251,7 @@ async function executeMeteoraMutation(input: {
       at: signedAt,
       payload: { transactionId },
     });
+    await recordJournal(input.store,input.plan,"SIGNING",{action:input.action,transactionId});
     const submitInput = {
       authority: mutationAuthority,
       ticket: mutationTicket,
@@ -1973,6 +2265,10 @@ async function executeMeteoraMutation(input: {
       ledger: ledger(input.store),
       transport: createWeb3SubmissionTransport(connection),
       submittedAt: signedAt,
+      onSigned: async ({ signerBackendId }: { signerBackendId: string }) =>
+        recordJournal(input.store,input.plan,"SIGNED",{action:input.action,transactionId,signerBackendId}),
+      onSubmissionUnknown: async ({ error }: { error: string }) =>
+        recordJournal(input.store,input.plan,"UNKNOWN_SUBMISSION",{action:input.action,transactionId,error}),
     };
     submissionAttempted=true;
     const submitted = open
@@ -1992,8 +2288,7 @@ async function executeMeteoraMutation(input: {
       payload: { signature: submitted.signature, transactionId },
     });
     if (input.afterSubmit) await input.afterSubmit({ signature: submitted.signature });
-    if (
-      !(await awaitConfirmation({
+    const confirmation = await awaitConfirmation({
         connection,
         store: input.store,
         transactionId,
@@ -2002,14 +2297,21 @@ async function executeMeteoraMutation(input: {
         lease,
         pollMs: input.config.confirmPollMs,
         attempts: input.config.confirmAttempts,
-      }))
-    )
+      });
+    if (!confirmation)
       return {
         status: "SUBMITTED",
         planId: input.plan.planId,
         reasonCodes: ["P6_CONFIRMATION_PENDING"],
         transactionSubmitted: true,
       };
+    await recordJournal(
+      input.store,
+      input.plan,
+      "CONFIRMED",
+      { action: input.action, transactionId, confirmation: confirmation.status },
+      submitted.signature,
+    );
     await input.store.insertExecutionReconciliation({
       reconciliationId: `${input.plan.planId}:${transactionId}`,
       planId: input.plan.planId,
@@ -2169,6 +2471,8 @@ async function executeManagementReplacement(input: {
   pool: MeteoraOpenAddPoolLike & MeteoraRemoveClaimPoolLike;
   positionAddress: string;
 }): Promise<LiveWorkerResult> {
+  if(input.config.controlledCanary&&!input.config.controlledCanary.replacementOpenAllowed)
+    throw new Error('LPFORGE_P6_CONTROLLED_CANARY_REPLACEMENT_OPEN_BLOCKED');
   const remove = input.plan.steps.find((step) => step.kind === "METEORA_CLOSE");
   const open = input.plan.steps.find((step) => step.kind === "METEORA_OPEN");
   if (!remove || !open)
@@ -2378,12 +2682,14 @@ type CloseSettlementStage =
   | "CLOSE_LIQUIDITY_REMOVED"
   | "CLOSE_CLAIMS_SETTLED"
   | "CLOSE_INVENTORY_MEASURED"
-  | "CLOSE_INVENTORY_UNWOUND";
+  | "CLOSE_INVENTORY_UNWOUND"
+  | "CLOSE_RECOVERED_OPEN_RESIDUAL_UNWOUND";
 
 type CloseSettlementPendingStage =
   | "CLOSE_REMOVE_SUBMITTED"
   | "CLOSE_CLAIM_SUBMITTED"
   | "CLOSE_UNWIND_SUBMITTED"
+  | "CLOSE_OPEN_RESIDUAL_UNWIND_SUBMITTED"
   | "CLOSE_POSITION_SUBMITTED";
 
 function closeSettlementDispatch(plan: AutonomousPlan): Record<string, unknown> {
@@ -2404,6 +2710,7 @@ function closeSettlementStage(
       "CLOSE_CLAIMS_SETTLED",
       "CLOSE_INVENTORY_MEASURED",
       "CLOSE_INVENTORY_UNWOUND",
+      "CLOSE_RECOVERED_OPEN_RESIDUAL_UNWOUND",
     ].includes(value)
     ? (value as CloseSettlementStage)
     : undefined;
@@ -2425,9 +2732,38 @@ function closeSettlementPending(plan: AutonomousPlan): {
   const dispatch = closeSettlementDispatch(plan), stage = dispatch.pendingStage,
     signature = dispatch.pendingSignature;
   return typeof stage === "string" && typeof signature === "string" &&
-    ["CLOSE_REMOVE_SUBMITTED", "CLOSE_CLAIM_SUBMITTED", "CLOSE_UNWIND_SUBMITTED", "CLOSE_POSITION_SUBMITTED"].includes(stage)
+    ["CLOSE_REMOVE_SUBMITTED", "CLOSE_CLAIM_SUBMITTED", "CLOSE_UNWIND_SUBMITTED", "CLOSE_OPEN_RESIDUAL_UNWIND_SUBMITTED", "CLOSE_POSITION_SUBMITTED"].includes(stage)
     ? { stage: stage as CloseSettlementPendingStage, signature }
     : undefined;
+}
+
+/**
+ * Compatibility recovery for the one historical failure mode where a
+ * multi-child protective close had already confirmed its unwind, but a
+ * pre-M0059 worker incorrectly terminalized the plan when it tried to sign
+ * the next child from a CONFIRMED plan journal.  This is deliberately much
+ * narrower than reopening failed plans: it is only a close-family plan, only
+ * the documented transition error, only an empty-position settlement stage,
+ * and still requires a separately recorded, chain-confirmed unwind below.
+ */
+export function isLegacySequentialCloseJournalRecovery(value: {
+  plan: AutonomousPlan;
+  journal: ExecutionJournal;
+  positionExists: boolean;
+}): boolean {
+  const dispatch = closeSettlementDispatch(value.plan);
+  return (
+    (value.plan.action === "CLOSE" || value.plan.action === "EMERGENCY_CLOSE") &&
+    value.plan.state === "RECONCILIATION_REQUIRED" &&
+    value.journal.state === "FAILED" &&
+    value.positionExists &&
+    dispatch.error === "LPFORGE_EXECUTION_JOURNAL_INVALID_TRANSITION:CONFIRMED->SIGNING" &&
+    dispatch.stage === "CLOSE_POSITION_PENDING" &&
+    dispatch.closeSettlementIncomplete === true &&
+    typeof dispatch.tokenXMint === "string" &&
+    closeSettlementAmount(dispatch.attributableTokenX) !== undefined &&
+    closeSettlementAmount(dispatch.tokenXBefore) !== undefined
+  );
 }
 
 function closeSettlementOutputPayload(
@@ -2476,6 +2812,9 @@ export async function reconcileConfirmedCloseUnwind(input: {
   inputMint: string;
   inputAmountRaw: bigint;
   observedAt?: string;
+  /** A recovered OPEN residual has its own lot and durable receipt ids. */
+  lotId?: string;
+  settlementIdSuffix?: string;
 }): Promise<{ ok: true; swapProceedsLamports: bigint; inputCorroborated: boolean } | { ok: false; reasonCodes: string[] }> {
   const receipt = await loadConfirmedExecutionReceipt(input.connection, input.signature);
   const effects = deriveTransactionAssetEffects(receipt, {
@@ -2503,7 +2842,13 @@ export async function reconcileConfirmedCloseUnwind(input: {
     return { ok: false, reasonCodes: settlement.reasonCodes };
 
   const observedAt = input.observedAt ?? new Date().toISOString(),
-    ids = closeUnwindSettlementIds(input.plan.planId);
+    ids = input.settlementIdSuffix
+      ? {
+          cashflowId:`${input.plan.planId}:${input.settlementIdSuffix}:swap-proceeds`,
+          lotEventId:`${input.plan.planId}:${input.settlementIdSuffix}:lot-settled`,
+        }
+      : closeUnwindSettlementIds(input.plan.planId),
+    lotId=input.lotId??`${input.plan.planId}:close-x:lot`;
   await input.store.insertPositionCashflow({
     cashflowId: ids.cashflowId,
     positionAddress: input.positionAddress,
@@ -2531,7 +2876,7 @@ export async function reconcileConfirmedCloseUnwind(input: {
   });
   await input.store.settlePositionInventoryLot({
     eventId: ids.lotEventId,
-    lotId: `${input.plan.planId}:close-x:lot`,
+    lotId,
     planId: input.plan.planId,
     eventType: "SETTLED",
     settledRawAmount: input.inputAmountRaw,
@@ -2856,7 +3201,7 @@ async function executeCloseSettlement(input: {
     stage = "CLOSE_INVENTORY_UNWOUND";
   }
 
-  if (stage !== "CLOSE_INVENTORY_UNWOUND")
+  if (stage !== "CLOSE_INVENTORY_UNWOUND" && stage !== "CLOSE_RECOVERED_OPEN_RESIDUAL_UNWOUND")
     throw new Error("LPFORGE_P6_CLOSE_SETTLEMENT_STAGE_INVALID");
   const tokenXPostUnwind = await readWalletTokenBalance({
     connection,
@@ -2882,6 +3227,94 @@ async function executeCloseSettlement(input: {
       transactionSubmitted: true,
     };
   }
+  // A partial chunked OPEN can have a funded token-X residual that predates
+  // the close snapshot.  It is not part of the REMOVE/CLAIM delta above and
+  // must be independently proven, journaled, swapped and settled before the
+  // PositionV2 account is closed.  This is deliberately distinct from the
+  // normal close-unwind child so neither confirmed child can be replayed.
+  if (stage === "CLOSE_INVENTORY_UNWOUND") {
+    const recoveredOpenResidual=await ensureRecoveredOpenResidualInventory({
+      store:input.store,
+      connection,
+      plan:input.plan,
+      positionAddress:input.positionAddress,
+      tokenMint:poolFact.tokenXMint,
+      pairedTokenRawBeforeClose:tokenXBefore,
+    });
+    if(recoveredOpenResidual){
+      const transactionId=`${input.plan.planId}:recovered-open-residual-unwind`,
+        unwind=await executeJupiterUnwindStep({
+          store:input.store,
+          plan:input.plan,
+          signer:input.signer,
+          config:input.config,
+          amount:recoveredOpenResidual.rawAmount,
+          economicReferenceLamports:mutationCapital(input.plan),
+          action:closeAction,
+          transactionId,
+          idempotencyKey:`${input.plan.idempotencyKey}:${transactionId}`,
+          stage:"CLOSE_RECOVERED_OPEN_RESIDUAL_UNWIND",
+          reasonPrefix:"P6_CLOSE_RECOVERED_OPEN_RESIDUAL_UNWIND",
+          afterSubmit:async({signature})=>persist("CLOSE_INVENTORY_UNWOUND",{
+            tokenXBefore:tokenXBefore.toString(),
+            tokenYBefore:tokenYBefore.toString(),
+            attributableTokenX:attributableTokenX?.toString()??"0",
+            attributableTokenY:attributableTokenY?.toString()??"0",
+            recoveredOpenResidualLotId:recoveredOpenResidual.lotId,
+            recoveredOpenResidualTokenMint:recoveredOpenResidual.tokenMint,
+            recoveredOpenResidualRawAmount:recoveredOpenResidual.rawAmount.toString(),
+            recoveredOpenResidualEntryPlanId:recoveredOpenResidual.entryPlanId,
+            recoveredOpenResidualUnwindTransactionId:transactionId,
+            pendingStage:"CLOSE_OPEN_RESIDUAL_UNWIND_SUBMITTED",
+            pendingSignature:signature,
+          }),
+        });
+      if(!unwind.ok)return incomplete(unwind.reasonCodes,"CLOSE_OPEN_RESIDUAL_UNWIND_PENDING");
+      if(!unwind.signature)return incomplete(["P6_CLOSE_RECOVERED_OPEN_RESIDUAL_UNWIND_SIGNATURE_MISSING"],"CLOSE_OPEN_RESIDUAL_UNWIND_SETTLEMENT_UNKNOWN");
+      const settlement=await reconcileConfirmedCloseUnwind({
+        store:input.store,
+        connection,
+        plan:input.plan,
+        positionAddress:input.positionAddress,
+        signature:unwind.signature,
+        transactionId,
+        inputMint:recoveredOpenResidual.tokenMint,
+        inputAmountRaw:recoveredOpenResidual.rawAmount,
+        lotId:recoveredOpenResidual.lotId,
+        settlementIdSuffix:"recovered-open-residual",
+      });
+      if(!settlement.ok)return incomplete(settlement.reasonCodes,"CLOSE_OPEN_RESIDUAL_UNWIND_SETTLEMENT_UNKNOWN");
+      await input.store.upsertPartialEntryRecovery({
+        planId:recoveredOpenResidual.entryPlanId,
+        poolAddress:String(recoveredOpenResidual.recoveryRow.pool_address),
+        ownerAddress:String(recoveredOpenResidual.recoveryRow.owner_address),
+        tokenMint:String(recoveredOpenResidual.recoveryRow.token_mint),
+        fundingTransactionId:String(recoveredOpenResidual.recoveryRow.funding_transaction_id),
+        fundingSignature:String(recoveredOpenResidual.recoveryRow.funding_signature),
+        fundedAt:new Date(String(recoveredOpenResidual.recoveryRow.funded_at)).toISOString(),
+        pairedTokenAmount:String(recoveredOpenResidual.recoveryRow.paired_token_amount),
+        intendedCapitalLamports:BigInt(String(recoveredOpenResidual.recoveryRow.intended_capital_lamports)),
+        intendedRange:(recoveredOpenResidual.recoveryRow.intended_range??{}) as Record<string,unknown>,
+        state:"RESOLVED",
+        walletTruth:{...(recoveredOpenResidual.recoveryRow.wallet_truth??{}),residualUnwindSignature:unwind.signature,residualUnwindRawAmount:recoveredOpenResidual.rawAmount.toString(),refreshedAt:new Date().toISOString()},
+        payload:{reasonCodes:["P6_PARTIAL_OPEN_RESIDUAL_SETTLED"],closePlanId:input.plan.planId,recoveredOpenResidualLotId:recoveredOpenResidual.lotId},
+        updatedAt:new Date().toISOString(),
+      });
+      await persist("CLOSE_RECOVERED_OPEN_RESIDUAL_UNWOUND",{
+        tokenXBefore:tokenXBefore.toString(),
+        tokenYBefore:tokenYBefore.toString(),
+        attributableTokenX:attributableTokenX?.toString()??"0",
+        attributableTokenY:attributableTokenY?.toString()??"0",
+        recoveredOpenResidualLotId:recoveredOpenResidual.lotId,
+        recoveredOpenResidualRawAmount:recoveredOpenResidual.rawAmount.toString(),
+        recoveredOpenResidualUnwindTransactionId:transactionId,
+        recoveredOpenResidualUnwindSignature:unwind.signature,
+        pendingStage:null,
+        pendingSignature:null,
+      });
+      stage="CLOSE_RECOVERED_OPEN_RESIDUAL_UNWOUND";
+    }
+  }
   const closedBuilt = await buildClosePositionTransaction(input.pool, {
     userAddress: input.plan.ownerAddress,
     positionAddress: input.positionAddress,
@@ -2904,21 +3337,27 @@ async function executeCloseSettlement(input: {
   // CLOSED is chain-account absence only.  Make the lifecycle terminal only
   // after the shared DB boundary proves every child transaction, lot and
   // cashflow can be reconciled into a deterministic SOL result.
-  const positionCheck=await connection.getAccountInfoAndContext(new PublicKey(input.positionAddress),"confirmed");
-  if(positionCheck.value!==null)return incomplete(["SETTLEMENT_POSITION_STILL_EXISTS"],"CLOSE_SETTLEMENT_POSITION_VERIFY");
-  const settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
-  if(!settlementInput)return incomplete(["SETTLEMENT_LIFECYCLE_MISSING"],"CLOSE_SETTLEMENT_LIFECYCLE");
-  const positionCheckedAt=new Date().toISOString(),positionCheckedSlot=BigInt(positionCheck.context.slot),settlementEvidence={positionCheckedAt,positionCheckedSlot:positionCheckedSlot.toString(),rpcUrl:input.config.rpcUrl,commitment:"confirmed"};
-  const assessment=assessLifecycleSettlement({...settlementInput,positionAbsent:true,positionCheckedAt,positionCheckedSlot});
-  if(!assessment.ready){
-    await input.store.markOwnedPositionLifecycle({positionAddress:input.positionAddress,lifecycleState:"RECONCILIATION_REQUIRED",reconciliationStatus:"SETTLEMENT_BLOCKED",lastPlanId:input.plan.planId,at:new Date().toISOString(),payload:{stage:"SOL_SETTLEMENT_BLOCKED",reasonCodes:assessment.reasonCodes,lifecycleId:settlementInput.lifecycle.lifecycleId,settlementEvidence}});
-    await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:"RECONCILIATION_REQUIRED",at:new Date().toISOString(),reasonCodes:assessment.reasonCodes,payload:{stage:"SOL_SETTLEMENT_BLOCKED",lifecycleId:settlementInput.lifecycle.lifecycleId}});
-    return {status:"UNKNOWN",planId:input.plan.planId,reasonCodes:assessment.reasonCodes,transactionSubmitted:true};
-  }
-  await input.store.persistLifecycleSolSettlement({assessment,input:{...settlementInput,positionAbsent:true,positionCheckedAt,positionCheckedSlot},...(process.env.LPFORGE_SOURCE_COMMIT?{sourceCommit:process.env.LPFORGE_SOURCE_COMMIT}:{}),...(process.env.LPFORGE_P7_POLICY_HASH?{policyHash:process.env.LPFORGE_P7_POLICY_HASH}:{}),migrationHead:"M0042_live_sol_settled_learning.sql",...(process.env.LPFORGE_BUILD_ID?{buildId:process.env.LPFORGE_BUILD_ID}:{}),at:new Date().toISOString()});
-  const outcome=await input.store.createLiveSolSettledLearningOutcome({positionAddress:input.positionAddress,at:new Date().toISOString()});
-  if(!outcome.outcome)throw new Error(`LPFORGE_LIVE_OUTCOME_MATERIALIZATION_FAILED:${outcome.reasonCodes.join(',')}`);
+  const settlement=await finalizeClosedPositionSettlement({...input,connection});
+  if(!settlement.ready)return {status:"UNKNOWN",planId:input.plan.planId,reasonCodes:settlement.reasonCodes,transactionSubmitted:true};
   return closed;
+}
+
+/** A recovered close reaches the same durable settlement boundary as a normal close. */
+async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:AutonomousPlan;positionAddress:string;connection:Connection;config:Pick<LiveWorkerConfig,"rpcUrl">}):Promise<{ready:boolean;reasonCodes:string[]}>{
+  const positionCheck=await input.connection.getAccountInfoAndContext(new PublicKey(input.positionAddress),"confirmed");
+  if(positionCheck.value!==null)return{ready:false,reasonCodes:["SETTLEMENT_POSITION_STILL_EXISTS"]};
+  const settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
+  if(!settlementInput)return{ready:false,reasonCodes:["SETTLEMENT_LIFECYCLE_MISSING"]};
+  const at=new Date().toISOString(),positionCheckedAt=at,positionCheckedSlot=BigInt(positionCheck.context.slot),settlementEvidence={positionCheckedAt,positionCheckedSlot:positionCheckedSlot.toString(),rpcUrl:input.config.rpcUrl,commitment:"confirmed"},assessment=assessLifecycleSettlement({...settlementInput,positionAbsent:true,positionCheckedAt,positionCheckedSlot});
+  if(!assessment.ready){
+    await input.store.markOwnedPositionLifecycle({positionAddress:input.positionAddress,lifecycleState:"RECONCILIATION_REQUIRED",reconciliationStatus:"SETTLEMENT_BLOCKED",lastPlanId:input.plan.planId,at,payload:{stage:"SOL_SETTLEMENT_BLOCKED",reasonCodes:assessment.reasonCodes,lifecycleId:settlementInput.lifecycle.lifecycleId,settlementEvidence}});
+    await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:"RECONCILIATION_REQUIRED",at,reasonCodes:assessment.reasonCodes,payload:{stage:"SOL_SETTLEMENT_BLOCKED",lifecycleId:settlementInput.lifecycle.lifecycleId}});
+    return{ready:false,reasonCodes:assessment.reasonCodes};
+  }
+  await input.store.persistLifecycleSolSettlement({assessment,input:{...settlementInput,positionAbsent:true,positionCheckedAt,positionCheckedSlot},...(process.env.LPFORGE_SOURCE_COMMIT?{sourceCommit:process.env.LPFORGE_SOURCE_COMMIT}:{}),...(process.env.LPFORGE_P7_POLICY_HASH?{policyHash:process.env.LPFORGE_P7_POLICY_HASH}:{}),migrationHead:"M0042_live_sol_settled_learning.sql",...(process.env.LPFORGE_BUILD_ID?{buildId:process.env.LPFORGE_BUILD_ID}:{}),at});
+  const outcome=await input.store.createLiveSolSettledLearningOutcome({positionAddress:input.positionAddress,at});
+  if(!outcome.outcome)throw new Error(`LPFORGE_LIVE_OUTCOME_MATERIALIZATION_FAILED:${outcome.reasonCodes.join(',')}`);
+  return{ready:true,reasonCodes:[]};
 }
 
 /** Generic plan entrypoint. Every mutation is claimed through the same durable queue. */
@@ -3156,6 +3595,20 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     // plan journal.
     const pendingSignature = closeSettlementPending(plan)?.signature;
     const recoverySignature = pendingSignature ?? journal.signature;
+    // A journal records the signature boundary; the durable submission row is
+    // the authoritative fallback for its blockhash lifetime.  This lets a
+    // crash between send and journal metadata persistence recover the exact
+    // child without ever retransmitting it.
+    let recoveryLastValidBlockHeight = journal.lastValidBlockHeight;
+    if (
+      recoveryLastValidBlockHeight === undefined &&
+      recoverySignature &&
+      typeof (input.store as unknown as { loadSubmissionAttemptBySignature?: unknown }).loadSubmissionAttemptBySignature === "function"
+    ) {
+      const attempt = await input.store.loadSubmissionAttemptBySignature(recoverySignature);
+      if (attempt?.lastValidBlockHeight !== undefined)
+        recoveryLastValidBlockHeight = attempt.lastValidBlockHeight;
+    }
     let confirmationStatus:
       | "PROCESSED"
       | "CONFIRMED"
@@ -3188,8 +3641,8 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       else if (status?.confirmationStatus === "finalized")
         confirmationStatus = "FINALIZED";
       else if (
-        journal.lastValidBlockHeight !== undefined &&
-        input.currentBlockHeight > journal.lastValidBlockHeight
+        recoveryLastValidBlockHeight !== undefined &&
+        input.currentBlockHeight > recoveryLastValidBlockHeight
       )
         confirmationStatus = "EXPIRED";
     }
@@ -3234,6 +3687,162 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     // transaction confirmed.  If the PositionV2 is still present, the next
     // close stage is safe to resume; no already-submitted stage is resent.
     const closeStage = closeSettlementStage(plan), closePending = closeSettlementPending(plan);
+    // Historical compatibility: before the sequential-child journal contract
+    // was deployed, a confirmed CLAIM/UNWIND could leave the shared close
+    // journal FAILED when the next child attempted CONFIRMED -> SIGNING.  Do
+    // not generally reopen failed plans.  Rehydrate only this exact close
+    // failure from the independently durable JUPITER_UNWIND receipt, then let
+    // the normal stage machine resume the *next* action.
+    if (
+      isLegacySequentialCloseJournalRecovery({
+        plan,
+        journal,
+        positionExists: positionTruth.exists === true,
+      })
+    ) {
+      const unwindStep = plan.steps.find((step) => step.kind === "JUPITER_UNWIND"),
+        dispatch = closeSettlementDispatch(plan),
+        inputMint = typeof dispatch.tokenXMint === "string" ? dispatch.tokenXMint : undefined,
+        inputAmountRaw = closeSettlementAmount(dispatch.attributableTokenX);
+      const confirmedUnwind = unwindStep
+        ? await input.store.loadConfirmedSubmissionByTransactionId(unwindStep.transactionId)
+        : undefined;
+      let chainConfirmed = false;
+      if (confirmedUnwind && connection) {
+        try {
+          const status = (
+            await connection.getSignatureStatus(confirmedUnwind.signature, {
+              searchTransactionHistory: true,
+            })
+          ).value;
+          chainConfirmed =
+            !status?.err &&
+            (status?.confirmationStatus === "confirmed" ||
+              status?.confirmationStatus === "finalized");
+        } catch {
+          chainConfirmed = false;
+        }
+      }
+      if (
+        !connection ||
+        !recoveryPositionAddress ||
+        !unwindStep ||
+        !confirmedUnwind ||
+        !chainConfirmed ||
+        !inputMint ||
+        inputAmountRaw === undefined
+      ) {
+        await input.store.transitionAutonomousPlan({
+          planId: plan.planId,
+          state: "RECONCILIATION_REQUIRED",
+          at: input.now,
+          reasonCodes: ["P6_LEGACY_CLOSE_JOURNAL_RECOVERY_CHAIN_PROOF_MISSING"],
+          payload: {
+            stage: "CLOSE_POSITION_PENDING",
+            legacyJournalRecovery: "CHAIN_PROOF_MISSING",
+          },
+        });
+        results.push({
+          planId: plan.planId,
+          action: "HOLD_FOR_OPERATOR",
+          reasonCodes: ["P6_LEGACY_CLOSE_JOURNAL_RECOVERY_CHAIN_PROOF_MISSING"],
+        });
+        continue;
+      }
+      const settlement = await reconcileConfirmedCloseUnwind({
+        store: input.store,
+        connection,
+        plan,
+        positionAddress: recoveryPositionAddress,
+        signature: confirmedUnwind.signature,
+        transactionId: unwindStep.transactionId,
+        inputMint,
+        inputAmountRaw,
+        observedAt: input.now,
+      });
+      if (!settlement.ok) {
+        await input.store.transitionAutonomousPlan({
+          planId: plan.planId,
+          state: "RECONCILIATION_REQUIRED",
+          at: input.now,
+          reasonCodes: [
+            "P6_LEGACY_CLOSE_JOURNAL_RECOVERY_RECEIPT_REJECTED",
+            ...settlement.reasonCodes,
+          ],
+          payload: {
+            stage: "CLOSE_POSITION_PENDING",
+            legacyJournalRecovery: "RECEIPT_REJECTED",
+            unwindTransactionId: unwindStep.transactionId,
+            unwindSignature: confirmedUnwind.signature,
+          },
+        });
+        results.push({
+          planId: plan.planId,
+          action: "HOLD_FOR_OPERATOR",
+          reasonCodes: [
+            "P6_LEGACY_CLOSE_JOURNAL_RECOVERY_RECEIPT_REJECTED",
+            ...settlement.reasonCodes,
+          ],
+        });
+        continue;
+      }
+      // This does not erase the failed evidence: the original state,
+      // signature and terminal payload are retained inside the recovery
+      // record.  It changes only the current journal state to the exact
+      // confirmed child proven above, enabling the already-safe
+      // CONFIRMED -> SIGNING transition for the next child.
+      await input.store.updateExecutionJournal({
+        idempotencyKey: plan.idempotencyKey,
+        expectedVersion: journal.version,
+        state: "CONFIRMED",
+        signature: confirmedUnwind.signature,
+        updatedAt: input.now,
+        payload: {
+          ...journal.payload,
+          action: plan.action,
+          transactionId: unwindStep.transactionId,
+          confirmation: confirmedUnwind.status,
+          legacySequentialCloseJournalRecovery: {
+            priorJournalState: journal.state,
+            priorJournalSignature: journal.signature ?? null,
+            priorJournalPayload: journal.payload,
+            recoveredAt: input.now,
+            unwindTransactionId: unwindStep.transactionId,
+            unwindSignature: confirmedUnwind.signature,
+            unwindConfirmation: confirmedUnwind.status,
+            ...(confirmedUnwind.slot === undefined
+              ? {}
+              : { unwindSlot: confirmedUnwind.slot.toString() }),
+          },
+        },
+      });
+      await input.store.transitionAutonomousPlan({
+        planId: plan.planId,
+        state: "RECONCILING",
+        at: input.now,
+        reasonCodes: ["P6_LEGACY_CLOSE_JOURNAL_RECOVERED_FROM_CONFIRMED_UNWIND"],
+        payload: {
+          stage: "CLOSE_INVENTORY_UNWOUND",
+          pendingStage: null,
+          pendingSignature: null,
+          tokenXMint: inputMint,
+          tokenXBefore: String(dispatch.tokenXBefore),
+          tokenYBefore: String(dispatch.tokenYBefore ?? "0"),
+          attributableTokenX: inputAmountRaw.toString(),
+          attributableTokenY: String(dispatch.attributableTokenY ?? "0"),
+          unwindTransactionId: unwindStep.transactionId,
+          unwindSignature: confirmedUnwind.signature,
+          swapProceedsLamports: settlement.swapProceedsLamports.toString(),
+          legacySequentialCloseJournalRecovery: true,
+        },
+      });
+      results.push({
+        planId: plan.planId,
+        action: "RESUME_CLOSE_SETTLEMENT",
+        reasonCodes: ["P6_LEGACY_CLOSE_JOURNAL_RECOVERED_FROM_CONFIRMED_UNWIND"],
+      });
+      continue;
+    }
     // A child submission is persisted before confirmation.  Its parent stage
     // is deliberately not advanced until chain truth confirms it.  This is
     // what makes a crash between REMOVE/CLAIM/UNWIND stages restartable
@@ -3241,6 +3850,46 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     if (closePending) {
       const settled = confirmationStatus === "CONFIRMED" || confirmationStatus === "FINALIZED";
       if (!settled) {
+        // A known signature with no chain status after its blockhash has
+        // expired is a terminal no-effect close child only when the
+        // PositionV2 is independently still present.  Retire that exact
+        // signature and plan; a later management cycle may build a *new*
+        // protective plan, but this path never resends the expired child.
+        if (
+          !signatureStatusReadUnknown &&
+          (confirmationStatus === "EXPIRED" || confirmationStatus === "FAILED") &&
+          positionTruth.exists === true
+        ) {
+          const reason = "P6_CLOSE_PENDING_STAGE_EXPIRED_NO_CHAIN_EFFECT";
+          await input.store.markSubmissionExpired(closePending.signature, input.now, reason);
+          await input.store.updateExecutionJournal({
+            idempotencyKey: plan.idempotencyKey,
+            expectedVersion: journal.version,
+            state: "FAILED",
+            updatedAt: input.now,
+            payload: {
+              ...journal.payload,
+              recovery: "CLOSE_PENDING_STAGE_EXPIRED",
+              confirmationStatus,
+              pendingStage: closePending.stage,
+              pendingSignature: closePending.signature,
+              positionTruth,
+            },
+          });
+          await input.store.completeAutonomousPlan({
+            planId: plan.planId,
+            state: "FAILED",
+            at: input.now,
+            payload: {
+              action: plan.action,
+              recovery: "CLOSE_PENDING_STAGE_EXPIRED_NO_CHAIN_EFFECT",
+              pendingStage: closePending.stage,
+              pendingSignature: closePending.signature,
+            },
+          });
+          results.push({ planId: plan.planId, action: "RETURN_EXISTING_PLAN", reasonCodes: [reason, closePending.stage] });
+          continue;
+        }
         await input.store.transitionAutonomousPlan({
           planId: plan.planId,
           state: "RECONCILIATION_REQUIRED",
@@ -3251,22 +3900,28 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         results.push({ planId: plan.planId, action: "HOLD_FOR_OPERATOR", reasonCodes: ["P6_CLOSE_PENDING_STAGE_RECONCILIATION_REQUIRED", closePending.stage] });
         continue;
       }
-      if (closePending.stage === "CLOSE_UNWIND_SUBMITTED") {
+      if (closePending.stage === "CLOSE_UNWIND_SUBMITTED" || closePending.stage === "CLOSE_OPEN_RESIDUAL_UNWIND_SUBMITTED") {
         const dispatch = closeSettlementDispatch(plan),
-          inputMint = typeof dispatch.tokenXMint === "string" ? dispatch.tokenXMint : undefined,
-          inputAmountRaw = closeSettlementAmount(dispatch.attributableTokenX),
-          unwindTransactionId = typeof dispatch.unwindTransactionId === "string"
-            ? dispatch.unwindTransactionId
-            : `${plan.planId}:unwind`;
+          recovered=closePending.stage === "CLOSE_OPEN_RESIDUAL_UNWIND_SUBMITTED",
+          inputMint = recovered
+            ? typeof dispatch.recoveredOpenResidualTokenMint === "string" ? dispatch.recoveredOpenResidualTokenMint : undefined
+            : typeof dispatch.tokenXMint === "string" ? dispatch.tokenXMint : undefined,
+          inputAmountRaw = recovered
+            ? closeSettlementAmount(dispatch.recoveredOpenResidualRawAmount)
+            : closeSettlementAmount(dispatch.attributableTokenX),
+          unwindTransactionId = recovered
+            ? typeof dispatch.recoveredOpenResidualUnwindTransactionId === "string" ? dispatch.recoveredOpenResidualUnwindTransactionId : `${plan.planId}:recovered-open-residual-unwind`
+            : typeof dispatch.unwindTransactionId === "string" ? dispatch.unwindTransactionId : `${plan.planId}:unwind`,
+          lotId = recovered && typeof dispatch.recoveredOpenResidualLotId === "string" ? dispatch.recoveredOpenResidualLotId : undefined;
         if (!connection || !recoveryPositionAddress || !inputMint || inputAmountRaw === undefined) {
           await input.store.transitionAutonomousPlan({
             planId: plan.planId,
             state: "RECONCILIATION_REQUIRED",
             at: input.now,
-            reasonCodes: ["P6_CLOSE_UNWIND_RECEIPT_RECONCILIATION_REQUIRED"],
+            reasonCodes: [recovered?"P6_CLOSE_RECOVERED_OPEN_RESIDUAL_RECEIPT_RECONCILIATION_REQUIRED":"P6_CLOSE_UNWIND_RECEIPT_RECONCILIATION_REQUIRED"],
             payload: { pendingStage: closePending.stage, pendingSignature: closePending.signature },
           });
-          results.push({ planId: plan.planId, action: "HOLD_FOR_OPERATOR", reasonCodes: ["P6_CLOSE_UNWIND_RECEIPT_RECONCILIATION_REQUIRED"] });
+          results.push({ planId: plan.planId, action: "HOLD_FOR_OPERATOR", reasonCodes: [recovered?"P6_CLOSE_RECOVERED_OPEN_RESIDUAL_RECEIPT_RECONCILIATION_REQUIRED":"P6_CLOSE_UNWIND_RECEIPT_RECONCILIATION_REQUIRED"] });
           continue;
         }
         const settlement = await reconcileConfirmedCloseUnwind({
@@ -3279,34 +3934,35 @@ export async function recoverUnfinishedAutonomousPlans(input: {
           inputMint,
           inputAmountRaw,
           observedAt: input.now,
+          ...(lotId?{lotId,settlementIdSuffix:"recovered-open-residual"}:{}),
         });
         if (!settlement.ok) {
           await input.store.transitionAutonomousPlan({
             planId: plan.planId,
             state: "RECONCILIATION_REQUIRED",
             at: input.now,
-            reasonCodes: ["P6_CLOSE_UNWIND_SETTLEMENT_RECONCILIATION_REQUIRED", ...settlement.reasonCodes],
+            reasonCodes: [recovered?"P6_CLOSE_RECOVERED_OPEN_RESIDUAL_SETTLEMENT_RECONCILIATION_REQUIRED":"P6_CLOSE_UNWIND_SETTLEMENT_RECONCILIATION_REQUIRED", ...settlement.reasonCodes],
             payload: { pendingStage: closePending.stage, pendingSignature: closePending.signature },
           });
-          results.push({ planId: plan.planId, action: "HOLD_FOR_OPERATOR", reasonCodes: ["P6_CLOSE_UNWIND_SETTLEMENT_RECONCILIATION_REQUIRED", ...settlement.reasonCodes] });
+          results.push({ planId: plan.planId, action: "HOLD_FOR_OPERATOR", reasonCodes: [recovered?"P6_CLOSE_RECOVERED_OPEN_RESIDUAL_SETTLEMENT_RECONCILIATION_REQUIRED":"P6_CLOSE_UNWIND_SETTLEMENT_RECONCILIATION_REQUIRED", ...settlement.reasonCodes] });
           continue;
         }
         await input.store.transitionAutonomousPlan({
           planId: plan.planId,
           state: "RECONCILING",
           at: input.now,
-          reasonCodes: ["P6_CLOSE_UNWIND_SETTLEMENT_RECOVERED"],
-          payload: {
-            stage: "CLOSE_INVENTORY_UNWOUND",
+            reasonCodes: [recovered?"P6_CLOSE_RECOVERED_OPEN_RESIDUAL_SETTLEMENT_RECOVERED":"P6_CLOSE_UNWIND_SETTLEMENT_RECOVERED"],
+            payload: {
+            stage: recovered?"CLOSE_RECOVERED_OPEN_RESIDUAL_UNWOUND":"CLOSE_INVENTORY_UNWOUND",
             pendingStage: null,
             pendingSignature: null,
             swapProceedsLamports: settlement.swapProceedsLamports.toString(),
           },
         });
-        results.push({ planId: plan.planId, action: "RESUME_CLOSE_SETTLEMENT", reasonCodes: ["P6_CLOSE_UNWIND_SETTLEMENT_RECOVERED"] });
+        results.push({ planId: plan.planId, action: "RESUME_CLOSE_SETTLEMENT", reasonCodes: [recovered?"P6_CLOSE_RECOVERED_OPEN_RESIDUAL_SETTLEMENT_RECOVERED":"P6_CLOSE_UNWIND_SETTLEMENT_RECOVERED"] });
         continue;
       }
-      const completedStage: Record<Exclude<CloseSettlementPendingStage, "CLOSE_UNWIND_SUBMITTED">, CloseSettlementStage | undefined> = {
+      const completedStage: Record<Exclude<CloseSettlementPendingStage, "CLOSE_UNWIND_SUBMITTED"|"CLOSE_OPEN_RESIDUAL_UNWIND_SUBMITTED">, CloseSettlementStage | undefined> = {
         CLOSE_REMOVE_SUBMITTED: "CLOSE_LIQUIDITY_REMOVED",
         CLOSE_CLAIM_SUBMITTED: "CLOSE_CLAIMS_SETTLED",
         CLOSE_POSITION_SUBMITTED: undefined,
@@ -3327,7 +3983,15 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       // when account absence is proven; confirmed signature alone is not
       // enough to turn an RPC/decode failure into a closed position.
       if (positionTruth.exists === false && recoveryPositionAddress) {
-        await input.store.markOwnedPositionLifecycle({ positionAddress: recoveryPositionAddress, lifecycleState: "CLOSED", reconciliationStatus: "MATCH", lastPlanId: plan.planId, at: input.now, payload: { stage: "CLOSE_CHAIN_VERIFIED", signature: closePending.signature } });
+        if(!connection || !input.rpcUrl){
+          results.push({ planId: plan.planId, action: "HOLD_FOR_OPERATOR", reasonCodes: ["P6_CLOSE_SETTLEMENT_RPC_UNAVAILABLE"] });
+          continue;
+        }
+        const settlement=await finalizeClosedPositionSettlement({store:input.store,plan,positionAddress:recoveryPositionAddress,connection,config:{rpcUrl:input.rpcUrl}});
+        if(!settlement.ready){
+          results.push({ planId: plan.planId, action: "HOLD_FOR_OPERATOR", reasonCodes: settlement.reasonCodes });
+          continue;
+        }
         await input.store.completeAutonomousPlan({ planId: plan.planId, state: "COMPLETED", at: input.now, payload: { action: plan.action, signature: closePending.signature, recovery: "CLOSE_POSITION_CONFIRMED" } });
         results.push({ planId: plan.planId, action: "MARK_RECONCILED", reasonCodes: ["P6_CLOSE_POSITION_RECOVERED"] });
       } else {
@@ -3400,10 +4064,29 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         String(positionTruth.pool) !== plan.poolAddress
       )
         return false;
+      const plannedChunks=plan.steps.filter(step=>step.kind==='METEORA_OPEN'||step.kind==='METEORA_OPEN_CHUNK').map((step,index)=>({transactionId:step.transactionId,sequence:index+1,kind:step.kind}));
+      const construction=plannedChunks.length>1?assessOpenChunkConstruction({planned:plannedChunks,dispositions:await input.store.loadOpenChunkDispositions(plan.planId)}):{fullyConstructed:true,partial:false,reasonCodes:['P6_SINGLE_OPEN_CHUNK_CONFIRMED_BY_POSITION_TRUTH']};
       const funding = (plan.intentPayload.entryFunding ?? {}) as Record<
         string,
         unknown
       >;
+      if(!construction.fullyConstructed){
+        const partial=await input.store.loadPartialEntryRecovery(plan.planId);
+        const planFlows=await input.store.loadPlanCashflows(plan.planId);
+        const fundingLamports=planFlows.filter(flow=>flow.flowType==='ENTRY_FUNDING_SOL_OUT').reduce((total,flow)=>total+(flow.lamports??0n),0n);
+        let confirmedLiquidityLamports=0n;
+        try{const truth=(partial?.wallet_truth??{}) as Record<string,unknown>;confirmedLiquidityLamports=BigInt(String(truth.confirmedLiquiditySolAssetOutLamports??'0'));}catch{}
+        const actualEconomicCapitalLamports=fundingLamports+confirmedLiquidityLamports;
+        await input.store.upsertOwnedPosition({
+          lpforgePositionId:`position-${address}`,poolAddress:plan.poolAddress,positionAddress:address,ownerAddress:plan.ownerAddress,strategy:String(intent.strategy??'SPOT'),orientation:String(funding.orientation??'ONE_SIDED_Y'),lowerBinId:Number(positionTruth.lowerBinId),upperBinId:Number(positionTruth.upperBinId),activeBinAtEntry:Number(intent.activeBinId??positionTruth.lowerBinId),initialCapitalLamports:capital,entryPlanId:plan.planId,...(journal.signature?{entrySignature:journal.signature}:{}),enteredAt:input.now,lifecycleState:'RECONCILIATION_REQUIRED',lastPlanId:plan.planId,reconciliationStatus:'PARTIAL_ENTRY',payload:{thesisId:plan.thesisId,entryFunding:funding,recovery:true,journalId:journal.journalId,partialEntry:true,actualEconomicCapitalLamports:actualEconomicCapitalLamports.toString(),openChunkDisposition:construction.reasonCodes,...(partial?.wallet_truth&&typeof partial.wallet_truth==='object'?{partialEntryWalletTruth:partial.wallet_truth as Record<string,unknown>}:{})},
+        });
+        if(connection&&partial){
+          const mint=String(partial.token_mint??''),truth=(partial.wallet_truth??{}) as Record<string,unknown>,measurement=(truth.entryFundingMeasurement??{}) as Record<string,unknown>;
+          try{const before=BigInt(String(measurement.pairedTokenRawBeforeFunding??'0')),received=BigInt(String(partial.paired_token_amount??'0')),current=await readWalletTokenBalance({connection,ownerAddress:plan.ownerAddress,mint}),residual=deriveRecoveredOpenResidualInventory({pairedTokenRawBeforeFunding:before,pairedTokenRawBeforeClose:current,pairedTokenRawAfterPriorUnwind:current,pairedTokenReceivedRaw:received}),fundingSignature=String(partial.funding_signature??'');if(mint&&fundingSignature&&residual!==undefined&&residual>0n){const supply=await connection.getTokenSupply(new PublicKey(mint),'confirmed');await input.store.createPositionInventoryLot({lotId:`${plan.planId}:partial-entry-residual:${mint}`,createdEventId:`${plan.planId}:partial-entry-residual-created`,positionAddress:address,planId:plan.planId,ownerAddress:plan.ownerAddress,poolAddress:plan.poolAddress,tokenMint:mint,tokenSide:'X',sourceEvent:'OPEN_RESIDUAL',rawAmount:residual,decimals:supply.value.decimals,acquiredAt:input.now,transactionSignature:fundingSignature,payload:{source:'P6_PARTIAL_ENTRY_CHAIN_RECONCILIATION',fundingSignature,attributionConfidence:'MEASURED_WALLET_DELTA',actualEconomicCapitalLamports:actualEconomicCapitalLamports.toString()}});}}catch{}
+        }
+        await input.store.upsertPartialEntryRecovery({planId:plan.planId,poolAddress:plan.poolAddress,ownerAddress:plan.ownerAddress,tokenMint:String(partial?.token_mint??funding.tokenMint??''),fundingTransactionId:String(partial?.funding_transaction_id??plan.steps[0]?.transactionId??'P6_PARTIAL_ENTRY'),fundingSignature:String(partial?.funding_signature??journal.signature??''),fundedAt:String(partial?.funded_at??input.now),pairedTokenAmount:String(partial?.paired_token_amount??funding.totalPairedTokenRaw??'0'),intendedCapitalLamports:capital,intendedRange:{lowerBinId:Number(positionTruth.lowerBinId),upperBinId:Number(positionTruth.upperBinId)},state:'RECONCILIATION_REQUIRED',walletTruth:{...(partial?.wallet_truth&&typeof partial.wallet_truth==='object'?partial.wallet_truth as Record<string,unknown>:{}),refreshRequired:true},payload:{partialEntry:true,positionAddress:address,reasonCodes:construction.reasonCodes},updatedAt:input.now});
+        return false;
+      }
       await input.store.upsertOwnedPosition({
         lpforgePositionId: `position-${address}`,
         poolAddress: plan.poolAddress,
@@ -3628,61 +4311,85 @@ export async function recoverUnfinishedAutonomousPlans(input: {
   }
   return results;
 }
+export interface WalletPositionFact {
+  positionAddress: string;
+  owner: string;
+  pool: string;
+  lowerBinId: number;
+  upperBinId: number;
+  activeBinId?: number;
+  tokenXAmount?: string;
+  tokenYAmount?: string;
+  feeX?: string;
+  feeY?: string;
+  chainSlot?: bigint;
+}
+export interface WalletWidePositionReconciliation {
+  scanned: number;
+  known: number;
+  adopted: number;
+  unknown: number;
+  ambiguous: number;
+  dbOnly: number;
+  reasonCodes: string[];
+}
+const recordValue = (value: unknown): Record<string, unknown> =>
+  value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+const positiveBigInt = (value: unknown): bigint | undefined => {
+  try {
+    const parsed = BigInt(String(value ?? ""));
+    return parsed > 0n ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+};
+const exactInteger = (value: unknown): number | undefined => {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) ? parsed : undefined;
+};
+const openPlanStates = new Set([
+  "SUBMITTED",
+  "UNKNOWN_SUBMISSION",
+  "CONFIRMED",
+  "RECONCILING",
+  "RECOVERING",
+  "RECONCILIATION_REQUIRED",
+  "RECONCILED",
+]);
+
 /**
- * Adopts on-chain positions the owner wallet holds that are absent from the
- * owned-positions registry. Read-only: never signs or submits anything.
- * Adopted rows are created RECONCILIATION_REQUIRED with zero known capital so
- * the standard management loop and production evidence surface them instead of
- * silently ignoring them; the exit governor treats zero-capital rows as
- * UNAVAILABLE and holds.
+ * Authoritative, bounded wallet sweep. It never signs or submits. A position
+ * is added to owned_positions only when a single immutable LPForge OPEN plan
+ * and durable journal signature bind the same owner, pool, range, and capital.
+ * Every other signer-owned position is durable forensic evidence, not trading
+ * authority.
  */
-export async function reconcileOrphanedPositions(input: {
+export async function reconcileWalletWidePositions(input: {
   store: Phase1Store;
   rpcUrl: string;
   programId: string;
   ownerAddress?: string;
-  poolAddresses: string[];
   now?: string;
-  /** Test seam for on-chain reads. Defaults to the DLMM SDK + Meteora read adapter. */
-  positionsProvider?: (
-    poolAddress: string,
-  ) => Promise<
-    Array<{
-      positionAddress: string;
-      owner: string;
-      pool: string;
-      lowerBinId: number;
-      upperBinId: number;
-    }>
-  >;
-}): Promise<{ adopted: number; reasonCodes: string[] }> {
+  /** Test seam for one authoritative signer-wallet scan. */
+  walletPositionsProvider?: () => Promise<WalletPositionFact[]>;
+}): Promise<WalletWidePositionReconciliation> {
   const at = input.now ?? new Date().toISOString();
-  if (!input.ownerAddress?.trim() || input.poolAddresses.length === 0)
-    return { adopted: 0, reasonCodes: [] };
+  if (!input.ownerAddress?.trim())
+    return { scanned: 0, known: 0, adopted: 0, unknown: 0, ambiguous: 0, dbOnly: 0, reasonCodes: [] };
   const ownerAddress = input.ownerAddress.trim();
-  const owned = await input.store.loadOwnedPositions(ownerAddress);
-  const known = new Set(owned.map((row) => String(row.position_address)));
-  const reasonCodes = new Set<string>();
-  let adopted = 0;
-  let allWalletPositions:
-    | Promise<
-        Map<
-          string,
-          { lbPairPositionsData: Array<{ publicKey: { toBase58(): string } }> }
-        >
-      >
-    | undefined;
-  const defaultProvider = async (poolAddress: string) => {
+  const defaultProvider = async (): Promise<WalletPositionFact[]> => {
     const runtime = await loadMeteoraExecutionRuntime();
     if (typeof runtime.DLMM.getAllLbPairPositionsByUser !== "function")
-      throw new Error("LPFORGE_ORPHAN_SWEEP_RUNTIME_UNAVAILABLE");
+      throw new Error("LPFORGE_WALLET_SWEEP_RUNTIME_UNAVAILABLE");
     const adapter = createMeteoraReadAdapter({
       rpcUrl: input.rpcUrl,
       cluster: "mainnet-beta",
       programId: input.programId,
       priority:'P1_RECOVERY_CRITICAL',
     });
-    allWalletPositions ??= runtime.DLMM.getAllLbPairPositionsByUser(
+    const result = await runtime.DLMM.getAllLbPairPositionsByUser(
       createGovernedConnection({rpcUrl:input.rpcUrl,priority:'P1_RECOVERY_CRITICAL'}),
       new runtime.PublicKey(ownerAddress),
       {
@@ -3693,17 +4400,9 @@ export async function reconcileOrphanedPositions(input: {
       // adoption path, never an execution-critical RPC fan-out.
       { chunkSize: 20, isParallelExecution: false },
     );
-    const result = await allWalletPositions;
-    const positions = result.get(poolAddress)?.lbPairPositionsData ?? [];
-    const facts: Array<{
-      positionAddress: string;
-      owner: string;
-      pool: string;
-      lowerBinId: number;
-      upperBinId: number;
-    }> = [];
-    for (const position of positions) {
-      try {
+    const facts: WalletPositionFact[] = [];
+    for (const [poolAddress, entry] of result.entries()) {
+      for (const position of entry.lbPairPositionsData ?? []) {
         const fact = await adapter.getPositionV2(
           poolAddress,
           position.publicKey.toBase58(),
@@ -3714,54 +4413,137 @@ export async function reconcileOrphanedPositions(input: {
           pool: fact.pool,
           lowerBinId: fact.lowerBinId,
           upperBinId: fact.upperBinId,
+          tokenXAmount: fact.totalXAmount,
+          tokenYAmount: fact.totalYAmount,
+          ...(fact.feeX === undefined ? {} : { feeX: fact.feeX }),
+          ...(fact.feeY === undefined ? {} : { feeY: fact.feeY }),
+          ...(fact.stamp.chainSlot === undefined ? {} : { chainSlot: fact.stamp.chainSlot }),
         });
-      } catch {
-        // Unreadable position: leave it unknown rather than guess identity.
       }
     }
     return facts;
   };
-  const readPoolPositions = input.positionsProvider ?? defaultProvider;
-  for (const poolAddress of input.poolAddresses) {
-    try {
-      for (const fact of await readPoolPositions(poolAddress)) {
-        if (known.has(fact.positionAddress)) continue;
-        if (fact.owner !== ownerAddress || fact.pool !== poolAddress)
-          continue;
-        await input.store.upsertOwnedPosition({
-          lpforgePositionId: `position-${fact.positionAddress}`,
-          poolAddress,
-          positionAddress: fact.positionAddress,
-          ownerAddress,
-          strategy: "SPOT",
-          orientation: "UNKNOWN",
-          lowerBinId: fact.lowerBinId,
-          upperBinId: fact.upperBinId,
-          activeBinAtEntry: fact.lowerBinId,
-          initialCapitalLamports: 0n,
-          enteredAt: at,
-          lifecycleState: "RECONCILIATION_REQUIRED",
-          reconciliationStatus: "MISMATCH",
-          payload: {
-            orphanDetected: true,
-            reasonCodes: ["P6_ORPHAN_POSITION_DETECTED"],
-            lowerBinId: fact.lowerBinId,
-            upperBinId: fact.upperBinId,
-          },
-        });
-        known.add(fact.positionAddress);
-        adopted++;
-        reasonCodes.add("P6_ORPHAN_POSITION_DETECTED");
-      }
-    } catch (error) {
-      // A single pool sweep failure must not disrupt the recovery cycle.
-      reasonCodes.add(
-        error instanceof Error &&
-          error.message === "LPFORGE_ORPHAN_SWEEP_RUNTIME_UNAVAILABLE"
-          ? "P6_ORPHAN_SWEEP_RUNTIME_UNAVAILABLE"
-          : "P6_ORPHAN_SWEEP_POOL_READ_FAILED",
-      );
-    }
+  let facts: WalletPositionFact[];
+  try {
+    facts = await (input.walletPositionsProvider ?? defaultProvider)();
+  } catch (error) {
+    return {
+      scanned: 0, known: 0, adopted: 0, unknown: 0, ambiguous: 0, dbOnly: 0,
+      reasonCodes: [error instanceof Error && error.message === "LPFORGE_WALLET_SWEEP_RUNTIME_UNAVAILABLE" ? "P6_WALLET_SWEEP_RUNTIME_UNAVAILABLE" : "P6_WALLET_SWEEP_READ_FAILED"],
+    };
   }
-  return { adopted, reasonCodes: [...reasonCodes] };
+  const owned = await input.store.loadOwnedPositions(ownerAddress);
+  const knownByAddress = new Map(owned.map(row => [String(row.position_address), row]));
+  const scannedByAddress = new Map<string, WalletPositionFact>();
+  const duplicateAddresses = new Set<string>();
+  for (const fact of facts) {
+    if (scannedByAddress.has(fact.positionAddress)) duplicateAddresses.add(fact.positionAddress);
+    else scannedByAddress.set(fact.positionAddress, fact);
+  }
+  const result: WalletWidePositionReconciliation = { scanned: 0, known: 0, adopted: 0, unknown: 0, ambiguous: 0, dbOnly: 0, reasonCodes: [] };
+  for (const fact of scannedByAddress.values()) {
+    if (fact.owner !== ownerAddress) continue;
+    result.scanned++;
+    const basePayload = {
+      source: "P6_WALLET_WIDE_RECONCILIATION",
+      lowerBinId: fact.lowerBinId,
+      upperBinId: fact.upperBinId,
+      ...(fact.activeBinId === undefined ? {} : { activeBinId: fact.activeBinId }),
+      ...(fact.tokenXAmount === undefined ? {} : { tokenXAmount: fact.tokenXAmount }),
+      ...(fact.tokenYAmount === undefined ? {} : { tokenYAmount: fact.tokenYAmount }),
+      ...(fact.feeX === undefined ? {} : { feeX: fact.feeX }),
+      ...(fact.feeY === undefined ? {} : { feeY: fact.feeY }),
+      ...(fact.chainSlot === undefined ? {} : { chainSlot: fact.chainSlot.toString() }),
+    };
+    const known = knownByAddress.get(fact.positionAddress);
+    if (known) {
+      result.known++;
+      await input.store.upsertWalletPositionDiscovery({
+        ownerAddress, positionAddress: fact.positionAddress, poolAddress: fact.pool,
+        classification: "KNOWN_LPFORGE_POSITION", lpforgePositionId: String(known.lpforge_position_id),
+        ...(known.entry_plan_id ? { executionPlanId: String(known.entry_plan_id) } : {}),
+        firstSeenAt: at, lastSeenAt: at, lastReconciledAt: at, payload: basePayload,
+      });
+      continue;
+    }
+    const plans = duplicateAddresses.has(fact.positionAddress)
+      ? []
+      : await input.store.findAutonomousOpenPlansByPosition({ ownerAddress, poolAddress: fact.pool, positionAddress: fact.positionAddress });
+    if (plans.length !== 1) {
+      const classification: WalletPositionClassification = plans.length > 1 || duplicateAddresses.has(fact.positionAddress) ? "AMBIGUOUS_POSITION" : "UNKNOWN_WALLET_POSITION";
+      if (classification === "AMBIGUOUS_POSITION") result.ambiguous++; else result.unknown++;
+      await input.store.upsertWalletPositionDiscovery({ ownerAddress, positionAddress: fact.positionAddress, poolAddress: fact.pool, classification, firstSeenAt: at, lastSeenAt: at, lastReconciledAt: at, payload: { ...basePayload, reasonCodes: [classification === "AMBIGUOUS_POSITION" ? "P6_WALLET_POSITION_LINKAGE_AMBIGUOUS" : "P6_WALLET_POSITION_LINKAGE_MISSING"] } });
+      continue;
+    }
+    const plan = plans[0]!;
+    const journal = await input.store.getExecutionJournal(plan.idempotencyKey);
+    const intent = recordValue(plan.planPayload.intent);
+    const capital = positiveBigInt(intent.capitalLamports);
+    const lower = exactInteger(intent.lowerBinId);
+    const upper = exactInteger(intent.upperBinId);
+    const active = exactInteger(intent.activeBinId) ?? fact.lowerBinId;
+    const strategy = String(intent.strategy ?? "");
+    const funding = recordValue(plan.intentPayload.entryFunding);
+    const signature = typeof journal?.signature === "string" ? journal.signature.trim() : "";
+    const linkageValid = Boolean(
+      signature && openPlanStates.has(plan.state) && capital !== undefined &&
+      lower === fact.lowerBinId && upper === fact.upperBinId &&
+      ["SPOT", "CURVE", "BID_ASK"].includes(strategy),
+    );
+    if (!linkageValid) {
+      result.ambiguous++;
+      await input.store.upsertWalletPositionDiscovery({ ownerAddress, positionAddress: fact.positionAddress, poolAddress: fact.pool, classification: "AMBIGUOUS_POSITION", executionPlanId: plan.planId, firstSeenAt: at, lastSeenAt: at, lastReconciledAt: at, payload: { ...basePayload, reasonCodes: ["P6_WALLET_POSITION_LINKAGE_INCOMPLETE"], planState: plan.state, journalState: journal?.state ?? null } });
+      continue;
+    }
+    await input.store.upsertOwnedPosition({
+      lpforgePositionId: `position-${fact.positionAddress}`,
+      poolAddress: fact.pool,
+      positionAddress: fact.positionAddress,
+      ownerAddress,
+      strategy,
+      orientation: String(funding.orientation ?? "UNKNOWN"),
+      lowerBinId: fact.lowerBinId,
+      upperBinId: fact.upperBinId,
+      activeBinAtEntry: active,
+      initialCapitalLamports: capital!,
+      entryPlanId: plan.planId,
+      entrySignature: signature,
+      ...(fact.chainSlot === undefined ? {} : { entrySlot: fact.chainSlot }),
+      enteredAt: typeof journal?.updated_at === "string" ? journal.updated_at : at,
+      lifecycleState: "OPEN",
+      lastPlanId: plan.planId,
+      reconciliationStatus: "MATCH",
+      payload: { thesisId: plan.thesisId, entryFunding: funding, recoveredBy: "P6_WALLET_WIDE_RECONCILIATION", journalId: journal?.journalId },
+    });
+    await input.store.insertExecutionReconciliation({
+      reconciliationId: `${plan.planId}:wallet-wide-recovery`, planId: plan.planId, observedAt: at, status: "MATCH",
+      expected: { owner: ownerAddress, pool: plan.poolAddress, lowerBinId: lower, upperBinId: upper },
+      actual: { positionAddress: fact.positionAddress, owner: fact.owner, pool: fact.pool, lowerBinId: fact.lowerBinId, upperBinId: fact.upperBinId },
+      discrepancies: [], payload: { recoveredBy: "P6_WALLET_WIDE_RECONCILIATION", journalId: journal?.journalId, signature },
+    });
+    await input.store.upsertWalletPositionDiscovery({ ownerAddress, positionAddress: fact.positionAddress, poolAddress: fact.pool, classification: "KNOWN_LPFORGE_POSITION", lpforgePositionId: `position-${fact.positionAddress}`, executionPlanId: plan.planId, firstSeenAt: at, lastSeenAt: at, lastReconciledAt: at, payload: { ...basePayload, recovered: true, journalId: journal?.journalId, signature } });
+    result.adopted++;
+  }
+  for (const [positionAddress, row] of knownByAddress) {
+    if (scannedByAddress.has(positionAddress)) continue;
+    result.dbOnly++;
+    await input.store.upsertWalletPositionDiscovery({ ownerAddress, positionAddress, poolAddress: String(row.pool_address), classification: "DB_ONLY", lpforgePositionId: String(row.lpforge_position_id), ...(row.entry_plan_id ? { executionPlanId: String(row.entry_plan_id) } : {}), firstSeenAt: at, lastSeenAt: at, lastReconciledAt: at, payload: { source: "P6_WALLET_WIDE_RECONCILIATION", reasonCodes: ["P6_WALLET_SWEEP_DB_ONLY"] } });
+    await input.store.markOwnedPositionLifecycle({ positionAddress, lifecycleState: "RECONCILIATION_REQUIRED", reconciliationStatus: "MISMATCH", ...(row.last_plan_id ? { lastPlanId: String(row.last_plan_id) } : {}), at, payload: { stage: "WALLET_WIDE_RECONCILIATION", reasonCodes: ["P6_WALLET_SWEEP_DB_ONLY"] } });
+  }
+  return result;
+}
+
+/** Backward-compatible name for callers that previously supplied pool hints.
+ * Pool hints are intentionally ignored: authoritative recovery is wallet-wide.
+ */
+export async function reconcileOrphanedPositions(input: {
+  store: Phase1Store;
+  rpcUrl: string;
+  programId: string;
+  ownerAddress?: string;
+  poolAddresses: string[];
+  now?: string;
+}): Promise<{ adopted: number; reasonCodes: string[] }> {
+  const result = await reconcileWalletWidePositions(input);
+  return { adopted: result.adopted, reasonCodes: result.reasonCodes };
 }

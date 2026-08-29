@@ -25,8 +25,26 @@ test('provenance HMACs round-trip over a canonical sorted serialization and reje
   assert.equal(verifyPlanProvenanceHmac({...fields,expiresAt:'2026-08-13T00:06:00.000Z'},secret,hmac),false,'a changed expiry breaks the stamp');
   assert.equal(verifyPlanProvenanceHmac(fields,'wrong-secret',hmac),false,'a different secret breaks the stamp');
   assert.equal(verifyPlanProvenanceHmac(fields,secret,'deadbeef'),false,'non-hex input fails closed');
+  const canaryAuthorization={schemaVersion:1,approvalId:'approval-a',action:'PROMOTE_PRODUCTION',operatorId:'operator',issuedAt:'2026-08-13T00:04:30.000Z',expiresAt:'2026-08-13T00:05:20.000Z',boundControlDecisionId:'control-1',planId:'p',wallet:'OWNER',pool:'POOL',candidateId:'candidate-a',thesisId:'t',intentId:'i',capitalLamports:'20000000',maxConcurrentPositions:1};
+  const canaryHmac=computePlanProvenanceHmac({...fields,controlledCanaryAuthorization:canaryAuthorization},secret);
+  assert.equal(verifyPlanProvenanceHmac({...fields,controlledCanaryAuthorization:canaryAuthorization},secret,canaryHmac),true,'the one-plan approval envelope is authenticated');
+  assert.equal(verifyPlanProvenanceHmac({...fields,controlledCanaryAuthorization:{...canaryAuthorization,planId:'second-plan'}},secret,canaryHmac),false,'the envelope cannot be retargeted to another plan');
   const src=fs.readFileSync(contracts,'utf8');
   assert.match(src,/sort\(\(\[a\],\[b\]\)=>a\.localeCompare\(b\)\)/,'keys serialize in sorted order so the canonical form is stable');
+});
+
+test('provenance HMAC survives the JSONB round trip used by protective management plans',()=>{
+ const beforePersistence={...fields,immutablePlan:{intentPayload:{required:'value',optional:undefined,nested:{keep:1,omit:undefined},array:['keep',undefined]},planIntent:{capitalLamports:'30000000'},steps:[]}};
+ const hmac=computePlanProvenanceHmac(beforePersistence,secret);
+ const afterPersistence=JSON.parse(JSON.stringify(beforePersistence));
+ assert.equal(verifyPlanProvenanceHmac(afterPersistence,secret,hmac),true,'undefined JSON fields must not invalidate a plan after PostgreSQL JSONB persistence');
+});
+
+test('provenance HMAC uses the persisted null candidate identity for protective plans',()=>{
+ const source={...fields,action:'EMERGENCY_CLOSE',positionAddress:'POSITION',immutablePlan:{intentPayload:{requestedManagementAction:'EMERGENCY_CLOSE'},planIntent:{capitalLamports:'30000000',candidateId:null},steps:[]}};
+ const hmac=computePlanProvenanceHmac(source,secret);
+ const afterPersistence=JSON.parse(JSON.stringify(source));
+ assert.equal(verifyPlanProvenanceHmac(afterPersistence,secret,hmac),true,'a no-candidate protective plan must remain authenticated after PostgreSQL JSONB persistence');
 });
 
 test('the operator stamps the complete immutable plan when the provenance secret is configured',()=>{
@@ -36,8 +54,10 @@ test('the operator stamps the complete immutable plan when the provenance secret
   assert.ok(src.includes('...(provenanceSecret'),'the stamp is conditional on the secret being set');
   assert.ok(src.includes('action: plan.intent.action'),'the stamp covers the plan action');
   assert.ok(src.includes('positionAddress: plan.intent.positionAddress ?? null'),'the stamp covers the optional position address');
+  assert.ok(src.includes('candidateId:plan.intent.candidateId??null'),'the HMAC uses the persisted null candidate representation for protective plans');
   assert.ok(src.includes('expiresAt: plan.expiresAt'),'the stamp covers plan expiry');
   assert.ok(src.includes('immutablePlan'),'the stamp covers immutable plan economics and transaction instructions');
+  assert.ok(src.includes('controlledCanaryAuthorization'),'the stamp includes the single-plan canary envelope when present');
 });
 
 test('the claim guard verifies the stamp fail-closed once the secret is configured and stays backward compatible without it',()=>{
@@ -65,4 +85,6 @@ test('the executor forwards the configured provenance secret into the claim guar
   const src=fs.readFileSync(execution,'utf8');
   assert.ok(src.includes("const provenanceSecret=(process.env.LPFORGE_PLAN_PROVENANCE_SECRET??'').trim();"),'the executor reads the shared secret');
   assert.ok(src.includes('...(provenanceSecret?{provenanceSecret}:{})'),'the secret reaches the claim guard input');
+  assert.ok(src.includes('loadPhase7ControlDecision(runtimeId,boundControlDecisionId)'),'the executor resolves the immutable control by its persisted identity rather than assuming latest wins');
+  assert.ok(src.includes('boundPhase7Control'),'the bound record is delivered separately from the latest hard-revocation control');
 });

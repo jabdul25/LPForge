@@ -5,6 +5,7 @@ declare const process: {
   exitCode?: number;
   exit(code?: number): never;
   cwd(): string;
+  memoryUsage(): { heapUsed:number; heapTotal:number; rss:number; external:number; arrayBuffers:number };
   on(event: string, listener: (...args: unknown[]) => void): void;
 };
 declare module 'node:http' {

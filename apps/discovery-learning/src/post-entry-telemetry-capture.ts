@@ -22,7 +22,7 @@ export async function runPostEntryTelemetryCapture(input:{
 }):Promise<{episodesCreated:number;due:number;inserted:number;deferred:number;duplicates:number;conflicts:number;sourceUnavailable:number;failures:number}> {
   const emit=input.emit??(event=>console.log(json(event)));
   const limit=Math.max(1,Math.min(500,Math.floor(input.limit??Number(process.env.LPFORGE_POST_ENTRY_TELEMETRY_MAX_BATCH??100))));
-  const prepared=await input.store.preparePostEntryTelemetryEpisodes(input.now);
+  const prepared=await input.store.preparePostEntryTelemetryEpisodes(input.now,limit);
   const tasks=await input.store.loadDuePostEntryTelemetryCheckpoints(input.now,limit);
   const result={episodesCreated:prepared.created,due:tasks.length,inserted:0,deferred:0,duplicates:0,conflicts:0,sourceUnavailable:0,failures:0};
   emit({event:'POST_ENTRY_TELEMETRY_START',authority:'RESEARCH_ONLY_NO_POLICY_MUTATION',observedAt:input.now,episodesCreated:prepared.created,due:tasks.length});

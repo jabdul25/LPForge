@@ -43,13 +43,15 @@ import {
   fixturePool,
   fixtureSwaps,
 } from "../../../packages/test-fixtures/src/index.js";
-import { loadDeploymentPolicyFile } from "../../../packages/deployment-policy/src/index.js";
+import { CONTROLLED_CANARY_LIQUIDITY_CAPITAL_LAMPORTS, loadDeploymentPolicyFile } from "../../../packages/deployment-policy/src/index.js";
 import { assessProductionOpenPlanCapacity } from "../../../packages/production-entry-capacity/src/index.js";
+import { assessPostEntryAuthority } from "../../../packages/phase7-post-entry-authority/src/index.js";
 import { refreshCanonicalHistoricalBackfill, refreshCurrentPhase3Evidence } from "../../../packages/active-candidate-evidence/src/index.js";
 import { derivePhase3EvidenceWidthRequirement } from "../../../packages/rangeforge/src/index.js";
 import { PublicKey } from "@solana/web3.js";
 import { readFileSync } from "node:fs";
-import { freezePhase3ForwardDecision, phase3ForwardDecisionStoreValue, type RuntimeArtifactProvenance } from "../../../packages/phase3-forward-validation/src/index.js";
+import { freezePhase3ForwardDecision, phase3ForwardDecisionStoreValue, evaluateUserSelectedCapitalOpportunity, buildCapitalContract, buildPositionContract, buildCapitalEvaluationIdentity, buildReset3cValidationSharedEvidenceReference, compactReset3cDecisionRelevantRawContract, selectReset3cDecisionRelevantCandidates, RESET3C_STORAGE_CONTRACT_V3, RESET3C_VALIDATION_SAMPLING_CONTRACT_V1, type RuntimeArtifactProvenance } from "../../../packages/phase3-forward-validation/src/index.js";
+import { canonicalJson, sha256Hex } from "../../../packages/domain/src/index.js";
 import type { Phase3QualificationPolicyId } from "../../../packages/opportunity/src/index.js";
 
 function json(v: unknown) {
@@ -192,9 +194,40 @@ async function persistTransactionPlan(
   store: Phase1Store,
   plan: TransactionPlan,
 ) {
+  const deployment=loadDeploymentPolicyFile(process.env.LPFORGE_EXECUTION_POLICY_PATH??"policies/live-execution-policy.json");
+  // The controlled-canary probe remains read-only; its plan-only marker still
+  // enforces the exact capital and no-replacement envelope before signing.
+  if((process.env.LPFORGE_MAINNET_CANARY==='true'||process.env.LPFORGE_CONTROLLED_CANARY_PLAN==='true')&&deployment.controlledCanary){
+    if(plan.intent.action==='OPEN'&&plan.intent.capitalLamports!==CONTROLLED_CANARY_LIQUIDITY_CAPITAL_LAMPORTS)
+      throw new Error('LPFORGE_P6_CONTROLLED_CANARY_EXACT_CAPITAL_REQUIRED');
+    if(['ADD','RESHAPE','REBALANCE'].includes(plan.intent.action))
+      throw new Error('LPFORGE_P6_CONTROLLED_CANARY_REPLACEMENT_OPEN_BLOCKED');
+  }
   const provenanceSecret=(process.env.LPFORGE_PLAN_PROVENANCE_SECRET??'').trim();
   const phase7RuntimeId=(process.env.LPFORGE_P7_RUNTIME_ID??'lpforge-production').trim(),control=await store.loadLatestPhase7ControlDecision(phase7RuntimeId),phase7Control=control?{decisionId:String(control.decision_id),cycleKey:String(control.cycle_key),observedAt:new Date(String(control.observed_at)).toISOString()}:undefined;
-  const immutablePlan={intentPayload:plan.intent.payload,planIntent:Object.fromEntries(Object.entries({capitalLamports:plan.intent.capitalLamports?.toString(),lowerBinId:plan.intent.lowerBinId,upperBinId:plan.intent.upperBinId,activeBinId:plan.intent.activeBinId,binStep:plan.intent.binStep,strategy:plan.intent.strategy,maxPositionWidthBins:plan.transactions.find((step)=>step.kind==='METEORA_OPEN'||step.kind==='METEORA_POSITION_EXTEND')?.metadata.maxPositionWidthBins}).filter(([,value])=>value!==undefined)),steps:plan.transactions.map(step=>({transactionId:step.transactionId,sequence:step.sequence,kind:step.kind,requiredSignerAddresses:[...step.requiredSignerAddresses],metadata:step.metadata}))};
+  const controlledCanaryPlan=(process.env.LPFORGE_MAINNET_CANARY==='true'||process.env.LPFORGE_CONTROLLED_CANARY_PLAN==='true')&&plan.intent.action==='OPEN'&&Boolean(deployment.controlledCanary);
+  const controlledCanaryAuthorization=controlledCanaryPlan&&phase7Control?{
+    schemaVersion:1,
+    approvalId:(process.env.LPFORGE_P7_APPROVAL_ID??'').trim(),
+    action:(process.env.LPFORGE_P7_APPROVAL_ACTION??'').trim(),
+    operatorId:(process.env.LPFORGE_P7_APPROVED_BY??'').trim(),
+    issuedAt:(process.env.LPFORGE_P7_APPROVAL_ISSUED_AT??'').trim(),
+    expiresAt:(process.env.LPFORGE_P7_APPROVAL_EXPIRES_AT??'').trim(),
+    boundControlDecisionId:phase7Control.decisionId,
+    planId:plan.planId,
+    wallet:plan.intent.ownerAddress,
+    pool:plan.intent.poolAddress,
+    candidateId:plan.intent.candidateId??null,
+    thesisId:plan.intent.thesisId,
+    intentId:plan.intent.intentId,
+    capitalLamports:plan.intent.capitalLamports?.toString()??'',
+    maxConcurrentPositions:1,
+  }:undefined;
+  // `candidateId` is intentionally persisted as JSON null for a protective
+  // lifecycle plan that has no entry candidate.  Bind the exact persisted
+  // representation here; otherwise a source `undefined` is omitted from the
+  // HMAC material and fails closed when the plan is read back from JSONB.
+  const immutablePlan={intentPayload:plan.intent.payload,planIntent:Object.fromEntries(Object.entries({capitalLamports:plan.intent.capitalLamports?.toString(),candidateId:plan.intent.candidateId??null,lowerBinId:plan.intent.lowerBinId,upperBinId:plan.intent.upperBinId,activeBinId:plan.intent.activeBinId,binStep:plan.intent.binStep,strategy:plan.intent.strategy,maxPositionWidthBins:plan.transactions.find((step)=>step.kind==='METEORA_OPEN'||step.kind==='METEORA_POSITION_EXTEND')?.metadata.maxPositionWidthBins}).filter(([,value])=>value!==undefined)),steps:plan.transactions.map(step=>({transactionId:step.transactionId,sequence:step.sequence,kind:step.kind,requiredSignerAddresses:[...step.requiredSignerAddresses],metadata:step.metadata}))};
   await store.insertExecutionIntent({
     intentId: plan.intent.intentId,
     idempotencyKey: plan.intent.idempotencyKey,
@@ -226,6 +259,7 @@ async function persistTransactionPlan(
         poolAddress: plan.intent.poolAddress,
         observedAt: plan.intent.observedAt,
         ...(phase7Control?{phase7Control}:{}),
+        ...(controlledCanaryAuthorization?{controlledCanaryAuthorization}:{}),
         // Stamped only when the provenance secret is configured; the claim
         // guard verifies it fail-closed from that moment on.
         ...(provenanceSecret
@@ -242,7 +276,12 @@ async function persistTransactionPlan(
                   positionAddress: plan.intent.positionAddress ?? null,
                   expiresAt: plan.expiresAt,
                   immutablePlan,
-                  phase7Control: phase7Control ?? null,
+                  // The claim guard normalizes an omitted binding to an empty
+                  // record.  Use that same persisted representation so a
+                  // non-entry protective plan remains verifiable after JSONB
+                  // read-back.
+                  phase7Control: phase7Control ?? {},
+                  ...(controlledCanaryAuthorization?{controlledCanaryAuthorization}:{}),
                 },
                 provenanceSecret,
               ),
@@ -251,6 +290,7 @@ async function persistTransactionPlan(
       },
       intent: {
         capitalLamports: plan.intent.capitalLamports?.toString(),
+        candidateId: plan.intent.candidateId ?? null,
         lowerBinId: plan.intent.lowerBinId,
         upperBinId: plan.intent.upperBinId,
         activeBinId: plan.intent.activeBinId,
@@ -271,6 +311,9 @@ async function persistTransactionPlan(
   });
 }
 function owned(row: Record<string, unknown>): OwnedLivePosition {
+  const payload=(row.payload as Record<string, unknown>) ?? {};
+  let actualEconomicCapitalLamports:bigint|undefined;
+  try { if (payload.actualEconomicCapitalLamports!==undefined) actualEconomicCapitalLamports=BigInt(String(payload.actualEconomicCapitalLamports)); } catch {}
   return {
     lpforgePositionId: String(row.lpforge_position_id),
     poolAddress: String(row.pool_address),
@@ -281,8 +324,10 @@ function owned(row: Record<string, unknown>): OwnedLivePosition {
     lowerBinId: Number(row.lower_bin_id),
     upperBinId: Number(row.upper_bin_id),
     initialCapitalLamports: BigInt(String(row.initial_capital_lamports)),
+    ...(actualEconomicCapitalLamports!==undefined?{actualEconomicCapitalLamports}:{}),
+    partialEntry: payload.partialEntry === true,
     thesisId: String(
-      ((row.payload as Record<string, unknown>) ?? {}).thesisId ??
+      payload.thesisId ??
         `owned-${row.position_address}`,
     ),
     enteredAt: String(row.entered_at ?? ''),
@@ -327,11 +372,12 @@ async function observeAndPlanOwnedPositions(input: {
         .activeBinId;
     } catch {}
     let economics = { evidenceState: "UNAVAILABLE" as const, observedAt: input.observedAt, reasonCodes: ["EXIT_VALUATION_POOL_DATA_UNAVAILABLE"] },apiPool:DataApiPool|undefined;
+    const attributedWalletInventory=await input.store.loadPositionInventoryLots(position.positionAddress);
     if (fact) {
       try {
         const [loadedPool,cashflows] = await Promise.all([input.api.getPool(position.poolAddress),input.store.loadPositionCashflows(position.positionAddress)]);
         apiPool=loadedPool;
-        economics = derivePositionEconomics({position: fact, pool: apiPool, initialCapitalLamports: position.initialCapitalLamports, observedAt: input.observedAt,realizedFeeCashflows:cashflows}) as typeof economics;
+        economics = derivePositionEconomics({position: fact, pool: apiPool, initialCapitalLamports: position.initialCapitalLamports, observedAt: input.observedAt,realizedFeeCashflows:cashflows,attributedWalletInventory:attributedWalletInventory.map(lot=>({tokenMint:lot.tokenMint,tokenAmountRaw:lot.remainingRawAmount.toString()})),...(position.actualEconomicCapitalLamports!==undefined?{actualContributedLamports:position.actualEconomicCapitalLamports}:{})}) as typeof economics;
       } catch {}
     }
     const priorExitRow=await input.store.loadPositionExitState(position.lpforgePositionId);
@@ -400,7 +446,9 @@ async function observeAndPlanOwnedPositions(input: {
             unclaimedFeeY: fact.feeY,
           }
         : {}),
-      walletTruth: { source: "NOT_REQUIRED_FOR_OBSERVATION" },
+      walletTruth: attributedWalletInventory.length===0
+        ? { source: "NO_ATTRIBUTED_WALLET_INVENTORY" }
+        : { source: "POSITION_INVENTORY_LOTS", required: true, lots: attributedWalletInventory.map(lot=>({lotId:lot.lotId,tokenMint:lot.tokenMint,tokenSide:lot.tokenSide,rawAmount:lot.remainingRawAmount.toString(),decimals:lot.decimals,status:lot.status})), valueUsd: exitDecision.economics.walletInventoryValueUsd ?? null },
       positionTruth: fact ?? { missing: true },
       managementContext: {
         decision,
@@ -415,13 +463,22 @@ async function observeAndPlanOwnedPositions(input: {
       staleData: false,
       payload: { source: "LPFORGE_PRODUCTION_OWNED_POSITION_MONITOR" },
     });
-    const riskIncreasing = ["ADD", "RESHAPE", "REBALANCE"].includes(
-      decision.action,
-    );
+    const riskIncreasing = ["ADD", "RESHAPE", "REBALANCE"].includes(decision.action);
+    // A reshape/rebalance includes a replacement OPEN. Under containment, do
+    // not leave the old risk in place waiting for new-entry authority: issue
+    // the already-supported terminal CLOSE workflow instead. It removes the
+    // old liquidity, settles wallet truth, and never builds a replacement.
+    const containmentTerminalClose =
+      riskIncreasing &&
+      !input.allowRiskIncreasingPlans &&
+      input.allowProtectiveManagementPlans &&
+      ["RESHAPE", "REBALANCE"].includes(decision.action);
+    const planAction = containmentTerminalClose ? "CLOSE" : decision.action;
+    const planRiskIncreasing = ["ADD", "RESHAPE", "REBALANCE"].includes(planAction);
     if (
       decision.action === "HOLD" ||
       !managementContext.planAllowed ||
-      (riskIncreasing
+      (planRiskIncreasing
         ? !input.allowRiskIncreasingPlans
         : !input.allowProtectiveManagementPlans) ||
       (await input.store.hasActiveAutonomousPlan(position.positionAddress))
@@ -430,12 +487,13 @@ async function observeAndPlanOwnedPositions(input: {
         skippedNoMatchingContext++;
       continue;
     }
+    if (planAction === "HOLD") continue;
     const expiresAt = new Date(
         Date.parse(input.observedAt) + policy.planTtlMs,
       ).toISOString(),
       replacement = decision.replacementRange;
     const plan = buildTransactionPlan({
-      action: decision.action,
+      action: planAction,
       cluster: "mainnet-beta",
       ownerAddress: position.ownerAddress,
       poolAddress: position.poolAddress,
@@ -446,7 +504,7 @@ async function observeAndPlanOwnedPositions(input: {
       // Position-management costs are assessed against the current remaining
       // capital basis. CLOSE and CLAIM must never fall back to one lamport.
       capitalLamports: position.initialCapitalLamports,
-      ...(replacement
+      ...(replacement && !containmentTerminalClose
         ? {
             lowerBinId: replacement.lowerBinId,
             upperBinId: replacement.upperBinId,
@@ -455,7 +513,7 @@ async function observeAndPlanOwnedPositions(input: {
             removeUpperBinId: position.upperBinId,
           }
         : {}),
-      ...(decision.action === "REDUCE"
+      ...(planAction === "REDUCE"
         ? {
             reductionBps: Math.max(
               1,
@@ -465,6 +523,8 @@ async function observeAndPlanOwnedPositions(input: {
         : {}),
       metadata: {
         managementReasonCodes: decision.reasonCodes,
+        requestedManagementAction: decision.action,
+        ...(containmentTerminalClose ? { containmentDisposition: "CLOSE_OLD_POSITION_NO_REPLACEMENT", reasonCodes: ["P7_CONTAINMENT_BLOCKED_REPLACEMENT_OPEN"] } : {}),
         managementContextReasonCodes: managementContext.reasonCodes,
         managementContextPoolAddress: current?.poolAddress ?? null,
         positionPoolAddress: position.poolAddress,
@@ -478,6 +538,44 @@ async function observeAndPlanOwnedPositions(input: {
     planned++;
   }
   return { observed: positions.length, planned, skippedNoMatchingContext };
+}
+function shadowPayloadForPersistence(shadow:NonNullable<OperationalCycleResult['shadow']>):Record<string,unknown>{
+ const {candidateUniverseEvidence,...persistent}=shadow;
+ // V3 writes the large replay arrays exactly once to its temporary
+ // validation-universe record.  They must not be duplicated permanently in
+ // every immutable shadow recommendation.
+ return persistent as unknown as Record<string,unknown>;
+}
+const finiteNumber=(value:unknown):number|null=>typeof value==='number'&&Number.isFinite(value)?value:null;
+
+async function persistReset3cUniverse(store:Phase1Store,r:OperationalCycleResult,frozen:ReturnType<typeof freezePhase3ForwardDecision>){
+ const universe=r.shadow?.candidateUniverseEvidence;if(!universe||!universe.frames.length)return;
+ const baseline=universe.frames[0]!,capital=BigInt(universe.capitalLamports),rankingById=new Map(universe.ranking.rankings.map(row=>[row.candidateId,row] as const)),rankById=new Map(universe.ranking.rankings.map((row,index)=>[row.candidateId,index+1] as const)),simulations=new Map(universe.simulations.map(row=>[row.candidateId,row] as const));
+ const rows=await Promise.all(universe.candidates.map(async candidate=>{
+   const simulation=simulations.get(candidate.id),ranking=rankingById.get(candidate.id);let result:Awaited<ReturnType<typeof evaluateUserSelectedCapitalOpportunity>>|undefined,error:string|undefined;
+   try{result=await evaluateUserSelectedCapitalOpportunity({decision:{...frozen,selectedCandidate:candidate,capitalLamports:capital.toString()},candidate,baseline,frames:universe.frames,events:universe.events,userSelectedCapitalLamports:capital,costs:universe.costs});}catch(cause){error=cause instanceof Error?cause.message:String(cause);}
+   const weightHash=await sha256Hex(canonicalJson(candidate.perBinWeights)),geometryIdentity=await sha256Hex(canonicalJson({candidateId:candidate.id,strategy:candidate.strategy,orientation:candidate.orientation,family:candidate.family,lowerBinId:candidate.lowerBinId,upperBinId:candidate.upperBinId,centerBinId:candidate.centerBinId,weightHash}));
+   return{candidate,simulation,ranking,result,error,geometryIdentity,weightHash};
+ }));
+ const currentSelectedCandidateId=frozen.phase3Outcome==='ENTRY_READY'?frozen.selectedCandidate?.id:undefined;
+ const selection=selectReset3cDecisionRelevantCandidates({...(currentSelectedCandidateId?{currentSelectedCandidateId}:{}),candidates:rows.map(row=>({candidateId:row.candidate.id,mechanicallyConstructible:row.result?.constructibility.mechanicallyConstructible===true,currentPolicyStatus:row.result?.economics.currentPolicyStatus??row.result?.feasibility.status??null,currentRank:rankById.get(row.candidate.id)??null,legacyExpectedNetPnl:finiteNumber(row.simulation?.netValue),canonicalExpectedNetPnl:finiteNumber(row.result?.economics.expectedNetPnlSol)}))});
+ const selectionById=new Map(selection.detailedCandidates.map(row=>[row.candidateId,row] as const));
+ const censusCandidates=rows.map(row=>({candidateId:row.candidate.id,pool:frozen.poolAddress,strategy:row.candidate.strategy,orientation:row.candidate.orientation,family:row.candidate.family,lowerBinId:row.candidate.lowerBinId,upperBinId:row.candidate.upperBinId,activeBinId:baseline.activeBinId,geometryIdentity:row.geometryIdentity,weightHash:row.weightHash,capitalLamports:capital.toString(),mechanicallyConstructible:row.result?.constructibility.mechanicallyConstructible===true,...(row.result?.constructibility.mechanicalFailureReason?{mechanicalFailureReason:row.result.constructibility.mechanicalFailureReason}:{}),currentPolicyStatus:row.result?.economics.currentPolicyStatus??row.result?.feasibility.status??'UNKNOWN',...(row.result?.economics.resultingOwnershipBps===undefined?{}:{resultingOwnershipBps:row.result.economics.resultingOwnershipBps}),legacyEconomics:row.simulation?{expectedFeePnl:row.simulation.feeValue,expectedInventoryEffect:row.simulation.inventoryChangeValue,expectedCosts:row.simulation.totalCostValue,expectedNetPnl:row.simulation.netValue}:null,canonicalEconomics:row.result?.economics?{expectedFeePnlSol:row.result.economics.expectedFeePnlSol,expectedInventoryEffectSol:row.result.economics.expectedInventoryEffectSol,expectedCostsSol:row.result.economics.expectedCostsSol,expectedNetPnlSol:row.result.economics.expectedNetPnlSol,expectedNetReturnBps:row.result.economics.expectedNetReturnBps}:null,currentRank:rankById.get(row.candidate.id)??null,currentRankingUtility:row.ranking?.utility??null,selectedCandidate:row.candidate.id===currentSelectedCandidateId,detailedValidationSelected:selectionById.has(row.candidate.id),detailedValidationReasons:selectionById.get(row.candidate.id)?.reasonCodes??[],...(selectionById.has(row.candidate.id)?{}:{detailedValidationOmissionReason:'NOT_DECISION_RELEVANT'}),...(row.error?{failureReason:row.error}:{})})).sort((a,b)=>a.candidateId.localeCompare(b.candidateId));
+ const manifestCore={version:RESET3C_STORAGE_CONTRACT_V3,decisionId:frozen.decisionId,capitalLamports:capital.toString(),candidates:censusCandidates.map(candidate=>({candidateId:candidate.candidateId,geometryIdentity:candidate.geometryIdentity,mechanicallyConstructible:candidate.mechanicallyConstructible,currentPolicyStatus:candidate.currentPolicyStatus})),expectedCandidateCount:rows.length,capturedCandidateCount:rows.length,universeComplete:true};
+ const universeManifestHash=await sha256Hex(canonicalJson(manifestCore));
+ const selectionManifest={samplingContractVersion:RESET3C_VALIDATION_SAMPLING_CONTRACT_V1,recommendationId:frozen.recommendationId,decisionId:frozen.decisionId,universeManifestHash,categoryWinners:selection.categoryWinners,detailedCandidates:selection.detailedCandidates};
+ const detailedSelectionManifestHash=await sha256Hex(canonicalJson(selectionManifest));
+ const census={version:RESET3C_STORAGE_CONTRACT_V3,samplingContractVersion:RESET3C_VALIDATION_SAMPLING_CONTRACT_V1,recommendationId:frozen.recommendationId,decisionId:frozen.decisionId,decisionAt:frozen.decisionTimestamp,pool:frozen.poolAddress,capitalLamports:capital.toString(),expectedCandidateCount:rows.length,capturedCandidateCount:rows.length,universeComplete:true,universeManifestHash,candidates:censusCandidates,qualificationFacts:universe.qualification,globalEconomics:universe.economics};
+ const {reference:sharedEvidenceReference,temporarySharedEvidence}=await buildReset3cValidationSharedEvidenceReference({recommendationId:frozen.recommendationId,universe:universe as unknown as Record<string,unknown>,frozenDecision:frozen as unknown as Record<string,unknown>});
+ const detailedRows=rows.filter(row=>selectionById.has(row.candidate.id)),outcomeEligibleCandidateCount=detailedRows.filter(row=>row.result?.constructibility.mechanicallyConstructible===true).length;
+ const universeContentHash=await sha256Hex(canonicalJson({census,selectionManifest,detailedCandidateIds:detailedRows.map(row=>row.candidate.id).sort(),sharedEvidenceHash:sharedEvidenceReference.sharedEvidenceHash}));
+ await store.insertReset3cValidationUniverse({recommendationId:frozen.recommendationId,decisionId:frozen.decisionId,decisionAt:frozen.decisionTimestamp,samplingContractVersion:RESET3C_VALIDATION_SAMPLING_CONTRACT_V1,storageContractVersion:RESET3C_STORAGE_CONTRACT_V3,capitalLamports:capital.toString(),expectedCandidateCount:rows.length,capturedCandidateCount:rows.length,universeComplete:true,universeManifestHash,detailedCandidateCount:detailedRows.length,outcomeEligibleCandidateCount,detailedCandidateIds:detailedRows.map(row=>row.candidate.id).sort(),selectionManifest,detailedSelectionManifestHash,census,sharedEvidenceHash:sharedEvidenceReference.sharedEvidenceHash,temporarySharedEvidence,contentHash:universeContentHash});
+ for(const row of detailedRows){
+   const candidate={...row.candidate,capitalFraction:1},capitalContract=await buildCapitalContract({proposedCapitalLamports:capital,candidateCapitalFraction:1}),positionContract=await buildPositionContract({decision:{...frozen,selectedCandidate:candidate,capitalLamports:capital.toString()},candidate,baseline,capitalContract}),identity=await buildCapitalEvaluationIdentity({decision:frozen,candidate,capitalContract,positionContract,modelVersion:'phase3-forward-outcome-v2',formulaVersion:'capital-constrained-forward-v2',namespace:'COUNTERFACTUAL_CANONICAL'}),result=row.result,selectionRow=selectionById.get(row.candidate.id)!;
+   const v1Raw={version:'reset3c-universe-v1',universeManifestHash,expectedCandidateCount:rows.length,capturedCandidateCount:rows.length,universeComplete:true,evidenceCutoffAt:frozen.decisionTimestamp,frozenDecision:{...frozen,selectedCandidate:candidate,capitalLamports:capital.toString()},candidate:{...row.candidate},legacyEconomics:row.simulation??null,canonicalEconomics:result?.economics??null,mechanicalConstructibility:result?.constructibility??null,currentPolicy:result?.feasibility??null,rankingFacts:row.ranking??null,...(!result?{failureReason:row.error}: {})};
+   const raw=compactReset3cDecisionRelevantRawContract(v1Raw,sharedEvidenceReference,{samplingContractVersion:RESET3C_VALIDATION_SAMPLING_CONTRACT_V1,detailedSelectionManifestHash,detailedValidationReasons:selectionRow.reasonCodes,outcomeEligible:result?.constructibility.mechanicallyConstructible===true}),contentHash=await sha256Hex(canonicalJson(raw));
+   await store.insertVariableCapitalEvaluation({capitalEvaluationId:identity.capitalEvaluationId,recommendationId:frozen.recommendationId,decisionId:frozen.decisionId,candidateId:row.candidate.id,proposedCapitalLamports:capital.toString(),...(result?.economics.allocatedCapitalLamports?{allocatedCapitalLamports:result.economics.allocatedCapitalLamports}:{}),capitalContractHash:capitalContract.capitalContractHash,positionContractHash:positionContract.positionContractHash,capitalFeasibilityStatus:result?.feasibility.status??'UNKNOWN',bindingConstraint:result?.feasibility.bindingConstraint??'UNKNOWN',sourceSha:frozen.sourceSha,buildId:frozen.buildId,policyHash:frozen.policyHash,migrationHead:frozen.migrationHead,evidenceManifestHash:universeManifestHash,provenance:{authority:'RESEARCH_ONLY_NO_POLICY_MUTATION',namespace:'COUNTERFACTUAL_CANONICAL',samplingContractVersion:RESET3C_VALIDATION_SAMPLING_CONTRACT_V1},rawContract:raw,contentHash});
+ }
 }
 async function persistResult(
   store: Phase1Store,
@@ -501,7 +599,7 @@ async function persistResult(
       ranking: r.shadow.ranking as unknown as Record<string, unknown>,
       economics: r.shadow.economics as unknown as Record<string, unknown>,
       reasonCodes: r.shadow.reasonCodes,
-      payload: r.shadow as unknown as Record<string, unknown>,
+      payload: shadowPayloadForPersistence(r.shadow),
     });
     // Shadow calibration must never influence the recommendation or authority
     // path. A capture failure is observable, but the already durable Phase-3
@@ -509,6 +607,7 @@ async function persistResult(
     try {
       const frozen=freezePhase3ForwardDecision({recommendation:r.shadow,artifact:verifiedForwardArtifactProvenance(),...(r.entry?{phase4:{result:r.entry.decision,readinessScore:r.entry.readinessScore,timingConfidence:r.entry.confidence,reasonCodes:[...r.entry.reasonCodes],diagnostics:{phase4EconomicUncertainty:r.entry.phase4EconomicUncertainty,phase4TimingConfidence:r.entry.phase4TimingConfidence,uncertaintyNoLongerBlocking:r.entry.uncertaintyNoLongerBlocking,removedBlockerReason:r.entry.removedBlockerReason,hardBlocks:[...r.entry.hardBlocks],waitReasons:[...r.entry.waitReasons]}}}:{})});
       await store.insertPhase3ForwardDecision(phase3ForwardDecisionStoreValue(frozen));
+      await persistReset3cUniverse(store,r,frozen);
     } catch (error) {
       console.error(json({event:'lpforge_phase3_forward_capture_failed',recommendationId:r.shadow.recommendationId,error:error instanceof Error?error.message:String(error),authority:'RESEARCH_ONLY_NO_POLICY_MUTATION'}));
     }
@@ -614,16 +713,21 @@ async function liveOnce() {
     const runtimeId = (process.env.LPFORGE_P7_RUNTIME_ID ?? "lpforge-production").trim();
     const planDispatchEnabled =
       (process.env.LPFORGE_P7_PLAN_DISPATCH_ENABLED ?? "false").toLowerCase() === "true";
+    const protectiveActionDispatchEnabled =
+      (process.env.LPFORGE_P7_PROTECTIVE_ACTION_DISPATCH_ENABLED ?? "true").toLowerCase() === "true";
     const control = await store.loadLatestPhase7ControlDecision(runtimeId);
-    const allowRiskIncreasingPlans =
-      planDispatchEnabled &&
-      control?.authority_mode !== "OBSERVE_ONLY" &&
-      Boolean(control?.new_economic_action_allowed);
-    // P7's new-economic-action switch governs new/increased exposure.  A
-    // normal or emergency protective exit must still be able to enter the
-    // existing execution/recovery workflow when production authority exists.
-    const allowProtectiveManagementPlans =
-      planDispatchEnabled && control?.authority_mode !== "OBSERVE_ONLY";
+    const postEntryAuthorityInput = {
+      ...(typeof control?.authority_mode === "string" ? { authorityMode: control.authority_mode } : {}),
+      ...(typeof control?.health_status === "string" ? { healthStatus: control.health_status } : {}),
+      ...(typeof control?.safety_mode === "string" ? { safetyMode: control.safety_mode } : {}),
+      newEconomicActionAllowed: Boolean(control?.new_economic_action_allowed),
+      riskIncreasingPlanDispatchEnabled: planDispatchEnabled,
+      protectiveActionDispatchEnabled,
+    };
+    const allowRiskIncreasingPlans = assessPostEntryAuthority(postEntryAuthorityInput, "OPEN").allowed;
+    // Containment explicitly permits verified, risk-reducing management while
+    // OBSERVE_ONLY continues to deny every new/increased exposure action.
+    const allowProtectiveManagementPlans = assessPostEntryAuthority(postEntryAuthorityInput, "CLOSE").allowed;
     let eventDecodeWarnings = 0;
     const adapter = createMeteoraReadAdapter({
       rpcUrl: cfg.solanaRpcHttpUrl,
@@ -853,6 +957,14 @@ async function liveOnce() {
         phase5Status: result.phase5Status,
         economicPlanDispatchAllowed: allowRiskIncreasingPlans,
         protectiveManagementPlanDispatchAllowed: allowProtectiveManagementPlans,
+        postEntryAuthority: {
+          riskIncreasing: assessPostEntryAuthority(postEntryAuthorityInput, "OPEN"),
+          claim: assessPostEntryAuthority(postEntryAuthorityInput, "CLAIM"),
+          close: assessPostEntryAuthority(postEntryAuthorityInput, "CLOSE"),
+          emergencyClose: assessPostEntryAuthority(postEntryAuthorityInput, "EMERGENCY_CLOSE"),
+          reconciliation: assessPostEntryAuthority(postEntryAuthorityInput, "RECONCILIATION"),
+          monitoring: assessPostEntryAuthority(postEntryAuthorityInput, "MONITORING"),
+        },
         openPlanCapacity: {
           approved: openPlanCapacity.approved,
           availableWalletLamports: openPlanCapacity.availableWalletLamports?.toString(),

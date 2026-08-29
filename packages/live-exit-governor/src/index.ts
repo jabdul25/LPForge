@@ -34,7 +34,19 @@ export interface PositionEconomicsSnapshot {
   realizedWithdrawalValueUsd?:number;
   contributedCapitalUsd?:number;
   executionCostUsd?:number;
+  /** Value of position-attributable inventory that remains in the owner wallet. */
+  walletInventoryValueUsd?:number;
   reasonCodes:string[];
+}
+/**
+ * Wallet inventory is included only when a durable position inventory lot
+ * identifies it as belonging to this PositionV2.  Aggregate wallet balances
+ * are intentionally not accepted here: they may include manual holdings or
+ * inventory attributable to another LPForge position.
+ */
+export interface AttributedWalletInventory {
+  tokenMint:string;
+  tokenAmountRaw:string;
 }
 /**
  * Value only the assets that are still inside PositionV2.  Portfolio NAV adds
@@ -126,22 +138,30 @@ export function valuePositionCashflows(input:{cashflows:readonly RealizedPositio
 /** Backward-compatible fee-only view for reporting callers. */
 export function valueRealizedFeeCashflows(input:{cashflows:readonly RealizedPositionCashflow[];pool:DataApiPool}){const v=valuePositionCashflows(input);return{valueUsd:v.realizedFeeUsd,complete:v.complete,reasonCodes:v.reasonCodes};}
 /** Capital-normalized economic valuation. No value is fabricated when token price/decimals are unavailable. */
-export function derivePositionEconomics(input:{position:PositionV2Fact;pool:DataApiPool;initialCapitalLamports:bigint;observedAt:string;realizedFeeCashflows?:readonly RealizedPositionCashflow[]}):PositionEconomicsSnapshot{
+export function derivePositionEconomics(input:{position:PositionV2Fact;pool:DataApiPool;initialCapitalLamports:bigint;observedAt:string;realizedFeeCashflows?:readonly RealizedPositionCashflow[];attributedWalletInventory?:readonly AttributedWalletInventory[];actualContributedLamports?:bigint}):PositionEconomicsSnapshot{
   const {position,pool,initialCapitalLamports,observedAt}=input,x=pool.token_x,y=pool.token_y;
+  const tokens=[x,y].filter((token):token is NonNullable<typeof token>=>Boolean(token));
   const sol=x?.address==='So11111111111111111111111111111111111111112'?x:y?.address==='So11111111111111111111111111111111111111112'?y:undefined;
-  const initial=finite(sol?.price)&&sol!.price!>0?Number(initialCapitalLamports)/1e9*sol!.price!:undefined;
+  const contributionLamports=input.actualContributedLamports??initialCapitalLamports;
+  const initial=finite(sol?.price)&&sol!.price!>0?Number(contributionLamports)/1e9*sol!.price!:undefined;
   const xv=tokenUsd(position.totalXAmount,x?.decimals,x?.price),yv=tokenUsd(position.totalYAmount,y?.decimals,y?.price);
   const fux=tokenUsd(position.feeX,x?.decimals,x?.price)??0,fuy=tokenUsd(position.feeY,y?.decimals,y?.price)??0;
   const onPositionClaimedX=tokenUsd(position.claimedFeeX,x?.decimals,x?.price)??0,onPositionClaimedY=tokenUsd(position.claimedFeeY,y?.decimals,y?.price)??0,
     ledger=input.realizedFeeCashflows&&input.realizedFeeCashflows.length>0?valuePositionCashflows({cashflows:input.realizedFeeCashflows,pool}):undefined;
   const reasons:string[]=[];if(initial===undefined||!(initial>0))reasons.push('EXIT_VALUATION_INITIAL_CAPITAL_UNAVAILABLE');if(xv===undefined)reasons.push('EXIT_VALUATION_TOKEN_X_UNAVAILABLE');if(yv===undefined)reasons.push('EXIT_VALUATION_TOKEN_Y_UNAVAILABLE');
   if(ledger&&!ledger.complete)reasons.push(...ledger.reasonCodes);
+  let walletInventory=0;
+  for(const asset of input.attributedWalletInventory??[]){
+    const token=tokens.find(candidate=>candidate.address===asset.tokenMint),value=tokenUsd(asset.tokenAmountRaw,token?.decimals,token?.price);
+    if(value===undefined){reasons.push('EXIT_VALUATION_ATTRIBUTED_WALLET_INVENTORY_UNAVAILABLE');continue;}
+    walletInventory+=value;
+  }
   if(reasons.length)return{evidenceState:'UNAVAILABLE',observedAt,reasonCodes:[...new Set(reasons)].sort()};
   // Once the durable ledger is present it is the authority for fees already
   // withdrawn to the wallet. This prevents a CLAIM from looking like a loss
   // and avoids double counting an SDK cumulative claimed-fee field.
-  const realizedFees=ledger?.hasRealizedFeeFlow?ledger.realizedFeeUsd:(onPositionClaimedX+onPositionClaimedY),contributed=ledger?.contributionsUsd&&ledger.contributionsUsd>0?ledger.contributionsUsd:initial!,withdrawals=ledger?.realizedWithdrawalUsd??0,costs=ledger?.executionCostUsd??0,fees=fux+fuy+realizedFees,current=xv!+yv!+fees+withdrawals-costs,net=current-contributed,fraction=net/contributed;
-  return{evidenceState:'AVAILABLE',observedAt,initialCapitalUsd:contributed,currentEconomicValueUsd:current,netPnlUsd:net,netReturnFraction:fraction,feesValueUsd:fees,realizedFeeValueUsd:realizedFees,realizedWithdrawalValueUsd:withdrawals,contributedCapitalUsd:contributed,executionCostUsd:costs,reasonCodes:['EXIT_VALUATION_CAPITAL_NORMALIZED',...(ledger?['EXIT_VALUATION_REALIZED_CASHFLOWS']:[])]};
+  const realizedFees=ledger?.hasRealizedFeeFlow?ledger.realizedFeeUsd:(onPositionClaimedX+onPositionClaimedY),contributed=input.actualContributedLamports!==undefined?initial!:(ledger?.contributionsUsd&&ledger.contributionsUsd>0?ledger.contributionsUsd:initial!),withdrawals=ledger?.realizedWithdrawalUsd??0,costs=ledger?.executionCostUsd??0,fees=fux+fuy+realizedFees,current=xv!+yv!+fees+walletInventory+withdrawals-costs,net=current-contributed,fraction=net/contributed;
+  return{evidenceState:'AVAILABLE',observedAt,initialCapitalUsd:contributed,currentEconomicValueUsd:current,netPnlUsd:net,netReturnFraction:fraction,feesValueUsd:fees,realizedFeeValueUsd:realizedFees,realizedWithdrawalValueUsd:withdrawals,contributedCapitalUsd:contributed,executionCostUsd:costs,walletInventoryValueUsd:walletInventory,reasonCodes:['EXIT_VALUATION_COMPLETE_MANAGED_NAV',...(walletInventory>0?['EXIT_VALUATION_ATTRIBUTED_WALLET_INVENTORY']:[]),...(ledger?['EXIT_VALUATION_REALIZED_CASHFLOWS']:[])]};
 }
 function nextHighWater(e:PositionEconomicsSnapshot,prior?:ExitHighWaterState):ExitHighWaterState{
   const current=e.netReturnFraction??Number.NEGATIVE_INFINITY;

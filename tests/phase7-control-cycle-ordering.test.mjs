@@ -30,10 +30,11 @@ test('drift reads lagged decoder telemetry from the prior evidence snapshot, fal
   assert.match(src,/const decoderSkipRate=Number\.isFinite\(telemetryWarnings\)&&Number\.isFinite\(telemetrySwaps\)\?telemetryWarnings\/Math\.max\(1,telemetryWarnings\+telemetrySwaps\):undefined;/,'skip rate is undefined, not assumed, when telemetry has never been observed');
 });
 
-test('drift folds every probed pool while preserving raw candidate BLOCK for targeted claim admission',()=>{
+test('drift folds the immutable universe while the serialized decision producer probes one bounded target',()=>{
   const src=fs.readFileSync(production,'utf8');
   assert.match(src,/const evaluationPoolAddresses=await productionEvaluationPoolAddresses\(input\.store,input\.env,input\.cycleKey,\[\.\.\.openPools\]\),driftPoolAddresses=\[\.\.\.new Set\(\[input\.cfg\.smokePoolAddress,\.\.\.evaluationPoolAddresses\]\)\];/,'one immutable evaluation-pool snapshot, including owned pools, feeds drift and probes');
-  assert.ok(src.includes('watch.activate&&watch.authorization?[watch.authorization.poolAddress]:evaluationPoolAddresses'), 'normal probes reuse the immutable evaluation-pool snapshot; the bounded canary bridge may narrow to its single fresh authorization pool');
+  assert.ok(src.includes('watch.activate&&watch.authorization?[watch.authorization.poolAddress]:phase7BoundedDecisionHealthProbePoolAddresses'), 'a canary probes its single authorized pool; ordinary cycles probe one deterministic target from the immutable evaluation universe');
+  assert.ok(src.includes('Schedule exactly one deterministic target per cycle instead.'),'the decision producer cannot serially consume its own 120-second freshness window');
   assert.ok(src.includes('significant:poolAddress===input.cfg.smokePoolAddress||capitalPools.has(poolAddress)||openPools.has(poolAddress)'),'smoke pool, deployed capital and open positions are the significance criteria');
   assert.ok(src.includes("rank(p.status)>rank('WATCH')?'WATCH':p.status"),'idle pools are capped at WATCH');
   assert.ok(src.includes('`P7_LIVE_DRIFT_POOL_${p.status}`'),'non-stable pools surface a per-pool reason code');

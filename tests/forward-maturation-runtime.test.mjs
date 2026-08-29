@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import { FORWARD_MATURATION_RETRY_LIMIT, deriveForwardMaturationRetryPlan, prioritizeForwardMaturationTasks, processDueForwardMaturations, startIndependentForwardMaturationLoop } from '../.build/apps/discovery-learning/src/forward-maturation-scheduler.js';
+import { FORWARD_MATURATION_RETRY_LIMIT, counterfactualV3ReservedSlots, deriveForwardMaturationRetryPlan, interleaveBoundedCounterfactualLanes, prioritizeForwardMaturationTasks, processDueForwardMaturations, startIndependentForwardMaturationLoop } from '../.build/apps/discovery-learning/src/forward-maturation-scheduler.js';
 
 const task=(recommendationId,horizonMinutes,state='PENDING',extra={})=>({recommendationId,horizonMinutes,state,retryCount:0,...extra});
 const key=row=>`${row.recommendationId}:${row.horizonMinutes}`;
@@ -26,13 +26,50 @@ test('queue starvation regression: due PENDING rows outrank old INSUFFICIENT_EVI
   assert.equal(firstBatch.length,12);assert.ok(firstBatch.every(row=>row.state==='PENDING'));assert.deepEqual(firstBatch.map(row=>row.recommendationId),pending.slice(0,12).map(row=>row.recommendationId));
 });
 
-test('current release due PENDING rows outrank legacy due PENDING backlog without promoting retries',()=>{
+test('source SHA never reorders due PENDING work',()=>{
   const legacy=Array.from({length:20},(_,index)=>task(`legacy-${index}`,30,'PENDING',{sourceSha:'legacy',dueAt:new Date(Date.parse('2026-08-23T00:00:00.000Z')+index*60_000).toISOString()}));
   const current=Array.from({length:4},(_,index)=>task(`current-${index}`,30,'PENDING',{sourceSha:'current',dueAt:new Date(Date.parse('2026-08-23T01:00:00.000Z')+index*60_000).toISOString()}));
   const retry=task('current-retry',30,'INSUFFICIENT_EVIDENCE',{sourceSha:'current',nextRetryAt:'2026-08-23T00:00:00.000Z'});
-  const firstBatch=prioritizeForwardMaturationTasks([...legacy,...current,retry],'current').slice(0,12);
-  assert.deepEqual(firstBatch.slice(0,4).map(row=>row.recommendationId),current.map(row=>row.recommendationId));
-  assert.ok(firstBatch.slice(4).every(row=>row.state==='PENDING'));assert.equal(firstBatch.includes(retry),false);
+  const firstBatch=prioritizeForwardMaturationTasks([...legacy,...current,retry]).slice(0,12);
+  assert.deepEqual(firstBatch.map(row=>row.recommendationId),legacy.slice(0,12).map(row=>row.recommendationId));
+  assert.equal(firstBatch.includes(retry),false);
+});
+
+test('M0054 fair scheduling reserves a bounded V3 lane without abandoning historical work',()=>{
+  const v3=Array.from({length:40},(_,index)=>({lane:'V3',id:`v3-${index}`}));
+  const historical=Array.from({length:100},(_,index)=>({lane:'HISTORICAL',id:`historical-${index}`}));
+  const limit=30,reserved=counterfactualV3ReservedSlots(limit);
+  assert.equal(reserved,20);
+  const batch=interleaveBoundedCounterfactualLanes(v3.slice(0,reserved),historical.slice(0,limit-reserved),limit);
+  assert.equal(batch.length,limit);
+  assert.equal(batch.filter(row=>row.lane==='V3').length,reserved);
+  assert.equal(batch.filter(row=>row.lane==='HISTORICAL').length,limit-reserved);
+  assert.deepEqual(batch.slice(0,6).map(row=>row.lane),['V3','HISTORICAL','V3','HISTORICAL','V3','HISTORICAL']);
+});
+
+test('M0054 fair scheduling backfills unused V3 reservation and remains strictly bounded',()=>{
+  const v3=[{lane:'V3',id:'v3-0'},{lane:'V3',id:'v3-1'}];
+  const historical=Array.from({length:40},(_,index)=>({lane:'HISTORICAL',id:`historical-${index}`}));
+  const limit=30,reserved=counterfactualV3ReservedSlots(limit);
+  const batch=interleaveBoundedCounterfactualLanes(v3,historical.slice(0,limit-v3.length),limit);
+  assert.equal(batch.length,limit);
+  assert.equal(batch.filter(row=>row.lane==='V3').length,2);
+  assert.equal(batch.filter(row=>row.lane==='HISTORICAL').length,28);
+  assert.deepEqual(batch.slice(0,4).map(row=>row.lane),['V3','HISTORICAL','V3','HISTORICAL']);
+  assert.ok(reserved<limit);
+});
+
+test('M0054 durable lane loader is V3-aware, bounded before raw-contract resolution, and fair across horizons',async()=>{
+  const source=await readFile('packages/db/src/index.ts','utf8');
+  assert.match(source,/CandidateCounterfactualQueueLane = 'ALL'\|'V3'\|'HISTORICAL'/);
+  assert.match(source,/v\.evaluation_schema_version='reset3c-universe-v3-decision-relevant'/);
+  assert.match(source,/v\.evaluation_schema_version<>'reset3c-universe-v3-decision-relevant'/);
+  assert.match(source,/WITH due AS MATERIALIZED/);
+  assert.match(source,/ROW_NUMBER\(\) OVER \(PARTITION BY o\.horizon_minutes/);
+  assert.match(source,/selected AS MATERIALIZED/);
+  assert.match(source,/FROM due ORDER BY horizon_position,ready_at,horizon_minutes,capital_evaluation_id LIMIT \$2/);
+  assert.match(source,/o\.created_at\+\(o\.horizon_minutes\|\|' minutes'\)::interval/);
+  assert.match(source,/Math\.max\(1,Math\.min\(200,limit\)\)/);
 });
 
 test('INSUFFICIENT_EVIDENCE retries are bounded; terminal frozen-candidate gaps never retry',()=>{
@@ -69,23 +106,30 @@ test('independent maturation loop runs while an unrelated learning cycle remains
   assert.equal(runs,1);loop.stop();await loop.completed;
 });
 
-test('durable SQL queue gives due PENDING first priority and records explicit retry state',async()=>{
+test('durable SQL queue selects only the canonical current V2 model and records explicit retry state',async()=>{
   const source=await readFile('packages/db/src/index.ts','utf8'),migration=await readFile('packages/db/migrations/M0047_phase3_forward_maturation_queue.sql','utf8');
+  assert.match(source,/PHASE3_FORWARD_CURRENT_OUTCOME_MODEL_VERSION/);
+  assert.match(source,/o\.outcome_model_version=\$3/);
   assert.match(source,/o\.state='PENDING' OR \(o\.state='INSUFFICIENT_EVIDENCE' AND o\.terminal_at IS NULL/);
   assert.match(source,/ORDER BY CASE WHEN o\.state='PENDING' THEN 0 ELSE 1 END ASC/);
-  assert.match(source,/CASE WHEN \$3::text<>'' AND d\.source_sha=\$3 THEN 0 ELSE 1 END ASC/);
+  assert.doesNotMatch(source,/d\.source_sha=\$3/);
   assert.match(source,/next_retry_at/);assert.match(source,/retryNoProgress/);assert.match(migration,/next_retry_at/);assert.match(migration,/terminal_at/);
 });
 
-test('discovery-learning start wiring keeps forward maturation outside the long learning loop',async()=>{
+test('discovery-learning start wiring keeps forward maturation outside the long learning loop and has no source priority',async()=>{
   const source=await readFile('apps/discovery-learning/src/main.ts','utf8');
   assert.match(source,/startIndependentForwardMaturationLoop/);assert.match(source,/includeForwardMaturation:false/);assert.match(source,/deriveForwardMaturationRetryPlan/);assert.match(source,/FORWARD_MATURATION_FAILED/);
-  assert.match(source,/LPFORGE_FORWARD_VALIDATION_PRIORITY_SOURCE_SHA/);
+  assert.doesNotMatch(source,/LPFORGE_FORWARD_VALIDATION_PRIORITY_SOURCE_SHA/);
 });
 
-test('discovery-learning launcher honors an explicit validation cohort priority',async()=>{
+test('discovery-learning launcher does not inject a validation source priority',async()=>{
   const launcher=await readFile('scripts/start-lpforge-service.sh','utf8');
-  assert.match(launcher,/\[\[ -z "\$\{LPFORGE_FORWARD_VALIDATION_PRIORITY_SOURCE_SHA:-\}" \]\]/);
-  assert.match(launcher,/node --env-file=\.env -e/);
-  assert.match(launcher,/export LPFORGE_FORWARD_VALIDATION_PRIORITY_SOURCE_SHA=/);
+  assert.doesNotMatch(launcher,/LPFORGE_FORWARD_VALIDATION_PRIORITY_SOURCE_SHA/);
+});
+
+test('new forward decisions create only V2 work while V1 remains readable historical evidence',async()=>{
+  const source=await readFile('packages/db/src/index.ts','utf8');
+  assert.match(source,/for \(const horizonMinutes of \[30,60,120\]\) await db\.query\(/);
+  assert.match(source,/\[v\.recommendationId,horizonMinutes,PHASE3_FORWARD_CURRENT_OUTCOME_MODEL_VERSION\]/);
+  assert.match(source,/LPFORGE_FORWARD_OUTCOME_MODEL_RETIRED/);
 });

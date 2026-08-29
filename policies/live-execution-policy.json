@@ -6,6 +6,11 @@
   "minDevnetConfirmedRuns": 3,
   "maxActionsPerDay": 30,
   "maxOpenPositions": 2,
+  "controlledCanary": {
+    "maxConcurrentPositions": 1,
+    "exactLiquidityCapitalSol": "0.03",
+    "replacementOpenAllowed": false
+  },
   "productionAdmission": {
     "enabled": true,
     "eligibleTiers": ["A"],

@@ -9,6 +9,16 @@ export function errorEnvelope(code: string, message: string, requestId: string, 
 }
 
 // ---------------- Phase 3 recommendation-only contracts ----------------
+/**
+ * Forward-outcome identities are research-evidence contracts, not trading
+ * policy. V1 remains supported for immutable historical reads; V2 is the
+ * only model permitted for new forward-outcome creation and maturation.
+ */
+export const PHASE3_FORWARD_OUTCOME_MODEL_VERSION_V1 = 'phase3-forward-outcome-v1';
+export const PHASE3_FORWARD_OUTCOME_MODEL_VERSION_V2 = 'phase3-forward-outcome-v2';
+export const PHASE3_FORWARD_CURRENT_OUTCOME_MODEL_VERSION = PHASE3_FORWARD_OUTCOME_MODEL_VERSION_V2;
+export const PHASE3_FORWARD_OUTCOME_MODEL_VERSIONS = [PHASE3_FORWARD_OUTCOME_MODEL_VERSION_V1, PHASE3_FORWARD_OUTCOME_MODEL_VERSION_V2] as const;
+
 export type Phase3RegimeLabel =
   | 'SIDEWAYS' | 'CONSOLIDATION' | 'CONTROLLED_PULLBACK' | 'BREAKOUT'
   | 'BREAKOUT_CONTROLLED_PULLBACK' | 'TREND_UP' | 'TREND_DOWN' | 'DISTRIBUTION'

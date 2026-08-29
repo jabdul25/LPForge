@@ -1,0 +1,21 @@
+{
+  "generatedForCommit": "c0f637d40eaa817ce299d770f5dda277fb340bdd",
+  "included": [
+    "tracked source selected by git archive",
+    "canonical compiled .build output",
+    "generated RELEASE_MANIFEST.json",
+    "generated SOURCE_REVISION.txt",
+    "generated SHA256SUMS.txt"
+  ],
+  "excluded": [
+    ".env",
+    ".env.* except .env.example",
+    "private keys",
+    "wallet/keypair files",
+    "API/RPC credentials",
+    "node_modules",
+    ".pnpm-store",
+    "runtime databases",
+    "SOURCE_GIT.bundle"
+  ]
+}

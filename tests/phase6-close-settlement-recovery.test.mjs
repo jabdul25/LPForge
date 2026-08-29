@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {shouldResumeCloseSettlement} from '../.build/packages/phase6-live-worker/src/index.js';
+import {
+  isLegacySequentialCloseJournalRecovery,
+  mutationRiskPlanExpiry,
+  shouldResumeCloseSettlement,
+} from '../.build/packages/phase6-live-worker/src/index.js';
 
 for (const stage of [
   'CLOSE_LIQUIDITY_REMOVED',
@@ -50,4 +54,87 @@ test('pending close-child recovery queries its durable child signature, not an o
   assert.match(source,/const pendingSignature = closeSettlementPending\(plan\)\?\.signature;/);
   assert.match(source,/const recoverySignature = pendingSignature \?\? journal\.signature;/);
   assert.match(source,/getSignatureStatus\(recoverySignature/);
+});
+
+test('only the exact legacy sequential-close journal failure can be rehydrated', () => {
+  const plan = {
+    action: 'EMERGENCY_CLOSE',
+    state: 'RECONCILIATION_REQUIRED',
+    planPayload: {autonomous_dispatch: {
+      error: 'LPFORGE_EXECUTION_JOURNAL_INVALID_TRANSITION:CONFIRMED->SIGNING',
+      stage: 'CLOSE_POSITION_PENDING',
+      closeSettlementIncomplete: true,
+      tokenXMint: 'mint',
+      attributableTokenX: '944088938',
+      tokenXBefore: '3023417042',
+    }},
+  };
+  const journal = {state: 'FAILED'};
+  assert.equal(isLegacySequentialCloseJournalRecovery({plan, journal, positionExists: true}), true);
+  for (const value of [
+    {plan: {...plan, action: 'OPEN'}, journal, positionExists: true},
+    {plan, journal: {state: 'CONFIRMED'}, positionExists: true},
+    {plan, journal, positionExists: false},
+    {plan: {...plan, planPayload: {autonomous_dispatch: {...plan.planPayload.autonomous_dispatch, error: 'OTHER'}}}, journal, positionExists: true},
+  ]) assert.equal(isLegacySequentialCloseJournalRecovery(value), false);
+});
+
+test('legacy sequential-close recovery verifies the exact durable unwind before rehydrating the journal', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile('packages/phase6-live-worker/src/index.ts', 'utf8'));
+  const db = await import('node:fs/promises').then(fs => fs.readFile('packages/db/src/index.ts', 'utf8'));
+  assert.match(source,/loadConfirmedSubmissionByTransactionId\(unwindStep\.transactionId\)/);
+  assert.match(source,/reconcileConfirmedCloseUnwind\(/);
+  assert.match(source,/P6_LEGACY_CLOSE_JOURNAL_RECOVERED_FROM_CONFIRMED_UNWIND/);
+  assert.match(source,/priorJournalState: journal\.state/);
+  assert.match(db,/async loadConfirmedSubmissionByTransactionId/);
+  assert.match(db,/a\.transaction_id=\$1/);
+});
+
+test('terminal OPEN_RECOVERED attribution remains off the recurring queue and is read only by exact entry-plan id', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile('packages/phase6-live-worker/src/index.ts', 'utf8'));
+  const db = await import('node:fs/promises').then(fs => fs.readFile('packages/db/src/index.ts', 'utf8'));
+  assert.match(source,/loadPartialEntryRecovery\(entryPlanId\)/);
+  assert.match(source,/recoveryRow\.state\)!=="OPEN_RECOVERED"/);
+  assert.match(db,/async loadPartialEntryRecovery\(planId\)/);
+  assert.match(db,/WHERE plan_id=\$1/);
+});
+
+test('expired entry deadlines never strand an existing protective close, but still bind OPEN', () => {
+  const input = {planExpiresAt: '2026-08-29T00:00:00.000Z', now: '2026-08-29T01:00:00.000Z', protectivePermitTtlMs: 5_000};
+  assert.equal(
+    mutationRiskPlanExpiry({...input, action: 'EMERGENCY_CLOSE', positionAddress: 'position'}),
+    '2026-08-29T01:00:05.000Z',
+  );
+  assert.equal(
+    mutationRiskPlanExpiry({...input, action: 'CLOSE'}),
+    input.planExpiresAt,
+  );
+  assert.equal(
+    mutationRiskPlanExpiry({...input, action: 'OPEN', positionAddress: 'position'}),
+    input.planExpiresAt,
+  );
+});
+
+test('a temporary risk block after a confirmed close child remains reconciliation debt', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile('packages/phase6-live-worker/src/index.ts', 'utf8'));
+  assert.match(source,/P6_PROTECTIVE_CLOSE_CHILD_RISK_RETRY/);
+  assert.match(source,/state: "RECONCILIATION_REQUIRED"/);
+  assert.match(source,/closeSettlementStage\(input\.plan\) !== undefined/);
+});
+
+test('completion terminalization binds its shared timestamp parameter consistently', async () => {
+  const db = await import('node:fs/promises').then(fs => fs.readFile('packages/db/src/index.ts', 'utf8'));
+  assert.match(
+    db,
+    /updated_at=\$3::timestamptz,payload=payload\|\|jsonb_build_object\('terminalPlanState',\$4,'terminalizedAt',\$3::text\)/,
+  );
+});
+
+test('recovered final account close materializes the same SOL settlement as the direct close path', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile('packages/phase6-live-worker/src/index.ts', 'utf8'));
+  assert.match(source,/async function finalizeClosedPositionSettlement/);
+  assert.match(source,/const settlement=await finalizeClosedPositionSettlement\(\{\.\.\.input,connection\}\)/);
+  assert.match(source,/const settlement=await finalizeClosedPositionSettlement\(\{store:input\.store,plan,positionAddress:recoveryPositionAddress/);
+  assert.match(source,/persistLifecycleSolSettlement/);
+  assert.match(source,/createLiveSolSettledLearningOutcome/);
 });

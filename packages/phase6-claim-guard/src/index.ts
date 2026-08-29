@@ -9,7 +9,7 @@ export interface ClaimGuardResult {
 }
 export interface ProductionAdmissionCandidate {poolAddress:string;state:string;tier:string;lastSeenAt:string;tokenYMint?:string|undefined;pairedTokenMint?:string|undefined;}
 const WSOL_MINT='So11111111111111111111111111111111111111112';
-export interface Phase7ExecutionControl {decisionId?:string;cycleKey?:string;authorityMode:string;healthStatus:string;driftStatus:string;safetyMode:string;newEconomicActionAllowed:boolean;observedAt:string;poolDrift?:Record<string,string>;}
+export interface Phase7ExecutionControl {decisionId?:string;cycleKey?:string;authorityMode:string;healthStatus:string;driftStatus:string;safetyMode:string;newEconomicActionAllowed:boolean;observedAt:string;poolDrift?:Record<string,string>;activeIncidentIds?:string[];releaseIntegrityValid?:boolean;portfolioValid?:boolean;revokedApprovalIds?:string[];}
 export function validateFreshPhase7ExecutionControl(control:Phase7ExecutionControl|undefined,now:string,maxAgeMs=60_000):string[]{
  if(!control)return ['P6_CLAIM_P7_CONTROL_MISSING'];
  const reasons:string[]=[];const age=Date.parse(now)-Date.parse(control.observedAt);
@@ -23,7 +23,7 @@ function record(value: unknown) {
     : {};
 }
 function immutablePlanMaterial(plan:AutonomousPlan):Record<string,unknown>{
- const intent=record(plan.planPayload.intent),planIntent=Object.fromEntries(Object.entries({capitalLamports:intent.capitalLamports,lowerBinId:intent.lowerBinId,upperBinId:intent.upperBinId,activeBinId:intent.activeBinId,binStep:intent.binStep,strategy:intent.strategy,maxPositionWidthBins:intent.maxPositionWidthBins}).filter(([,value])=>value!==undefined));
+ const intent=record(plan.planPayload.intent),planIntent=Object.fromEntries(Object.entries({capitalLamports:intent.capitalLamports,candidateId:intent.candidateId,lowerBinId:intent.lowerBinId,upperBinId:intent.upperBinId,activeBinId:intent.activeBinId,binStep:intent.binStep,strategy:intent.strategy,maxPositionWidthBins:intent.maxPositionWidthBins}).filter(([,value])=>value!==undefined));
  return{intentPayload:plan.intentPayload,planIntent,steps:plan.steps.map(step=>({transactionId:step.transactionId,sequence:step.sequence,kind:step.kind,requiredSignerAddresses:[...step.requiredSignerAddresses],metadata:step.metadata}))};
 }
 function capital(plan: AutonomousPlan) {
@@ -51,6 +51,35 @@ function policyPoolForPlan(input:{plan:AutonomousPlan;policy:MainnetCanaryDeploy
  if(candidate.tokenYMint!==WSOL_MINT){reasons.push('P6_PRODUCTION_REQUIRES_WSOL_TOKEN_Y');return undefined;}
  return{address:candidate.poolAddress,maxCapitalLamports:admission.maxCapitalLamports,maxOpenPositions:admission.maxOpenPositions};
 }
+function equals(value:unknown, expected:unknown){return String(value??'')===String(expected??'');}
+function validTimestamp(value:unknown){return Number.isFinite(Date.parse(String(value??'')));}
+function validateCanaryHardRevocation(input:{current:Phase7ExecutionControl|undefined;approvalId:string;now:string}):string[]{
+ const control=input.current,reasons:string[]=[];
+ if(!control){reasons.push('P6_CANARY_CURRENT_CONTROL_MISSING');return reasons;}
+ const age=Date.parse(input.now)-Date.parse(control.observedAt);
+ if(!Number.isFinite(age)||age<0||age>60_000)reasons.push('P6_CANARY_CURRENT_CONTROL_STALE');
+ if(control.healthStatus!=='HEALTHY')reasons.push('P6_CANARY_CURRENT_HEALTH_NOT_HEALTHY');
+ if(control.driftStatus==='BLOCK')reasons.push('P6_CANARY_CURRENT_DRIFT_BLOCK');
+ if(control.safetyMode!=='NORMAL')reasons.push('P6_CANARY_CURRENT_SAFETY_NOT_NORMAL');
+ if(control.releaseIntegrityValid!==true)reasons.push('P6_CANARY_CURRENT_RELEASE_INTEGRITY_UNAVAILABLE');
+ if(control.portfolioValid!==true)reasons.push('P6_CANARY_CURRENT_PORTFOLIO_UNAVAILABLE');
+ if((control.activeIncidentIds??[]).length)reasons.push('P6_CANARY_CURRENT_ACTIVE_INCIDENT');
+ if((control.revokedApprovalIds??[]).includes(input.approvalId))reasons.push('P6_CANARY_APPROVAL_REVOKED');
+ return reasons.sort();
+}
+function validateBoundCanaryAuthorization(input:{plan:AutonomousPlan;provenance:Record<string,unknown>;bound:Phase7ExecutionControl|undefined;current:Phase7ExecutionControl|undefined;now:string}):string[]{
+ const authorization=record(input.provenance.controlledCanaryAuthorization),intent=record(input.plan.planPayload.intent),binding=record(input.provenance.phase7Control),reasons:string[]=[];
+ const approvalId=String(authorization.approvalId??''),issuedAt=String(authorization.issuedAt??''),expiresAt=String(authorization.expiresAt??''),boundDecisionId=String(authorization.boundControlDecisionId??'');
+ if(authorization.schemaVersion!==1||authorization.action!=='PROMOTE_PRODUCTION'||!approvalId||!String(authorization.operatorId??'')||!validTimestamp(issuedAt)||!validTimestamp(expiresAt)||Date.parse(expiresAt)<=Date.parse(issuedAt))reasons.push('P6_CANARY_AUTHORIZATION_INVALID');
+ if(!equals(authorization.planId,input.plan.planId)||!equals(authorization.wallet,input.plan.ownerAddress)||!equals(authorization.pool,input.plan.poolAddress)||!equals(authorization.thesisId,input.plan.thesisId)||!equals(authorization.intentId,input.plan.intentId)||!equals(authorization.candidateId,intent.candidateId)||!equals(authorization.capitalLamports,intent.capitalLamports)||authorization.maxConcurrentPositions!==1)reasons.push('P6_CANARY_AUTHORIZATION_SCOPE_MISMATCH');
+ if(!boundDecisionId||!equals(boundDecisionId,binding.decisionId)||!equals(boundDecisionId,input.bound?.decisionId))reasons.push('P6_CANARY_BOUND_CONTROL_MISMATCH');
+ if(Date.parse(input.plan.expiresAt)<=Date.parse(input.now))reasons.push('P6_CANARY_PLAN_EXPIRED');
+ if(!validTimestamp(expiresAt)||Date.parse(expiresAt)<=Date.parse(input.now))reasons.push('P6_CANARY_APPROVAL_EXPIRED');
+ reasons.push(...validateFreshPhase7ExecutionControl(input.bound,input.now));
+ reasons.push(...validateCanaryHardRevocation({current:input.current,approvalId,now:input.now}));
+ if(input.current?.poolDrift?.[input.plan.poolAddress]==='BLOCK')reasons.push('P6_CLAIM_P7_POOL_DRIFT_BLOCK');
+ return [...new Set(reasons)].sort();
+}
 /** Signing-boundary validation. A PostgreSQL plan is untrusted until this passes. */
 export function validateClaimedPlan(input: {
   plan: AutonomousPlan;
@@ -59,7 +88,14 @@ export function validateClaimedPlan(input: {
   positionTruth?: { owner: string; pool: string };
   productionCandidates?: ProductionAdmissionCandidate[];
   phase7Control?:Phase7ExecutionControl;
+  /** The immutable P7 control that the authenticated canary plan binds. */
+  boundPhase7Control?:Phase7ExecutionControl;
   actionsToday?:number;
+  /** Includes the just-claimed OPEN plan. A controlled canary admits that
+   * one unresolved entry workflow and no second OPEN. */
+  pendingExecutionCount?:number;
+  unresolvedReconciliationDebt?:number;
+  controlledCanary?:boolean;
   provenanceSecret?: string;
   now?: string;
 }): ClaimGuardResult {
@@ -103,6 +139,7 @@ export function validateClaimedPlan(input: {
           // instruction. A database edit cannot retarget a valid economic
           // plan to a different control decision without invalidating HMAC.
           phase7Control:record(provenance.phase7Control),
+          ...(Object.keys(record(provenance.controlledCanaryAuthorization)).length?{controlledCanaryAuthorization:record(provenance.controlledCanaryAuthorization)}:{}),
         },
         input.provenanceSecret,
         hmac,
@@ -128,6 +165,17 @@ export function validateClaimedPlan(input: {
       poolOpen.length >= policyPool?.maxOpenPositions!)
   )
     reasons.push("P6_CLAIM_POSITION_LIMIT");
+  if(input.controlledCanary){
+    const canary=input.policy.controlledCanary;
+    if(!canary)reasons.push('P6_CONTROLLED_CANARY_POLICY_REQUIRED');
+    else {
+      if(p.action==='OPEN'&&amount!==canary.exactLiquidityCapitalLamports)reasons.push('P6_CONTROLLED_CANARY_EXACT_CAPITAL_REQUIRED');
+      if(p.action==='OPEN'&&input.pendingExecutionCount!==undefined&&input.pendingExecutionCount!==1)reasons.push('P6_CONTROLLED_CANARY_UNRESOLVED_OPEN_EXISTS');
+      if(['ADD','RESHAPE','REBALANCE'].includes(p.action)&&!canary.replacementOpenAllowed)reasons.push('P6_CONTROLLED_CANARY_REPLACEMENT_OPEN_BLOCKED');
+      if(p.action==='OPEN'&&input.ownedPositions.some(row=>!['CLOSED','SOL_SETTLED'].includes(String(row.lifecycle_state))))reasons.push('P6_CONTROLLED_CANARY_POSITION_ALREADY_EXISTS');
+      if(p.action==='OPEN'&&input.unresolvedReconciliationDebt!==undefined&&input.unresolvedReconciliationDebt!==0)reasons.push('P6_CONTROLLED_CANARY_RECONCILIATION_DEBT');
+    }
+  }
   if (p.action !== "OPEN") {
     const owned = input.ownedPositions.find(
       (row) =>
@@ -146,16 +194,22 @@ export function validateClaimedPlan(input: {
   // Risk-increasing mutations are fail-closed when P7 authority is unavailable.
   // Protective actions retain their dedicated degraded-control authorization path.
   if(riskIncreasing){
-    reasons.push(...validateFreshPhase7ExecutionControl(input.phase7Control,input.now??new Date().toISOString()));
     const binding=record(provenance.phase7Control),boundDecisionId=String(binding.decisionId??''),boundObservedAt=String(binding.observedAt??''),control=input.phase7Control;
     // P7 controls are persisted *before* the operator creates a plan.  A
     // signed plan therefore binds the decision that governed it by identity;
     // chronological control-before-plan is expected, not a rejection reason.
-    if(!boundDecisionId||!boundObservedAt)reasons.push('P6_CLAIM_P7_CONTROL_BINDING_MISSING');
-    else if(!control?.decisionId)reasons.push('P6_CLAIM_P7_CONTROL_ID_MISSING');
-    else if(control.decisionId!==boundDecisionId)reasons.push('P6_CLAIM_P7_CONTROL_BINDING_MISMATCH');
-    else if(!Number.isFinite(Date.parse(boundObservedAt))||Date.parse(boundObservedAt)>Date.parse(p.observedAt))reasons.push('P6_CLAIM_P7_CONTROL_BINDING_INVALID');
-    if(control?.poolDrift?.[p.poolAddress]==='BLOCK')reasons.push('P6_CLAIM_P7_POOL_DRIFT_BLOCK');
+    const boundCanary=p.action==='OPEN'&&input.controlledCanary&&Object.keys(record(provenance.controlledCanaryAuthorization)).length>0;
+    if(boundCanary){
+      reasons.push(...validateBoundCanaryAuthorization({plan:p,provenance,bound:input.boundPhase7Control,current:control,now:input.now??new Date().toISOString()}));
+      if(!boundDecisionId||!boundObservedAt||!Number.isFinite(Date.parse(boundObservedAt))||Date.parse(boundObservedAt)>Date.parse(p.observedAt))reasons.push('P6_CLAIM_P7_CONTROL_BINDING_INVALID');
+    }else{
+      reasons.push(...validateFreshPhase7ExecutionControl(control,input.now??new Date().toISOString()));
+      if(!boundDecisionId||!boundObservedAt)reasons.push('P6_CLAIM_P7_CONTROL_BINDING_MISSING');
+      else if(!control?.decisionId)reasons.push('P6_CLAIM_P7_CONTROL_ID_MISSING');
+      else if(control.decisionId!==boundDecisionId)reasons.push('P6_CLAIM_P7_CONTROL_BINDING_MISMATCH');
+      else if(!Number.isFinite(Date.parse(boundObservedAt))||Date.parse(boundObservedAt)>Date.parse(p.observedAt))reasons.push('P6_CLAIM_P7_CONTROL_BINDING_INVALID');
+      if(control?.poolDrift?.[p.poolAddress]==='BLOCK')reasons.push('P6_CLAIM_P7_POOL_DRIFT_BLOCK');
+    }
   }
   // Protective actions (close/reduce/claim) must never be starved by the daily
   // action cap; the cap budgets only risk-increasing mutations.

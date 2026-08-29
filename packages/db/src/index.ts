@@ -1,4 +1,5 @@
 import { canonicalJson, sha256Hex } from "../../domain/src/index.js";
+import type { ExecutionJournalState } from "../../execution-recovery/src/index.js";
 import type {
   BinLiquidityFact,
   FeatureEnvelope,
@@ -9,10 +10,12 @@ import type {
   TokenFact,
 } from "../../domain/src/index.js";
 import type { RegimeHistorySample } from "../../regime/src/index.js";
-import type {
-  Phase3RegimeLabel,
-  ProbabilityEntry,
+import {
+  PHASE3_FORWARD_CURRENT_OUTCOME_MODEL_VERSION,
+  type Phase3RegimeLabel,
+  type ProbabilityEntry,
 } from "../../contracts/src/index.js";
+import { reconstructReset3cRawContractFromResolvedShared, resolveReset3cSharedEvidence, resolveReset3cValidationSharedEvidence } from "../../phase3-forward-validation/src/index.js";
 const WSOL_MINT="So11111111111111111111111111111111111111112";
 
 export interface IngestionCheckpoint {
@@ -20,6 +23,33 @@ export interface IngestionCheckpoint {
   lastSeenSlot?: bigint;
   lastFullyProcessedSlot?: bigint;
   state: Record<string, unknown>;
+}
+
+/**
+ * M0054 is one immutable outcome contract with two capture generations.  The
+ * lane is an access-path concern only: it cannot change outcome identity,
+ * capital, economics, or terminal-state semantics.
+ */
+export type CandidateCounterfactualQueueLane = 'ALL'|'V3'|'HISTORICAL';
+
+/**
+ * Canonicalizes an optional immutable upper bound for operational-history
+ * reads. Callers that omit `through` retain the existing live-history
+ * behavior. Forward-outcome callers supply it so delayed maturation cannot
+ * substitute newer wall-clock observations for frozen-horizon evidence.
+ */
+export function operationalHistoryWindow(since: string, through?: string): {
+  since: string;
+  through?: string;
+} {
+  const lower = Date.parse(since);
+  if (!Number.isFinite(lower)) throw new Error("LPFORGE_OPERATIONAL_HISTORY_SINCE_INVALID");
+  if (through === undefined) return { since: new Date(lower).toISOString() };
+  const upper = Date.parse(through);
+  if (!Number.isFinite(upper) || upper < lower) {
+    throw new Error("LPFORGE_OPERATIONAL_HISTORY_THROUGH_INVALID");
+  }
+  return { since: new Date(lower).toISOString(), through: new Date(upper).toISOString() };
 }
 
 /**
@@ -248,6 +278,26 @@ export interface AutonomousPlan {
   planPayload: Record<string, unknown>;
   steps: AutonomousPlanStep[];
 }
+export type WalletPositionClassification =
+  | "KNOWN_LPFORGE_POSITION"
+  | "UNKNOWN_WALLET_POSITION"
+  | "PENDING_LPFORGE_OPEN"
+  | "PENDING_LPFORGE_CLOSE"
+  | "HISTORICAL_EXTERNAL_POSITION"
+  | "AMBIGUOUS_POSITION"
+  | "DB_ONLY";
+export interface WalletPositionDiscovery {
+  ownerAddress: string;
+  positionAddress: string;
+  poolAddress?: string;
+  classification: WalletPositionClassification;
+  lpforgePositionId?: string;
+  executionPlanId?: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  lastReconciledAt: string;
+  payload: Record<string, unknown>;
+}
 export interface ExecutionCapitalReservationRequest {planId:string;ownerAddress:string;poolAddress:string;capitalLamports:bigint;walletLamports:bigint;reserveLamports:bigint;maxPortfolioLamports:bigint;maxPoolLamports:bigint;maxTokenLamports:bigint;maxInitialPositionLamports:bigint;now:string;}
 export interface ExecutionCapitalReservationDiagnostics {walletBalanceLamports:bigint;walletReserveLamports:bigint;pendingCashReservationLamports:bigint;walletDeployableLamports:bigint;deployedPortfolioLamports:bigint;reservedPortfolioLamports:bigint;requestedLamports:bigint;projectedPortfolioLamports:bigint;poolCurrentLamports:bigint;poolReservedLamports:bigint;poolProjectedLamports:bigint;poolLimitLamports:bigint;tokenCurrentLamports:bigint;tokenReservedLamports:bigint;tokenProjectedLamports:bigint;tokenLimitLamports:bigint;}
 export interface ExecutionCapitalReservationResult {approved:boolean;reasonCodes:string[];tokenMint?:string;deployedLamports:bigint;reservedLamports:bigint;availableLamports:bigint;diagnostics?:ExecutionCapitalReservationDiagnostics;}
@@ -310,6 +360,27 @@ export interface PositionInventoryLotEvent {
   remainingRawAmount:bigint;
   observedAt:string;
   transactionSignature?:string;
+  payload:Record<string,unknown>;
+}
+export type OpenChunkDisposition =
+  | "PENDING"
+  | "SIGNING"
+  | "SIGNED"
+  | "SUBMITTED"
+  | "CONFIRMED"
+  | "UNKNOWN_SUBMISSION"
+  | "PROVEN_NOT_LANDED"
+  | "FAILED_PRE_SIGN"
+  | "EXPIRED_PRE_SUBMISSION";
+export interface OpenChunkDispositionRecord {
+  planId:string;
+  transactionId:string;
+  sequence:number;
+  kind:string;
+  disposition:OpenChunkDisposition;
+  signature?:string;
+  lastValidBlockHeight?:bigint;
+  observedAt:string;
   payload:Record<string,unknown>;
 }
 export type PlanCashflowType =
@@ -566,6 +637,7 @@ export interface Phase1Store {
   insertDiscoveryBaseline(value:{runId:string;observedAt:string;baselineId:string;selectedPoolAddress?:string;informationCutoff:string;result:Record<string,unknown>}):Promise<void>;
   upsertDiscoveryPolicyProposal(value:{proposalId:string;createdAt:string;state:string;hypothesis:string;targetPolicy:string;changes:Record<string,unknown>;evidence:Record<string,unknown>}):Promise<void>;
   loadRecentDiscoveryPredictions(limit?:number):Promise<Array<Record<string,unknown>>>;
+  loadDueDiscoveryCounterfactualPredictions(now:string,limit:number):Promise<Array<Record<string,unknown>>>;
   loadDiscoveryOutcomes(limit?:number):Promise<Array<Record<string,unknown>>>;
   insertForensicEpisode(value: {
     poolAddress: string;
@@ -612,7 +684,15 @@ export interface Phase1Store {
     reasonCodes: string[];
     payload: Record<string, unknown>;
   }): Promise<void>;
+  /** Immutable decision-wide RESET-3C source; never an authority input. */
+  loadShadowRecommendationPayload(recommendationId:string):Promise<Record<string,unknown>|undefined>;
   /** Shadow-only Phase-3 forward-validation capture. It has no authority path. */
+  /** RESET-3C append-only full-universe evidence. It is never read by authority paths. */
+  insertReset3cValidationUniverse(value:{recommendationId:string;decisionId:string;decisionAt:string;samplingContractVersion:string;storageContractVersion:string;capitalLamports:string;expectedCandidateCount:number;capturedCandidateCount:number;universeComplete:boolean;universeManifestHash:string;detailedCandidateCount:number;outcomeEligibleCandidateCount:number;detailedCandidateIds:string[];selectionManifest:Record<string,unknown>;detailedSelectionManifestHash:string;census:Record<string,unknown>;sharedEvidenceHash:string;temporarySharedEvidence:Record<string,unknown>;contentHash:string;}):Promise<'INSERTED'|'IDEMPOTENT'>;
+  loadReset3cValidationUniverse(recommendationId:string):Promise<Record<string,unknown>|undefined>;
+  markTerminalEligibleReset3cValidationUniverses(now:string,limit:number):Promise<number>;
+  purgeTerminalEligibleReset3cValidationEvidence(now:string,limit:number):Promise<number>;
+  insertVariableCapitalEvaluation(value:{capitalEvaluationId:string;recommendationId:string;decisionId:string;candidateId:string;proposedCapitalLamports:string;allocatedCapitalLamports?:string;capitalContractHash:string;positionContractHash?:string;capitalFeasibilityStatus:string;bindingConstraint:string;sourceSha:string;buildId:string;policyHash:string;migrationHead:string;evidenceManifestHash?:string;provenance:Record<string,unknown>;rawContract:Record<string,unknown>;contentHash:string;}):Promise<'INSERTED'|'IDEMPOTENT'>;
   insertPhase3ForwardDecision(value: {
     recommendationId: string;
     decisionId: string;
@@ -641,11 +721,16 @@ export interface Phase1Store {
     payload: Record<string, unknown>;
   }): Promise<boolean>;
   ensurePhase3ForwardOutcome(value:{recommendationId:string;horizonMinutes:30|60|120;outcomeModelVersion:string}):Promise<boolean>;
-  loadDuePhase3ForwardOutcomes(now: string, limit: number, prioritySourceSha?: string): Promise<Array<{recommendationId:string;horizonMinutes:30|60|120;outcomeModelVersion:string;sourceSha?:string;decisionPayload:Record<string,unknown>;state:'PENDING'|'INSUFFICIENT_EVIDENCE'|'FINAL'|'FAILED_DATA_INTEGRITY';retryCount:number;dueAt:string;nextRetryAt?:string;evidenceHash?:string;resultHash?:string}>>;
+  loadDuePhase3ForwardOutcomes(now: string, limit: number): Promise<Array<{recommendationId:string;horizonMinutes:30|60|120;outcomeModelVersion:string;sourceSha?:string;decisionPayload:Record<string,unknown>;state:'PENDING'|'INSUFFICIENT_EVIDENCE'|'FINAL'|'FAILED_DATA_INTEGRITY';retryCount:number;dueAt:string;nextRetryAt?:string;evidenceHash?:string;resultHash?:string}>>;
   persistPhase3ForwardOutcome(value:{recommendationId:string;horizonMinutes:30|60|120;outcomeModelVersion:string;state:'PENDING'|'INSUFFICIENT_EVIDENCE'|'FINAL'|'FAILED_DATA_INTEGRITY';evidenceHash?:string;resultHash?:string;reasonCodes:string[];realized?:Record<string,unknown>;payload:Record<string,unknown>;maturedAt:string;attemptedAt:string;retryCount:number;nextRetryAt?:string;terminalAt?:string}):Promise<{writeApplied:boolean;stateTransition:boolean;retryNoProgress:boolean}>;
   loadPhase3ForwardOutcomes(limit?:number): Promise<Array<Record<string,unknown>>>;
   /** Prospective-only research telemetry. No Phase-3/4 consumer calls these. */
-  preparePostEntryTelemetryEpisodes(capturedAt:string):Promise<{created:number}>;
+  loadDueCandidateCounterfactualOutcomes(now:string,limit:number,lane?:CandidateCounterfactualQueueLane):Promise<Array<{capitalEvaluationId:string;horizonMinutes:30|60|120;outcomeModelVersion:string;state:'PENDING'|'INSUFFICIENT_EVIDENCE'|'FINAL'|'FAILED_DATA_INTEGRITY';retryCount:number;rawContract:Record<string,unknown>}>>;
+  persistCandidateCounterfactualOutcome(value:{capitalEvaluationId:string;horizonMinutes:30|60|120;outcomeModelVersion:string;state:'INSUFFICIENT_EVIDENCE'|'FINAL'|'FAILED_DATA_INTEGRITY';evidenceHash?:string;resultHash:string;reasonCodes:string[];realized?:Record<string,unknown>;payload:Record<string,unknown>;attemptedAt:string;retryCount:number;nextRetryAt?:string;terminalAt?:string}):Promise<'APPLIED'|'IDEMPOTENT'>;
+  /** Dynamic, fail-closed retention protection for raw protocol bin history. */
+  loadBinSnapshotRetentionPlan(now:string):Promise<{state:'READY'|'UNKNOWN';protectionFloor?:string;protectionInputs:Partial<Record<'SELECTED_FORWARD'|'CANDIDATE_COUNTERFACTUAL'|'INVENTORY_FORECAST_V2'|'OPERATIONAL_HISTORY',string>>;reasonCodes:string[]}>;
+  deleteBinSnapshotsBefore(protectionFloor:string,limit:number):Promise<{deleted:number;oldestDeletedAt?:string;newestDeletedAt?:string}>;
+  preparePostEntryTelemetryEpisodes(capturedAt:string,limit?:number):Promise<{created:number}>;
   loadDuePostEntryTelemetryCheckpoints(now:string,limit:number):Promise<Array<{
     telemetryEpisodeId:string;checkpointKey:string;observationType:'ENTRY'|'CHECKPOINT'|'FINALIZATION';targetAt:string;decisionAt:string;sourceVersion:string;frozenHeader:Record<string,unknown>;decisionPayload:Record<string,unknown>;decisionCheckpointContent?:Record<string,unknown>;previousCheckpointContent?:Record<string,unknown>;terminalOutcomes?:Array<Record<string,unknown>>;
   }>>;
@@ -653,6 +738,16 @@ export interface Phase1Store {
     telemetryEpisodeId:string;checkpointKey:string;observationType:'ENTRY'|'CHECKPOINT'|'FINALIZATION';targetAt:string;observedAt?:string;capturedAt:string;checkpointStatus:'OBSERVED'|'MISSED'|'DELAYED'|'SOURCE_UNAVAILABLE'|'DUPLICATE_REJECTED'|'INTEGRITY_CONFLICT';sourceVersion:string;collectorVersion:string;valuationContractVersion:string;content:Record<string,unknown>;
   }):Promise<{status:'INSERTED'|'DUPLICATE_REJECTED'|'INTEGRITY_CONFLICT';observationId?:string;sequenceNumber?:number;contentHash:string;currentHash?:string}>;
   loadPostEntryTelemetryEpisode(telemetryEpisodeId:string):Promise<{headerHash:string;observations:Array<Record<string,unknown>>;manifest:Array<Record<string,unknown>>}|undefined>;
+  /** M0050 reads only frozen forward decisions and writes research evidence. */
+  ensureMarketContextTelemetryActivation(value:{activationId:string;activatedAt:string;sourceSha:string;buildId:string;migrationVersion:string;telemetrySchemaVersion:string;marketContextSchemaVersion:string;marketContextModelVersion:string;collectorVersion:string;}):Promise<{created:boolean;activatedAt:string}>;
+  loadDueProspectiveMarketContextSnapshots(now:string,limit:number,marketContextModelVersion:string):Promise<Array<{telemetryEpisodeId:string;recommendationId:string;poolAddress:string;decisionAt:string;headerHash:string;decisionPayload:Record<string,unknown>;sourceSha:string;buildId:string;migrationHead:string;}>>;
+  appendProspectiveMarketContextSnapshot(value:{telemetryEpisodeId:string;recommendationId:string;poolAddress:string;decisionAt:string;capturedAt:string;decisionSourceSha:string;decisionBuildId:string;decisionMigrationHead:string;telemetrySchemaVersion:string;marketContextSchemaVersion:string;marketContextModelVersion:string;regimeModelVersion?:string;volatilityModelVersion?:string;collectorVersion:string;captureStatus:'OBSERVED'|'PARTIAL'|'SOURCE_UNAVAILABLE'|'SOURCE_STALE'|'SOURCE_TIMESTAMP_UNVERIFIED';reasonCodes:string[];availability:Record<string,unknown>;rawPayload:Record<string,unknown>;derivedInterpretation:Record<string,unknown>;provenance:Record<string,unknown>;facts:Array<{key:string;layer:'RAW_FACT'|'DERIVED_INTERPRETATION';value:unknown;unit:string;sourceIdentity:string;sourceVersion:string;availabilityStatus:string;sourceObservedAt?:string;sourceAgeMs?:number;sourceWindow?:string;}>;}):Promise<{status:'INSERTED'|'DUPLICATE_REJECTED'|'INTEGRITY_CONFLICT';contentHash:string;snapshotId?:string;currentHash?:string}>;
+  loadProspectiveMarketContextSnapshot(telemetryEpisodeId:string,marketContextModelVersion:string):Promise<{headerHash:string;snapshot:Record<string,unknown>;facts:Array<Record<string,unknown>>;manifest?:Record<string,unknown>}|undefined>;
+  /** M0052 is a separate shadow-only recorder. No authority path consumes it. */
+  ensureInventoryForecastV2Activation(value:{activationId:string;activatedAt:string;sourceSha:string;buildId:string;migrationHead:string;policyHash:string;forecastSchemaVersion:string;forecastModelVersion:string;formulaVersion:string;collectorVersion:string;m0050MarketContextModelVersion:string;v2OutcomeModelVersion:string;}):Promise<{created:boolean;activatedAt:string}>;
+  loadDueInventoryForecastV2Predictions(now:string,limit:number,forecastModelVersion:string):Promise<Array<{telemetryEpisodeId:string;recommendationId:string;poolAddress:string;decisionAt:string;headerHash:string;decisionPayload:Record<string,unknown>;sourceSha:string;buildId:string;migrationHead:string;tokenXMint?:string;tokenYMint?:string;poolFirstSeenAt?:string;}>>;
+  appendInventoryForecastV2Prediction(value:{telemetryEpisodeId:string;recommendationId:string;candidateId:string;poolAddress:string;decisionAt:string;capturedAt:string;decisionSourceSha:string;decisionBuildId:string;decisionMigrationHead:string;forecastSchemaVersion:string;forecastModelVersion:string;formulaVersion:string;collectorVersion:string;captureStatus:'OBSERVED'|'FORECAST_UNAVAILABLE'|'SOURCE_UNAVAILABLE'|'SOURCE_STALE'|'SOURCE_TIMESTAMP_UNVERIFIED';reasonCodes:string[];rawFrozenInputs:Record<string,unknown>;derivedForecast:Record<string,unknown>;provenance:Record<string,unknown>;}):Promise<{status:'INSERTED'|'DUPLICATE_REJECTED'|'INTEGRITY_CONFLICT';contentHash:string;predictionId?:string;currentHash?:string}>;
+  loadInventoryForecastV2ValidationRows(forecastModelVersion:string):Promise<Array<Record<string,unknown>>>;
   insertRegimeAssessment(value: {
     poolAddress: string;
     decisionAt: string;
@@ -803,6 +898,13 @@ export interface Phase1Store {
   markExecutionCapitalSubmitted(planId:string,at:string):Promise<void>;
   reconcileExecutionCapitalReservations(at:string):Promise<void>;
   countExecutionActionsSince(ownerAddress:string,since:string):Promise<number>;
+  /**
+   * A durable, one-time permit for a specifically armed controlled-canary
+   * campaign.  A pre-sign, proven-zero-exposure failure can use exactly one
+   * separately audited replacement attempt; the original campaign run is
+   * never rewritten or released.
+   */
+  reserveControlledCanaryCampaignOpen(value:{campaignId:string;planId:string;poolAddress:string;capitalLamports:bigint;at:string}):Promise<{reserved:boolean;existingPlanId?:string}>;
   claimNextAutonomousOpenPlan(now: string): Promise<
     | {
         planId: string;
@@ -855,6 +957,7 @@ export interface Phase1Store {
     initialCapitalLamports: bigint;
     entryPlanId?: string;
     entrySignature?: string;
+    entrySlot?: bigint;
     enteredAt: string;
     lifecycleState:
       | "OPEN"
@@ -885,6 +988,13 @@ export interface Phase1Store {
     payload: Record<string, unknown>;
   }): Promise<void>;
   loadOwnedPositions(ownerAddress: string): Promise<Record<string, unknown>[]>;
+  upsertWalletPositionDiscovery(value: WalletPositionDiscovery): Promise<void>;
+  loadWalletPositionDiscoveries(ownerAddress: string): Promise<WalletPositionDiscovery[]>;
+  findAutonomousOpenPlansByPosition(value: {
+    ownerAddress: string;
+    poolAddress: string;
+    positionAddress: string;
+  }): Promise<AutonomousPlan[]>;
   loadOwnedPoolHistory(ownerAddress:string):Promise<Array<{poolAddress:string;tokenXMint?:string;tokenYMint?:string}>>;
   loadPhase7PortfolioFacts(ownerAddress:string):Promise<{deployedLamports:bigint;pendingReservedLamports:bigint;pendingExecutionCount:number;openPositions:number;unresolvedReconciliationDebt:number;poolExposureLamports:Record<string,bigint>;poolPendingLamports:Record<string,bigint>;tokenExposureLamports:Record<string,bigint>;tokenPendingLamports:Record<string,bigint>}>;
   loadPhase7PortfolioRiskState(ownerAddress:string):Promise<Record<string,unknown>|undefined>;
@@ -959,6 +1069,14 @@ export interface Phase1Store {
     updatedAt: string;
   }): Promise<void>;
   loadPartialEntryRecoveries(): Promise<Record<string, unknown>[]>;
+  /** Direct lookup is needed only for close-time attribution of a terminal
+   * OPEN_RECOVERED row; the recurring entry-recovery queue intentionally
+   * excludes that terminal state. */
+  loadPartialEntryRecovery(
+    planId: string,
+  ): Promise<Record<string, unknown> | undefined>;
+  upsertOpenChunkDisposition(value:OpenChunkDispositionRecord):Promise<void>;
+  loadOpenChunkDispositions(planId:string):Promise<OpenChunkDispositionRecord[]>;
   loadAutonomousPlan(planId: string): Promise<AutonomousPlan | undefined>;
   loadUnresolvedAutonomousPlans(): Promise<AutonomousPlan[]>;
   insertExecutionSimulation(value: {
@@ -1001,6 +1119,30 @@ export interface Phase1Store {
     at: string,
     error: string,
   ): Promise<void>;
+  /** A signature was observed absent after its blockhash expired.  This is a
+   * terminal no-effect recovery result, never permission to resend it. */
+  markSubmissionExpired(
+    signature: string,
+    at: string,
+    reason: string,
+  ): Promise<void>;
+  /** Durable blockhash evidence for signature-first recovery. */
+  loadSubmissionAttemptBySignature(
+    signature: string,
+  ): Promise<{ lastValidBlockHeight?: number } | undefined>;
+  /**
+   * Recovery may resume a multi-child protective close only from the exact
+   * child that is durably recorded as confirmed.  This is intentionally a
+   * transaction-id lookup rather than a plan-wide "latest signature" lookup:
+   * the latter can point at an earlier REMOVE or CLAIM child.
+   */
+  loadConfirmedSubmissionByTransactionId(
+    transactionId: string,
+  ): Promise<{
+    signature: string;
+    status: "CONFIRMED" | "FINALIZED";
+    slot?: bigint;
+  } | undefined>;
   insertExecutionConfirmation(value: {
     attemptId: string;
     signature?: string;
@@ -1025,7 +1167,7 @@ export interface Phase1Store {
     idempotencyKey: string;
     planId: string;
     transactionId?: string;
-    state: string;
+    state: ExecutionJournalState;
     signature?: string;
     blockhash?: string;
     lastValidBlockHeight?: number;
@@ -1036,7 +1178,7 @@ export interface Phase1Store {
   updateExecutionJournal(value: {
     idempotencyKey: string;
     expectedVersion: number;
-    state: string;
+    state: ExecutionJournalState;
     signature?: string;
     blockhash?: string;
     lastValidBlockHeight?: number;
@@ -1063,6 +1205,9 @@ export interface Phase1Store {
     poolAddress: string,
     since: string,
     limit: number,
+    /** Optional immutable evidence boundary. Undefined preserves the
+     * existing unbounded live-history reader for non-forward callers. */
+    through?: string,
   ): Promise<{
     marketObservations: Array<{
       observedAt: string;
@@ -1263,6 +1408,10 @@ export interface Phase1Store {
   }): Promise<void>;
   loadLatestPhase7ControlDecision(
     runtimeId: string,
+  ): Promise<Record<string, unknown> | undefined>;
+  loadPhase7ControlDecision(
+    runtimeId: string,
+    decisionId: string,
   ): Promise<Record<string, unknown> | undefined>;
   insertPhase7EvidenceSnapshot(value: {
     snapshotId: string;
@@ -1917,7 +2066,8 @@ export async function createPostgresStore(
     async insertDiscoveryCalibration(v){await db.query(`INSERT INTO research.discovery_calibration_snapshots(snapshot_id,observed_at,model_version,sample_count,independent_episodes,brier_profit,survival_brier,net_value_mae,mean_bias,all_outcome_net,model_calibration_net,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb) ON CONFLICT(snapshot_id) DO NOTHING`,[v.snapshotId,v.observedAt,v.modelVersion,v.sampleCount,v.independentEpisodes,v.brierProfit??null,v.survivalBrier??null,v.netValueMae??null,v.meanBias??null,v.allOutcomeNet,v.modelCalibrationNet,json(v.payload)]);},
     async insertDiscoveryBaseline(v){await db.query(`INSERT INTO research.discovery_baseline_results(run_id,observed_at,baseline_id,selected_pool_address,information_cutoff,result) VALUES($1,$2,$3,$4,$5,$6::jsonb) ON CONFLICT(run_id,baseline_id) DO UPDATE SET result=EXCLUDED.result,selected_pool_address=EXCLUDED.selected_pool_address`,[v.runId,v.observedAt,v.baselineId,v.selectedPoolAddress??null,v.informationCutoff,json(v.result)]);},
     async upsertDiscoveryPolicyProposal(v){await db.query(`INSERT INTO research.discovery_policy_proposals(proposal_id,created_at,state,hypothesis,target_policy,changes,evidence,automatic_promotion) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,FALSE) ON CONFLICT(proposal_id) DO UPDATE SET state=EXCLUDED.state,evidence=EXCLUDED.evidence,changes=EXCLUDED.changes,automatic_promotion=FALSE`,[v.proposalId,v.createdAt,v.state,v.hypothesis,v.targetPolicy,json(v.changes),json(v.evidence)]);},
-    async loadRecentDiscoveryPredictions(limit=5000){const r=await db.query(`SELECT * FROM research.discovery_predictions ORDER BY observed_at DESC LIMIT $1`,[limit]);return r.rows as Array<Record<string,unknown>>;},
+    async loadRecentDiscoveryPredictions(limit=5000){const r=await db.query(`SELECT * FROM research.discovery_predictions ORDER BY observed_at DESC LIMIT $1`,[Math.max(1,Math.min(1000,Math.floor(limit)))]);return r.rows as Array<Record<string,unknown>>;},
+    async loadDueDiscoveryCounterfactualPredictions(now,limit){const r=await db.query(`SELECT p.* FROM research.discovery_predictions p WHERE EXISTS(SELECT 1 FROM (VALUES(30),(60),(120),(240),(360)) AS horizon(minutes) WHERE p.observed_at+(horizon.minutes||' minutes')::interval<=$1::timestamptz AND NOT EXISTS(SELECT 1 FROM research.discovery_outcomes o WHERE o.prediction_id=p.prediction_id AND o.horizon_minutes=horizon.minutes)) ORDER BY p.observed_at ASC,p.prediction_id ASC LIMIT $2`,[now,Math.max(1,Math.min(25,Math.floor(limit)))]);return r.rows as Array<Record<string,unknown>>;},
     async loadDiscoveryOutcomes(limit=20000){const r=await db.query(`SELECT * FROM research.discovery_outcomes ORDER BY observed_at DESC LIMIT $1`,[limit]);return r.rows as Array<Record<string,unknown>>;},
     async insertForensicEpisode(v) {
       const r = await db.query(
@@ -1981,6 +2131,52 @@ export async function createPostgresStore(
         ],
       );
     },
+    async loadShadowRecommendationPayload(recommendationId) {
+      const r=await db.query('SELECT payload FROM research.shadow_recommendations WHERE recommendation_id=$1',[recommendationId]);
+      return r.rows[0]?.payload as Record<string,unknown>|undefined;
+    },
+    async insertReset3cValidationUniverse(v) {
+      const inserted=await db.query(
+        `INSERT INTO research.reset3c_validation_universes(recommendation_id,decision_id,decision_at,sampling_contract_version,storage_contract_version,capital_lamports,expected_candidate_count,captured_candidate_count,universe_complete,universe_manifest_hash,detailed_candidate_count,outcome_eligible_candidate_count,expected_outcome_count,detailed_candidate_ids,selection_manifest,detailed_selection_manifest_hash,census,shared_evidence_hash,temporary_shared_evidence,content_hash,authority) VALUES($1,$2,$3::timestamptz,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15::jsonb,$16,$17::jsonb,$18,$19::jsonb,$20,'RESEARCH_ONLY_NO_POLICY_MUTATION') ON CONFLICT DO NOTHING RETURNING recommendation_id`,
+        [v.recommendationId,v.decisionId,v.decisionAt,v.samplingContractVersion,v.storageContractVersion,v.capitalLamports,v.expectedCandidateCount,v.capturedCandidateCount,v.universeComplete,v.universeManifestHash,v.detailedCandidateCount,v.outcomeEligibleCandidateCount,v.outcomeEligibleCandidateCount*3,json([...new Set(v.detailedCandidateIds)].sort()),json(v.selectionManifest),v.detailedSelectionManifestHash,json(v.census),v.sharedEvidenceHash,json(v.temporarySharedEvidence),v.contentHash],
+      );
+      if(inserted.rows.length)return 'INSERTED';
+      const existing=await db.query('SELECT content_hash FROM research.reset3c_validation_universes WHERE recommendation_id=$1',[v.recommendationId]);
+      if(String(existing.rows[0]?.content_hash??'')===v.contentHash)return 'IDEMPOTENT';
+      throw new Error('LPFORGE_RESET3C_VALIDATION_UNIVERSE_CONFLICT');
+    },
+    async loadReset3cValidationUniverse(recommendationId) {
+      const r=await db.query('SELECT recommendation_id,decision_id,decision_at,sampling_contract_version,storage_contract_version,capital_lamports,expected_candidate_count,captured_candidate_count,universe_complete,universe_manifest_hash,detailed_candidate_count,outcome_eligible_candidate_count,expected_outcome_count,detailed_candidate_ids,selection_manifest,detailed_selection_manifest_hash,census,shared_evidence_hash,temporary_shared_evidence,lifecycle_state,terminal_eligible_at,purged_at,content_hash,created_at FROM research.reset3c_validation_universes WHERE recommendation_id=$1',[recommendationId]);
+      return r.rows[0] as Record<string,unknown>|undefined;
+    },
+    async markTerminalEligibleReset3cValidationUniverses(now,limit) {
+      const lim=Math.max(1,Math.min(50,Math.floor(limit)));
+      // Eligibility must precede the bounded batch. Selecting the oldest ACTIVE
+      // rows first lets PENDING/retry rows consume every maintenance slot and
+      // starve later terminal universes of their safe raw-evidence purge.
+      const r=await db.query(`WITH eligible AS (SELECT u.recommendation_id FROM research.reset3c_validation_universes u WHERE u.lifecycle_state='ACTIVE' AND u.universe_complete AND (SELECT COUNT(*) FROM research.variable_capital_evaluations e WHERE e.recommendation_id=u.recommendation_id AND e.evaluation_schema_version='reset3c-universe-v3-decision-relevant')=u.detailed_candidate_count AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements_text(u.detailed_candidate_ids) AS required(candidate_id) WHERE NOT EXISTS(SELECT 1 FROM research.variable_capital_evaluations e WHERE e.recommendation_id=u.recommendation_id AND e.candidate_id=required.candidate_id AND e.evaluation_schema_version='reset3c-universe-v3-decision-relevant')) AND (SELECT COUNT(*) FROM research.candidate_counterfactual_forward_outcomes o JOIN research.variable_capital_evaluations e ON e.capital_evaluation_id=o.capital_evaluation_id WHERE e.recommendation_id=u.recommendation_id AND e.evaluation_schema_version='reset3c-universe-v3-decision-relevant')=u.expected_outcome_count AND NOT EXISTS(SELECT 1 FROM research.candidate_counterfactual_forward_outcomes o JOIN research.variable_capital_evaluations e ON e.capital_evaluation_id=o.capital_evaluation_id WHERE e.recommendation_id=u.recommendation_id AND e.evaluation_schema_version='reset3c-universe-v3-decision-relevant' AND (o.result_hash IS NULL OR NOT (o.state='FINAL' OR (o.state='INSUFFICIENT_EVIDENCE' AND o.terminal_at IS NOT NULL)))) ORDER BY u.created_at,u.recommendation_id LIMIT $2) UPDATE research.reset3c_validation_universes u SET lifecycle_state='TERMINAL_ELIGIBLE',terminal_eligible_at=$1::timestamptz FROM eligible e WHERE u.recommendation_id=e.recommendation_id RETURNING u.recommendation_id`,[now,lim]);
+      return r.rows.length;
+    },
+    async purgeTerminalEligibleReset3cValidationEvidence(now,limit) {
+      const lim=Math.max(1,Math.min(50,Math.floor(limit)));
+      // Reverify terminal-outcome invariants immediately before the only
+      // destructive lifecycle action. A stale TERMINAL_ELIGIBLE row cannot
+      // block newer safe rows because the batch is bounded after revalidation.
+      const r=await db.query(`WITH eligible AS (SELECT u.recommendation_id FROM research.reset3c_validation_universes u WHERE u.lifecycle_state='TERMINAL_ELIGIBLE' AND u.universe_complete AND u.temporary_shared_evidence IS NOT NULL AND (SELECT COUNT(*) FROM research.variable_capital_evaluations e WHERE e.recommendation_id=u.recommendation_id AND e.evaluation_schema_version='reset3c-universe-v3-decision-relevant')=u.detailed_candidate_count AND (SELECT COUNT(*) FROM research.candidate_counterfactual_forward_outcomes o JOIN research.variable_capital_evaluations e ON e.capital_evaluation_id=o.capital_evaluation_id WHERE e.recommendation_id=u.recommendation_id AND e.evaluation_schema_version='reset3c-universe-v3-decision-relevant')=u.expected_outcome_count AND NOT EXISTS(SELECT 1 FROM research.candidate_counterfactual_forward_outcomes o JOIN research.variable_capital_evaluations e ON e.capital_evaluation_id=o.capital_evaluation_id WHERE e.recommendation_id=u.recommendation_id AND e.evaluation_schema_version='reset3c-universe-v3-decision-relevant' AND (o.result_hash IS NULL OR NOT (o.state='FINAL' OR (o.state='INSUFFICIENT_EVIDENCE' AND o.terminal_at IS NOT NULL)))) ORDER BY u.terminal_eligible_at,u.recommendation_id LIMIT $2) UPDATE research.reset3c_validation_universes u SET lifecycle_state='PURGED',temporary_shared_evidence=NULL,purged_at=$1::timestamptz FROM eligible e WHERE u.recommendation_id=e.recommendation_id RETURNING u.recommendation_id`,[now,lim]);
+      return r.rows.length;
+    },
+    async insertVariableCapitalEvaluation(v) {
+      const storageVersion=String(v.rawContract.version??'');
+      if(storageVersion!=='reset3c-universe-v1'&&storageVersion!=='reset3c-universe-v2-compact'&&storageVersion!=='reset3c-universe-v3-decision-relevant')throw new Error('LPFORGE_RESET3C_STORAGE_CONTRACT_INVALID');
+      const inserted=await db.query(
+        `INSERT INTO research.variable_capital_evaluations(capital_evaluation_id,recommendation_id,decision_id,candidate_id,namespace,evaluation_schema_version,proposed_capital_lamports,allocated_capital_lamports,candidate_capital_fraction_scaled,capital_contract_hash,position_contract_hash,capital_feasibility_status,binding_constraint,source_sha,build_id,policy_hash,migration_head,evidence_manifest_hash,provenance,raw_contract,content_hash,authority) VALUES($1,$2,$3,$4,'COUNTERFACTUAL_CANONICAL',$17::jsonb->>'version',$5,$6,1000000000000,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17::jsonb,$18,'RESEARCH_ONLY_NO_POLICY_MUTATION') ON CONFLICT DO NOTHING RETURNING capital_evaluation_id`,
+        [v.capitalEvaluationId,v.recommendationId,v.decisionId,v.candidateId,v.proposedCapitalLamports,v.allocatedCapitalLamports??null,v.capitalContractHash,v.positionContractHash??null,v.capitalFeasibilityStatus,v.bindingConstraint,v.sourceSha,v.buildId,v.policyHash,v.migrationHead,v.evidenceManifestHash??null,json(v.provenance),json(v.rawContract),v.contentHash],
+      );
+      if(inserted.rows.length){const outcomeEligible=storageVersion==='reset3c-universe-v3-decision-relevant'?v.rawContract.outcomeEligible===true:true;if(outcomeEligible)for(const horizonMinutes of [30,60,120])await db.query(`INSERT INTO research.candidate_counterfactual_forward_outcomes(capital_evaluation_id,horizon_minutes,outcome_model_version,namespace,state,payload) VALUES($1,$2,'phase3-forward-outcome-v2','COUNTERFACTUAL_CANONICAL','PENDING','{}'::jsonb) ON CONFLICT DO NOTHING`,[v.capitalEvaluationId,horizonMinutes]);return 'INSERTED';}
+      const existing=await db.query('SELECT content_hash FROM research.variable_capital_evaluations WHERE capital_evaluation_id=$1',[v.capitalEvaluationId]);
+      if(String(existing.rows[0]?.content_hash??'')===v.contentHash)return 'IDEMPOTENT';
+      throw new Error('LPFORGE_VARIABLE_CAPITAL_EVIDENCE_CONFLICT');
+    },
     async insertPhase3ForwardDecision(v) {
       await db.query('BEGIN');
       try {
@@ -1989,9 +2185,9 @@ export async function createPostgresStore(
           [v.recommendationId,v.decisionId,v.poolAddress,v.decisionAt,v.sourceSha,v.buildId,v.policyHash,v.migrationHead,v.capitalLamports,v.selectedCandidateKind,v.strategy??null,v.orientation??null,v.rangeFamily??null,v.activeBinIdAtDecision,v.lowerBinId??null,v.upperBinId??null,v.includedBinCount??null,json(v.candidateWeights),json(v.prediction),json(v.evidenceProvenance),v.phase3State,v.phase3Outcome,json(v.reasonCodes),v.wouldAugEraThesisSemanticsHaveCreatedThesis,json(v.payload)],
         );
         if (inserted.rows.length) {
-          for (const horizonMinutes of [30,60,120]) for (const outcomeModelVersion of ['phase3-forward-outcome-v1','phase3-forward-outcome-v2']) await db.query(
+          for (const horizonMinutes of [30,60,120]) await db.query(
             `INSERT INTO research.phase3_forward_outcomes(recommendation_id,horizon_minutes,outcome_model_version,state,payload) VALUES($1,$2,$3,'PENDING','{}'::jsonb) ON CONFLICT(recommendation_id,horizon_minutes,outcome_model_version) DO NOTHING`,
-            [v.recommendationId,horizonMinutes,outcomeModelVersion],
+            [v.recommendationId,horizonMinutes,PHASE3_FORWARD_CURRENT_OUTCOME_MODEL_VERSION],
           );
         }
         await db.query('COMMIT');
@@ -2002,14 +2198,107 @@ export async function createPostgresStore(
       }
     },
     async ensurePhase3ForwardOutcome(v) {
+      if (v.outcomeModelVersion !== PHASE3_FORWARD_CURRENT_OUTCOME_MODEL_VERSION) throw new Error('LPFORGE_FORWARD_OUTCOME_MODEL_RETIRED');
       const r=await db.query(`INSERT INTO research.phase3_forward_outcomes(recommendation_id,horizon_minutes,outcome_model_version,state,payload) VALUES($1,$2,$3,'PENDING','{}'::jsonb) ON CONFLICT(recommendation_id,horizon_minutes,outcome_model_version) DO NOTHING RETURNING recommendation_id`,[v.recommendationId,v.horizonMinutes,v.outcomeModelVersion]);
       return r.rows.length===1;
     },
-    async loadDuePhase3ForwardOutcomes(now, limit, prioritySourceSha) {
+    async loadDueCandidateCounterfactualOutcomes(now,limit,lane='ALL') {
+      const lim=Math.max(1,Math.min(200,limit));
+      const laneClause=lane==='V3'
+        ? "v.evaluation_schema_version='reset3c-universe-v3-decision-relevant'"
+        : lane==='HISTORICAL'
+          ? "v.evaluation_schema_version<>'reset3c-universe-v3-decision-relevant'"
+          : 'TRUE';
+      /* The candidate outcome row is written only after its immutable M0053
+       * evaluation. `created_at + horizon` is therefore a conservative due
+       * gate: it can delay a late write, never mature from future evidence.
+       * Keep the full raw contract outside the ranked CTE; historical V1/V2
+       * contracts are toasted and must be resolved only for the selected
+       * bounded rows, not tens of thousands of queue candidates. */
+      const r=await db.query(`WITH due AS MATERIALIZED (
+        SELECT o.capital_evaluation_id,o.horizon_minutes,o.outcome_model_version,o.state,o.retry_count,v.recommendation_id,o.created_at,
+          CASE WHEN o.state='PENDING' THEN o.created_at+(o.horizon_minutes||' minutes')::interval ELSE o.next_retry_at END AS ready_at,
+          ROW_NUMBER() OVER (PARTITION BY o.horizon_minutes ORDER BY CASE WHEN o.state='PENDING' THEN 0 ELSE 1 END,CASE WHEN o.state='PENDING' THEN o.created_at+(o.horizon_minutes||' minutes')::interval ELSE o.next_retry_at END,o.created_at,o.capital_evaluation_id) AS horizon_position
+        FROM research.candidate_counterfactual_forward_outcomes o
+        JOIN research.variable_capital_evaluations v ON v.capital_evaluation_id=o.capital_evaluation_id
+        WHERE ${laneClause} AND o.state IN ('PENDING','INSUFFICIENT_EVIDENCE') AND (o.next_retry_at IS NULL OR o.next_retry_at<=$1::timestamptz) AND (o.created_at+(o.horizon_minutes||' minutes')::interval)<=$1::timestamptz
+      ), selected AS MATERIALIZED (
+        SELECT capital_evaluation_id,horizon_minutes,outcome_model_version,state,retry_count,recommendation_id,horizon_position,ready_at
+        FROM due ORDER BY horizon_position,ready_at,horizon_minutes,capital_evaluation_id LIMIT $2
+      ) SELECT s.capital_evaluation_id,s.horizon_minutes,s.outcome_model_version,s.state,s.retry_count,s.recommendation_id,v.raw_contract FROM selected s JOIN research.variable_capital_evaluations v ON v.capital_evaluation_id=s.capital_evaluation_id ORDER BY s.horizon_position,s.ready_at,s.horizon_minutes,s.capital_evaluation_id`,[now,lim]);
+      const v2RecommendationIds=[...new Set(r.rows.filter(row=>String(((row.raw_contract??{}) as Record<string,unknown>).version)==='reset3c-universe-v2-compact').map(row=>String(row.recommendation_id)))];
+      const v3RecommendationIds=[...new Set(r.rows.filter(row=>String(((row.raw_contract??{}) as Record<string,unknown>).version)==='reset3c-universe-v3-decision-relevant').map(row=>String(row.recommendation_id)))];
+      const v2PayloadByRecommendation=new Map<string,Record<string,unknown>>(),v3SharedByRecommendation=new Map<string,Record<string,unknown>>();
+      if(v2RecommendationIds.length){const shared=await db.query(`SELECT recommendation_id,payload FROM research.shadow_recommendations WHERE recommendation_id=ANY($1::text[])`,[v2RecommendationIds]);for(const row of shared.rows)v2PayloadByRecommendation.set(String(row.recommendation_id),(row.payload??{}) as Record<string,unknown>);}
+      if(v3RecommendationIds.length){const shared=await db.query(`SELECT recommendation_id,temporary_shared_evidence FROM research.reset3c_validation_universes WHERE recommendation_id=ANY($1::text[])`,[v3RecommendationIds]);for(const row of shared.rows)v3SharedByRecommendation.set(String(row.recommendation_id),(row.temporary_shared_evidence??{}) as Record<string,unknown>);}
+      const resolvedV2=new Map<string,Record<string,unknown>|Error>(),resolvedV3=new Map<string,Record<string,unknown>|Error>();
+      for(const row of r.rows){const source=(row.raw_contract??{}) as Record<string,unknown>,reference=(source.sharedEvidenceReference??{}) as Record<string,unknown>,recommendationId=typeof reference.recommendationId==='string'?reference.recommendationId:'',sharedEvidenceHash=typeof reference.sharedEvidenceHash==='string'?reference.sharedEvidenceHash:'',key=`${recommendationId}:${sharedEvidenceHash}`;
+        if(source.version==='reset3c-universe-v2-compact'&&!resolvedV2.has(key))try{if(!recommendationId||!sharedEvidenceHash)throw new Error('LPFORGE_RESET3C_SHARED_EVIDENCE_REFERENCE_INVALID');const payload=v2PayloadByRecommendation.get(String(row.recommendation_id));if(!payload)throw new Error('LPFORGE_RESET3C_SHARED_EVIDENCE_REFERENCE_INVALID');resolvedV2.set(key,await resolveReset3cSharedEvidence({sharedEvidenceReference:{version:'shadow-recommendation-candidate-universe-v1',recommendationId,sharedEvidenceHash},shadowRecommendationPayload:payload}));}catch(error){resolvedV2.set(key,error instanceof Error?error:new Error(String(error)));}
+        if(source.version==='reset3c-universe-v3-decision-relevant'&&!resolvedV3.has(key))try{if(!recommendationId||!sharedEvidenceHash)throw new Error('LPFORGE_RESET3C_VALIDATION_SHARED_EVIDENCE_REFERENCE_INVALID');const payload=v3SharedByRecommendation.get(String(row.recommendation_id));if(!payload||!Object.keys(payload).length)throw new Error('LPFORGE_RESET3C_VALIDATION_SHARED_EVIDENCE_PURGED');resolvedV3.set(key,await resolveReset3cValidationSharedEvidence({sharedEvidenceReference:{version:'reset3c-validation-universe-shared-evidence-v1',recommendationId,sharedEvidenceHash},temporarySharedEvidence:payload}));}catch(error){resolvedV3.set(key,error instanceof Error?error:new Error(String(error)));}
+      }
+      const values=[] as Array<{capitalEvaluationId:string;horizonMinutes:30|60|120;outcomeModelVersion:string;state:'PENDING'|'INSUFFICIENT_EVIDENCE'|'FINAL'|'FAILED_DATA_INTEGRITY';retryCount:number;rawContract:Record<string,unknown>}>;
+      for(const row of r.rows){const source=(row.raw_contract??{}) as Record<string,unknown>,reference=(source.sharedEvidenceReference??{}) as Record<string,unknown>,key=`${typeof reference.recommendationId==='string'?reference.recommendationId:''}:${typeof reference.sharedEvidenceHash==='string'?reference.sharedEvidenceHash:''}`;let rawContract=source;
+        if(source.version==='reset3c-universe-v2-compact'){const shared=resolvedV2.get(key);if(shared instanceof Error)rawContract={...source,reset3cReconstructionFailure:shared.message};else if(!shared)rawContract={...source,reset3cReconstructionFailure:'LPFORGE_RESET3C_SHARED_EVIDENCE_REFERENCE_INVALID'};else rawContract=reconstructReset3cRawContractFromResolvedShared(source,shared);}
+        if(source.version==='reset3c-universe-v3-decision-relevant'){const shared=resolvedV3.get(key);if(shared instanceof Error)rawContract={...source,reset3cReconstructionFailure:shared.message};else if(!shared)rawContract={...source,reset3cReconstructionFailure:'LPFORGE_RESET3C_VALIDATION_SHARED_EVIDENCE_REFERENCE_INVALID'};else rawContract=reconstructReset3cRawContractFromResolvedShared(source,shared);}
+        values.push({capitalEvaluationId:String(row.capital_evaluation_id),horizonMinutes:Number(row.horizon_minutes) as 30|60|120,outcomeModelVersion:String(row.outcome_model_version),state:String(row.state) as 'PENDING'|'INSUFFICIENT_EVIDENCE'|'FINAL'|'FAILED_DATA_INTEGRITY',retryCount:Number(row.retry_count),rawContract});
+      }
+      return values;
+    },
+    async persistCandidateCounterfactualOutcome(v) {
+      const existing=await db.query('SELECT state,result_hash FROM research.candidate_counterfactual_forward_outcomes WHERE capital_evaluation_id=$1 AND horizon_minutes=$2 AND outcome_model_version=$3 FOR UPDATE',[v.capitalEvaluationId,v.horizonMinutes,v.outcomeModelVersion]);
+      if(String(existing.rows[0]?.state)==='FINAL'){if(String(existing.rows[0]?.result_hash)===v.resultHash)return 'IDEMPOTENT';throw new Error('LPFORGE_COUNTERFACTUAL_OUTCOME_CONFLICT');}
+      const q=await db.query(`UPDATE research.candidate_counterfactual_forward_outcomes SET state=$4,evidence_hash=$5,result_hash=$6,reason_codes=$7::jsonb,realized=$8::jsonb,payload=$9::jsonb,last_attempt_at=$10::timestamptz,matured_at=CASE WHEN $4='FINAL' THEN $10::timestamptz ELSE matured_at END,retry_count=$11,next_retry_at=$12::timestamptz,terminal_at=$13::timestamptz WHERE capital_evaluation_id=$1 AND horizon_minutes=$2 AND outcome_model_version=$3`,[v.capitalEvaluationId,v.horizonMinutes,v.outcomeModelVersion,v.state,v.evidenceHash??null,v.resultHash,json(v.reasonCodes),v.realized?json(v.realized):null,json(v.payload),v.attemptedAt,v.retryCount,v.nextRetryAt??null,v.terminalAt??null]);
+return 'APPLIED';
+    },
+    async loadBinSnapshotRetentionPlan(now) {
+      const parsed=Date.parse(now);
+      if(!Number.isFinite(parsed))return{state:'UNKNOWN' as const,protectionInputs:{},reasonCodes:['RETENTION_PROTECTION_FLOOR_UNKNOWN','RETENTION_NOW_INVALID']};
+      const r=await db.query(`WITH selected_open AS (
+        SELECT min(d.decision_at-interval '15 minutes') AS floor
+        FROM research.phase3_forward_outcomes o
+        JOIN research.phase3_forward_decisions d ON d.recommendation_id=o.recommendation_id
+        WHERE o.outcome_model_version='phase3-forward-outcome-v2' AND (o.state='PENDING' OR (o.state='INSUFFICIENT_EVIDENCE' AND o.terminal_at IS NULL))
+      ), candidate_open AS (
+        SELECT min(s.decision_at-interval '15 minutes') AS floor,count(*) FILTER (WHERE s.recommendation_id IS NULL)::integer AS missing_references
+        FROM research.candidate_counterfactual_forward_outcomes o
+        JOIN research.variable_capital_evaluations e ON e.capital_evaluation_id=o.capital_evaluation_id
+        LEFT JOIN research.shadow_recommendations s ON s.recommendation_id=e.recommendation_id
+        WHERE o.state='PENDING' OR (o.state='INSUFFICIENT_EVIDENCE' AND o.terminal_at IS NULL)
+      ), inventory_open AS (
+        SELECT min(e.decision_at-interval '240 minutes') AS floor
+        FROM research.inventory_forecast_v2_activation a
+        JOIN research.post_entry_telemetry_episodes e ON e.decision_at>=a.activated_at AND e.decision_at<=$1::timestamptz
+        WHERE a.activation_id='inventory-forecast-v2-shadow-v1'
+          AND NOT EXISTS(SELECT 1 FROM research.inventory_forecast_v2_predictions f WHERE f.telemetry_episode_id=e.telemetry_episode_id AND f.forecast_model_version='inventory-forecast-v2-shadow-v1')
+      ) SELECT selected_open.floor AS selected_floor,candidate_open.floor AS candidate_floor,candidate_open.missing_references,inventory_open.floor AS inventory_floor FROM selected_open,candidate_open,inventory_open`,[now]);
+      const row=r.rows[0]??{},asIso=(value:unknown)=>{if(!value)return undefined;const t=Date.parse(String(value));return Number.isFinite(t)?new Date(t).toISOString():undefined;},missing=Number(row.missing_references??0);
+      if(missing>0)return{state:'UNKNOWN' as const,protectionInputs:{},reasonCodes:['RETENTION_PROTECTION_FLOOR_UNKNOWN','RETENTION_CANDIDATE_DECISION_REFERENCE_MISSING']};
+      const protectionInputs={
+        ...(asIso(row.selected_floor)?{SELECTED_FORWARD:asIso(row.selected_floor)!}:{}),
+        ...(asIso(row.candidate_floor)?{CANDIDATE_COUNTERFACTUAL:asIso(row.candidate_floor)!}:{}),
+        ...(asIso(row.inventory_floor)?{INVENTORY_FORECAST_V2:asIso(row.inventory_floor)!}:{}),
+        OPERATIONAL_HISTORY:new Date(parsed-4*60*60_000).toISOString(),
+      } as Partial<Record<'SELECTED_FORWARD'|'CANDIDATE_COUNTERFACTUAL'|'INVENTORY_FORECAST_V2'|'OPERATIONAL_HISTORY',string>>;
+      const floors=Object.values(protectionInputs).map(Date.parse).filter(Number.isFinite);
+      if(!floors.length)return{state:'UNKNOWN' as const,protectionInputs,reasonCodes:['RETENTION_PROTECTION_FLOOR_UNKNOWN','RETENTION_FLOOR_EMPTY']};
+      return{state:'READY' as const,protectionFloor:new Date(Math.min(...floors)).toISOString(),protectionInputs,reasonCodes:[]};
+    },
+    async deleteBinSnapshotsBefore(protectionFloor,limit) {
+      const parsed=Date.parse(protectionFloor),lim=Math.max(1,Math.min(10_000,Math.floor(limit)));
+      if(!Number.isFinite(parsed))throw new Error('LPFORGE_BIN_SNAPSHOT_RETENTION_FLOOR_INVALID');
+      const r=await db.query(`WITH candidates AS MATERIALIZED (
+        SELECT ctid,observed_at FROM protocol.bin_snapshots WHERE observed_at<$1::timestamptz ORDER BY observed_at ASC LIMIT $2
+      ), deleted AS (
+        DELETE FROM protocol.bin_snapshots b USING candidates c WHERE b.ctid=c.ctid RETURNING b.observed_at
+      ) SELECT count(*)::integer AS deleted,min(observed_at) AS oldest_deleted_at,max(observed_at) AS newest_deleted_at FROM deleted`,[protectionFloor,lim]);
+      const row=r.rows[0]??{},asIso=(value:unknown)=>{if(!value)return undefined;const t=Date.parse(String(value));return Number.isFinite(t)?new Date(t).toISOString():undefined;};
+      return{deleted:Math.max(0,Number(row.deleted??0)),...(asIso(row.oldest_deleted_at)?{oldestDeletedAt:asIso(row.oldest_deleted_at)!}:{}),...(asIso(row.newest_deleted_at)?{newestDeletedAt:asIso(row.newest_deleted_at)!}:{})};
+    },
+    async loadDuePhase3ForwardOutcomes(now, limit) {
       const lim=Math.max(1,Math.min(200,Math.floor(limit)));
       const r=await db.query(
-        `SELECT o.recommendation_id,o.horizon_minutes,o.outcome_model_version,o.state,o.retry_count,o.next_retry_at,o.evidence_hash,o.result_hash,d.source_sha,d.payload AS decision_payload,d.decision_at+(o.horizon_minutes||' minutes')::interval AS due_at FROM research.phase3_forward_outcomes o JOIN research.phase3_forward_decisions d ON d.recommendation_id=o.recommendation_id WHERE d.decision_at+(o.horizon_minutes||' minutes')::interval<=$1::timestamptz AND (o.state='PENDING' OR (o.state='INSUFFICIENT_EVIDENCE' AND o.terminal_at IS NULL AND (o.next_retry_at IS NULL OR o.next_retry_at<=$1::timestamptz))) ORDER BY CASE WHEN o.state='PENDING' THEN 0 ELSE 1 END ASC,CASE WHEN $3::text<>'' AND d.source_sha=$3 THEN 0 ELSE 1 END ASC,CASE WHEN o.state='PENDING' THEN d.decision_at+(o.horizon_minutes||' minutes')::interval END ASC NULLS LAST,CASE WHEN o.state='INSUFFICIENT_EVIDENCE' THEN COALESCE(o.next_retry_at,d.decision_at+(o.horizon_minutes||' minutes')::interval) END ASC NULLS LAST,o.horizon_minutes ASC,o.recommendation_id ASC LIMIT $2`,
-        [now,lim,prioritySourceSha??''],
+        `SELECT o.recommendation_id,o.horizon_minutes,o.outcome_model_version,o.state,o.retry_count,o.next_retry_at,o.evidence_hash,o.result_hash,d.source_sha,d.payload AS decision_payload,d.decision_at+(o.horizon_minutes||' minutes')::interval AS due_at FROM research.phase3_forward_outcomes o JOIN research.phase3_forward_decisions d ON d.recommendation_id=o.recommendation_id WHERE o.outcome_model_version=$3 AND d.decision_at+(o.horizon_minutes||' minutes')::interval<=$1::timestamptz AND (o.state='PENDING' OR (o.state='INSUFFICIENT_EVIDENCE' AND o.terminal_at IS NULL AND (o.next_retry_at IS NULL OR o.next_retry_at<=$1::timestamptz))) ORDER BY CASE WHEN o.state='PENDING' THEN 0 ELSE 1 END ASC,CASE WHEN o.state='PENDING' THEN d.decision_at+(o.horizon_minutes||' minutes')::interval END ASC NULLS LAST,CASE WHEN o.state='INSUFFICIENT_EVIDENCE' THEN COALESCE(o.next_retry_at,d.decision_at+(o.horizon_minutes||' minutes')::interval) END ASC NULLS LAST,o.horizon_minutes ASC,o.recommendation_id ASC LIMIT $2`,
+        [now,lim,PHASE3_FORWARD_CURRENT_OUTCOME_MODEL_VERSION],
       );
       return r.rows.map(row=>({recommendationId:String(row.recommendation_id),horizonMinutes:Number(row.horizon_minutes) as 30|60|120,outcomeModelVersion:String(row.outcome_model_version),...(row.source_sha?{sourceSha:String(row.source_sha)}:{}),decisionPayload:(row.decision_payload??{}) as Record<string,unknown>,state:String(row.state) as 'PENDING'|'INSUFFICIENT_EVIDENCE'|'FINAL'|'FAILED_DATA_INTEGRITY',retryCount:Math.max(0,Number(row.retry_count??0)),dueAt:toIsoTimestamp(row.due_at),...(row.next_retry_at?{nextRetryAt:toIsoTimestamp(row.next_retry_at)}:{}),...(row.evidence_hash?{evidenceHash:String(row.evidence_hash)}:{}),...(row.result_hash?{resultHash:String(row.result_hash)}:{})}));
     },
@@ -2040,11 +2329,11 @@ export async function createPostgresStore(
       const r=await db.query(`SELECT d.payload AS decision_payload,o.recommendation_id,o.horizon_minutes,o.outcome_model_version,o.state,o.evidence_hash,o.result_hash,o.reason_codes,o.realized,o.payload,o.created_at,o.matured_at FROM research.phase3_forward_outcomes o JOIN research.phase3_forward_decisions d ON d.recommendation_id=o.recommendation_id ORDER BY d.decision_at DESC,o.horizon_minutes ASC LIMIT $1`,[lim]);
       return r.rows.map(row=>({decisionPayload:(row.decision_payload??{}) as Record<string,unknown>,recommendationId:String(row.recommendation_id),horizonMinutes:Number(row.horizon_minutes),outcomeModelVersion:String(row.outcome_model_version),state:String(row.state),...(row.evidence_hash?{evidenceHash:String(row.evidence_hash)}:{}),...(row.result_hash?{resultHash:String(row.result_hash)}:{}),reasonCodes:(row.reason_codes??[]) as string[],...(row.realized?{realized:row.realized as Record<string,unknown>}:{}) ,payload:(row.payload??{}) as Record<string,unknown>,createdAt:new Date(String(row.created_at)).toISOString(),...(row.matured_at?{maturedAt:new Date(String(row.matured_at)).toISOString()}:{})}));
     },
-    async preparePostEntryTelemetryEpisodes(capturedAt) {
+    async preparePostEntryTelemetryEpisodes(capturedAt,limit=100) {
       const activation=await db.query(`SELECT activated_at FROM research.post_entry_telemetry_activation WHERE activation_id='post-entry-state-telemetry-v2'`);
       const activatedAt=activation.rows[0]?.activated_at;
       if(!activatedAt)throw new Error('LPFORGE_POST_ENTRY_TELEMETRY_ACTIVATION_MISSING');
-      const rows=await db.query(`SELECT d.*,p.token_x_mint,p.token_y_mint,p.bin_step,tx.decimals AS token_x_decimals,tx.symbol AS token_x_symbol,ty.decimals AS token_y_decimals,ty.symbol AS token_y_symbol FROM research.phase3_forward_decisions d JOIN protocol.pools p ON p.address=d.pool_address LEFT JOIN protocol.tokens tx ON tx.mint=p.token_x_mint LEFT JOIN protocol.tokens ty ON ty.mint=p.token_y_mint WHERE d.decision_at >= $1::timestamptz AND NOT EXISTS(SELECT 1 FROM research.post_entry_telemetry_episodes e WHERE e.recommendation_id=d.recommendation_id) ORDER BY d.decision_at ASC`,[activatedAt]);
+      const rows=await db.query(`SELECT d.*,p.token_x_mint,p.token_y_mint,p.bin_step,tx.decimals AS token_x_decimals,tx.symbol AS token_x_symbol,ty.decimals AS token_y_decimals,ty.symbol AS token_y_symbol FROM research.phase3_forward_decisions d JOIN protocol.pools p ON p.address=d.pool_address LEFT JOIN protocol.tokens tx ON tx.mint=p.token_x_mint LEFT JOIN protocol.tokens ty ON ty.mint=p.token_y_mint WHERE d.decision_at >= $1::timestamptz AND NOT EXISTS(SELECT 1 FROM research.post_entry_telemetry_episodes e WHERE e.recommendation_id=d.recommendation_id) ORDER BY d.decision_at ASC LIMIT $2`,[activatedAt,Math.max(1,Math.min(500,Math.floor(limit)))]);
       let created=0;
       for(const row of rows.rows){
         const payload=(row.payload??{}) as Record<string,unknown>,phase4=(payload.phase4&&typeof payload.phase4==='object'&&!Array.isArray(payload.phase4)?payload.phase4:{}) as Record<string,unknown>,prediction=(row.prediction??{}) as Record<string,unknown>,evidence=(row.evidence_provenance??{}) as Record<string,unknown>,recommendationId=String(row.recommendation_id),telemetryEpisodeId=`post-entry-v2:${recommendationId}`;
@@ -2106,6 +2395,106 @@ export async function createPostgresStore(
       if(!episode.rows[0])return undefined;
       const [observations,manifest]=await Promise.all([db.query(`SELECT observation_id,sequence_number,checkpoint_key,observation_type,target_at,observed_at,captured_at,checkpoint_status,source_version,collector_version,valuation_contract_version,content_hash,content FROM research.post_entry_telemetry_observations WHERE telemetry_episode_id=$1 ORDER BY sequence_number ASC`,[telemetryEpisodeId]),db.query(`SELECT sequence_number,observation_id,observation_type,observed_at,captured_at,source_version,collector_version,content_hash,previous_hash,current_hash,capture_status FROM research.telemetry_manifest WHERE telemetry_episode_id=$1 ORDER BY sequence_number ASC`,[telemetryEpisodeId])]);
       return{headerHash:String(episode.rows[0].header_hash),observations:observations.rows,manifest:manifest.rows};
+    },
+    async ensureMarketContextTelemetryActivation(v) {
+      await db.query('BEGIN');
+      try{
+        const existing=await db.query("SELECT activated_at,source_sha,build_id,migration_version,telemetry_schema_version,market_context_schema_version,market_context_model_version,collector_version FROM research.market_context_telemetry_activation WHERE activation_id=$1 FOR UPDATE",[v.activationId]);
+        if(existing.rows[0]){
+          /* The activation row records the first accepted M0050 artifact. A later
+             verified release may contain an additive telemetry-only migration;
+             preserve the original activation provenance rather than rewriting it. */
+          const row=existing.rows[0],sameContract=String(row.migration_version)===v.migrationVersion&&String(row.telemetry_schema_version)===v.telemetrySchemaVersion&&String(row.market_context_schema_version)===v.marketContextSchemaVersion&&String(row.market_context_model_version)===v.marketContextModelVersion&&String(row.collector_version)===v.collectorVersion;
+          if(!sameContract)throw new Error('LPFORGE_M0050_ACTIVATION_CONTRACT_CONFLICT');
+          await db.query('COMMIT');return{created:false,activatedAt:toIsoTimestamp(row.activated_at)};
+        }
+        await db.query("INSERT INTO research.market_context_telemetry_activation(activation_id,activated_at,source_sha,build_id,migration_version,telemetry_schema_version,market_context_schema_version,market_context_model_version,collector_version,authority) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'RESEARCH_ONLY_NO_POLICY_MUTATION')",[v.activationId,v.activatedAt,v.sourceSha,v.buildId,v.migrationVersion,v.telemetrySchemaVersion,v.marketContextSchemaVersion,v.marketContextModelVersion,v.collectorVersion]);
+        await db.query('COMMIT');return{created:true,activatedAt:v.activatedAt};
+      }catch(error){try{await db.query('ROLLBACK');}catch{}throw error;}
+    },
+    async loadDueProspectiveMarketContextSnapshots(now,limit,marketContextModelVersion) {
+      const lim=Math.max(1,Math.min(500,Math.floor(limit)));
+      const r=await db.query("SELECT e.telemetry_episode_id,e.recommendation_id,e.pool_address,e.decision_at,e.header_hash,d.payload AS decision_payload,d.source_sha,d.build_id,d.migration_head FROM research.market_context_telemetry_activation a JOIN research.post_entry_telemetry_episodes e ON e.decision_at>=a.activated_at JOIN research.phase3_forward_decisions d ON d.recommendation_id=e.recommendation_id WHERE a.activation_id='m0050-prospective-market-context-telemetry-v1' AND e.decision_at<=$1::timestamptz AND NOT EXISTS(SELECT 1 FROM research.market_context_telemetry_snapshots s WHERE s.telemetry_episode_id=e.telemetry_episode_id AND s.market_context_model_version=$3) ORDER BY e.decision_at ASC,e.telemetry_episode_id ASC LIMIT $2",[now,lim,marketContextModelVersion]);
+      return r.rows.map(row=>({telemetryEpisodeId:String(row.telemetry_episode_id),recommendationId:String(row.recommendation_id),poolAddress:String(row.pool_address),decisionAt:toIsoTimestamp(row.decision_at),headerHash:String(row.header_hash),decisionPayload:(row.decision_payload??{}) as Record<string,unknown>,sourceSha:String(row.source_sha),buildId:String(row.build_id),migrationHead:String(row.migration_head)}));
+    },
+    async appendProspectiveMarketContextSnapshot(v) {
+      const contentHash=await sha256Hex(canonicalJson({telemetryEpisodeId:v.telemetryEpisodeId,recommendationId:v.recommendationId,poolAddress:v.poolAddress,decisionAt:v.decisionAt,captureStatus:v.captureStatus,reasonCodes:[...v.reasonCodes].sort(),availability:v.availability,rawPayload:v.rawPayload,derivedInterpretation:v.derivedInterpretation,provenance:v.provenance,facts:v.facts}));
+      await db.query('BEGIN');
+      try{
+        const episode=await db.query("SELECT header_hash,recommendation_id,pool_address,decision_at FROM research.post_entry_telemetry_episodes WHERE telemetry_episode_id=$1 FOR UPDATE",[v.telemetryEpisodeId]);
+        const header=episode.rows[0];if(!header)throw new Error('LPFORGE_M0050_EPISODE_MISSING');
+        if(String(header.recommendation_id)!==v.recommendationId||String(header.pool_address)!==v.poolAddress||toIsoTimestamp(header.decision_at)!==v.decisionAt)throw new Error('LPFORGE_M0050_EPISODE_LINKAGE_CONFLICT');
+        const existing=await db.query("SELECT market_context_snapshot_id,content_hash FROM research.market_context_telemetry_snapshots WHERE telemetry_episode_id=$1 AND market_context_model_version=$2 FOR UPDATE",[v.telemetryEpisodeId,v.marketContextModelVersion]);
+        if(existing.rows[0]){
+          const status=String(existing.rows[0].content_hash)===contentHash?'DUPLICATE_REJECTED':'INTEGRITY_CONFLICT';
+          await db.query("INSERT INTO research.market_context_telemetry_capture_audit(telemetry_episode_id,market_context_model_version,attempted_at,capture_status,attempted_content_hash,detail,authority) VALUES($1,$2,$3,$4,$5,$6::jsonb,'RESEARCH_ONLY_NO_POLICY_MUTATION')",[v.telemetryEpisodeId,v.marketContextModelVersion,v.capturedAt,status,contentHash,json({marketContextSnapshotId:String(existing.rows[0].market_context_snapshot_id),existingContentHash:String(existing.rows[0].content_hash)})]);
+          await db.query('COMMIT');return{status,contentHash};
+        }
+        const snapshotId='market-context:'+await sha256Hex(canonicalJson({telemetryEpisodeId:v.telemetryEpisodeId,marketContextModelVersion:v.marketContextModelVersion,contentHash}));
+        const previousHash=String(header.header_hash),currentHash=await sha256Hex(canonicalJson({telemetryEpisodeId:v.telemetryEpisodeId,marketContextModelVersion:v.marketContextModelVersion,snapshotId,sequenceNumber:1,capturedAt:v.capturedAt,contentHash,previousHash,captureStatus:v.captureStatus,collectorVersion:v.collectorVersion,sourceVersion:v.decisionSourceSha}));
+        await db.query("INSERT INTO research.market_context_telemetry_snapshots(market_context_snapshot_id,telemetry_episode_id,recommendation_id,pool_address,decision_at,captured_at,decision_source_sha,decision_build_id,decision_migration_head,telemetry_schema_version,market_context_schema_version,market_context_model_version,regime_model_version,volatility_model_version,collector_version,capture_status,reason_codes,availability,raw_payload,derived_interpretation,provenance,content_hash,authority) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,$18::jsonb,$19::jsonb,$20::jsonb,$21::jsonb,$22,'RESEARCH_ONLY_NO_POLICY_MUTATION')",[snapshotId,v.telemetryEpisodeId,v.recommendationId,v.poolAddress,v.decisionAt,v.capturedAt,v.decisionSourceSha,v.decisionBuildId,v.decisionMigrationHead,v.telemetrySchemaVersion,v.marketContextSchemaVersion,v.marketContextModelVersion,v.regimeModelVersion??null,v.volatilityModelVersion??null,v.collectorVersion,v.captureStatus,json([...v.reasonCodes].sort()),json(v.availability),json(v.rawPayload),json(v.derivedInterpretation),json(v.provenance),contentHash]);
+        for(const fact of v.facts){
+          const factHash=await sha256Hex(canonicalJson({marketContextSnapshotId:snapshotId,...fact}));
+          const factId='market-context-fact:'+await sha256Hex(canonicalJson({marketContextSnapshotId:snapshotId,key:fact.key,contentHash:factHash}));
+          await db.query("INSERT INTO research.market_context_telemetry_facts(market_context_fact_id,market_context_snapshot_id,fact_key,fact_layer,value,unit,source_identity,source_version,source_observed_at,source_age_ms,source_window,availability_status,content_hash) VALUES($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,$10,$11,$12,$13)",[factId,snapshotId,fact.key,fact.layer,json(fact.value),fact.unit,fact.sourceIdentity,fact.sourceVersion,fact.sourceObservedAt??null,fact.sourceAgeMs??null,fact.sourceWindow??null,fact.availabilityStatus,factHash]);
+        }
+        await db.query("INSERT INTO research.market_context_telemetry_manifest(market_context_snapshot_id,telemetry_episode_id,sequence_number,observed_at,captured_at,source_version,collector_version,market_context_model_version,content_hash,previous_hash,current_hash,capture_status) VALUES($1,$2,1,$3,$4,$5,$6,$7,$8,$9,$10,$11)",[snapshotId,v.telemetryEpisodeId,v.decisionAt,v.capturedAt,v.decisionSourceSha,v.collectorVersion,v.marketContextModelVersion,contentHash,previousHash,currentHash,v.captureStatus]);
+        await db.query("INSERT INTO research.market_context_telemetry_capture_audit(telemetry_episode_id,market_context_model_version,attempted_at,capture_status,attempted_content_hash,detail,authority) VALUES($1,$2,$3,'INSERTED',$4,$5::jsonb,'RESEARCH_ONLY_NO_POLICY_MUTATION')",[v.telemetryEpisodeId,v.marketContextModelVersion,v.capturedAt,contentHash,json({marketContextSnapshotId:snapshotId,currentHash,factCount:v.facts.length})]);
+        await db.query('COMMIT');return{status:'INSERTED' as const,contentHash,snapshotId,currentHash};
+      }catch(error){try{await db.query('ROLLBACK');}catch{}throw error;}
+    },
+    async loadProspectiveMarketContextSnapshot(telemetryEpisodeId,marketContextModelVersion) {
+      const episode=await db.query("SELECT header_hash FROM research.post_entry_telemetry_episodes WHERE telemetry_episode_id=$1",[telemetryEpisodeId]);
+      if(!episode.rows[0])return undefined;
+      const snapshot=await db.query("SELECT * FROM research.market_context_telemetry_snapshots WHERE telemetry_episode_id=$1 AND market_context_model_version=$2",[telemetryEpisodeId,marketContextModelVersion]);
+      if(!snapshot.rows[0])return undefined;
+      const snapshotId=String(snapshot.rows[0].market_context_snapshot_id);
+      const facts=await db.query("SELECT fact_key,fact_layer,value,unit,source_identity,source_version,source_observed_at,source_age_ms,source_window,availability_status,content_hash FROM research.market_context_telemetry_facts WHERE market_context_snapshot_id=$1 ORDER BY fact_key ASC",[snapshotId]);
+      const manifest=await db.query("SELECT sequence_number,observed_at,captured_at,source_version,collector_version,market_context_model_version,content_hash,previous_hash,current_hash,capture_status FROM research.market_context_telemetry_manifest WHERE market_context_snapshot_id=$1",[snapshotId]);
+      return{headerHash:String(episode.rows[0].header_hash),snapshot:snapshot.rows[0] as Record<string,unknown>,facts:facts.rows,...(manifest.rows[0]?{manifest:manifest.rows[0] as Record<string,unknown>}:{})};
+    },
+    async ensureInventoryForecastV2Activation(v) {
+      await db.query('BEGIN');
+      try {
+        const existing=await db.query("SELECT activated_at,forecast_schema_version,forecast_model_version,formula_version,collector_version,m0050_market_context_model_version,v2_outcome_model_version FROM research.inventory_forecast_v2_activation WHERE activation_id=$1 FOR UPDATE",[v.activationId]);
+        if(existing.rows[0]){
+          const row=existing.rows[0],sameContract=String(row.forecast_schema_version)===v.forecastSchemaVersion&&String(row.forecast_model_version)===v.forecastModelVersion&&String(row.formula_version)===v.formulaVersion&&String(row.collector_version)===v.collectorVersion&&String(row.m0050_market_context_model_version)===v.m0050MarketContextModelVersion&&String(row.v2_outcome_model_version)===v.v2OutcomeModelVersion;
+          if(!sameContract)throw new Error('LPFORGE_INVENTORY_FORECAST_V2_ACTIVATION_CONTRACT_CONFLICT');
+          await db.query('COMMIT');return{created:false,activatedAt:toIsoTimestamp(row.activated_at)};
+        }
+        await db.query("INSERT INTO research.inventory_forecast_v2_activation(activation_id,activated_at,source_sha,build_id,migration_head,policy_hash,forecast_schema_version,forecast_model_version,formula_version,collector_version,m0050_market_context_model_version,v2_outcome_model_version,authority) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'RESEARCH_ONLY_NO_POLICY_MUTATION')",[v.activationId,v.activatedAt,v.sourceSha,v.buildId,v.migrationHead,v.policyHash,v.forecastSchemaVersion,v.forecastModelVersion,v.formulaVersion,v.collectorVersion,v.m0050MarketContextModelVersion,v.v2OutcomeModelVersion]);
+        await db.query('COMMIT');return{created:true,activatedAt:v.activatedAt};
+      }catch(error){try{await db.query('ROLLBACK');}catch{}throw error;}
+    },
+    async loadDueInventoryForecastV2Predictions(now,limit,forecastModelVersion) {
+      const lim=Math.max(1,Math.min(500,Math.floor(limit)));
+      const r=await db.query("SELECT e.telemetry_episode_id,e.recommendation_id,e.pool_address,e.decision_at,e.header_hash,d.payload AS decision_payload,d.source_sha,d.build_id,d.migration_head,p.token_x_mint,p.token_y_mint,p.first_seen_at FROM research.inventory_forecast_v2_activation a JOIN research.post_entry_telemetry_episodes e ON e.decision_at>=a.activated_at JOIN research.phase3_forward_decisions d ON d.recommendation_id=e.recommendation_id JOIN protocol.pools p ON p.address=e.pool_address WHERE a.activation_id='inventory-forecast-v2-shadow-v1' AND e.decision_at<=$1::timestamptz AND NOT EXISTS(SELECT 1 FROM research.inventory_forecast_v2_predictions f WHERE f.telemetry_episode_id=e.telemetry_episode_id AND f.forecast_model_version=$3) ORDER BY e.decision_at ASC,e.telemetry_episode_id ASC LIMIT $2",[now,lim,forecastModelVersion]);
+      return r.rows.map(row=>({telemetryEpisodeId:String(row.telemetry_episode_id),recommendationId:String(row.recommendation_id),poolAddress:String(row.pool_address),decisionAt:toIsoTimestamp(row.decision_at),headerHash:String(row.header_hash),decisionPayload:(row.decision_payload??{}) as Record<string,unknown>,sourceSha:String(row.source_sha),buildId:String(row.build_id),migrationHead:String(row.migration_head),...(row.token_x_mint?{tokenXMint:String(row.token_x_mint)}:{}),...(row.token_y_mint?{tokenYMint:String(row.token_y_mint)}:{}),...(row.first_seen_at?{poolFirstSeenAt:toIsoTimestamp(row.first_seen_at)}:{})}));
+    },
+    async appendInventoryForecastV2Prediction(v) {
+      const contentHash=await sha256Hex(canonicalJson({telemetryEpisodeId:v.telemetryEpisodeId,recommendationId:v.recommendationId,candidateId:v.candidateId,poolAddress:v.poolAddress,decisionAt:v.decisionAt,captureStatus:v.captureStatus,reasonCodes:[...v.reasonCodes].sort(),rawFrozenInputs:v.rawFrozenInputs,derivedForecast:v.derivedForecast,provenance:v.provenance}));
+      await db.query('BEGIN');
+      try {
+        const episode=await db.query("SELECT header_hash,recommendation_id,pool_address,decision_at FROM research.post_entry_telemetry_episodes WHERE telemetry_episode_id=$1 FOR UPDATE",[v.telemetryEpisodeId]);
+        const header=episode.rows[0];if(!header)throw new Error('LPFORGE_INVENTORY_FORECAST_V2_EPISODE_MISSING');
+        if(String(header.recommendation_id)!==v.recommendationId||String(header.pool_address)!==v.poolAddress||toIsoTimestamp(header.decision_at)!==v.decisionAt)throw new Error('LPFORGE_INVENTORY_FORECAST_V2_EPISODE_LINKAGE_CONFLICT');
+        const existing=await db.query("SELECT inventory_forecast_prediction_id,content_hash FROM research.inventory_forecast_v2_predictions WHERE telemetry_episode_id=$1 AND candidate_id=$2 AND forecast_model_version=$3 FOR UPDATE",[v.telemetryEpisodeId,v.candidateId,v.forecastModelVersion]);
+        if(existing.rows[0]){
+          const status=String(existing.rows[0].content_hash)===contentHash?'DUPLICATE_REJECTED':'INTEGRITY_CONFLICT';
+          await db.query("INSERT INTO research.inventory_forecast_v2_capture_audit(telemetry_episode_id,candidate_id,forecast_model_version,attempted_at,capture_status,attempted_content_hash,detail,authority) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,'RESEARCH_ONLY_NO_POLICY_MUTATION')",[v.telemetryEpisodeId,v.candidateId,v.forecastModelVersion,v.capturedAt,status,contentHash,json({inventoryForecastPredictionId:String(existing.rows[0].inventory_forecast_prediction_id),existingContentHash:String(existing.rows[0].content_hash)})]);
+          await db.query('COMMIT');return{status,contentHash};
+        }
+        const predictionId='inventory-forecast-v2:'+await sha256Hex(canonicalJson({telemetryEpisodeId:v.telemetryEpisodeId,candidateId:v.candidateId,forecastModelVersion:v.forecastModelVersion,contentHash}));
+        const previousHash=String(header.header_hash),currentHash=await sha256Hex(canonicalJson({telemetryEpisodeId:v.telemetryEpisodeId,predictionId,capturedAt:v.capturedAt,sourceVersion:v.decisionSourceSha,collectorVersion:v.collectorVersion,contentHash,previousHash,captureStatus:v.captureStatus}));
+        await db.query("INSERT INTO research.inventory_forecast_v2_predictions(inventory_forecast_prediction_id,telemetry_episode_id,recommendation_id,candidate_id,pool_address,decision_at,captured_at,decision_source_sha,decision_build_id,decision_migration_head,forecast_schema_version,forecast_model_version,formula_version,collector_version,capture_status,reason_codes,raw_frozen_inputs,derived_forecast,provenance,content_hash,authority) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17::jsonb,$18::jsonb,$19::jsonb,$20,'RESEARCH_ONLY_NO_POLICY_MUTATION')",[predictionId,v.telemetryEpisodeId,v.recommendationId,v.candidateId,v.poolAddress,v.decisionAt,v.capturedAt,v.decisionSourceSha,v.decisionBuildId,v.decisionMigrationHead,v.forecastSchemaVersion,v.forecastModelVersion,v.formulaVersion,v.collectorVersion,v.captureStatus,json([...v.reasonCodes].sort()),json(v.rawFrozenInputs),json(v.derivedForecast),json(v.provenance),contentHash]);
+        await db.query("INSERT INTO research.inventory_forecast_v2_manifest(inventory_forecast_prediction_id,telemetry_episode_id,observed_at,captured_at,source_version,collector_version,forecast_model_version,content_hash,previous_hash,current_hash,capture_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",[predictionId,v.telemetryEpisodeId,v.decisionAt,v.capturedAt,v.decisionSourceSha,v.collectorVersion,v.forecastModelVersion,contentHash,previousHash,currentHash,v.captureStatus]);
+        await db.query("INSERT INTO research.inventory_forecast_v2_capture_audit(telemetry_episode_id,candidate_id,forecast_model_version,attempted_at,capture_status,attempted_content_hash,detail,authority) VALUES($1,$2,$3,$4,'INSERTED',$5,$6::jsonb,'RESEARCH_ONLY_NO_POLICY_MUTATION')",[v.telemetryEpisodeId,v.candidateId,v.forecastModelVersion,v.capturedAt,contentHash,json({inventoryForecastPredictionId:predictionId,currentHash})]);
+        await db.query('COMMIT');return{status:'INSERTED' as const,contentHash,predictionId,currentHash};
+      }catch(error){try{await db.query('ROLLBACK');}catch{}throw error;}
+    },
+    async loadInventoryForecastV2ValidationRows(forecastModelVersion) {
+      const r=await db.query("SELECT f.pool_address,f.decision_at,f.recommendation_id,f.raw_frozen_inputs,f.derived_forecast,d.payload->'prediction'->>'candidateExpectedInventoryPnl' AS v1_predicted_inventory_pnl,o.horizon_minutes,o.realized->>'realizedInventoryPnl' AS realized_inventory_pnl FROM research.inventory_forecast_v2_predictions f JOIN research.phase3_forward_decisions d ON d.recommendation_id=f.recommendation_id JOIN research.phase3_forward_outcomes o ON o.recommendation_id=f.recommendation_id AND o.outcome_model_version='phase3-forward-outcome-v2' AND o.state='FINAL' WHERE f.forecast_model_version=$1 AND f.capture_status='OBSERVED' ORDER BY f.decision_at ASC,o.horizon_minutes ASC",[forecastModelVersion]);
+      return r.rows;
     },
     async insertRegimeAssessment(v) {
       await db.query(
@@ -2392,6 +2781,59 @@ export async function createPostgresStore(
     async markExecutionCapitalSubmitted(planId,at){await db.query("UPDATE execution.capital_reservations SET state='SUBMITTED',updated_at=$2 WHERE plan_id=$1 AND state='RESERVED'",[planId,at]);},
     async reconcileExecutionCapitalReservations(at){await db.query("UPDATE execution.capital_reservations r SET state=CASE WHEN p.state IN ('BLOCKED','FAILED') THEN 'RELEASED' WHEN EXISTS(SELECT 1 FROM execution.owned_positions o WHERE o.entry_plan_id=r.plan_id AND o.lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN')) THEN 'DEPLOYED' WHEN r.state='DEPLOYED' AND EXISTS(SELECT 1 FROM execution.owned_positions o WHERE o.entry_plan_id=r.plan_id AND o.lifecycle_state='CLOSED') THEN 'RELEASED' ELSE r.state END,updated_at=$1,reason_codes=CASE WHEN r.state='DEPLOYED' AND EXISTS(SELECT 1 FROM execution.owned_positions o WHERE o.entry_plan_id=r.plan_id AND o.lifecycle_state='CLOSED') THEN '[\"P6_CAPITAL_POSITION_CLOSED_RECONCILED\"]'::jsonb ELSE r.reason_codes END FROM execution.transaction_plans p WHERE p.plan_id=r.plan_id AND r.state IN ('RESERVED','SUBMITTED','DEPLOYED')",[at]);},
     async countExecutionActionsSince(ownerAddress,since){const r=await db.query("SELECT count(DISTINCT p.plan_id)::int AS n FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id LEFT JOIN execution.transaction_steps s ON s.plan_id=p.plan_id LEFT JOIN execution.submission_attempts a ON a.transaction_id=s.transaction_id WHERE i.owner_address=$1 AND a.state IN ('SENT','UNKNOWN') AND a.submitted_at >= $2::timestamptz",[ownerAddress,since]);return Number(r.rows[0]?.n??0);},
+    async reserveControlledCanaryCampaignOpen(v){
+      // `canary_runs` remains immutable audit history for attempt 1.  The
+      // explicit M0059 replacement table is the only path by which a failed
+      // pre-sign plan can admit one fresh plan; it is not a counter reset.
+      const tx=db;
+      try{
+        await tx.query('BEGIN');
+        await tx.query("SELECT pg_advisory_xact_lock(hashtext($1))",[v.campaignId]);
+        const existing=await tx.query("SELECT run_id,plan_id,capital_lamports FROM execution.canary_runs WHERE run_id=$1 FOR UPDATE",[v.campaignId]);
+        if(!existing.rows[0]){
+          await tx.query(
+            "INSERT INTO execution.canary_runs(run_id,plan_id,pool_address,action,capital_lamports,status,started_at,payload) VALUES($1,$2,$3,'OPEN',$4,'BUILD_ONLY',$5,$6::jsonb)",
+            [v.campaignId,v.planId,v.poolAddress,v.capitalLamports.toString(),v.at,json({recordType:'CONTROLLED_CANARY_CAMPAIGN_OPEN_ALLOWANCE',campaignId:v.campaignId,maximumOpenCount:1,allowanceState:'CONSUMED_BEFORE_SIGNING',attemptNumber:1})],
+          );
+          await tx.query('COMMIT');
+          return{reserved:true};
+        }
+        const existingPlanId=String(existing.rows[0].plan_id??'');
+        if(existingPlanId===v.planId){await tx.query('COMMIT');return{reserved:true,existingPlanId};}
+        const replacement=await tx.query("SELECT replacement_plan_id FROM execution.canary_pre_sign_replacements WHERE campaign_id=$1 FOR UPDATE",[v.campaignId]);
+        const replacementPlanId=replacement.rows[0]?.replacement_plan_id===undefined?undefined:String(replacement.rows[0].replacement_plan_id);
+        if(replacementPlanId){await tx.query('COMMIT');return{reserved:replacementPlanId===v.planId,existingPlanId:replacementPlanId};}
+        // A replacement is permitted only after the original plan is terminal
+        // and every durable record proves it stopped before signature or send.
+        const proof=await tx.query(
+          `SELECT p.state AS plan_state,j.state AS journal_state,j.signature,
+                  EXISTS(SELECT 1 FROM execution.transaction_steps s JOIN execution.submission_attempts a ON a.transaction_id=s.transaction_id WHERE s.plan_id=p.plan_id) AS any_submission,
+                  EXISTS(SELECT 1 FROM execution.transaction_steps s JOIN execution.submission_attempts a ON a.transaction_id=s.transaction_id JOIN execution.confirmations c ON c.attempt_id=a.attempt_id WHERE s.plan_id=p.plan_id) AS any_confirmation,
+                  EXISTS(SELECT 1 FROM execution.owned_positions o WHERE o.entry_plan_id=p.plan_id) AS any_position
+             FROM execution.transaction_plans p
+             LEFT JOIN execution.execution_journal j ON j.plan_id=p.plan_id
+            WHERE p.plan_id=$1 FOR UPDATE OF p`,
+          [existingPlanId],
+        );
+        const row=proof.rows[0];
+        if(!row){await tx.query('COMMIT');return{reserved:false,existingPlanId};}
+        const preSignZeroExposure=String(row.plan_state)==='FAILED'
+          &&typeof row.journal_state==='string'
+          &&row.signature==null
+          &&row.any_submission===false
+          &&row.any_confirmation===false
+          &&row.any_position===false
+          &&String(existing.rows[0].capital_lamports)===v.capitalLamports.toString();
+        if(!preSignZeroExposure){await tx.query('COMMIT');return{reserved:false,existingPlanId};}
+        await tx.query(
+          `INSERT INTO execution.canary_pre_sign_replacements(campaign_id,failed_attempt_plan_id,replacement_plan_id,authorized_at,payload)
+           VALUES($1,$2,$3,$4,$5::jsonb)`,
+          [v.campaignId,existingPlanId,v.planId,v.at,json({recordType:'CONTROLLED_CANARY_PRE_SIGN_ZERO_EXPOSURE_REPLACEMENT',attemptNumber:2,maximumPlanAttempts:2,maximumEconomicOpens:1,failedAttemptPlanId:existingPlanId,replacementPlanId:v.planId,capitalLamports:v.capitalLamports.toString(),poolAddress:v.poolAddress})],
+        );
+        await tx.query('COMMIT');
+        return{reserved:true,existingPlanId};
+      }catch(error){try{await tx.query('ROLLBACK');}catch{}throw error;}
+    },
     async claimNextAutonomousOpenPlan(now) {
       const claimed = await db.query(
         `WITH candidate AS (SELECT p.plan_id FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id WHERE p.cluster='mainnet-beta' AND p.state='PLANNED' AND i.action='OPEN' AND p.expires_at>$1::timestamptz ORDER BY p.created_at ASC FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE execution.transaction_plans p SET state='DISPATCHING',payload=p.payload||jsonb_build_object('autonomous_dispatch_claimed_at',$1::text) FROM candidate c WHERE p.plan_id=c.plan_id RETURNING p.plan_id,p.intent_id,p.expires_at,p.payload`,
@@ -2448,10 +2890,12 @@ export async function createPostgresStore(
           ? "EXPIRED"
           : v.state === "BLOCKED" || v.state === "FAILED"
             ? "FAILED"
-            : undefined;
+            : v.state === "RECONCILED" || v.state === "COMPLETED"
+              ? "RECONCILED"
+              : undefined;
       if (terminalJournalState)
         await db.query(
-          `UPDATE execution.execution_journal SET state=$2,updated_at=$3,payload=payload||jsonb_build_object('terminalPlanState',$4,'terminalizedAt',$3::text) WHERE plan_id=$1 AND state IN ('PLAN_CREATED','BUILT','SIMULATED','APPROVED','SIGNED')`,
+          `UPDATE execution.execution_journal SET state=$2,updated_at=$3,payload=payload||jsonb_build_object('terminalPlanState',$4::text,'terminalizedAt',$3::timestamptz) WHERE plan_id=$1 AND state IN ('PLAN_CREATED','BUILT','SIMULATED','APPROVED','SIGNING','SIGNED','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILIATION_REQUIRED')`,
           [v.planId, terminalJournalState, v.at, v.state],
         );
     },
@@ -2461,16 +2905,20 @@ export async function createPostgresStore(
         [v.planId, v.state, v.at, json(v.payload)],
       );
       const terminalJournalState =
-        v.state === "BLOCKED" || v.state === "FAILED" ? "FAILED" : undefined;
+        v.state === "BLOCKED" || v.state === "FAILED"
+          ? "FAILED"
+          : v.state === "RECONCILED" || v.state === "COMPLETED"
+            ? "RECONCILED"
+            : undefined;
       if (terminalJournalState)
         await db.query(
-          `UPDATE execution.execution_journal SET state=$2,updated_at=$3,payload=payload||jsonb_build_object('terminalPlanState',$4,'terminalizedAt',$3::text) WHERE plan_id=$1 AND state IN ('PLAN_CREATED','BUILT','SIMULATED','APPROVED','SIGNED')`,
+          `UPDATE execution.execution_journal SET state=$2,updated_at=$3::timestamptz,payload=payload||jsonb_build_object('terminalPlanState',$4,'terminalizedAt',$3::text) WHERE plan_id=$1 AND state IN ('PLAN_CREATED','BUILT','SIMULATED','APPROVED','SIGNING','SIGNED','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILIATION_REQUIRED')`,
           [v.planId, terminalJournalState, v.at, v.state],
         );
     },
     async upsertOwnedPosition(v) {
       await db.query(
-        `INSERT INTO execution.owned_positions(lpforge_position_id,pool_address,position_address,owner_address,strategy,orientation,lower_bin_id,upper_bin_id,active_bin_at_entry,initial_capital_lamports,entry_plan_id,entry_signature,entered_at,lifecycle_state,last_plan_id,reconciliation_status,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb) ON CONFLICT(lpforge_position_id) DO UPDATE SET lifecycle_state=EXCLUDED.lifecycle_state,last_plan_id=COALESCE(EXCLUDED.last_plan_id,execution.owned_positions.last_plan_id),reconciliation_status=EXCLUDED.reconciliation_status,entry_signature=COALESCE(EXCLUDED.entry_signature,execution.owned_positions.entry_signature),payload=EXCLUDED.payload`,
+        `INSERT INTO execution.owned_positions(lpforge_position_id,pool_address,position_address,owner_address,strategy,orientation,lower_bin_id,upper_bin_id,active_bin_at_entry,initial_capital_lamports,entry_plan_id,entry_signature,entry_slot,entered_at,lifecycle_state,last_plan_id,reconciliation_status,last_reconciled_at,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb) ON CONFLICT(lpforge_position_id) DO UPDATE SET lifecycle_state=EXCLUDED.lifecycle_state,last_plan_id=COALESCE(EXCLUDED.last_plan_id,execution.owned_positions.last_plan_id),reconciliation_status=EXCLUDED.reconciliation_status,entry_signature=COALESCE(EXCLUDED.entry_signature,execution.owned_positions.entry_signature),entry_slot=COALESCE(EXCLUDED.entry_slot,execution.owned_positions.entry_slot),last_reconciled_at=EXCLUDED.last_reconciled_at,payload=EXCLUDED.payload`,
         [
           v.lpforgePositionId,
           v.poolAddress,
@@ -2484,10 +2932,12 @@ export async function createPostgresStore(
           v.initialCapitalLamports.toString(),
           v.entryPlanId ?? null,
           v.entrySignature ?? null,
+          v.entrySlot?.toString() ?? null,
           v.enteredAt,
           v.lifecycleState,
           v.lastPlanId ?? null,
           v.reconciliationStatus,
+          v.enteredAt,
           json(v.payload),
         ],
       );
@@ -2523,8 +2973,25 @@ export async function createPostgresStore(
       );
       return r.rows;
     },
+    async upsertWalletPositionDiscovery(v) {
+      await db.query(
+        `INSERT INTO execution.wallet_position_discoveries(owner_address,position_address,pool_address,classification,lpforge_position_id,execution_plan_id,first_seen_at,last_seen_at,last_reconciled_at,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb) ON CONFLICT(owner_address,position_address) DO UPDATE SET pool_address=EXCLUDED.pool_address,classification=EXCLUDED.classification,lpforge_position_id=COALESCE(EXCLUDED.lpforge_position_id,execution.wallet_position_discoveries.lpforge_position_id),execution_plan_id=COALESCE(EXCLUDED.execution_plan_id,execution.wallet_position_discoveries.execution_plan_id),last_seen_at=EXCLUDED.last_seen_at,last_reconciled_at=EXCLUDED.last_reconciled_at,payload=EXCLUDED.payload`,
+        [v.ownerAddress,v.positionAddress,v.poolAddress??null,v.classification,v.lpforgePositionId??null,v.executionPlanId??null,v.firstSeenAt,v.lastSeenAt,v.lastReconciledAt,json(v.payload)],
+      );
+    },
+    async loadWalletPositionDiscoveries(ownerAddress) {
+      const r=await db.query(`SELECT owner_address,position_address,pool_address,classification,lpforge_position_id,execution_plan_id,first_seen_at,last_seen_at,last_reconciled_at,payload FROM execution.wallet_position_discoveries WHERE owner_address=$1 ORDER BY last_reconciled_at DESC,position_address ASC`,[ownerAddress]);
+      return r.rows.map(row=>({ownerAddress:String(row.owner_address),positionAddress:String(row.position_address),...(row.pool_address?{poolAddress:String(row.pool_address)}:{}),classification:String(row.classification) as WalletPositionClassification,...(row.lpforge_position_id?{lpforgePositionId:String(row.lpforge_position_id)}:{}),...(row.execution_plan_id?{executionPlanId:String(row.execution_plan_id)}:{}),firstSeenAt:toIsoTimestamp(row.first_seen_at),lastSeenAt:toIsoTimestamp(row.last_seen_at),lastReconciledAt:toIsoTimestamp(row.last_reconciled_at),payload:(row.payload??{}) as Record<string,unknown>}));
+    },
+    async findAutonomousOpenPlansByPosition(v) {
+      const r=await db.query(
+        `SELECT p.plan_id,p.intent_id,p.state,p.expires_at,p.payload AS plan_payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload AS intent_payload,COALESCE(json_agg(json_build_object('transactionId',s.transaction_id,'sequence',s.sequence,'kind',s.kind,'state',s.state,'requiredSignerAddresses',s.required_signers,'metadata',s.metadata) ORDER BY s.sequence) FILTER (WHERE s.transaction_id IS NOT NULL),'[]'::json) AS steps FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id LEFT JOIN execution.execution_journal j ON j.plan_id=p.plan_id LEFT JOIN execution.transaction_steps s ON s.plan_id=p.plan_id WHERE p.cluster='mainnet-beta' AND i.action='OPEN' AND i.owner_address=$1 AND i.pool_address=$2 AND (i.position_address=$3 OR p.payload->'autonomous_dispatch'->>'positionAddress'=$3 OR p.payload->'autonomous_dispatch'->>'generatedPositionAddress'=$3 OR j.payload->>'positionAddress'=$3 OR j.payload->>'generatedPositionAddress'=$3) GROUP BY p.plan_id,p.intent_id,p.state,p.expires_at,p.payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload ORDER BY p.plan_id ASC`,
+        [v.ownerAddress,v.poolAddress,v.positionAddress],
+      );
+      return r.rows.map(autonomousPlanFromRow);
+    },
     async loadOwnedPoolHistory(ownerAddress){const r=await db.query("SELECT DISTINCT o.pool_address,p.token_x_mint,p.token_y_mint FROM execution.owned_positions o LEFT JOIN protocol.pools p ON p.address=o.pool_address WHERE o.owner_address=$1",[ownerAddress]);return r.rows.map(row=>({poolAddress:String(row.pool_address),...(row.token_x_mint?{tokenXMint:String(row.token_x_mint)}:{}),...(row.token_y_mint?{tokenYMint:String(row.token_y_mint)}:{})}));},
-    async loadPhase7PortfolioFacts(ownerAddress){const [positions,reservations,recon,pending]=await Promise.all([db.query("SELECT COALESCE(sum(o.initial_capital_lamports),0)::text AS deployed,count(*)::int AS open_positions,COALESCE((SELECT jsonb_object_agg(g.pool_address,g.deployed) FROM (SELECT p.address AS pool_address,COALESCE(sum(o2.initial_capital_lamports),0) AS deployed FROM execution.owned_positions o2 JOIN protocol.pools p ON p.address=o2.pool_address WHERE o2.owner_address=$1 AND o2.lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN') GROUP BY p.address) g),'{}'::jsonb) AS by_pool,COALESCE((SELECT jsonb_object_agg(g.token_x_mint,g.deployed) FROM (SELECT p.token_x_mint,COALESCE(sum(o3.initial_capital_lamports),0) AS deployed FROM execution.owned_positions o3 JOIN protocol.pools p ON p.address=o3.pool_address WHERE o3.owner_address=$1 AND o3.lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN') AND p.token_x_mint IS NOT NULL GROUP BY p.token_x_mint) g),'{}'::jsonb) AS by_token FROM execution.owned_positions o WHERE o.owner_address=$1 AND o.lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN')",[ownerAddress]),db.query("SELECT COALESCE(sum(capital_lamports),0)::text AS reserved,COALESCE((SELECT jsonb_object_agg(g.pool_address,g.reserved) FROM (SELECT pool_address,COALESCE(sum(capital_lamports),0) AS reserved FROM execution.capital_reservations WHERE owner_address=$1 AND state IN ('RESERVED','SUBMITTED') AND pool_address IS NOT NULL GROUP BY pool_address) g),'{}'::jsonb) AS by_pool,COALESCE((SELECT jsonb_object_agg(g.token_mint,g.reserved) FROM (SELECT token_mint,COALESCE(sum(capital_lamports),0) AS reserved FROM execution.capital_reservations WHERE owner_address=$1 AND state IN ('RESERVED','SUBMITTED') AND token_mint IS NOT NULL GROUP BY token_mint) g),'{}'::jsonb) AS by_token FROM execution.capital_reservations WHERE owner_address=$1 AND state IN ('RESERVED','SUBMITTED')",[ownerAddress]),db.query("SELECT count(*)::int AS n FROM execution.owned_positions WHERE owner_address=$1 AND lifecycle_state IN ('RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN')",[ownerAddress]),db.query("SELECT count(DISTINCT p.plan_id)::int AS n FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id LEFT JOIN execution.execution_journal j ON j.plan_id=p.plan_id WHERE i.owner_address=$1 AND (p.state NOT IN ('BLOCKED','FAILED','EXPIRED','RECONCILED') OR (j.journal_id IS NOT NULL AND j.state NOT IN ('RECONCILED','EXPIRED','FAILED','HOLD')))",[ownerAddress])]);const map=(v:unknown)=>Object.fromEntries(Object.entries((v??{}) as Record<string,unknown>).map(([k,x])=>[k,BigInt(String(x))]));return{deployedLamports:BigInt(String(positions.rows[0]?.deployed??'0')),pendingReservedLamports:BigInt(String(reservations.rows[0]?.reserved??'0')),pendingExecutionCount:Number(pending.rows[0]?.n??0),openPositions:Number(positions.rows[0]?.open_positions??0),unresolvedReconciliationDebt:Number(recon.rows[0]?.n??0),poolExposureLamports:map(positions.rows[0]?.by_pool),poolPendingLamports:map(reservations.rows[0]?.by_pool),tokenExposureLamports:map(positions.rows[0]?.by_token),tokenPendingLamports:map(reservations.rows[0]?.by_token)};},
+    async loadPhase7PortfolioFacts(ownerAddress){const [positions,reservations,recon,pending]=await Promise.all([db.query("SELECT COALESCE(sum(o.initial_capital_lamports),0)::text AS deployed,count(*)::int AS open_positions,COALESCE((SELECT jsonb_object_agg(g.pool_address,g.deployed) FROM (SELECT p.address AS pool_address,COALESCE(sum(o2.initial_capital_lamports),0) AS deployed FROM execution.owned_positions o2 JOIN protocol.pools p ON p.address=o2.pool_address WHERE o2.owner_address=$1 AND o2.lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN') GROUP BY p.address) g),'{}'::jsonb) AS by_pool,COALESCE((SELECT jsonb_object_agg(g.token_x_mint,g.deployed) FROM (SELECT p.token_x_mint,COALESCE(sum(o3.initial_capital_lamports),0) AS deployed FROM execution.owned_positions o3 JOIN protocol.pools p ON p.address=o3.pool_address WHERE o3.owner_address=$1 AND o3.lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN') AND p.token_x_mint IS NOT NULL GROUP BY p.token_x_mint) g),'{}'::jsonb) AS by_token FROM execution.owned_positions o WHERE o.owner_address=$1 AND o.lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN')",[ownerAddress]),db.query("SELECT COALESCE(sum(capital_lamports),0)::text AS reserved,COALESCE((SELECT jsonb_object_agg(g.pool_address,g.reserved) FROM (SELECT pool_address,COALESCE(sum(capital_lamports),0) AS reserved FROM execution.capital_reservations WHERE owner_address=$1 AND state IN ('RESERVED','SUBMITTED') AND pool_address IS NOT NULL GROUP BY pool_address) g),'{}'::jsonb) AS by_pool,COALESCE((SELECT jsonb_object_agg(g.token_mint,g.reserved) FROM (SELECT token_mint,COALESCE(sum(capital_lamports),0) AS reserved FROM execution.capital_reservations WHERE owner_address=$1 AND state IN ('RESERVED','SUBMITTED') AND token_mint IS NOT NULL GROUP BY token_mint) g),'{}'::jsonb) AS by_token FROM execution.capital_reservations WHERE owner_address=$1 AND state IN ('RESERVED','SUBMITTED')",[ownerAddress]),db.query("SELECT count(*)::int AS n FROM execution.owned_positions WHERE owner_address=$1 AND lifecycle_state IN ('RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN')",[ownerAddress]),db.query("SELECT count(DISTINCT p.plan_id)::int AS n FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id WHERE i.owner_address=$1 AND (p.state NOT IN ('BLOCKED','FAILED','EXPIRED','RECONCILED') OR EXISTS(SELECT 1 FROM execution.transaction_steps s JOIN execution.submission_attempts a ON a.transaction_id=s.transaction_id WHERE s.plan_id=p.plan_id AND a.state IN ('SENT','UNKNOWN')))",[ownerAddress])]);const map=(v:unknown)=>Object.fromEntries(Object.entries((v??{}) as Record<string,unknown>).map(([k,x])=>[k,BigInt(String(x))]));return{deployedLamports:BigInt(String(positions.rows[0]?.deployed??'0')),pendingReservedLamports:BigInt(String(reservations.rows[0]?.reserved??'0')),pendingExecutionCount:Number(pending.rows[0]?.n??0),openPositions:Number(positions.rows[0]?.open_positions??0),unresolvedReconciliationDebt:Number(recon.rows[0]?.n??0),poolExposureLamports:map(positions.rows[0]?.by_pool),poolPendingLamports:map(reservations.rows[0]?.by_pool),tokenExposureLamports:map(positions.rows[0]?.by_token),tokenPendingLamports:map(reservations.rows[0]?.by_token)};},
     async loadPhase7PortfolioRiskState(ownerAddress){const r=await db.query("SELECT * FROM operations.phase7_live_portfolio_risk_state WHERE owner_address=$1",[ownerAddress]);return r.rows[0] as Record<string,unknown>|undefined;},
     async upsertPhase7PortfolioRiskState(v){await db.query("INSERT INTO operations.phase7_live_portfolio_risk_state(owner_address,day_start,daily_start_equity_lamports,peak_equity_lamports,current_equity_lamports,observed_at,valuation_state,reason_codes,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb) ON CONFLICT(owner_address) DO UPDATE SET day_start=EXCLUDED.day_start,daily_start_equity_lamports=EXCLUDED.daily_start_equity_lamports,peak_equity_lamports=EXCLUDED.peak_equity_lamports,current_equity_lamports=EXCLUDED.current_equity_lamports,observed_at=EXCLUDED.observed_at,valuation_state=EXCLUDED.valuation_state,reason_codes=EXCLUDED.reason_codes,payload=EXCLUDED.payload",[v.ownerAddress,v.dayStart,v.dailyStartEquityLamports.toString(),v.peakEquityLamports.toString(),v.currentEquityLamports.toString(),v.observedAt,v.valuationState,json(v.reasonCodes),json(v.payload)]);},
     async loadPositionExitState(lpforgePositionId) {
@@ -2705,6 +3172,25 @@ export async function createPostgresStore(
       );
       return r.rows;
     },
+    async loadPartialEntryRecovery(planId) {
+      const r = await db.query(
+        `SELECT * FROM execution.partial_entry_recovery WHERE plan_id=$1`,
+        [planId],
+      );
+      return r.rows[0] as Record<string, unknown> | undefined;
+    },
+    async upsertOpenChunkDisposition(v) {
+      await db.query(
+        `INSERT INTO execution.open_chunk_dispositions(plan_id,transaction_id,sequence,kind,disposition,signature,last_valid_block_height,observed_at,payload)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
+         ON CONFLICT(plan_id,transaction_id) DO UPDATE SET disposition=EXCLUDED.disposition,signature=COALESCE(EXCLUDED.signature,execution.open_chunk_dispositions.signature),last_valid_block_height=COALESCE(EXCLUDED.last_valid_block_height,execution.open_chunk_dispositions.last_valid_block_height),observed_at=EXCLUDED.observed_at,payload=execution.open_chunk_dispositions.payload||EXCLUDED.payload`,
+        [v.planId,v.transactionId,v.sequence,v.kind,v.disposition,v.signature??null,v.lastValidBlockHeight?.toString()??null,v.observedAt,json(v.payload)],
+      );
+    },
+    async loadOpenChunkDispositions(planId) {
+      const r=await db.query("SELECT plan_id,transaction_id,sequence,kind,disposition,signature,last_valid_block_height,observed_at,payload FROM execution.open_chunk_dispositions WHERE plan_id=$1 ORDER BY sequence,transaction_id",[planId]);
+      return r.rows.map(row=>({planId:String(row.plan_id),transactionId:String(row.transaction_id),sequence:Number(row.sequence),kind:String(row.kind),disposition:String(row.disposition) as OpenChunkDisposition,...(row.signature?{signature:String(row.signature)}:{}),...(row.last_valid_block_height===null?{}:{lastValidBlockHeight:BigInt(String(row.last_valid_block_height))}),observedAt:toIsoTimestamp(row.observed_at),payload:(row.payload??{}) as Record<string,unknown>}));
+    },
     async loadAutonomousPlan(planId) {
       const r = await db.query(
         `SELECT p.plan_id,p.intent_id,p.state,p.expires_at,p.payload AS plan_payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload AS intent_payload,COALESCE(json_agg(json_build_object('transactionId',s.transaction_id,'sequence',s.sequence,'kind',s.kind,'state',s.state,'requiredSignerAddresses',s.required_signers,'metadata',s.metadata) ORDER BY s.sequence) FILTER (WHERE s.transaction_id IS NOT NULL),'[]'::json) AS steps FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id LEFT JOIN execution.transaction_steps s ON s.plan_id=p.plan_id WHERE p.plan_id=$1 GROUP BY p.plan_id,p.intent_id,p.state,p.expires_at,p.payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload`,
@@ -2776,6 +3262,47 @@ export async function createPostgresStore(
         [attemptId, at, error],
       );
     },
+    async markSubmissionExpired(signature, at, reason) {
+      await db.query(
+        `UPDATE execution.submission_attempts SET state='EXPIRED',payload=payload||jsonb_build_object('terminal_recovery_reason',$3::text,'terminal_recovered_at',$2::timestamptz) WHERE signature=$1 AND state IN ('PREPARED','SENT','UNKNOWN')`,
+        [signature, at, reason],
+      );
+    },
+    async loadSubmissionAttemptBySignature(signature) {
+      const r = await db.query(
+        `SELECT last_valid_block_height FROM execution.submission_attempts WHERE signature=$1 ORDER BY prepared_at DESC LIMIT 1`,
+        [signature],
+      );
+      const value = r.rows[0]?.last_valid_block_height;
+      return value === undefined || value === null
+        ? undefined
+        : { lastValidBlockHeight: Number(value) };
+    },
+    async loadConfirmedSubmissionByTransactionId(transactionId) {
+      const r = await db.query(
+        `SELECT a.signature,c.status,c.slot
+         FROM execution.submission_attempts a
+         JOIN execution.confirmations c ON c.attempt_id=a.attempt_id
+         WHERE a.transaction_id=$1
+           AND a.state='SENT'
+           AND a.signature IS NOT NULL
+           AND c.status IN ('CONFIRMED','FINALIZED')
+         ORDER BY CASE c.status WHEN 'FINALIZED' THEN 0 ELSE 1 END,
+                  c.observed_at DESC
+         LIMIT 1`,
+        [transactionId],
+      );
+      const row = r.rows[0];
+      if (!row?.signature || (row.status !== "CONFIRMED" && row.status !== "FINALIZED"))
+        return undefined;
+      return {
+        signature: String(row.signature),
+        status: String(row.status) as "CONFIRMED" | "FINALIZED",
+        ...(row.slot === null || row.slot === undefined
+          ? {}
+          : { slot: BigInt(String(row.slot)) }),
+      };
+    },
     async insertExecutionConfirmation(v) {
       await db.query(
         `INSERT INTO execution.confirmations(attempt_id,signature,status,observed_at,slot,error,payload) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb) ON CONFLICT(attempt_id,observed_at,status) DO NOTHING`,
@@ -2842,40 +3369,73 @@ export async function createPostgresStore(
     },
     async getExecutionJournal(idempotencyKey) {
       const r = await db.query(
-        `SELECT * FROM execution.execution_journal WHERE idempotency_key=$1`,
+        // A process can die after the submission ledger durably records SENT
+        // but before the journal's SUBMITTED update commits.  Return an
+        // effective recovery view so that window is never treated as an
+        // unsent, rebuildable plan.  The underlying journal row stays
+        // append-only/auditable; recovery later writes its normal terminal
+        // state once chain truth is known.
+        `SELECT j.*,
+                COALESCE(j.signature,a.signature) AS signature,
+                CASE
+                  WHEN j.state='SIGNED' AND a.state='SENT' THEN 'SUBMITTED'
+                  WHEN j.state='SIGNED' AND a.state='UNKNOWN' THEN 'UNKNOWN_SUBMISSION'
+                  ELSE j.state
+                END AS state
+           FROM execution.execution_journal j
+           LEFT JOIN LATERAL (
+             SELECT a.state,a.signature
+             FROM execution.transaction_steps s
+             JOIN execution.submission_attempts a ON a.transaction_id=s.transaction_id
+             WHERE s.plan_id=j.plan_id
+             ORDER BY COALESCE(a.submitted_at,a.prepared_at) DESC,a.attempt DESC
+             LIMIT 1
+           ) a ON true
+           WHERE j.idempotency_key=$1`,
         [idempotencyKey],
       );
       return r.rows[0];
     },
-    async loadOperationalHistory(poolAddress, since, limit) {
+    async loadOperationalHistory(poolAddress, since, limit, through) {
       const lim = Math.max(1, Math.min(2000, limit));
+      const window = operationalHistoryWindow(since, through);
       const market = await db.query(
         `WITH candidate AS (
            SELECT observed_at,price::double precision AS price,local_liquidity::double precision AS tvl,active_bin_id,resolution_ms,
              COALESCE(volume,0)::double precision AS volume_5m,COALESCE(fee_value,0)::double precision AS fee_5m,
              CASE source_type WHEN 'LIVE_OBSERVED' THEN 0 WHEN 'RECONSTRUCTED' THEN 1 ELSE 2 END AS source_rank
            FROM market.candidate_market_observations
-           WHERE pool_address=$1 AND observed_at>=$2
+           WHERE pool_address=$1 AND observed_at>=$2 AND ($3::timestamptz IS NULL OR observed_at<=$3)
          ), snapshots AS (
            SELECT d.observed_at,(d.payload->>'current_price')::double precision AS price,(d.payload->>'tvl')::double precision AS tvl,
              (SELECT p.active_bin_id FROM protocol.pool_snapshots p WHERE p.pool_address=d.pool_address AND p.observed_at<=d.observed_at ORDER BY p.observed_at DESC LIMIT 1) AS active_bin_id,
              COALESCE((d.payload->'volume'->>'5m')::double precision,0) AS volume_5m,
              COALESCE((d.payload->'fees'->>'5m')::double precision,0) AS fee_5m,60000::integer AS resolution_ms,1 AS source_rank
            FROM market.data_api_pool_snapshots d
-           WHERE d.pool_address=$1 AND d.observed_at>=$2 AND (d.payload->>'current_price') IS NOT NULL
+           WHERE d.pool_address=$1 AND d.observed_at>=$2 AND ($3::timestamptz IS NULL OR d.observed_at<=$3) AND (d.payload->>'current_price') IS NOT NULL
          ), all_points AS (SELECT * FROM candidate UNION ALL SELECT * FROM snapshots),
          dedup AS (SELECT DISTINCT ON(observed_at) * FROM all_points ORDER BY observed_at,source_rank)
-         SELECT observed_at,price,tvl,active_bin_id,resolution_ms,volume_5m,fee_5m FROM dedup ORDER BY observed_at ASC LIMIT $3`,
-        [poolAddress, since, lim],
+         SELECT observed_at,price,tvl,active_bin_id,resolution_ms,volume_5m,fee_5m FROM dedup ORDER BY observed_at ASC LIMIT $4`,
+        [poolAddress, window.since, window.through ?? null, lim],
       );
       const active = await db.query(
-        `SELECT observed_at,active_bin_id FROM protocol.pool_snapshots WHERE pool_address=$1 AND observed_at>=$2 ORDER BY observed_at ASC LIMIT $3`,
-        [poolAddress, since, lim],
+        `SELECT observed_at,active_bin_id FROM protocol.pool_snapshots WHERE pool_address=$1 AND observed_at>=$2 AND ($3::timestamptz IS NULL OR observed_at<=$3) ORDER BY observed_at ASC LIMIT $4`,
+        [poolAddress, window.since, window.through ?? null, lim],
       );
-      const stamps = await db.query(
-        `SELECT DISTINCT observed_at FROM protocol.bin_snapshots WHERE pool_address=$1 AND observed_at>=$2 ORDER BY observed_at DESC LIMIT $3`,
-        [poolAddress, since, Math.min(lim, 240)],
-      );
+      /* A forward-outcome window is intrinsically bounded (baseline lookback
+       * through frozen horizon). Do not apply the old newest-N timestamp cap
+       * there: delayed maturation could otherwise hide valid historical
+       * frames behind later wall-clock observations. The legacy live-history
+       * path deliberately retains its existing bounded-recency behavior. */
+      const stamps = window.through
+        ? await db.query(
+          `SELECT DISTINCT observed_at FROM protocol.bin_snapshots WHERE pool_address=$1 AND observed_at>=$2 AND observed_at<=$3 ORDER BY observed_at ASC`,
+          [poolAddress, window.since, window.through],
+        )
+        : await db.query(
+          `SELECT DISTINCT observed_at FROM protocol.bin_snapshots WHERE pool_address=$1 AND observed_at>=$2 ORDER BY observed_at DESC LIMIT $3`,
+          [poolAddress, window.since, Math.min(lim, 240)],
+        );
       const stampValues = stamps.rows.map((r) => r.observed_at).filter(Boolean);
       const frames: Array<{
         observedAt: string;
@@ -2888,33 +3448,49 @@ export async function createPostgresStore(
           liquiditySupply?: string;
         }>;
       }> = [];
-      for (const stamp of stampValues.reverse()) {
+      if (stampValues.length) {
+        /* Preserve the former per-stamp active-bin lookup and ascending frame
+         * order, but fetch the immutable bin frames in one bounded round trip.
+         * This is access-path only: no frame, valuation, or outcome semantics
+         * change. */
         const rows = await db.query(
-          `SELECT b.bin_id,b.price,b.amount_x,b.amount_y,b.liquidity_supply,
-          (SELECT p.active_bin_id FROM protocol.pool_snapshots p WHERE p.pool_address=b.pool_address AND p.observed_at<=b.observed_at ORDER BY p.observed_at DESC LIMIT 1) AS active_bin_id
-          FROM protocol.bin_snapshots b WHERE b.pool_address=$1 AND b.observed_at=$2 ORDER BY b.bin_id`,
-          [poolAddress, stamp],
+          `WITH selected_stamps AS (SELECT unnest($2::timestamptz[]) AS observed_at)
+           SELECT s.observed_at,p.active_bin_id,b.bin_id,b.price,b.amount_x,b.amount_y,b.liquidity_supply
+           FROM selected_stamps s
+           JOIN LATERAL (
+             SELECT active_bin_id FROM protocol.pool_snapshots
+             WHERE pool_address=$1 AND observed_at<=s.observed_at
+             ORDER BY observed_at DESC LIMIT 1
+           ) p ON true
+           JOIN protocol.bin_snapshots b ON b.pool_address=$1 AND b.observed_at=s.observed_at
+           ORDER BY s.observed_at ASC,b.bin_id ASC`,
+          [poolAddress, stampValues],
         );
-        if (!rows.rows.length) continue;
-        const a = operationalActiveBinIdFromDbValue(rows.rows[0]!.active_bin_id);
-        if (a === undefined) continue;
-        frames.push({
-          observedAt: new Date(String(stamp)).toISOString(),
-          activeBinId: a,
-          bins: rows.rows.map((r) => ({
-            binId: Number(r.bin_id),
-            price: String(r.price ?? "0"),
-            amountX: String(r.amount_x ?? "0"),
-            amountY: String(r.amount_y ?? "0"),
-            ...(r.liquidity_supply !== null && r.liquidity_supply !== undefined
-              ? { liquiditySupply: String(r.liquidity_supply) }
+        let frameObservedAt: string | undefined;
+        let frame: (typeof frames)[number] | undefined;
+        for (const row of rows.rows) {
+          const observedAt = new Date(String(row.observed_at)).toISOString();
+          if (frameObservedAt !== observedAt) {
+            frameObservedAt = observedAt;
+            const activeBinId = operationalActiveBinIdFromDbValue(row.active_bin_id);
+            frame = activeBinId === undefined ? undefined : { observedAt, activeBinId, bins: [] };
+            if (frame) frames.push(frame);
+          }
+          if (!frame) continue;
+          frame.bins.push({
+            binId: Number(row.bin_id),
+            price: String(row.price ?? "0"),
+            amountX: String(row.amount_x ?? "0"),
+            amountY: String(row.amount_y ?? "0"),
+            ...(row.liquidity_supply !== null && row.liquidity_supply !== undefined
+              ? { liquiditySupply: String(row.liquidity_supply) }
               : {}),
-          })),
-        });
+          });
+        }
       }
       const swaps = await db.query(
-        `SELECT signature,event_index,pool_address,chain_slot,block_time,observed_at,start_bin_id,end_bin_id,swap_for_y,amount_in,amount_left,amount_out,fee_bps,mm_fee,protocol_fee,limit_order_fee,host_fee,fees_on_input,fees_on_token_x,payload FROM protocol.swap_events WHERE pool_address=$1 AND observed_at>=$2 ORDER BY observed_at ASC LIMIT $3`,
-        [poolAddress, since, lim],
+        `SELECT signature,event_index,pool_address,chain_slot,block_time,observed_at,start_bin_id,end_bin_id,swap_for_y,amount_in,amount_left,amount_out,fee_bps,mm_fee,protocol_fee,limit_order_fee,host_fee,fees_on_input,fees_on_token_x,payload FROM protocol.swap_events WHERE pool_address=$1 AND observed_at>=$2 AND ($3::timestamptz IS NULL OR observed_at<=$3) ORDER BY observed_at ASC LIMIT $4`,
+        [poolAddress, window.since, window.through ?? null, lim],
       );
       return {
         marketObservations: market.rows.flatMap((r) => {
@@ -3197,6 +3773,13 @@ export async function createPostgresStore(
       const r = await db.query(
         `SELECT * FROM operations.phase7_control_decisions WHERE runtime_id=$1 ORDER BY observed_at DESC LIMIT 1`,
         [runtimeId],
+      );
+      return r.rows[0];
+    },
+    async loadPhase7ControlDecision(runtimeId, decisionId) {
+      const r = await db.query(
+        `SELECT * FROM operations.phase7_control_decisions WHERE runtime_id=$1 AND decision_id=$2 LIMIT 1`,
+        [runtimeId, decisionId],
       );
       return r.rows[0];
     },
@@ -3506,6 +4089,7 @@ export function createMemoryStore(): Phase1Store {
     async insertDiscoveryBaseline() {},
     async upsertDiscoveryPolicyProposal() {},
     async loadRecentDiscoveryPredictions() { return []; },
+    async loadDueDiscoveryCounterfactualPredictions() { return []; },
     async loadDiscoveryOutcomes() { return []; },
     async insertForensicEpisode() {
       return "memory-episode";
@@ -3514,6 +4098,16 @@ export function createMemoryStore(): Phase1Store {
     async insertExperiment() {},
     async insertExperimentResult() {},
     async insertShadowRecommendation() {},
+    async loadShadowRecommendationPayload() { return undefined; },
+    async insertReset3cValidationUniverse() { return 'INSERTED' as const; },
+    async loadReset3cValidationUniverse() { return undefined; },
+    async markTerminalEligibleReset3cValidationUniverses() { return 0; },
+    async purgeTerminalEligibleReset3cValidationEvidence() { return 0; },
+    async insertVariableCapitalEvaluation() { return 'INSERTED' as const; },
+    async loadDueCandidateCounterfactualOutcomes() { return []; },
+    async persistCandidateCounterfactualOutcome() { return 'APPLIED' as const; },
+    async loadBinSnapshotRetentionPlan(now) { return {state:'READY' as const,protectionFloor:new Date(Date.parse(now)-4*60*60_000).toISOString(),protectionInputs:{OPERATIONAL_HISTORY:new Date(Date.parse(now)-4*60*60_000).toISOString()},reasonCodes:[]}; },
+    async deleteBinSnapshotsBefore() { return {deleted:0}; },
     async insertPhase3ForwardDecision() { return false; },
     async ensurePhase3ForwardOutcome() { return false; },
     async loadDuePhase3ForwardOutcomes() { return []; },
@@ -3523,6 +4117,14 @@ export function createMemoryStore(): Phase1Store {
     async loadDuePostEntryTelemetryCheckpoints() { return []; },
     async appendPostEntryTelemetryObservation(v) { return {status:'INSERTED' as const,contentHash:await sha256Hex(canonicalJson(v.content))}; },
     async loadPostEntryTelemetryEpisode() { return undefined; },
+    async ensureMarketContextTelemetryActivation(v) { return {created:false,activatedAt:v.activatedAt}; },
+    async loadDueProspectiveMarketContextSnapshots() { return []; },
+    async appendProspectiveMarketContextSnapshot(v) { return {status:'INSERTED' as const,contentHash:await sha256Hex(canonicalJson({telemetryEpisodeId:v.telemetryEpisodeId,recommendationId:v.recommendationId,poolAddress:v.poolAddress,decisionAt:v.decisionAt,captureStatus:v.captureStatus,reasonCodes:[...v.reasonCodes].sort(),availability:v.availability,rawPayload:v.rawPayload,derivedInterpretation:v.derivedInterpretation,provenance:v.provenance,facts:v.facts}))}; },
+    async loadProspectiveMarketContextSnapshot() { return undefined; },
+    async ensureInventoryForecastV2Activation(v) { return {created:false,activatedAt:v.activatedAt}; },
+    async loadDueInventoryForecastV2Predictions() { return []; },
+    async appendInventoryForecastV2Prediction(v) { return {status:'INSERTED' as const,contentHash:await sha256Hex(canonicalJson({telemetryEpisodeId:v.telemetryEpisodeId,recommendationId:v.recommendationId,candidateId:v.candidateId,poolAddress:v.poolAddress,decisionAt:v.decisionAt,captureStatus:v.captureStatus,reasonCodes:[...v.reasonCodes].sort(),rawFrozenInputs:v.rawFrozenInputs,derivedForecast:v.derivedForecast,provenance:v.provenance}))}; },
+    async loadInventoryForecastV2ValidationRows() { return []; },
     async insertRegimeAssessment() {},
     async insertLpThesis() {},
     async insertEntryEvaluation() {},
@@ -3544,6 +4146,7 @@ export function createMemoryStore(): Phase1Store {
     async markExecutionCapitalSubmitted() {},
     async reconcileExecutionCapitalReservations() {},
     async countExecutionActionsSince() { return 0; },
+    async reserveControlledCanaryCampaignOpen() { return {reserved:true}; },
     async claimNextAutonomousOpenPlan() {
       return undefined;
     },
@@ -3554,6 +4157,9 @@ export function createMemoryStore(): Phase1Store {
     async loadOwnedPositions() {
       return [];
     },
+    async upsertWalletPositionDiscovery() {},
+    async loadWalletPositionDiscoveries() { return []; },
+    async findAutonomousOpenPlansByPosition() { return []; },
     async loadOwnedPoolHistory() { return []; },
     async loadPhase7PortfolioFacts() { return {deployedLamports:0n,pendingReservedLamports:0n,pendingExecutionCount:0,openPositions:0,unresolvedReconciliationDebt:0,poolExposureLamports:{},poolPendingLamports:{},tokenExposureLamports:{},tokenPendingLamports:{}}; },
     async loadPhase7PortfolioRiskState() { return undefined; },
@@ -3586,6 +4192,9 @@ export function createMemoryStore(): Phase1Store {
     async loadPartialEntryRecoveries() {
       return [];
     },
+    async loadPartialEntryRecovery() { return undefined; },
+    async upsertOpenChunkDisposition() {},
+    async loadOpenChunkDispositions() { return []; },
     async loadAutonomousPlan() {
       return undefined;
     },
@@ -3599,6 +4208,9 @@ export function createMemoryStore(): Phase1Store {
     },
     async markSubmissionSent() {},
     async markSubmissionUnknown() {},
+    async markSubmissionExpired() {},
+    async loadSubmissionAttemptBySignature() { return undefined; },
+    async loadConfirmedSubmissionByTransactionId() { return undefined; },
     async insertExecutionConfirmation() {},
     async insertExecutionReconciliation() {},
     async createExecutionJournal() {
@@ -3659,6 +4271,9 @@ export function createMemoryStore(): Phase1Store {
     },
     async insertPhase7ControlDecision() {},
     async loadLatestPhase7ControlDecision() {
+      return undefined;
+    },
+    async loadPhase7ControlDecision() {
       return undefined;
     },
     async insertPhase7EvidenceSnapshot() {},

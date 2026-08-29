@@ -130,8 +130,29 @@ export interface PlanProvenanceFields {
   immutablePlan?:Record<string,unknown>;
   /** The exact P7 control decision under which the plan was created. */
   phase7Control?:Record<string,unknown>|null;
+  /**
+   * A one-plan canary envelope.  This is deliberately part of the signed
+   * provenance rather than mutable control state: a later observation may
+   * contain a new P7 snapshot, but cannot retarget this exact open.
+   */
+  controlledCanaryAuthorization?:Record<string,unknown>|null;
 }
-function stableProvenance(v:unknown):string{if(Array.isArray(v))return`[${v.map(stableProvenance).join(',')}]`;if(v&&typeof v==='object')return`{${Object.entries(v as Record<string,unknown>).sort(([a],[b])=>a.localeCompare(b)).map(([k,x])=>`${JSON.stringify(k)}:${stableProvenance(x)}`).join(',')}}`;return JSON.stringify(v);}
+/**
+ * Match JSON persistence before authenticating plan provenance.  Execution
+ * intents are persisted as JSONB before the worker reads them back.  In
+ * particular, JSON omits undefined object properties and turns undefined
+ * array items into null.  Signing the pre-persistence shape would make a
+ * legitimate protective plan fail its own HMAC after the round trip.
+ */
+function stableProvenance(v:unknown):string{
+  if(v===undefined||v===null)return'null';
+  if(typeof v==='bigint')return JSON.stringify(v.toString());
+  if(v instanceof Date)return JSON.stringify(v.toJSON());
+  if(Array.isArray(v))return`[${v.map(item=>item===undefined?'null':stableProvenance(item)).join(',')}]`;
+  if(typeof v==='object')return`{${Object.entries(v as Record<string,unknown>).filter(([,item])=>item!==undefined).sort(([a],[b])=>a.localeCompare(b)).map(([key,item])=>`${JSON.stringify(key)}:${stableProvenance(item)}`).join(',')}}`;
+  if(typeof v==='number'&&!Number.isFinite(v))return'null';
+  return JSON.stringify(v)??'null';
+}
 export function computePlanProvenanceHmac(fields:PlanProvenanceFields,secret:string):string{
   return createHmac('sha256',secret).update(stableProvenance(fields)).digest('hex');
 }

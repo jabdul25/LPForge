@@ -9,6 +9,13 @@ const fact={address:'POS',pool:'POOL',owner:'OWNER',lowerBinId:90,upperBinId:110
 
 test('owned-position management preserves strategy and width only for a positive-forward-EV out-of-range replacement',()=>{const r=decideLivePositionManagement({policy,owned,position:fact,activeBinId:120,currentForwardEv:.01});assert.equal(r.action,'RESHAPE');assert.deepEqual(r.replacementRange,{lowerBinId:110,upperBinId:130});assert.equal(decideLivePositionManagement({policy,owned,position:fact,activeBinId:120,currentForwardEv:-.01}).action,'CLOSE');assert.equal(decideLivePositionManagement({policy,owned,position:fact,activeBinId:120}).action,'HOLD');});
 test('owned-position management claims only economically sufficient accrued fees and holds on unknown chain truth',()=>{assert.equal(decideLivePositionManagement({policy,owned,position:{...fact,feeY:'1'},activeBinId:100,claimExpectedValueLamports:20n}).action,'CLAIM');assert.equal(decideLivePositionManagement({policy,owned,position:{...fact,feeY:'1'},activeBinId:100,claimExpectedValueLamports:19n}).action,'HOLD');assert.equal(decideLivePositionManagement({policy,owned,activeBinId:100}).action,'HOLD');});
+test('partial entry bypasses ordinary claim, reshape, and replacement management into one protective close',()=>{
+  const partial={...owned,partialEntry:true};
+  const hold=decideLivePositionManagement({policy,owned:partial,position:{...fact,feeY:'1'},activeBinId:120,claimExpectedValueLamports:20n,currentForwardEv:.01});
+  assert.equal(hold.action,'CLOSE');assert.deepEqual(hold.reasonCodes,['PARTIAL_ENTRY_PROTECTIVE_CLOSE_REQUIRED']);
+  const emergency=decideLivePositionManagement({policy,owned:partial,position:fact,activeBinId:100,exitDecision:{action:'EMERGENCY_CLOSE',reasonCodes:['EXIT_EMERGENCY_STOP_LOSS']}});
+  assert.equal(emergency.action,'EMERGENCY_CLOSE');assert.ok(emergency.reasonCodes.includes('PARTIAL_ENTRY_PROTECTIVE_CLOSE'));
+});
 test('claim economics defers dust and fails closed without a trustworthy SOL value',()=>{assert.equal(assessClaimEconomics({estimatedClaimCostLamports:10n,minimumClaimNetBenefitLamports:10n}).approved,false);assert.equal(assessClaimEconomics({expectedClaimValueLamports:19n,estimatedClaimCostLamports:10n,minimumClaimNetBenefitLamports:10n}).approved,false);assert.equal(assessClaimEconomics({expectedClaimValueLamports:20n,estimatedClaimCostLamports:10n,minimumClaimNetBenefitLamports:10n}).approved,true);});
 test('normal management is bound to the position pool context',()=>{
   const poolA=assessLiveManagementContext({positionPoolAddress:'POOL_A',managementPoolAddress:'POOL_A',action:'CLAIM'});
