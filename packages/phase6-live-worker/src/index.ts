@@ -2074,6 +2074,33 @@ async function confirmedTransactionFeeLamports(connection:Connection,signature:s
  * wallet delta. The closing receipt must prove that the exact position
  * account fell from a positive lamport balance to zero.
  */
+/** Persist the native SOL component of a confirmed REMOVE receipt. */
+async function persistConfirmedCloseNativeWithdrawal(input:{
+  store:Pick<Phase1Store,"insertPositionCashflow">;
+  connection:Connection;
+  plan:AutonomousPlan;
+  positionAddress:string;
+  signature:string;
+  transactionId:string;
+  observedAt?:string;
+}):Promise<{ok:true;lamports:bigint}|{ok:false;reasonCodes:string[]}>{
+  const receipt=await loadConfirmedExecutionReceipt(input.connection,input.signature);
+  if(receipt.state!=="CONFIRMED_SUCCESS")return{ok:false,reasonCodes:[`P6_CLOSE_NATIVE_WITHDRAWAL_RECEIPT_${receipt.state}`]};
+  const ownerIndex=receipt.resolvedAccountKeys.indexOf(input.plan.ownerAddress),before=ownerIndex>=0?receipt.preBalancesLamports[ownerIndex]:undefined,after=ownerIndex>=0?receipt.postBalancesLamports[ownerIndex]:undefined;
+  if(ownerIndex<0||before===undefined||after===undefined)return{ok:false,reasonCodes:["P6_CLOSE_NATIVE_WITHDRAWAL_OWNER_UNPROVEN"]};
+  const gross=after-before+(receipt.feeLamports??0n);
+  if(gross<0n)return{ok:false,reasonCodes:["P6_CLOSE_NATIVE_WITHDRAWAL_NEGATIVE"]};
+  if(gross>0n)await input.store.insertPositionCashflow({
+    cashflowId:`${input.plan.planId}:close-native-withdrawal:${input.transactionId}`,
+    positionAddress:input.positionAddress,
+    planId:input.plan.planId,
+    flowType:"CLOSE_WITHDRAWAL",
+    observedAt:input.observedAt??new Date().toISOString(),
+    lamports:gross,
+    payload:{source:"CONFIRMED_REMOVE_RECEIPT_OWNER_NATIVE_DELTA",transactionSignature:input.signature,transactionId:input.transactionId,ownerAddress:input.plan.ownerAddress,preBalanceLamports:before.toString(),postBalanceLamports:after.toString(),transactionFeeLamports:(receipt.feeLamports??0n).toString()},
+  });
+  return{ok:true,lamports:gross};
+}
 async function persistConfirmedPositionRentRecovery(input:{
   store:Pick<Phase1Store,"insertPositionCashflow">;
   connection:Connection;
@@ -3176,6 +3203,10 @@ async function executeCloseSettlement(input: {
         pendingStage: "CLOSE_REMOVE_SUBMITTED",
         pendingSignature: signature,
       }),
+      afterConfirmed: async ({signature}) => {
+        const native=await persistConfirmedCloseNativeWithdrawal({store:input.store,connection,plan:input.plan,positionAddress:input.positionAddress,signature,transactionId:removeStep.transactionId});
+        if(!native.ok)throw new Error(native.reasonCodes.join(","));
+      },
     });
     // No preceding child exists yet. A pre-send REMOVE rejection is a normal
     // block; only later phases must carry parent-level submitted truth.
@@ -3505,7 +3536,13 @@ async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:Au
   if(!closeSignature||!closeTransactionId)return{ready:false,reasonCodes:["SETTLEMENT_CLOSE_RECEIPT_MISSING"]};
   const rent=await persistConfirmedPositionRentRecovery({store:input.store,connection:input.connection,plan:input.plan,positionAddress:input.positionAddress,signature:closeSignature,transactionId:closeTransactionId,observedAt:new Date().toISOString()});
   if(!rent.ok)return{ready:false,reasonCodes:rent.reasonCodes};
-  const settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
+  let settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
+  if(!settlementInput)return{ready:false,reasonCodes:["SETTLEMENT_LIFECYCLE_MISSING"]};
+  const removeTransactionId=typeof dispatch.removeTransactionId==="string"?dispatch.removeTransactionId:undefined,removeSignature=removeTransactionId?settlementInput.transactions.find(transaction=>transaction.transactionId===removeTransactionId)?.signature:undefined;
+  if(!removeTransactionId||!removeSignature)return{ready:false,reasonCodes:["SETTLEMENT_REMOVE_RECEIPT_MISSING"]};
+  const native=await persistConfirmedCloseNativeWithdrawal({store:input.store,connection:input.connection,plan:input.plan,positionAddress:input.positionAddress,signature:removeSignature,transactionId:removeTransactionId,observedAt:new Date().toISOString()});
+  if(!native.ok)return{ready:false,reasonCodes:native.reasonCodes};
+  settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
   if(!settlementInput)return{ready:false,reasonCodes:["SETTLEMENT_LIFECYCLE_MISSING"]};
   const at=new Date().toISOString(),positionCheckedAt=at,positionCheckedSlot=BigInt(positionCheck.context.slot),settlementEvidence={positionCheckedAt,positionCheckedSlot:positionCheckedSlot.toString(),rpcUrl:input.config.rpcUrl,commitment:"confirmed"};
   // A close is intentionally marked RECONCILIATION_REQUIRED until this

@@ -85,6 +85,9 @@ assert.match(migration,/SOL_SETTLED/);
 {
   const worker=fs.readFileSync('packages/phase6-live-worker/src/index.ts','utf8');
   const dbSource=fs.readFileSync('packages/db/src/index.ts','utf8');
+  assert.match(worker,/persistConfirmedCloseNativeWithdrawal/);
+  assert.match(worker,/CONFIRMED_REMOVE_RECEIPT_OWNER_NATIVE_DELTA/);
+  assert.match(worker,/gross=after-before\+\(receipt\.feeLamports\?\?0n\)/);
   assert.match(worker,/persistConfirmedPositionRentRecovery/);
   assert.match(worker,/receipt\.resolvedAccountKeys\.indexOf\(input\.positionAddress\)/);
   assert.match(worker,/before<=0n\|\|after!==0n/);
