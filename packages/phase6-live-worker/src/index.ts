@@ -1270,6 +1270,39 @@ type RecoveredOpenResidual={
   recoveryRow:Record<string,unknown>;
 };
 
+type ResidualLotView={
+  lotId:string;
+  planId:string;
+  tokenMint:string;
+  sourceEvent:string;
+  remainingRawAmount:bigint;
+  status:string;
+};
+
+/** Select the one wallet-backed residual lot and identify any duplicate recovery representation. */
+export function selectCanonicalRecoveredResidualLot(input:{
+  lots:ResidualLotView[];
+  entryPlanId:string;
+  tokenMint:string;
+  rawAmount:bigint;
+}):{canonicalLotId?:string;duplicateLotIds:string[]}{
+  const eligible=input.lots.filter(lot=>
+    lot.planId===input.entryPlanId&&
+    lot.tokenMint===input.tokenMint&&
+    lot.remainingRawAmount===input.rawAmount&&
+    (lot.status==="OPEN"||lot.status==="PARTIALLY_SETTLED")
+  );
+  const original=eligible.find(lot=>lot.sourceEvent==="OPEN_RESIDUAL");
+  const recovered=eligible.find(lot=>lot.sourceEvent==="RECOVERY_RESIDUAL");
+  const canonical=original??recovered;
+  return {
+    ...(canonical?{canonicalLotId:canonical.lotId}:{}),
+    duplicateLotIds:canonical&&original
+      ? eligible.filter(lot=>lot.sourceEvent==="RECOVERY_RESIDUAL"&&lot.lotId!==canonical.lotId).map(lot=>lot.lotId)
+      : [],
+  };
+}
+
 /**
  * Backfill the normal inventory ledger for an OPEN that was reconciled after
  * only a subset of its chunked add-liquidity children confirmed.  The lot is
@@ -1321,31 +1354,51 @@ async function ensureRecoveredOpenResidualInventory(input:{
   });
   if(attributable===undefined)throw new Error("LPFORGE_P6_RECOVERED_OPEN_RESIDUAL_WALLET_MISMATCH");
   if(attributable<=0n)return undefined;
-  const lotId=`${entryPlanId}:recovered-open-residual:${input.tokenMint}`,
-    supply=await input.connection.getTokenSupply(new PublicKey(input.tokenMint),"confirmed");
-  await input.store.createPositionInventoryLot({
-    lotId,
-    createdEventId:`${entryPlanId}:recovered-open-residual-created`,
-    positionAddress:input.positionAddress,
-    planId:entryPlanId,
-    ownerAddress:input.plan.ownerAddress,
-    poolAddress:input.plan.poolAddress,
-    tokenMint:input.tokenMint,
-    tokenSide:"X",
-    sourceEvent:"RECOVERY_RESIDUAL",
-    rawAmount:attributable,
-    decimals:supply.value.decimals,
-    acquiredAt:new Date().toISOString(),
-    transactionSignature:String(recoveryRow.funding_signature),
-    payload:{
-      source:"PARTIAL_CHUNKED_OPEN_CHAIN_RECONSTRUCTION",
-      fundingSignature:String(recoveryRow.funding_signature),
-      pairedTokenRawBeforeFunding:pairedTokenRawBeforeFunding.toString(),
-      pairedTokenRawBeforeClose:input.pairedTokenRawBeforeClose.toString(),
-      pairedTokenRawAfterPriorUnwind:pairedTokenRawAfterPriorUnwind.toString(),
-      pairedTokenReceivedRaw:pairedTokenReceivedRaw.toString(),
-    },
-  });
+  const inventoryLots=await input.store.loadPositionInventoryLots(input.positionAddress,input.tokenMint),
+    selected=selectCanonicalRecoveredResidualLot({lots:inventoryLots,entryPlanId,tokenMint:input.tokenMint,rawAmount:attributable}),
+    at=new Date().toISOString();
+  let lotId=selected.canonicalLotId;
+  // The former recovery path could represent the same measured wallet balance
+  // twice. Keep both immutable event histories, but transfer the redundant
+  // accounting representation into the original lot before a single unwind.
+  if(lotId&&selected.duplicateLotIds.length>0)for(const duplicateLotId of selected.duplicateLotIds){
+    await input.store.settlePositionInventoryLot({
+      eventId:input.plan.planId+":deduplicate-recovered-open-residual:"+duplicateLotId,
+      lotId:duplicateLotId,
+      planId:input.plan.planId,
+      eventType:"TRANSFERRED",
+      settledRawAmount:attributable,
+      observedAt:at,
+      payload:{source:"P6_RECOVERED_OPEN_RESIDUAL_DEDUPLICATION",canonicalLotId:lotId,rawAmount:attributable.toString()},
+    });
+  }
+  if(!lotId){
+    lotId=entryPlanId+":recovered-open-residual:"+input.tokenMint;
+    const supply=await input.connection.getTokenSupply(new PublicKey(input.tokenMint),"confirmed");
+    await input.store.createPositionInventoryLot({
+      lotId,
+      createdEventId:entryPlanId+":recovered-open-residual-created",
+      positionAddress:input.positionAddress,
+      planId:entryPlanId,
+      ownerAddress:input.plan.ownerAddress,
+      poolAddress:input.plan.poolAddress,
+      tokenMint:input.tokenMint,
+      tokenSide:"X",
+      sourceEvent:"RECOVERY_RESIDUAL",
+      rawAmount:attributable,
+      decimals:supply.value.decimals,
+      acquiredAt:at,
+      transactionSignature:String(recoveryRow.funding_signature),
+      payload:{
+        source:"PARTIAL_CHUNKED_OPEN_CHAIN_RECONSTRUCTION",
+        fundingSignature:String(recoveryRow.funding_signature),
+        pairedTokenRawBeforeFunding:pairedTokenRawBeforeFunding.toString(),
+        pairedTokenRawBeforeClose:input.pairedTokenRawBeforeClose.toString(),
+        pairedTokenRawAfterPriorUnwind:pairedTokenRawAfterPriorUnwind.toString(),
+        pairedTokenReceivedRaw:pairedTokenReceivedRaw.toString(),
+      },
+    });
+  }
   return{entryPlanId,lotId,tokenMint:input.tokenMint,rawAmount:attributable,recoveryRow};
 }
 
@@ -2790,6 +2843,25 @@ export function isLegacySequentialCloseJournalRecovery(value: {
   );
 }
 
+/** Only a proven expired residual child may receive a fresh recovery attempt. */
+export function shouldRebuildExpiredResidualUnwind(input:{
+  signatureStatusReadUnknown:boolean;
+  confirmationStatus:"PROCESSED"|"CONFIRMED"|"FINALIZED"|"EXPIRED"|"FAILED"|"UNKNOWN";
+  positionExists:boolean;
+  pendingStage:CloseSettlementPendingStage;
+}):boolean{
+  return !input.signatureStatusReadUnknown&&
+    input.confirmationStatus==="EXPIRED"&&
+    input.positionExists&&
+    input.pendingStage==="CLOSE_OPEN_RESIDUAL_UNWIND_SUBMITTED";
+}
+
+/** Bounded recovery delay prevents a proven-safe retry from becoming a tight loop. */
+function recoveredResidualRetryNotBefore(now:string,retryCount:number):string{
+  const delayMs=Math.min(300_000,60_000*Math.max(1,retryCount));
+  return new Date(Date.parse(now)+delayMs).toISOString();
+}
+
 function closeSettlementOutputPayload(
   effects: ReturnType<typeof deriveTransactionAssetEffects>["swapOutputEffects"],
 ): Array<Record<string, unknown>> {
@@ -3266,7 +3338,15 @@ async function executeCloseSettlement(input: {
       pairedTokenRawBeforeClose:tokenXBefore,
     });
     if(recoveredOpenResidual){
-      const transactionId=`${input.plan.planId}:recovered-open-residual-unwind`,
+      // An expired residual-unwind has no chain effect, but it must never
+      // reuse its old transaction/idempotency identity. Each proven-safe
+      // recovery attempt receives a new child identity while remaining bound
+      // to this same protective close plan.
+      const retryRaw=Number(closeSettlementDispatch(input.plan).recoveredOpenResidualRetryCount??0),
+        retryCount=Number.isSafeInteger(retryRaw)&&retryRaw>=0?retryRaw:0,
+        transactionId=retryCount===0
+          ? `${input.plan.planId}:recovered-open-residual-unwind`
+          : `${input.plan.planId}:recovered-open-residual-unwind:retry-${retryCount}`,
         unwind=await executeJupiterUnwindStep({
           store:input.store,
           plan:input.plan,
@@ -3289,6 +3369,7 @@ async function executeCloseSettlement(input: {
             recoveredOpenResidualRawAmount:recoveredOpenResidual.rawAmount.toString(),
             recoveredOpenResidualEntryPlanId:recoveredOpenResidual.entryPlanId,
             recoveredOpenResidualUnwindTransactionId:transactionId,
+            recoveredOpenResidualRetryCount:retryCount,
             pendingStage:"CLOSE_OPEN_RESIDUAL_UNWIND_SUBMITTED",
             pendingSignature:signature,
           }),
@@ -3333,6 +3414,7 @@ async function executeCloseSettlement(input: {
         recoveredOpenResidualRawAmount:recoveredOpenResidual.rawAmount.toString(),
         recoveredOpenResidualUnwindTransactionId:transactionId,
         recoveredOpenResidualUnwindSignature:unwind.signature,
+        recoveredOpenResidualRetryCount:retryCount,
         pendingStage:null,
         pendingSignature:null,
       });
@@ -3869,6 +3951,34 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       });
       continue;
     }
+    // A prior version marked the parent journal EXPIRED when a residual child
+    // had proven no chain effect. If its fresh replacement settled before the
+    // following account-close sign, rehydrate only this exact parent back to
+    // its last confirmed stage. The child submission ledger remains immutable.
+    const expiredResidualJournalRehydrate=
+      (plan.action==="CLOSE"||plan.action==="EMERGENCY_CLOSE")&&
+      plan.state==="RECONCILIATION_REQUIRED"&&
+      journal.state==="EXPIRED"&&
+      closeSettlementDispatch(plan).stage==="CLOSE_POSITION_PENDING"&&
+      closeSettlementDispatch(plan).error==="LPFORGE_EXECUTION_JOURNAL_INVALID_TRANSITION:EXPIRED->SIGNING"&&
+      typeof closeSettlementDispatch(plan).recoveredOpenResidualUnwindSignature==="string"&&
+      positionTruth.exists===true;
+    if(expiredResidualJournalRehydrate){
+      await input.store.updateExecutionJournal({
+        idempotencyKey:plan.idempotencyKey,
+        expectedVersion:journal.version,
+        state:"CONFIRMED",
+        updatedAt:input.now,
+        payload:{...journal.payload,recovery:"CLOSE_RECOVERED_OPEN_RESIDUAL_PARENT_JOURNAL_REHYDRATED"},
+      });
+      await input.store.transitionAutonomousPlan({
+        planId:plan.planId,state:"RECONCILING",at:input.now,
+        reasonCodes:["P6_CLOSE_RECOVERED_OPEN_RESIDUAL_PARENT_JOURNAL_REHYDRATED"],
+        payload:{stage:"CLOSE_RECOVERED_OPEN_RESIDUAL_UNWOUND",pendingStage:null,pendingSignature:null},
+      });
+      results.push({planId:plan.planId,action:"RESUME_CLOSE_SETTLEMENT",reasonCodes:["P6_CLOSE_RECOVERED_OPEN_RESIDUAL_PARENT_JOURNAL_REHYDRATED"]});
+      continue;
+    }
     // A child submission is persisted before confirmation.  Its parent stage
     // is deliberately not advanced until chain truth confirms it.  This is
     // what makes a crash between REMOVE/CLAIM/UNWIND stages restartable
@@ -3876,6 +3986,70 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     if (closePending) {
       const settled = confirmationStatus === "CONFIRMED" || confirmationStatus === "FINALIZED";
       if (!settled) {
+        // A protected residual unwind is safe to rebuild only after the
+        // previous child has authoritatively expired without a chain receipt.
+        // Preserve every completed close child and resume the parent at the
+        // residual stage; never resend the old signed transaction.
+        if (shouldRebuildExpiredResidualUnwind({
+          signatureStatusReadUnknown,
+          confirmationStatus,
+          positionExists:positionTruth.exists===true,
+          pendingStage:closePending.stage,
+        })) {
+          const dispatch=closeSettlementDispatch(plan),
+            priorRetryRaw=Number(dispatch.recoveredOpenResidualRetryCount??0),
+            priorRetry=Number.isSafeInteger(priorRetryRaw)&&priorRetryRaw>=0?priorRetryRaw:0,
+            nextRetry=priorRetry+1,
+            rebuildNotBefore=recoveredResidualRetryNotBefore(input.now,nextRetry);
+          await input.store.markSubmissionExpired(
+            closePending.signature,
+            input.now,
+            "P6_CLOSE_RECOVERED_OPEN_RESIDUAL_EXPIRED_NO_CHAIN_EFFECT",
+          );
+          await input.store.updateExecutionJournal({
+            idempotencyKey: plan.idempotencyKey,
+            expectedVersion: journal.version,
+            // The parent journal tracks the last confirmed close child. The
+            // expired residual attempt is terminal only in its own submission
+            // ledger; preserving CONFIRMED permits a fresh follow-up child.
+            state: "CONFIRMED",
+            updatedAt: input.now,
+            payload: {
+              ...journal.payload,
+              recovery: "CLOSE_RECOVERED_OPEN_RESIDUAL_EXPIRED_NO_CHAIN_EFFECT",
+              expiredResidualSignature: closePending.signature,
+              expiredResidualStage: closePending.stage,
+              confirmationStatus,
+              positionTruth,
+            },
+          });
+          await input.store.transitionAutonomousPlan({
+            planId: plan.planId,
+            state: "RECONCILING",
+            at: input.now,
+            reasonCodes: [
+              "P6_CLOSE_RECOVERED_OPEN_RESIDUAL_EXPIRED_NO_CHAIN_EFFECT",
+              "P6_CLOSE_RECOVERED_OPEN_RESIDUAL_REBUILD_READY",
+            ],
+            payload: {
+              stage: "CLOSE_INVENTORY_UNWOUND",
+              pendingStage: null,
+              pendingSignature: null,
+              expiredResidualSignature: closePending.signature,
+              recoveredOpenResidualRetryCount: nextRetry,
+              recoveredOpenResidualRebuildNotBefore: rebuildNotBefore,
+            },
+          });
+          results.push({
+            planId: plan.planId,
+            action: "RETURN_EXISTING_PLAN",
+            reasonCodes: [
+              "P6_CLOSE_RECOVERED_OPEN_RESIDUAL_EXPIRED_NO_CHAIN_EFFECT",
+              "P6_CLOSE_RECOVERED_OPEN_RESIDUAL_REBUILD_BACKOFF",
+            ],
+          });
+          continue;
+        }
         // A known signature with no chain status after its blockhash has
         // expired is a terminal no-effect close child only when the
         // PositionV2 is independently still present.  Retire that exact
@@ -4024,6 +4198,16 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         await input.store.transitionAutonomousPlan({ planId: plan.planId, state: "RECONCILIATION_REQUIRED", at: input.now, reasonCodes: ["P6_CLOSE_POSITION_ABSENCE_UNPROVEN"], payload: { pendingStage: closePending.stage, pendingSignature: closePending.signature } });
         results.push({ planId: plan.planId, action: "HOLD_FOR_OPERATOR", reasonCodes: ["P6_CLOSE_POSITION_ABSENCE_UNPROVEN"] });
       }
+      continue;
+    }
+    const recoveryDispatch=closeSettlementDispatch(plan),
+      rebuildNotBefore=typeof recoveryDispatch.recoveredOpenResidualRebuildNotBefore==="string"?Date.parse(recoveryDispatch.recoveredOpenResidualRebuildNotBefore):NaN;
+    if(
+      closeStage==="CLOSE_INVENTORY_UNWOUND"&&
+      Number.isFinite(rebuildNotBefore)&&
+      Date.parse(input.now)<rebuildNotBefore
+    ){
+      results.push({planId:plan.planId,action:"RETURN_EXISTING_PLAN",reasonCodes:["P6_CLOSE_RECOVERED_OPEN_RESIDUAL_REBUILD_BACKOFF"]});
       continue;
     }
     if (shouldResumeCloseSettlement({
