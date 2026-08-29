@@ -98,6 +98,8 @@ assert.match(migration,/SOL_SETTLED/);
   assert.match(dbSource,/loadTerminalCloseRentRecoveryCandidates/);
   assert.match(dbSource,/EXISTS\(SELECT 1 FROM execution\.position_management_decision_audit audit WHERE audit\.position_address=l\.position_address\)/);
   assert.match(dbSource,/audit WHERE audit\.position_address=\$1/);
+  assert.match(dbSource,/summary\.final_realized_pnl_lamports IS DISTINCT FROM settlement\.realized_sol_pnl_lamports/);
+  assert.match(dbSource,/LATEST_IMMUTABLE_SETTLEMENT/);
 }
 
 console.log('LIFECYCLE_SOL_SETTLEMENT_OK');
