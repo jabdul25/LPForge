@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "policyId": "lpforge-autonomous-entry-v1",
+  "status": "ENABLED",
+  "swapQuote": {
+    "provider": "JUPITER_METIS",
+    "endpoint": "https://lite-api.jup.ag/swap/v1/quote",
+    "slippageBps": 100,
+    "maxPriceImpactBps": 200,
+    "maxInputFeeBps": 100,
+    "timeoutMs": 5000
+  }
+}

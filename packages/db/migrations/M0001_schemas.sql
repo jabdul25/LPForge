@@ -1,0 +1,9 @@
+BEGIN;
+CREATE SCHEMA IF NOT EXISTS protocol;
+CREATE SCHEMA IF NOT EXISTS market;
+CREATE SCHEMA IF NOT EXISTS features;
+CREATE SCHEMA IF NOT EXISTS accounting;
+CREATE SCHEMA IF NOT EXISTS governance;
+CREATE SCHEMA IF NOT EXISTS research;
+CREATE TABLE IF NOT EXISTS governance.schema_migrations(version text PRIMARY KEY, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now());
+COMMIT;

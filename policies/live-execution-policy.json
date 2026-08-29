@@ -1,0 +1,63 @@
+{
+  "schemaVersion": 1,
+  "policyId": "lpforge-live-execution-v1",
+  "status": "ENABLED",
+  "approvalTtlMs": 15000,
+  "minDevnetConfirmedRuns": 3,
+  "maxActionsPerDay": 30,
+  "maxOpenPositions": 2,
+  "controlledCanary": {
+    "maxConcurrentPositions": 1,
+    "exactLiquidityCapitalSol": "0.03",
+    "replacementOpenAllowed": false
+  },
+  "productionAdmission": {
+    "enabled": true,
+    "eligibleTiers": ["A"],
+    "maxCandidates": 20,
+    "maxCandidateAgeMs": 900000,
+    "maxCapitalSol": "0.5",
+    "maxOpenPositions": 1
+  },
+  "productionCapital": {
+    "reserveSol": "0.01",
+    "maxPortfolioCapitalSol": "0.5",
+    "maxTokenCapitalSol": "0.5",
+    "targetInitialPositionSol": "0.03",
+    "maxInitialPositionSol": "0.03",
+    "minInitialPositionSol": "0.01"
+  },
+  "positionConstruction": {
+    "maxInitialPositionWidthBins": 100,
+    "maxPositionAccountRentSol": "0.09",
+    "requirePreinitializedBinArrays": true,
+    "liquiditySlippageBps": 100
+  },
+  "pools": [
+    {
+      "address": "2VHM9pTZEU6pqeZoiNi8ZCeyerqhRYgS5Um7U8AEKrd9",
+      "maxCapitalSol": "0.5",
+      "maxOpenPositions": 1
+    },
+    {
+      "address": "AeUfFU6LU159YSBQvhLbXmh5bW2BqCgAFi5zUSQMnUc7",
+      "maxCapitalSol": "0.5",
+      "maxOpenPositions": 1
+    },
+    {
+      "address": "8CsgJcQ6YCE93wYiZW21gKF7a9HrTvW7WjwKaKt9cFDp",
+      "maxCapitalSol": "0.5",
+      "maxOpenPositions": 1
+    },
+    {
+      "address": "EsR3gRxMtqt3bBhDDsuY3SFyYNYvYzszzG9KVYpcQfs7",
+      "maxCapitalSol": "0.5",
+      "maxOpenPositions": 1
+    },
+    {
+      "address": "AUvX4hEMi9t43aqovA5tEAA5AZ7yugcpHa8SkJVEoEKa",
+      "maxCapitalSol": "0.5",
+      "maxOpenPositions": 1
+    }
+  ]
+}

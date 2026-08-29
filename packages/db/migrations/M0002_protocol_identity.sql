@@ -1,0 +1,5 @@
+BEGIN;
+CREATE TABLE IF NOT EXISTS protocol.tokens(mint text PRIMARY KEY,decimals integer,token_program text,symbol text,name text,first_seen_at timestamptz NOT NULL DEFAULT now(),CHECK(decimals IS NULL OR(decimals>=0 AND decimals<=255)));
+CREATE TABLE IF NOT EXISTS protocol.pools(address text PRIMARY KEY,token_x_mint text NOT NULL REFERENCES protocol.tokens(mint),token_y_mint text NOT NULL REFERENCES protocol.tokens(mint),bin_step integer NOT NULL CHECK(bin_step>0),function_type text NOT NULL DEFAULT 'UNKNOWN',collect_fee_mode text NOT NULL DEFAULT 'UNKNOWN',first_seen_at timestamptz NOT NULL DEFAULT now(),last_seen_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS protocol.compatibility_checks(id bigserial PRIMARY KEY,checked_at timestamptz NOT NULL,program_id text NOT NULL,program_release text,sdk_version text NOT NULL,decoder_version text NOT NULL,idl_hash text,state text NOT NULL CHECK(state IN('VERIFIED','HOLD','UNKNOWN')),details jsonb NOT NULL DEFAULT '{}'::jsonb);
+COMMIT;

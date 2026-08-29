@@ -1,0 +1,37 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import test from 'node:test';
+import {assessClaimEconomics,assessLiveManagementContext,decideLivePositionManagement,parseLivePositionManagementPolicy} from '../.build/packages/live-position-management/src/index.js';
+
+const policy=parseLivePositionManagementPolicy({schemaVersion:1,enabled:true,outOfRangeAction:'RESHAPE',claimAccruedFees:true,estimatedClaimCostLamports:'10',minimumClaimNetBenefitLamports:'10',missingPositionAction:'HOLD',replacementRange:'PRESERVE_WIDTH_CENTER_ACTIVE',planTtlMs:300000});
+const owned={lpforgePositionId:'p',poolAddress:'POOL',positionAddress:'POS',ownerAddress:'OWNER',strategy:'CURVE',orientation:'BALANCED',lowerBinId:90,upperBinId:110,initialCapitalLamports:20_000_000n,thesisId:'thesis'};
+const fact={address:'POS',pool:'POOL',owner:'OWNER',lowerBinId:90,upperBinId:110,totalXAmount:'10',totalYAmount:'20',feeX:'0',feeY:'0',stamp:{source:'METEORA_SDK',observedAt:'2026-08-13T00:00:00.000Z'},raw:{}};
+
+test('owned-position management preserves strategy and width only for a positive-forward-EV out-of-range replacement',()=>{const r=decideLivePositionManagement({policy,owned,position:fact,activeBinId:120,currentForwardEv:.01});assert.equal(r.action,'RESHAPE');assert.deepEqual(r.replacementRange,{lowerBinId:110,upperBinId:130});assert.equal(decideLivePositionManagement({policy,owned,position:fact,activeBinId:120,currentForwardEv:-.01}).action,'CLOSE');assert.equal(decideLivePositionManagement({policy,owned,position:fact,activeBinId:120}).action,'HOLD');});
+test('owned-position management claims only economically sufficient accrued fees and holds on unknown chain truth',()=>{assert.equal(decideLivePositionManagement({policy,owned,position:{...fact,feeY:'1'},activeBinId:100,claimExpectedValueLamports:20n}).action,'CLAIM');assert.equal(decideLivePositionManagement({policy,owned,position:{...fact,feeY:'1'},activeBinId:100,claimExpectedValueLamports:19n}).action,'HOLD');assert.equal(decideLivePositionManagement({policy,owned,activeBinId:100}).action,'HOLD');});
+test('partial entry bypasses ordinary claim, reshape, and replacement management into one protective close',()=>{
+  const partial={...owned,partialEntry:true};
+  const hold=decideLivePositionManagement({policy,owned:partial,position:{...fact,feeY:'1'},activeBinId:120,claimExpectedValueLamports:20n,currentForwardEv:.01});
+  assert.equal(hold.action,'CLOSE');assert.deepEqual(hold.reasonCodes,['PARTIAL_ENTRY_PROTECTIVE_CLOSE_REQUIRED']);
+  const emergency=decideLivePositionManagement({policy,owned:partial,position:fact,activeBinId:100,exitDecision:{action:'EMERGENCY_CLOSE',reasonCodes:['EXIT_EMERGENCY_STOP_LOSS']}});
+  assert.equal(emergency.action,'EMERGENCY_CLOSE');assert.ok(emergency.reasonCodes.includes('PARTIAL_ENTRY_PROTECTIVE_CLOSE'));
+});
+test('claim economics defers dust and fails closed without a trustworthy SOL value',()=>{assert.equal(assessClaimEconomics({estimatedClaimCostLamports:10n,minimumClaimNetBenefitLamports:10n}).approved,false);assert.equal(assessClaimEconomics({expectedClaimValueLamports:19n,estimatedClaimCostLamports:10n,minimumClaimNetBenefitLamports:10n}).approved,false);assert.equal(assessClaimEconomics({expectedClaimValueLamports:20n,estimatedClaimCostLamports:10n,minimumClaimNetBenefitLamports:10n}).approved,true);});
+test('normal management is bound to the position pool context',()=>{
+  const poolA=assessLiveManagementContext({positionPoolAddress:'POOL_A',managementPoolAddress:'POOL_A',action:'CLAIM'});
+  const poolBWhileEvaluatingA=assessLiveManagementContext({positionPoolAddress:'POOL_B',managementPoolAddress:'POOL_A',action:'RESHAPE'});
+  const poolBAfterItsOwnEvaluation=assessLiveManagementContext({positionPoolAddress:'POOL_B',managementPoolAddress:'POOL_B',action:'RESHAPE'});
+  assert.equal(poolA.planAllowed,true);
+  assert.equal(poolBWhileEvaluatingA.planAllowed,false);
+  assert.deepEqual(poolBWhileEvaluatingA.reasonCodes,['LIVE_MANAGEMENT_CONTEXT_POOL_MISMATCH']);
+  assert.equal(poolBAfterItsOwnEvaluation.planAllowed,true);
+});
+test('only emergency protective management may proceed without a matching pool context',()=>{
+  const emergency=assessLiveManagementContext({positionPoolAddress:'POOL_B',managementPoolAddress:'POOL_A',action:'EMERGENCY_CLOSE'});
+  const ordinaryClose=assessLiveManagementContext({positionPoolAddress:'POOL_B',managementPoolAddress:'POOL_A',action:'CLOSE'});
+  assert.equal(emergency.planAllowed,true);
+  assert.deepEqual(emergency.reasonCodes,['LIVE_MANAGEMENT_CONTEXT_EMERGENCY_INDEPENDENT']);
+  assert.equal(ordinaryClose.planAllowed,false);
+});
+test('lifecycle worker contains ordered replacement, chain-aware recovery, and token-X attribution',()=>{const src=fs.readFileSync(new URL('../packages/phase6-live-worker/src/index.ts',import.meta.url),'utf8');for(const token of ['REMOVE_OLD','AWAIT_REMOVE_RECONCILIATION','REFRESH_WALLET_TRUTH','BUILD_REPLACEMENT','getSignatureStatus','getPositionV2','P6_SEQUENCE_CHAIN_TRUTH_PENDING','recordPositionTokenXLot','sourceEvent:"FEE_CLAIM"','sourceEvent:"REDUCE_WITHDRAWAL"'])assert.match(src,new RegExp(token));assert.ok(src.indexOf('P6_MANAGEMENT_OLD_POSITION_STILL_EXISTS')<src.indexOf('BUILD_REPLACEMENT'));});
+test("continuation close wiring is geometry-bound and cannot use generic pool EV",()=>{const src=fs.readFileSync(new URL("../apps/operator/src/main.ts",import.meta.url),"utf8");for(const token of ["loadPositionContinuationEconomics","candidate.strategy===position.strategy","candidate.lowerBinId===position.lowerBinId","estimateExpectedCloseCostLamports","forwardEvConfirmationCount","insertPositionManagementDecisionAudit"])assert.match(src,new RegExp(token));});

@@ -1,0 +1,18 @@
+node_modules/
+.build/
+dist/
+.env
+.env.execution
+runtime/execution-plan.json
+*.log
+coverage/
+.DS_Store
+*.key
+*.pem
+phase1-runtime/
+
+# Production secrets and process logs
+.env
+.env.*.local
+*.swp
+logs/*.log

@@ -1,0 +1,10 @@
+// LPFORGE_PHASE6_MAINNET_MODULE
+import {emptyPhase6Programme,evaluatePhase6Exit} from '../../../packages/phase6-evaluation/src/index.js';
+import {evaluatePhase6LivePathAuthorization,loadPhase6LiveAuthorizationConfig} from '../../../packages/phase6-operational-gates/src/index.js';
+const json=(v:unknown)=>JSON.stringify(v,(_,x)=>typeof x==='bigint'?x.toString():x,2);
+const cmd=process.argv[2]??'capabilities';
+if(cmd==='capabilities')console.log(json({phase:'P6',cluster:'mainnet-beta',controlledCanary:true,mainnetExecutionEnabled:false,autonomousScaling:false,productionAuthorityIssued:false,livePaths:['READ_ONLY','BUILD','SIMULATE','PRESIGN','SIGN','SUBMIT','RECONCILE_OPEN','MONITOR','CLOSE','RECONCILE_CLOSE','RECOVERY']}));
+else if(cmd==='gate-status'){const status=evaluatePhase6LivePathAuthorization(loadPhase6LiveAuthorizationConfig());console.log(json(status));if(status.capitalDeploymentAuthorized)console.error('WARNING: capital deployment gates are currently armed; this should not be true during read-only soak.');}
+else if(cmd==='assert-read-only'){const status=evaluatePhase6LivePathAuthorization(loadPhase6LiveAuthorizationConfig());if(status.capitalDeploymentAuthorized)throw new Error('LPFORGE_P6_READ_ONLY_ASSERTION_FAILED');if(process.env.LIVE_SIGNING==='true'||process.env.LPFORGE_LIVE_EXECUTION==='true'||process.env.LPFORGE_MAINNET_CANARY==='true')throw new Error('LPFORGE_P6_READ_ONLY_FLAGS_NOT_FALSE');console.log(json({status:'PASS',capitalDeploymentAuthorized:false,reasonCodes:status.reasonCodes}));}
+else if(cmd==='fixture-evaluate'){const r=evaluatePhase6Exit({programme:emptyPhase6Programme(),liveForwardCycles:15,unresolvedReconciliationDebt:0,emergencyStopEvidence:true,rpcRedundancyHealthy:true,databaseRuntimeVerified:true,phase6BoundaryPass:true,localMeteoraLifecyclePass:true,mainnetCanaryEvidenceReal:false},{minFullyReconciledCanaries:3,minForwardCycles:12,maxFailedCanaries:0,maxHeldCanaries:0,requireEmergencyStopEvidence:true,requireRpcRedundancy:true});console.log(json(r));}
+else{console.error('Usage: canary [capabilities|gate-status|assert-read-only|fixture-evaluate]');process.exitCode=2;}

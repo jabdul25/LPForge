@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "planId": "operator-plan-unique-id",
+  "action": "OPEN",
+  "poolAddress": "REQUIRED_METEORA_POOL_ADDRESS",
+  "requestedAt": "2026-08-13T00:00:00.000Z",
+  "expiresAt": "2026-08-13T00:01:00.000Z"
+}

@@ -1,0 +1,1 @@
+{"extends":"../../tsconfig.base.json","compilerOptions":{"outDir":"../../.build/packages/phase5-evaluation","rootDir":"../.."},"include":["src/**/*.ts"]}

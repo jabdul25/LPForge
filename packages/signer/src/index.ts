@@ -1,0 +1,10 @@
+// LPFORGE_PHASE5_EXECUTION_MODULE
+import { assertAuthority, type ExecutionAuthority } from '../../execution-contracts/src/index.js';
+import type { ExecutionRiskDecision } from '../../execution-risk/src/index.js';
+export interface SignerBackend {publicKeyAddress:string;backendId:string;signMessage(message:Uint8Array,context:{transactionId:string;permitId:string;cluster:string}):Promise<Uint8Array>;}
+export interface SignableEnvelope {serializeMessage():Uint8Array;attachSignature(publicKeyAddress:string,signature:Uint8Array):void;}
+export interface SignerAuditRecord {transactionId:string;backendId:string;publicKeyAddress:string;signedAt:string;permitId:string;messageLength:number;signatureLength:number;}
+export async function signWithIsolatedBackend(input:{authority:ExecutionAuthority;riskDecision:ExecutionRiskDecision;transactionId:string;requiredSignerAddresses:string[];backend:SignerBackend;envelope:SignableEnvelope;signedAt:string}):Promise<SignerAuditRecord>{
+  assertAuthority(input.authority,['DEVNET_SIGN','DEVNET_SUBMIT','MAINNET_CANARY'],input.signedAt);if(input.riskDecision.decision!=='APPROVE'||!input.riskDecision.permitId||!input.riskDecision.expiresAt)throw new Error('LPFORGE_SIGN_RISK_PERMIT_REQUIRED');if(Date.parse(input.riskDecision.expiresAt)<=Date.parse(input.signedAt))throw new Error('LPFORGE_SIGN_RISK_PERMIT_EXPIRED');if(!input.requiredSignerAddresses.includes(input.backend.publicKeyAddress))throw new Error('LPFORGE_SIGNER_NOT_REQUIRED');
+  const message=input.envelope.serializeMessage();const signature=await input.backend.signMessage(message,{transactionId:input.transactionId,permitId:input.riskDecision.permitId,cluster:input.authority.cluster});if(signature.byteLength!==64)throw new Error('LPFORGE_SIGNER_SIGNATURE_LENGTH');input.envelope.attachSignature(input.backend.publicKeyAddress,signature);return{transactionId:input.transactionId,backendId:input.backend.backendId,publicKeyAddress:input.backend.publicKeyAddress,signedAt:input.signedAt,permitId:input.riskDecision.permitId,messageLength:message.byteLength,signatureLength:signature.byteLength};
+}

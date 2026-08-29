@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: lpforge
+      POSTGRES_PASSWORD: lpforge_dev_only
+      POSTGRES_DB: lpforge
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lpforge -d lpforge"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes: ["lpforge_pg:/var/lib/postgresql/data"]
+volumes:
+  lpforge_pg: {}

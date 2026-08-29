@@ -1,0 +1,5 @@
+import test from 'node:test'; import assert from 'node:assert/strict'; import { governRisk } from '../.build/packages/risk-governor/src/index.js';
+const good={now:'2026-08-12T10:00:30Z',protocolCompatible:true,criticalDataObservedAt:'2026-08-12T10:00:00Z',dailyDrawdownFraction:.01,rollingDrawdownFraction:.02,tokenExposureFraction:.05,poolExposureFraction:.03,referenceDivergenceBps:20,liquidityChangeFraction:0};
+test('P4-06 healthy paper action is approved with expiring approval',()=>{const r=governRisk(good);assert.equal(r.decision,'APPROVE');assert.ok(Date.parse(r.expiresAt)>Date.parse(good.now));});
+test('P4-06 strategy cannot override drawdown or stale-data blocks',()=>{const r=governRisk({...good,dailyDrawdownFraction:.2,criticalDataObservedAt:'2026-08-12T09:50:00Z'});assert.equal(r.decision,'BLOCK');assert.ok(r.hardBlocks.includes('RISK_DAILY_DRAWDOWN_LIMIT'));assert.ok(r.hardBlocks.includes('RISK_CRITICAL_DATA_STALE'));});
+test('P4-06 liquidity collapse escalates to EMERGENCY',()=>{const r=governRisk({...good,liquidityChangeFraction:-.6});assert.equal(r.decision,'EMERGENCY');assert.ok(r.emergencyReasons.includes('RISK_LIQUIDITY_COLLAPSE'));});
