@@ -13,12 +13,17 @@ export interface CanaryJournalCallbacks {
    * lost. The caller must persist UNKNOWN_SUBMISSION and recover by ledger /
    * chain lookup, never retry blindly. */
   onSubmissionUnknown?: (value:{transactionId:string;submittedAt:string;error:string})=>Promise<void>;
+  /** Runs after local signing but before the signed bytes reach any network
+   * transport. A failure here is a deterministic pre-submission abort, not an
+   * unknown submission. */
+  beforeSubmit?: (value:{transactionId:string;submittedAt:string})=>Promise<void>;
 }
 function phase5Authority(a:Phase6Authority):ExecutionAuthority{return{phase:'P5',cluster:'mainnet-beta',level:'MAINNET_CANARY',liveExecution:true,issuedAt:a.issuedAt,expiresAt:a.expiresAt,reasonCodes:['DERIVED_FROM_PHASE6',a.ticketId]};}
 async function signThenSubmit(input:{authority:Phase6Authority;ticket:Phase6CanaryTicket;transactionId:string;idempotencyKey:string;requiredSignerAddresses:string[];backend:MainnetSignerBackend;auxiliaryBackends?:AuxiliaryMainnetSignerBackend[];envelope:SerializableMainnetEnvelope;phase5RiskDecision:ExecutionRiskDecision;lease:BlockhashLease;ledger:SubmissionLedger;transport:SubmissionTransport;submittedAt:string}&CanaryJournalCallbacks):Promise<CanaryOpenResult>{
   const audits=await signMainnetCanaryWithAuxiliaries({authority:input.authority,ticket:input.ticket,transactionId:input.transactionId,requiredSignerAddresses:input.requiredSignerAddresses,ownerBackend:input.backend,auxiliaryBackends:input.auxiliaryBackends??[],envelope:input.envelope,signedAt:input.submittedAt});
   const signerBackendId=audits.find(a=>a.purpose==='OWNER')?.backendId??input.backend.backendId;
   await input.onSigned?.({transactionId:input.transactionId,signerBackendId,submittedAt:input.submittedAt});
+  await input.beforeSubmit?.({transactionId:input.transactionId,submittedAt:input.submittedAt});
   let record;
   try{record=await submitSignedTransaction({authority:phase5Authority(input.authority),riskDecision:input.phase5RiskDecision,transactionId:input.transactionId,idempotencyKey:input.idempotencyKey,attempt:1,raw:input.envelope.serializeSigned(),lease:input.lease,ledger:input.ledger,transport:input.transport,submittedAt:input.submittedAt});}
   catch(error){await input.onSubmissionUnknown?.({transactionId:input.transactionId,submittedAt:input.submittedAt,error:error instanceof Error?error.message:String(error)});throw error;}

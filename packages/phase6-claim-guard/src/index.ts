@@ -10,6 +10,12 @@ export interface ClaimGuardResult {
 export interface ProductionAdmissionCandidate {poolAddress:string;state:string;tier:string;lastSeenAt:string;tokenYMint?:string|undefined;pairedTokenMint?:string|undefined;}
 const WSOL_MINT='So11111111111111111111111111111111111111112';
 export interface Phase7ExecutionControl {decisionId?:string;cycleKey?:string;authorityMode:string;healthStatus:string;driftStatus:string;safetyMode:string;newEconomicActionAllowed:boolean;observedAt:string;poolDrift?:Record<string,string>;activeIncidentIds?:string[];releaseIntegrityValid?:boolean;portfolioValid?:boolean;revokedApprovalIds?:string[];}
+/** Canonical projection used by both claim-time and execution-time P7 checks. */
+export function phase7ExecutionControlFromRow(controlRow:Record<string,unknown>|undefined):Phase7ExecutionControl|undefined{
+ if(!controlRow)return undefined;
+ const payload=record(controlRow.payload),rawPoolDrift=Array.isArray(payload.poolDrift)?payload.poolDrift:[],releaseIdentity=record(payload.releaseIdentity),portfolio=record(payload.portfolio),strings=(value:unknown)=>Array.isArray(value)?value.map(String).filter(Boolean):[];
+ return{decisionId:String(controlRow.decision_id),cycleKey:String(controlRow.cycle_key),authorityMode:String(controlRow.authority_mode),healthStatus:String(controlRow.health_status),driftStatus:String(controlRow.drift_status),safetyMode:String(controlRow.safety_mode),newEconomicActionAllowed:Boolean(controlRow.new_economic_action_allowed),observedAt:new Date(String(controlRow.observed_at)).toISOString(),poolDrift:Object.fromEntries(rawPoolDrift.filter(row=>row&&typeof row==="object").map(row=>{const value=row as Record<string,unknown>;return[String(value.poolAddress??""),String(value.rawStatus??value.status??"")]}).filter(([pool])=>Boolean(pool))),activeIncidentIds:strings(payload.activeIncidentIds),releaseIntegrityValid:releaseIdentity.valid===true,portfolioValid:portfolio.valid===true,revokedApprovalIds:strings(payload.controlledCanaryRevokedApprovalIds)};
+}
 export function validateFreshPhase7ExecutionControl(control:Phase7ExecutionControl|undefined,now:string,maxAgeMs=60_000):string[]{
  if(!control)return ['P6_CLAIM_P7_CONTROL_MISSING'];
  const reasons:string[]=[];const age=Date.parse(now)-Date.parse(control.observedAt);
@@ -80,6 +86,12 @@ function validateBoundCanaryAuthorization(input:{plan:AutonomousPlan;provenance:
  if(input.current?.poolDrift?.[input.plan.poolAddress]==='BLOCK')reasons.push('P6_CLAIM_P7_POOL_DRIFT_BLOCK');
  return [...new Set(reasons)].sort();
 }
+/** Fresh pre-sign safety preserves a bound controlled-canary authorization across harmless later observe-only controls, while still applying every current hard revocation. */
+export function validateFreshOpenPhase7Safety(input:{plan:AutonomousPlan;current:Phase7ExecutionControl|undefined;bound:Phase7ExecutionControl|undefined;now:string;controlledCanary:boolean}):string[]{
+ const provenance=record(record(input.plan.planPayload).provenance),boundCanary=input.plan.action==="OPEN"&&input.controlledCanary&&Object.keys(record(provenance.controlledCanaryAuthorization)).length>0;
+ return boundCanary?validateBoundCanaryAuthorization({plan:input.plan,provenance,bound:input.bound,current:input.current,now:input.now}):validateFreshPhase7ExecutionControl(input.current,input.now);
+}
+
 /** Signing-boundary validation. A PostgreSQL plan is untrusted until this passes. */
 export function validateClaimedPlan(input: {
   plan: AutonomousPlan;
