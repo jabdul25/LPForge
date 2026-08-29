@@ -1,5 +1,5 @@
 BEGIN;
-CREATE TABLE research.candidate_universe_rerank_retention(
+CREATE TABLE IF NOT EXISTS research.candidate_universe_rerank_retention(
  recommendation_id text PRIMARY KEY REFERENCES research.shadow_recommendations(recommendation_id),
  decision_id text NOT NULL, decision_at timestamptz NOT NULL, pool_address text NOT NULL, calibration_version text NOT NULL,
  expected_candidate_count integer NOT NULL CHECK(expected_candidate_count>=0), persisted_candidate_count integer NOT NULL CHECK(persisted_candidate_count=expected_candidate_count),
@@ -19,3 +19,4 @@ BEGIN
 END; $$;
 CREATE TRIGGER trg_candidate_universe_rerank_retention_guard BEFORE UPDATE OR DELETE ON research.candidate_universe_rerank_retention FOR EACH ROW EXECUTE FUNCTION research.guard_candidate_universe_rerank_retention();
 REVOKE DELETE ON research.candidate_universe_rerank_retention FROM PUBLIC;
+COMMIT;
