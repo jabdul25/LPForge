@@ -121,6 +121,18 @@ export interface LiveRecoveryResult {
 }
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
 
+async function readMintDecimals(connection:Connection,mint:string):Promise<number|undefined>{
+  const account=await connection.getAccountInfo(new PublicKey(mint),'confirmed'),data=account?.data;
+  // SPL Token and Token-2022 Mint layouts share the decimals byte at offset 44.
+  const decimals=data&&data.length>44?Number(data[44]):undefined;
+  return Number.isInteger(decimals)&&decimals!>=0&&decimals!<=255?decimals:undefined;
+}
+function rawTokenUi(raw:bigint,decimals:number|undefined):string|undefined{
+  if(!Number.isInteger(decimals)||decimals!<0)return undefined;
+  const d=10n**BigInt(decimals),whole=raw/d,fraction=(raw%d).toString().padStart(decimals,'0').replace(/0+$/,'');
+  return fraction?`${whole}.${fraction}`:whole.toString();
+}
+
 /**
  * Wallet observations, not a Jupiter request amount, are the authority for
  * funded-entry economics.  Native SOL and WSOL are deliberately combined:
