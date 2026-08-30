@@ -98,7 +98,7 @@ test('V2 reader remains compatible while the V3 writer uses decision-relevant te
   assert.match(operator, /compactReset3cDecisionRelevantRawContract\(v1Raw,sharedEvidenceReference/);
   assert.match(operator, /buildReset3cValidationSharedEvidenceReference/);
   assert.match(operator, /insertReset3cValidationUniverse/);
-  assert.match(operator, /detailedRows=rows\.filter/);
+  assert.match(operator, /outcomeRows=rows/);
   assert.match(db, /FROM research\.shadow_recommendations WHERE recommendation_id=ANY\(\$1::text\[\]\)/);
   assert.match(db, /research\.reset3c_validation_universes/);
   assert.match(db, /outcomeEligible/);

@@ -52,7 +52,7 @@ export interface IngestionCheckpoint {
  * lane is an access-path concern only: it cannot change outcome identity,
  * capital, economics, or terminal-state semantics.
  */
-export type CandidateCounterfactualQueueLane = 'ALL'|'V3'|'HISTORICAL';
+export type CandidateCounterfactualQueueLane = 'ALL'|'V3'|'FULL_UNIVERSE'|'HISTORICAL';
 
 /**
  * Canonicalizes an optional immutable upper bound for operational-history
@@ -809,6 +809,10 @@ export interface Phase1Store {
   /** Prospective-only research telemetry. No Phase-3/4 consumer calls these. */
   loadDueCandidateCounterfactualOutcomes(now:string,limit:number,lane?:CandidateCounterfactualQueueLane):Promise<Array<{capitalEvaluationId:string;horizonMinutes:30|60|120;outcomeModelVersion:string;state:'PENDING'|'INSUFFICIENT_EVIDENCE'|'FINAL'|'FAILED_DATA_INTEGRITY';retryCount:number;rawContract:Record<string,unknown>}>>;
   persistCandidateCounterfactualOutcome(value:{capitalEvaluationId:string;horizonMinutes:30|60|120;outcomeModelVersion:string;state:'INSUFFICIENT_EVIDENCE'|'FINAL'|'FAILED_DATA_INTEGRITY';evidenceHash?:string;resultHash:string;reasonCodes:string[];realized?:Record<string,unknown>;payload:Record<string,unknown>;attemptedAt:string;retryCount:number;nextRetryAt?:string;terminalAt?:string}):Promise<'APPLIED'|'IDEMPOTENT'>;
+  /** Oldest-first M0062 full-universe contract backfill.  It returns only
+   * immutable decision-time data and never consults current market state. */
+  loadFullUniverseOutcomeCoverageBackfill(limit:number):Promise<Array<{recommendationId:string;decisionId:string;decisionAt:string;poolAddress:string;expectedCandidateCount:number;candidateFacts:Record<string,unknown>;temporarySharedEvidence?:Record<string,unknown>;missingCandidateIds:string[]}>>;
+  refreshCandidateUniverseForwardOutcomeCoverage(recommendationId:string,at:string):Promise<void>;
   /** Dynamic, fail-closed retention protection for raw protocol bin history. */
   loadBinSnapshotRetentionPlan(now:string):Promise<{state:'READY'|'UNKNOWN';protectionFloor?:string;protectionInputs:Partial<Record<'SELECTED_FORWARD'|'CANDIDATE_COUNTERFACTUAL'|'INVENTORY_FORECAST_V2'|'OPERATIONAL_HISTORY',string>>;reasonCodes:string[]}>;
   deleteBinSnapshotsBefore(protectionFloor:string,limit:number):Promise<{deleted:number;oldestDeletedAt?:string;newestDeletedAt?:string}>;
@@ -2261,14 +2265,17 @@ export async function createPostgresStore(
     },
     async insertCandidateUniverseRerankRetention(v) {
       const r=await db.query(`INSERT INTO research.candidate_universe_rerank_retention(recommendation_id,decision_id,decision_at,pool_address,calibration_version,expected_candidate_count,persisted_candidate_count,universe_manifest_hash,candidate_facts,compact_summary,retention_until,content_hash) VALUES($1,$2,$3::timestamptz,$4,$5,$6,$6,$7,$8::jsonb,$9::jsonb,$10::timestamptz,$11) ON CONFLICT DO NOTHING RETURNING recommendation_id`,[v.recommendationId,v.decisionId,v.decisionAt,v.poolAddress,v.calibrationVersion,v.expectedCandidateCount,v.universeManifestHash,json(v.candidateFacts),json(v.compactSummary),v.retentionUntil,v.contentHash]);
-      if(r.rows.length)return 'INSERTED';
+      if(r.rows.length){
+        for(const horizonMinutes of [30,60,120])await db.query(`INSERT INTO research.candidate_universe_forward_outcome_coverage(recommendation_id,horizon_minutes,outcome_model_version,expected_candidate_count,updated_at) VALUES($1,$2,'phase3-forward-outcome-v2',$3,now()) ON CONFLICT DO NOTHING`,[v.recommendationId,horizonMinutes,v.expectedCandidateCount]);
+        return 'INSERTED';
+      }
       const existing=await db.query('SELECT content_hash FROM research.candidate_universe_rerank_retention WHERE recommendation_id=$1',[v.recommendationId]);
       if(String(existing.rows[0]?.content_hash??'')===v.contentHash)return 'IDEMPOTENT';
       throw new Error('LPFORGE_CANDIDATE_UNIVERSE_RERANK_RETENTION_CONFLICT');
     },
     async compactEligibleCandidateUniverseRerankRetention(now,limit) {
       const lim=Math.max(1,Math.min(50,Math.floor(limit)));
-      const r=await db.query(`WITH eligible AS (SELECT u.recommendation_id FROM research.candidate_universe_rerank_retention u WHERE u.lifecycle_state='ACTIVE' AND u.retention_until<=$1::timestamptz AND (SELECT COUNT(*) FROM research.phase3_forward_outcomes o WHERE o.recommendation_id=u.recommendation_id AND o.outcome_model_version='phase3-forward-outcome-v2' AND o.horizon_minutes IN (30,60,120))=3 AND NOT EXISTS(SELECT 1 FROM research.phase3_forward_outcomes o WHERE o.recommendation_id=u.recommendation_id AND o.outcome_model_version='phase3-forward-outcome-v2' AND o.horizon_minutes IN (30,60,120) AND NOT (o.state='FINAL' OR (o.state='INSUFFICIENT_EVIDENCE' AND o.terminal_at IS NOT NULL))) ORDER BY u.retention_until,u.recommendation_id LIMIT $2) UPDATE research.candidate_universe_rerank_retention u SET lifecycle_state='COMPACTED',candidate_facts=NULL,compacted_at=$1::timestamptz FROM eligible e WHERE u.recommendation_id=e.recommendation_id RETURNING u.recommendation_id`,[now,lim]);
+      const r=await db.query(`WITH eligible AS (SELECT u.recommendation_id FROM research.candidate_universe_rerank_retention u WHERE u.lifecycle_state='ACTIVE' AND u.retention_until<=$1::timestamptz AND (SELECT COUNT(*) FROM research.phase3_forward_outcomes o WHERE o.recommendation_id=u.recommendation_id AND o.outcome_model_version='phase3-forward-outcome-v2' AND o.horizon_minutes IN (30,60,120))=3 AND NOT EXISTS(SELECT 1 FROM research.phase3_forward_outcomes o WHERE o.recommendation_id=u.recommendation_id AND o.outcome_model_version='phase3-forward-outcome-v2' AND o.horizon_minutes IN (30,60,120) AND NOT (o.state='FINAL' OR (o.state='INSUFFICIENT_EVIDENCE' AND o.terminal_at IS NOT NULL))) AND (SELECT COUNT(*) FROM research.candidate_universe_forward_outcome_coverage c WHERE c.recommendation_id=u.recommendation_id AND c.outcome_model_version='phase3-forward-outcome-v2' AND c.horizon_minutes IN (30,60,120) AND c.terminal_candidate_count=c.expected_candidate_count)=3 ORDER BY u.retention_until,u.recommendation_id LIMIT $2) UPDATE research.candidate_universe_rerank_retention u SET lifecycle_state='COMPACTED',candidate_facts=NULL,compacted_at=$1::timestamptz FROM eligible e WHERE u.recommendation_id=e.recommendation_id RETURNING u.recommendation_id`,[now,lim]);
       return r.rows.length;
     },
     async insertVariableCapitalEvaluation(v) {
@@ -2310,8 +2317,10 @@ export async function createPostgresStore(
     },
     async loadDueCandidateCounterfactualOutcomes(now,limit,lane='ALL') {
       const lim=Math.max(1,Math.min(200,limit));
-      const laneClause=lane==='V3'
-        ? "v.evaluation_schema_version='reset3c-universe-v3-decision-relevant'"
+      const laneClause=lane==='FULL_UNIVERSE'
+        ? "v.evaluation_schema_version='reset3c-universe-v3-decision-relevant' AND v.raw_contract->'detailedValidationReasons' ? 'FULL_UNIVERSE_RERANK_COVERAGE'"
+        : lane==='V3'
+        ? "v.evaluation_schema_version='reset3c-universe-v3-decision-relevant' AND NOT (v.raw_contract->'detailedValidationReasons' ? 'FULL_UNIVERSE_RERANK_COVERAGE')"
         : lane==='HISTORICAL'
           ? "v.evaluation_schema_version<>'reset3c-universe-v3-decision-relevant'"
           : 'TRUE';
@@ -2349,6 +2358,14 @@ export async function createPostgresStore(
         values.push({capitalEvaluationId:String(row.capital_evaluation_id),horizonMinutes:Number(row.horizon_minutes) as 30|60|120,outcomeModelVersion:String(row.outcome_model_version),state:String(row.state) as 'PENDING'|'INSUFFICIENT_EVIDENCE'|'FINAL'|'FAILED_DATA_INTEGRITY',retryCount:Number(row.retry_count),rawContract});
       }
       return values;
+    },
+    async loadFullUniverseOutcomeCoverageBackfill(limit) {
+      const lim=Math.max(1,Math.min(8,Math.floor(limit)));
+      const r=await db.query(`SELECT u.recommendation_id,u.decision_id,u.decision_at,u.pool_address,u.expected_candidate_count,u.candidate_facts,v.temporary_shared_evidence,COALESCE((SELECT array_agg(c.candidate_id ORDER BY c.candidate_id) FROM (SELECT candidate->>'id' AS candidate_id FROM jsonb_array_elements(u.candidate_facts->'candidates') candidate WHERE NOT EXISTS(SELECT 1 FROM research.variable_capital_evaluations e WHERE e.recommendation_id=u.recommendation_id AND e.candidate_id=candidate->>'id' AND e.evaluation_schema_version='reset3c-universe-v3-decision-relevant')) c),ARRAY[]::text[]) AS missing_candidate_ids FROM research.candidate_universe_rerank_retention u LEFT JOIN research.reset3c_validation_universes v ON v.recommendation_id=u.recommendation_id WHERE u.lifecycle_state='ACTIVE' AND u.candidate_facts IS NOT NULL AND EXISTS(SELECT 1 FROM jsonb_array_elements(u.candidate_facts->'candidates') candidate WHERE NOT EXISTS(SELECT 1 FROM research.variable_capital_evaluations e WHERE e.recommendation_id=u.recommendation_id AND e.candidate_id=candidate->>'id' AND e.evaluation_schema_version='reset3c-universe-v3-decision-relevant')) ORDER BY u.decision_at,u.recommendation_id LIMIT $1`,[lim]);
+      return r.rows.map(row=>({recommendationId:String(row.recommendation_id),decisionId:String(row.decision_id),decisionAt:new Date(String(row.decision_at)).toISOString(),poolAddress:String(row.pool_address),expectedCandidateCount:Number(row.expected_candidate_count),candidateFacts:(row.candidate_facts??{}) as Record<string,unknown>,...(row.temporary_shared_evidence?{temporarySharedEvidence:row.temporary_shared_evidence as Record<string,unknown>}:{}) ,missingCandidateIds:Array.isArray(row.missing_candidate_ids)?row.missing_candidate_ids.map(String):[]}));
+    },
+    async refreshCandidateUniverseForwardOutcomeCoverage(recommendationId,at) {
+      for(const horizonMinutes of [30,60,120])await db.query(`INSERT INTO research.candidate_universe_forward_outcome_coverage(recommendation_id,horizon_minutes,outcome_model_version,expected_candidate_count,evaluated_candidate_count,terminal_candidate_count,valid_candidate_count,insufficient_candidate_count,invalid_candidate_count,updated_at) SELECT u.recommendation_id,$2,'phase3-forward-outcome-v2',u.expected_candidate_count,COUNT(DISTINCT e.candidate_id),COUNT(DISTINCT e.candidate_id) FILTER(WHERE o.state='FINAL' OR (o.state='INSUFFICIENT_EVIDENCE' AND o.terminal_at IS NOT NULL) OR o.state='FAILED_DATA_INTEGRITY'),COUNT(DISTINCT e.candidate_id) FILTER(WHERE o.state='FINAL'),COUNT(DISTINCT e.candidate_id) FILTER(WHERE o.state='INSUFFICIENT_EVIDENCE' AND o.terminal_at IS NOT NULL),COUNT(DISTINCT e.candidate_id) FILTER(WHERE o.state='FAILED_DATA_INTEGRITY'),$3::timestamptz FROM research.candidate_universe_rerank_retention u LEFT JOIN research.variable_capital_evaluations e ON e.recommendation_id=u.recommendation_id AND e.evaluation_schema_version='reset3c-universe-v3-decision-relevant' LEFT JOIN research.candidate_counterfactual_forward_outcomes o ON o.capital_evaluation_id=e.capital_evaluation_id AND o.horizon_minutes=$2 AND o.outcome_model_version='phase3-forward-outcome-v2' WHERE u.recommendation_id=$1 GROUP BY u.recommendation_id,u.expected_candidate_count ON CONFLICT(recommendation_id,horizon_minutes,outcome_model_version) DO UPDATE SET expected_candidate_count=EXCLUDED.expected_candidate_count,evaluated_candidate_count=EXCLUDED.evaluated_candidate_count,terminal_candidate_count=EXCLUDED.terminal_candidate_count,valid_candidate_count=EXCLUDED.valid_candidate_count,insufficient_candidate_count=EXCLUDED.insufficient_candidate_count,invalid_candidate_count=EXCLUDED.invalid_candidate_count,updated_at=EXCLUDED.updated_at`,[recommendationId,horizonMinutes,at]);
     },
     async persistCandidateCounterfactualOutcome(v) {
       const existing=await db.query('SELECT state,result_hash FROM research.candidate_counterfactual_forward_outcomes WHERE capital_evaluation_id=$1 AND horizon_minutes=$2 AND outcome_model_version=$3 FOR UPDATE',[v.capitalEvaluationId,v.horizonMinutes,v.outcomeModelVersion]);
@@ -4253,6 +4270,8 @@ export function createMemoryStore(): Phase1Store {
     async purgeTerminalEligibleReset3cValidationEvidence() { return 0; },
     async insertCandidateUniverseRerankRetention() { return 'INSERTED' as const; },
     async compactEligibleCandidateUniverseRerankRetention() { return 0; },
+    async loadFullUniverseOutcomeCoverageBackfill() { return []; },
+    async refreshCandidateUniverseForwardOutcomeCoverage() {},
     async insertVariableCapitalEvaluation() { return 'INSERTED' as const; },
     async loadDueCandidateCounterfactualOutcomes() { return []; },
     async persistCandidateCounterfactualOutcome() { return 'APPLIED' as const; },

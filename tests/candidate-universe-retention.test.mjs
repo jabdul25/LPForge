@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 
 const migration=await readFile(new URL('../packages/db/migrations/M0062_candidate_universe_rerank_retention.sql',import.meta.url),'utf8');
+const coverageMigration=await readFile(new URL('../packages/db/migrations/M0064_full_universe_forward_outcome_coverage.sql',import.meta.url),'utf8');
 const db=await readFile(new URL('../packages/db/src/index.ts',import.meta.url),'utf8');
 const operator=await readFile(new URL('../apps/operator/src/main.ts',import.meta.url),'utf8');
 const learning=await readFile(new URL('../apps/discovery-learning/src/main.ts',import.meta.url),'utf8');
@@ -21,7 +22,19 @@ test('M0062 is idempotent, versioned, and compacts only after mature outcomes',(
  assert.match(db,/candidate_facts=NULL/);
  assert.match(operator,/LPFORGE_CANDIDATE_UNIVERSE_RETENTION_HOURS/);
  assert.match(operator,/feeEvidenceCalibration/);
- assert.match(learning,/compactEligibleCandidateUniverseRerankRetention/);
+  assert.match(learning,/compactEligibleCandidateUniverseRerankRetention/);
+});
+
+test('full-universe canonical coverage is bounded, oldest-first, and protects M0062 facts until every candidate horizon is terminal',()=>{
+ assert.match(coverageMigration,/candidate_universe_forward_outcome_coverage/);
+ assert.match(coverageMigration,/terminal_candidate_count/);
+ assert.match(db,/loadFullUniverseOutcomeCoverageBackfill/);
+ assert.match(db,/FULL_UNIVERSE_RERANK_COVERAGE/);
+ assert.match(db,/terminal_candidate_count=c\.expected_candidate_count/);
+ assert.match(learning,/backfillFullUniverseForwardOutcomeContracts/);
+ assert.match(learning,/LPFORGE_FULL_UNIVERSE_BACKFILL_MAX_CANDIDATES/);
+ assert.match(learning,/LPFORGE_FULL_UNIVERSE_COUNTERFACTUAL_MAX_BATCH/);
+ assert.match(operator,/const detailedRows=rows,outcomeRows=rows/);
 });
 
 test('retention capture cannot alter fee-evidence-calibration-v1 production economics',async()=>{

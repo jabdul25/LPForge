@@ -102,7 +102,7 @@ test('M0056 retains a compact permanent census, gates purge on terminal outcomes
   assert.match(migration, /toast\.autovacuum_vacuum_scale_factor=0\.02/);
   assert.doesNotMatch(migration, /(?:DELETE|TRUNCATE|UPDATE)\s+research\.(?:variable_capital_evaluations|candidate_counterfactual_forward_outcomes|shadow_recommendations)/i);
   assert.match(operator, /selectReset3cDecisionRelevantCandidates/);
-  assert.match(operator, /detailedRows=rows\.filter/);
+  assert.match(operator, /outcomeRows=rows/);
   assert.match(operator, /shadowPayloadForPersistence/);
   assert.match(db, /markTerminalEligibleReset3cValidationUniverses/);
   assert.match(db, /purgeTerminalEligibleReset3cValidationEvidence/);
