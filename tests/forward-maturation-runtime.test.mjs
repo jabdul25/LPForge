@@ -64,6 +64,7 @@ test('M0054 durable lane loader is V3-aware, bounded before raw-contract resolut
   assert.match(source,/CandidateCounterfactualQueueLane = 'ALL'\|'V3'\|'FULL_UNIVERSE'\|'HISTORICAL'/);
   assert.match(source,/dueOrigin=lane==='FULL_UNIVERSE'/);
   assert.match(source,/raw_contract->'frozenDecision'->>'decisionTimestamp'/);
+  assert.match(source,/raw_contract->>'evidenceCutoffAt'/);
   assert.match(source,/v\.evaluation_schema_version='reset3c-universe-v3-decision-relevant'/);
   assert.match(source,/v\.evaluation_schema_version<>'reset3c-universe-v3-decision-relevant'/);
   assert.match(source,/WITH due AS MATERIALIZED/);

@@ -2323,7 +2323,7 @@ export async function createPostgresStore(
         ? "v.evaluation_schema_version='reset3c-universe-v3-decision-relevant' AND NOT (v.raw_contract->'detailedValidationReasons' ? 'FULL_UNIVERSE_RERANK_COVERAGE')"
         : lane==='HISTORICAL'
           ? "v.evaluation_schema_version<>'reset3c-universe-v3-decision-relevant'"
-          : 'TRUE',dueOrigin=lane==='FULL_UNIVERSE'?"COALESCE(NULLIF(v.raw_contract->'frozenDecision'->>'decisionTimestamp','')::timestamptz,o.created_at)":'o.created_at';
+          : 'TRUE',dueOrigin=lane==='FULL_UNIVERSE'?"COALESCE(NULLIF(v.raw_contract->'frozenDecision'->>'decisionTimestamp','')::timestamptz,NULLIF(v.raw_contract->>'evidenceCutoffAt','')::timestamptz,o.created_at)":'o.created_at';
       /* Ordinary candidate rows mature from their immutable write time.
        * Full-universe backfills mature from their frozen decision time, so a
        * late research write cannot delay an already-complete historical
