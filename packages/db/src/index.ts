@@ -2323,20 +2323,21 @@ export async function createPostgresStore(
         ? "v.evaluation_schema_version='reset3c-universe-v3-decision-relevant' AND NOT (v.raw_contract->'detailedValidationReasons' ? 'FULL_UNIVERSE_RERANK_COVERAGE')"
         : lane==='HISTORICAL'
           ? "v.evaluation_schema_version<>'reset3c-universe-v3-decision-relevant'"
-          : 'TRUE';
-      /* The candidate outcome row is written only after its immutable M0053
-       * evaluation. `created_at + horizon` is therefore a conservative due
-       * gate: it can delay a late write, never mature from future evidence.
+          : 'TRUE',dueOrigin=lane==='FULL_UNIVERSE'?"COALESCE(NULLIF(v.raw_contract->'frozenDecision'->>'decisionTimestamp','')::timestamptz,o.created_at)":'o.created_at';
+      /* Ordinary candidate rows mature from their immutable write time.
+       * Full-universe backfills mature from their frozen decision time, so a
+       * late research write cannot delay an already-complete historical
+       * window or change which evidence belongs to that window.
        * Keep the full raw contract outside the ranked CTE; historical V1/V2
        * contracts are toasted and must be resolved only for the selected
        * bounded rows, not tens of thousands of queue candidates. */
       const r=await db.query(`WITH due AS MATERIALIZED (
         SELECT o.capital_evaluation_id,o.horizon_minutes,o.outcome_model_version,o.state,o.retry_count,v.recommendation_id,o.created_at,
-          CASE WHEN o.state='PENDING' THEN o.created_at+(o.horizon_minutes||' minutes')::interval ELSE o.next_retry_at END AS ready_at,
-          ROW_NUMBER() OVER (PARTITION BY o.horizon_minutes ORDER BY CASE WHEN o.state='PENDING' THEN 0 ELSE 1 END,CASE WHEN o.state='PENDING' THEN o.created_at+(o.horizon_minutes||' minutes')::interval ELSE o.next_retry_at END,o.created_at,o.capital_evaluation_id) AS horizon_position
+          CASE WHEN o.state='PENDING' THEN ${dueOrigin}+(o.horizon_minutes||' minutes')::interval ELSE o.next_retry_at END AS ready_at,
+          ROW_NUMBER() OVER (PARTITION BY o.horizon_minutes ORDER BY CASE WHEN o.state='PENDING' THEN 0 ELSE 1 END,CASE WHEN o.state='PENDING' THEN ${dueOrigin}+(o.horizon_minutes||' minutes')::interval ELSE o.next_retry_at END,o.created_at,o.capital_evaluation_id) AS horizon_position
         FROM research.candidate_counterfactual_forward_outcomes o
         JOIN research.variable_capital_evaluations v ON v.capital_evaluation_id=o.capital_evaluation_id
-        WHERE ${laneClause} AND o.state IN ('PENDING','INSUFFICIENT_EVIDENCE') AND (o.next_retry_at IS NULL OR o.next_retry_at<=$1::timestamptz) AND (o.created_at+(o.horizon_minutes||' minutes')::interval)<=$1::timestamptz
+        WHERE ${laneClause} AND o.state IN ('PENDING','INSUFFICIENT_EVIDENCE') AND (o.next_retry_at IS NULL OR o.next_retry_at<=$1::timestamptz) AND (${dueOrigin}+(o.horizon_minutes||' minutes')::interval)<=$1::timestamptz
       ), selected AS MATERIALIZED (
         SELECT capital_evaluation_id,horizon_minutes,outcome_model_version,state,retry_count,recommendation_id,horizon_position,ready_at
         FROM due ORDER BY horizon_position,ready_at,horizon_minutes,capital_evaluation_id LIMIT $2

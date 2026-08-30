@@ -62,13 +62,15 @@ test('M0054 fair scheduling backfills unused V3 reservation and remains strictly
 test('M0054 durable lane loader is V3-aware, bounded before raw-contract resolution, and fair across horizons',async()=>{
   const source=await readFile('packages/db/src/index.ts','utf8');
   assert.match(source,/CandidateCounterfactualQueueLane = 'ALL'\|'V3'\|'FULL_UNIVERSE'\|'HISTORICAL'/);
+  assert.match(source,/dueOrigin=lane==='FULL_UNIVERSE'/);
+  assert.match(source,/raw_contract->'frozenDecision'->>'decisionTimestamp'/);
   assert.match(source,/v\.evaluation_schema_version='reset3c-universe-v3-decision-relevant'/);
   assert.match(source,/v\.evaluation_schema_version<>'reset3c-universe-v3-decision-relevant'/);
   assert.match(source,/WITH due AS MATERIALIZED/);
   assert.match(source,/ROW_NUMBER\(\) OVER \(PARTITION BY o\.horizon_minutes/);
   assert.match(source,/selected AS MATERIALIZED/);
   assert.match(source,/FROM due ORDER BY horizon_position,ready_at,horizon_minutes,capital_evaluation_id LIMIT \$2/);
-  assert.match(source,/o\.created_at\+\(o\.horizon_minutes\|\|' minutes'\)::interval/);
+  assert.match(source,/\$\{dueOrigin\}\+\(o\.horizon_minutes\|\|' minutes'\)::interval/);
   assert.match(source,/Math\.max\(1,Math\.min\(200,limit\)\)/);
 });
 
