@@ -5,7 +5,7 @@
   "approvalTtlMs": 15000,
   "minDevnetConfirmedRuns": 3,
   "maxActionsPerDay": 30,
-  "maxOpenPositions": 2,
+  "maxOpenPositions": 1,
   "controlledCanary": {
     "maxConcurrentPositions": 1,
     "exactLiquidityCapitalSol": "0.03",
@@ -25,7 +25,7 @@
     "maxTokenCapitalSol": "0.5",
     "targetInitialPositionSol": "0.03",
     "maxInitialPositionSol": "0.03",
-    "minInitialPositionSol": "0.01"
+    "minInitialPositionSol": "0.03"
   },
   "positionConstruction": {
     "maxInitialPositionWidthBins": 100,
