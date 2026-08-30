@@ -32,6 +32,8 @@ test('full-universe canonical coverage is bounded, oldest-first, and protects M0
  assert.match(db,/FULL_UNIVERSE_RERANK_COVERAGE/);
  assert.match(db,/terminal_candidate_count=c\.expected_candidate_count/);
  assert.match(learning,/backfillFullUniverseForwardOutcomeContracts/);
+ assert.match(learning,/verifiedResearchArtifact/);
+ assert.match(learning,/frozenDecisionSourceSha/);
  assert.match(learning,/LPFORGE_FULL_UNIVERSE_BACKFILL_MAX_CANDIDATES/);
  assert.match(learning,/LPFORGE_FULL_UNIVERSE_COUNTERFACTUAL_MAX_BATCH/);
  assert.match(operator,/const detailedRows=rows,outcomeRows=rows/);
