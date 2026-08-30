@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS execution.close_fee_attributions(
   owner_address text NOT NULL,
   observed_slot bigint,
   observed_at timestamptz NOT NULL,
+  observed_block_time timestamptz,
   rpc_commitment text NOT NULL,
   token_x_mint text NOT NULL,
   token_y_mint text NOT NULL,
@@ -45,7 +46,7 @@ CREATE INDEX IF NOT EXISTS close_fee_attributions_terminal_idx ON execution.clos
 CREATE OR REPLACE FUNCTION execution.guard_close_fee_attributions() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   IF TG_OP='DELETE' THEN RAISE EXCEPTION 'close fee attribution deletion is prohibited'; END IF;
-  IF OLD.close_plan_id IS DISTINCT FROM NEW.close_plan_id OR OLD.position_address IS DISTINCT FROM NEW.position_address OR OLD.pool_address IS DISTINCT FROM NEW.pool_address OR OLD.owner_address IS DISTINCT FROM NEW.owner_address OR OLD.observed_slot IS DISTINCT FROM NEW.observed_slot OR OLD.observed_at IS DISTINCT FROM NEW.observed_at OR OLD.rpc_commitment IS DISTINCT FROM NEW.rpc_commitment OR OLD.token_x_mint IS DISTINCT FROM NEW.token_x_mint OR OLD.token_y_mint IS DISTINCT FROM NEW.token_y_mint OR OLD.token_x_decimals IS DISTINCT FROM NEW.token_x_decimals OR OLD.token_y_decimals IS DISTINCT FROM NEW.token_y_decimals OR OLD.pre_close_fee_x_raw IS DISTINCT FROM NEW.pre_close_fee_x_raw OR OLD.pre_close_fee_y_raw IS DISTINCT FROM NEW.pre_close_fee_y_raw OR OLD.pre_close_reward_one_raw IS DISTINCT FROM NEW.pre_close_reward_one_raw OR OLD.pre_close_reward_two_raw IS DISTINCT FROM NEW.pre_close_reward_two_raw OR OLD.created_at IS DISTINCT FROM NEW.created_at THEN RAISE EXCEPTION 'close fee snapshot is immutable'; END IF;
+  IF OLD.close_plan_id IS DISTINCT FROM NEW.close_plan_id OR OLD.position_address IS DISTINCT FROM NEW.position_address OR OLD.pool_address IS DISTINCT FROM NEW.pool_address OR OLD.owner_address IS DISTINCT FROM NEW.owner_address OR OLD.observed_slot IS DISTINCT FROM NEW.observed_slot OR OLD.observed_at IS DISTINCT FROM NEW.observed_at OR OLD.observed_block_time IS DISTINCT FROM NEW.observed_block_time OR OLD.rpc_commitment IS DISTINCT FROM NEW.rpc_commitment OR OLD.token_x_mint IS DISTINCT FROM NEW.token_x_mint OR OLD.token_y_mint IS DISTINCT FROM NEW.token_y_mint OR OLD.token_x_decimals IS DISTINCT FROM NEW.token_x_decimals OR OLD.token_y_decimals IS DISTINCT FROM NEW.token_y_decimals OR OLD.pre_close_fee_x_raw IS DISTINCT FROM NEW.pre_close_fee_x_raw OR OLD.pre_close_fee_y_raw IS DISTINCT FROM NEW.pre_close_fee_y_raw OR OLD.pre_close_reward_one_raw IS DISTINCT FROM NEW.pre_close_reward_one_raw OR OLD.pre_close_reward_two_raw IS DISTINCT FROM NEW.pre_close_reward_two_raw OR OLD.created_at IS DISTINCT FROM NEW.created_at THEN RAISE EXCEPTION 'close fee snapshot is immutable'; END IF;
   IF OLD.finalized_at IS NULL AND NEW.finalized_at IS NOT NULL THEN RETURN NEW; END IF;
   IF OLD.finalized_at IS NOT NULL AND NEW IS NOT DISTINCT FROM OLD THEN RETURN NEW; END IF;
   RAISE EXCEPTION 'close fee attribution lifecycle mutation rejected';

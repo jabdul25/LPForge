@@ -125,10 +125,10 @@ async function readMintDecimals(connection:Connection,mint:string):Promise<numbe
   const account=await connection.getAccountInfo(new PublicKey(mint),'confirmed'),data=account?.data;
   // SPL Token and Token-2022 Mint layouts share the decimals byte at offset 44.
   const decimals=data&&data.length>44?Number(data[44]):undefined;
-  return Number.isInteger(decimals)&&decimals!>=0&&decimals!<=255?decimals:undefined;
+  return decimals!==undefined&&Number.isInteger(decimals)&&decimals>=0&&decimals<=255?decimals:undefined;
 }
 function rawTokenUi(raw:bigint,decimals:number|undefined):string|undefined{
-  if(!Number.isInteger(decimals)||decimals!<0)return undefined;
+  if(decimals===undefined||!Number.isInteger(decimals)||decimals<0)return undefined;
   const d=10n**BigInt(decimals),whole=raw/d,fraction=(raw%d).toString().padStart(decimals,'0').replace(/0+$/,'');
   return fraction?`${whole}.${fraction}`:whole.toString();
 }
@@ -3161,9 +3161,14 @@ async function executeCloseSettlement(input: {
     tokenYBefore = closeSettlementAmount(dispatch.tokenYBefore);
   if (!stage) {
     [tokenXBefore,tokenYBefore]=await Promise.all([readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenXMint}),readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenYMint})]);
+    // Final immutable PositionV2 read before the first economic close instruction.
+    const feePosition=await createMeteoraReadAdapter({rpcUrl:input.config.rpcUrl,cluster:"mainnet-beta",programId:input.config.programId,priority:'P0_EXECUTION_CRITICAL'}).getPositionV2(input.plan.poolAddress,input.positionAddress);
+    const [tokenXDecimals,tokenYDecimals,blockTimeUnix]=await Promise.all([readMintDecimals(connection,poolFact.tokenXMint),readMintDecimals(connection,poolFact.tokenYMint),feePosition.stamp.chainSlot===undefined?Promise.resolve(null):connection.getBlockTime(Number(feePosition.stamp.chainSlot)).catch(()=>null)]);
+    const observedBlockTime=blockTimeUnix===null?undefined:new Date(blockTimeUnix*1000).toISOString();
+    await input.store.upsertCloseFeeAttributionSnapshot({closePlanId:input.plan.planId,positionAddress:input.positionAddress,poolAddress:input.plan.poolAddress,ownerAddress:input.plan.ownerAddress,...(feePosition.stamp.chainSlot===undefined?{}:{observedSlot:feePosition.stamp.chainSlot}),observedAt:feePosition.stamp.observedAt,...(observedBlockTime===undefined?{}:{observedBlockTime}),commitment:"confirmed",tokenXMint:poolFact.tokenXMint,tokenYMint:poolFact.tokenYMint,...(tokenXDecimals===undefined?{}:{tokenXDecimals}),...(tokenYDecimals===undefined?{}:{tokenYDecimals}),preCloseFeeXRaw:BigInt(feePosition.feeX??"0"),preCloseFeeYRaw:BigInt(feePosition.feeY??"0"),preCloseRewardOneRaw:BigInt(feePosition.rewardOne??"0"),preCloseRewardTwoRaw:BigInt(feePosition.rewardTwo??"0")});
     await persist(
       "CLOSE_INVENTORY_SNAPSHOTTED",
-      { tokenXBefore: tokenXBefore.toString(),tokenYBefore: tokenYBefore.toString() },
+      { tokenXBefore: tokenXBefore.toString(),tokenYBefore: tokenYBefore.toString(),feeSnapshotSlot:feePosition.stamp.chainSlot?.toString()??null,feeSnapshotObservedAt:feePosition.stamp.observedAt,feeXRaw:(feePosition.feeX??"0"),feeYRaw:(feePosition.feeY??"0"),feeXUi:rawTokenUi(BigInt(feePosition.feeX??"0"),tokenXDecimals)??null,feeYUi:rawTokenUi(BigInt(feePosition.feeY??"0"),tokenYDecimals)??null },
       "BUILDING",
     );
     stage = "CLOSE_INVENTORY_SNAPSHOTTED";
@@ -3569,7 +3574,9 @@ async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:Au
     await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:"RECONCILIATION_REQUIRED",at,reasonCodes:assessment.reasonCodes,payload:{stage:"SOL_SETTLEMENT_BLOCKED",lifecycleId:settlementInput.lifecycle.lifecycleId}});
     return{ready:false,reasonCodes:assessment.reasonCodes};
   }
-  const persisted=await input.store.persistLifecycleSolSettlement({assessment,input:{...settlementInput,positionAbsent:true,positionCheckedAt,positionCheckedSlot},...(process.env.LPFORGE_SOURCE_COMMIT?{sourceCommit:process.env.LPFORGE_SOURCE_COMMIT}:{}),...(process.env.LPFORGE_P7_POLICY_HASH?{policyHash:process.env.LPFORGE_P7_POLICY_HASH}:{}),migrationHead:"M0042_live_sol_settled_learning.sql",...(process.env.LPFORGE_BUILD_ID?{buildId:process.env.LPFORGE_BUILD_ID}:{}),at});
+  const persisted=await input.store.persistLifecycleSolSettlement({assessment,input:{...settlementInput,positionAbsent:true,positionCheckedAt,positionCheckedSlot},...(process.env.LPFORGE_SOURCE_COMMIT?{sourceCommit:process.env.LPFORGE_SOURCE_COMMIT}:{}),...(process.env.LPFORGE_P7_POLICY_HASH?{policyHash:process.env.LPFORGE_P7_POLICY_HASH}:{}),migrationHead:"M0063_close_fee_attribution.sql",...(process.env.LPFORGE_BUILD_ID?{buildId:process.env.LPFORGE_BUILD_ID}:{}),at});
+  const claimSignature=settlementInput.transactions.find(transaction=>transaction.transactionId.endsWith(':claim'))?.signature;
+  await input.store.finalizeCloseFeeAttribution({closePlanId:input.plan.planId,positionAddress:input.positionAddress,removeSignature,...(claimSignature===undefined?{}:{claimSignature}),terminalSettlementId:persisted.settlementId,at});
   await input.store.compactPositionManagementDecisionAudit({positionAddress:input.positionAddress,at});
   // Existing research outcomes are immutable. A settlement supersession fixes
   // the accounting authority without mutating or duplicating V3 evidence.
@@ -3648,7 +3655,7 @@ export async function executeAutonomousPlan(input: {
       const afterX=await readWalletTokenBalance({connection:claimConnection,ownerAddress:input.plan.ownerAddress,mint:claimPoolFact.tokenXMint}),afterY=await readWalletTokenBalance({connection:claimConnection,ownerAddress:input.plan.ownerAddress,mint:claimPoolFact.tokenYMint}),observedAt=new Date().toISOString();
       if(afterX>claimBeforeX){const rawAmount=afterX-claimBeforeX,cashflowId=`${input.plan.planId}:claim-x`;await input.store.insertPositionCashflow({cashflowId,positionAddress,planId:input.plan.planId,flowType:'FEE_CLAIM',observedAt,tokenMint:claimPoolFact.tokenXMint,tokenAmountRaw:rawAmount.toString(),payload:{source:'WALLET_DELTA'}});await recordPositionTokenXLot({store:input.store,connection:claimConnection,plan:input.plan,positionAddress,tokenMint:claimPoolFact.tokenXMint,sourceEvent:"FEE_CLAIM",sourceCashflowId:cashflowId,rawAmount,observedAt,signature});}
       if(afterY>claimBeforeY)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:claim-y`,positionAddress,planId:input.plan.planId,flowType:'FEE_CLAIM',observedAt,tokenMint:claimPoolFact.tokenYMint,tokenAmountRaw:(afterY-claimBeforeY).toString(),payload:{source:'WALLET_DELTA'}});
-      const receipt=await loadConfirmedExecutionReceipt(claimConnection,signature);if(receipt.state==="CONFIRMED_SUCCESS"){const ownerIndex=receipt.resolvedAccountKeys.indexOf(input.plan.ownerAddress),pre=ownerIndex>=0?receipt.preBalancesLamports[ownerIndex]:undefined,post=ownerIndex>=0?receipt.postBalancesLamports[ownerIndex]:undefined,gross=pre!==undefined&&post!==undefined?post-pre+(receipt.feeLamports??0n):0n;if(gross>0n)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:claim-native-sol`,positionAddress,planId:input.plan.planId,flowType:"FEE_CLAIM",observedAt,lamports:gross,payload:{source:"CONFIRMED_RECEIPT_OWNER_NATIVE_DELTA",signature,feeLamports:(receipt.feeLamports??0n).toString()}});}
+      const receipt=await loadConfirmedExecutionReceipt(claimConnection,signature);if(receipt.state==="CONFIRMED_SUCCESS"){const ownerIndex=receipt.resolvedAccountKeys.indexOf(input.plan.ownerAddress),pre=ownerIndex>=0?receipt.preBalancesLamports[ownerIndex]:undefined,post=ownerIndex>=0?receipt.postBalancesLamports[ownerIndex]:undefined,gross=pre!==undefined&&post!==undefined?post-pre+(receipt.feeLamports??0n):0n;if(gross>0n)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:claim-native-sol`,positionAddress,planId:input.plan.planId,flowType:"FEE_CLAIM",observedAt,lamports:gross,tokenMint:WSOL_MINT,tokenAmountRaw:gross.toString(),payload:{source:"CONFIRMED_RECEIPT_OWNER_NATIVE_DELTA",signature,feeLamports:(receipt.feeLamports??0n).toString()}});}
       },
     });
   }
