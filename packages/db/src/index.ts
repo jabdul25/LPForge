@@ -467,7 +467,8 @@ export interface LifecycleSettlementAssessment {
 }
 export interface LiveLearningOutcome {outcomeId:string;outcomeKind:"LIVE_SOL_SETTLED"|"LIVE_ENTRY_ABORTED_SOL_SETTLED";settlementId?:string;lifecycleId?:string;entryPlanId:string;predictionId:string;recommendationId:string;thesisId:string;poolAddress:string;realizedSolPnlLamports:bigint;realizedReturnFraction?:number;}
 const SETTLEMENT_TERMINAL_TRANSACTION_STATES=new Set<LifecycleChildTransactionState>(["CONFIRMED","FAILED_FINAL","PROVEN_NOT_LANDED"]);
-const SETTLEMENT_SOL_IN=new Set(["FEE_CLAIM","REWARD_CLAIM","REDUCE_WITHDRAWAL","CLOSE_WITHDRAWAL","SWAP_PROCEEDS","RENT_RECOVERY"]);
+const FEE_INCOME_CASHFLOW_TYPES=['FEE_CLAIM','REWARD_CLAIM'] as const;
+const SETTLEMENT_SOL_IN=new Set([...FEE_INCOME_CASHFLOW_TYPES,"REDUCE_WITHDRAWAL","CLOSE_WITHDRAWAL","SWAP_PROCEEDS","RENT_RECOVERY"]);
 const SETTLEMENT_SOL_OUT=new Set(["OPEN_CONTRIBUTION","ADD_CONTRIBUTION","SWAP_COST","TX_COST","RENT_LOCK"]);
 /**
  * Canonical terminal convention: gross observed SOL/WSOL instruction flows.
