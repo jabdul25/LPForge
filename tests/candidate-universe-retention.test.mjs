@@ -40,6 +40,7 @@ test('full-universe canonical coverage is bounded, oldest-first, and protects M0
  assert.match(learning,/loadStaleCandidateUniverseForwardOutcomeCoverage/);
  assert.match(db,/_queueRecommendationId:String\(row\.recommendation_id\)/);
  assert.match(db,/terminal_candidate_count<>expected\.terminal_candidate_count/);
+ assert.match(db,/ORDER BY decision_at,recommendation_id LIMIT \$1/);
  assert.match(learning,/outcomeCreatedAt:universe\.decisionAt/);
  assert.match(db,/COALESCE\(\$3::timestamptz,now\(\)\)/);
  assert.match(operator,/const detailedRows=rows,outcomeRows=rows/);
