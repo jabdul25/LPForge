@@ -201,9 +201,10 @@ async function persistTransactionPlan(
   plan: TransactionPlan,
 ) {
   const deployment=loadDeploymentPolicyFile(process.env.LPFORGE_EXECUTION_POLICY_PATH??"policies/live-execution-policy.json");
+  const boundedUnattended=process.env.LPFORGE_BOUNDED_UNATTENDED_PRODUCTION==='true';
   // The controlled-canary probe remains read-only; its plan-only marker still
   // enforces the exact capital and no-replacement envelope before signing.
-  if((process.env.LPFORGE_MAINNET_CANARY==='true'||process.env.LPFORGE_CONTROLLED_CANARY_PLAN==='true')&&deployment.controlledCanary){
+  if(!boundedUnattended&&(process.env.LPFORGE_MAINNET_CANARY==='true'||process.env.LPFORGE_CONTROLLED_CANARY_PLAN==='true')&&deployment.controlledCanary){
     if(plan.intent.action==='OPEN'&&plan.intent.capitalLamports!==CONTROLLED_CANARY_LIQUIDITY_CAPITAL_LAMPORTS)
       throw new Error('LPFORGE_P6_CONTROLLED_CANARY_EXACT_CAPITAL_REQUIRED');
     if(['ADD','RESHAPE','REBALANCE'].includes(plan.intent.action))
@@ -211,7 +212,7 @@ async function persistTransactionPlan(
   }
   const provenanceSecret=(process.env.LPFORGE_PLAN_PROVENANCE_SECRET??'').trim();
   const phase7RuntimeId=(process.env.LPFORGE_P7_RUNTIME_ID??'lpforge-production').trim(),control=await store.loadLatestPhase7ControlDecision(phase7RuntimeId),phase7Control=control?{decisionId:String(control.decision_id),cycleKey:String(control.cycle_key),observedAt:new Date(String(control.observed_at)).toISOString()}:undefined;
-  const controlledCanaryPlan=(process.env.LPFORGE_MAINNET_CANARY==='true'||process.env.LPFORGE_CONTROLLED_CANARY_PLAN==='true')&&plan.intent.action==='OPEN'&&Boolean(deployment.controlledCanary);
+  const controlledCanaryPlan=!boundedUnattended&&(process.env.LPFORGE_MAINNET_CANARY==='true'||process.env.LPFORGE_CONTROLLED_CANARY_PLAN==='true')&&plan.intent.action==='OPEN'&&Boolean(deployment.controlledCanary);
   const controlledCanaryAuthorization=controlledCanaryPlan&&phase7Control?{
     schemaVersion:1,
     approvalId:(process.env.LPFORGE_P7_APPROVAL_ID??'').trim(),

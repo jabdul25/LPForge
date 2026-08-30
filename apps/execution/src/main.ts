@@ -26,6 +26,13 @@ import { Phase7TelegramAlerter,alertsForExecutionResult,loadPhase7TelegramConfig
 const json = (value: unknown) => JSON.stringify(value, null, 2);
 const yes = (value: string | undefined) =>
   String(value ?? "").toLowerCase() === "true";
+/**
+ * Phase-6 still requires its explicit mainnet-live switch. This separate
+ * bounded-production mode removes only the retired single-campaign allowance;
+ * P7, portfolio, signer, freshness, and claim-time controls remain live.
+ */
+const boundedUnattendedProduction = () =>
+  yes(process.env.LPFORGE_BOUNDED_UNATTENDED_PRODUCTION);
 const object=(value:unknown):Record<string,unknown>=>value&&typeof value==='object'&&!Array.isArray(value)?value as Record<string,unknown>:{};
 const stringArray=(value:unknown):string[]=>Array.isArray(value)?value.map(String).filter(Boolean):[];
 function phase7ExecutionControlFromRow(controlRow:Record<string,unknown>|undefined):Phase7ExecutionControl|undefined{
@@ -102,6 +109,7 @@ function assertLaunchable() {
 }
 /** A real canary campaign gets exactly one durable OPEN allowance. */
 function controlledCanaryCampaignId():string|undefined{
+  if(boundedUnattendedProduction())return undefined;
   if(!yes(process.env.LPFORGE_MAINNET_CANARY))return undefined;
   const campaignId=(process.env.LPFORGE_MAINNET_CANARY_CAMPAIGN_ID??'').trim();
   if(!/^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$/.test(campaignId))throw new Error('LPFORGE_P6_CONTROLLED_CANARY_CAMPAIGN_ID_REQUIRED');
@@ -194,7 +202,7 @@ function workerConfig() {
     maxPresignReferenceDivergenceBps: Number(process.env.LPFORGE_P6_MAX_PRESIGN_REFERENCE_DIVERGENCE_BPS ?? 250),
     confirmPollMs: Number(process.env.LPFORGE_P6_CONFIRM_POLL_MS ?? 1000),
     confirmAttempts: Number(process.env.LPFORGE_P6_CONFIRM_ATTEMPTS ?? 30),
-    ...(yes(process.env.LPFORGE_MAINNET_CANARY)
+    ...(yes(process.env.LPFORGE_MAINNET_CANARY)&&!boundedUnattendedProduction()
       ? { controlledCanary: policy.controlledCanary }
       : {}),
   };
@@ -253,7 +261,7 @@ async function dispatchOne() {
       actionsToday,
       pendingExecutionCount:portfolioFacts.pendingExecutionCount,
       unresolvedReconciliationDebt:portfolioFacts.unresolvedReconciliationDebt,
-      controlledCanary:yes(process.env.LPFORGE_MAINNET_CANARY),
+      controlledCanary:yes(process.env.LPFORGE_MAINNET_CANARY)&&!boundedUnattendedProduction(),
       ...(provenanceSecret?{provenanceSecret}:{}),
       now,
       ...(positionTruth ? { positionTruth } : {}),

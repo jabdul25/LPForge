@@ -37,6 +37,14 @@ test('controlled-canary campaign preserves attempt 1 and permits only an audited
  assert.match(execution,/LPFORGE_P6_CONTROLLED_CANARY_CAMPAIGN_ID_REQUIRED/);
  assert.match(execution,/P6_CONTROLLED_CANARY_CAMPAIGN_OPEN_CONSUMED/,'a second campaign OPEN is terminally blocked before execution');
 });
+test('bounded unattended production retains the live Phase-6 gate while removing only the retired campaign reservation',async()=>{
+ const [execution,operator]=await Promise.all(['apps/execution/src/main.ts','apps/operator/src/main.ts'].map(async path=>(await import('node:fs/promises')).readFile(path,'utf8')));
+ assert.match(execution,/LPFORGE_BOUNDED_UNATTENDED_PRODUCTION/);
+ assert.match(execution,/if\(boundedUnattendedProduction\(\)\)return undefined/,'bounded mode has no campaign identifier or one-open campaign allowance');
+ assert.match(execution,/yes\(process\.env\.LPFORGE_MAINNET_CANARY\)&&!boundedUnattendedProduction\(\)/,'the legacy mainnet-live gate remains required while canary-only claim constraints are disabled');
+ assert.match(operator,/const boundedUnattended=process\.env\.LPFORGE_BOUNDED_UNATTENDED_PRODUCTION==='true'/);
+ assert.match(operator,/const controlledCanaryPlan=!boundedUnattended/,'plans in bounded mode are bound to the ordinary fresh P7 control, not one campaign authorization');
+});
 test('terminal recovery binds its timestamp consistently when expiring an unsent journal',async()=>{
  const db=await import('node:fs/promises').then(fs=>fs.readFile('packages/db/src/index.ts','utf8'));
  assert.match(db,/terminalizedAt',\$3::timestamptz/);
