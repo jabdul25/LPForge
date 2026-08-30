@@ -507,6 +507,58 @@ export function assessLifecycleSettlement(input:LifecycleSettlementInput):Lifecy
   return {ready:reasons.length===0,reasonCodes:[...new Set(reasons)].sort(),totalSolInLamports,totalSolOutLamports,rentLockedLamports,rentRecoveredLamports,netRentCostLamports:rentLockedLamports-rentRecoveredLamports,realizedSolPnlLamports:totalSolInLamports-totalSolOutLamports};
 }
 /** Exact transaction IDs are retained so recovery has a concrete proof target. */
+export interface CloseFeeAttributionAccountingInput {
+  tokenXMint:string;
+  tokenYMint:string;
+  preCloseFeeXRaw:bigint;
+  preCloseFeeYRaw:bigint;
+  tokenXDecimals?:number;
+  tokenYDecimals?:number;
+  closeTokenXRaw?:bigint;
+  closeTokenYRaw?:bigint;
+  closeNativeLamports:bigint;
+  swapProceedsLamports:bigint;
+  explicitClaimLamports:bigint;
+  rewardLamports:bigint;
+  initialCapitalLamports:bigint;
+  transactionCostLamports:bigint;
+  rentLockedLamports:bigint;
+  rentRecoveredLamports:bigint;
+  realizedSolPnlLamports:bigint;
+}
+export interface CloseFeeAttributionAccounting {
+  status:'COMPLETE'|'PARTIAL';
+  reasonCodes:string[];
+  embeddedRemoveFeeXRaw:bigint;
+  embeddedRemoveFeeYRaw:bigint;
+  realizedLpFeeValueLamports?:bigint;
+  principalReturnedValueLamports?:bigint;
+  inventoryUnwindResultLamports?:bigint;
+  accountingReconciliationDifferenceLamports?:bigint;
+}
+/** Pure, receipt-bound accounting for a full REMOVE. The Meteora SDK adds
+ * PositionData feeX/feeY to remove output; raw fee labels are never inferred
+ * from an aggregate wallet withdrawal. */
+export function deriveCloseFeeAttributionAccounting(input:CloseFeeAttributionAccountingInput):CloseFeeAttributionAccounting {
+  const reasons:string[]=[];
+  if(!Number.isInteger(input.tokenXDecimals)||input.tokenXDecimals!<0)reasons.push('TOKEN_X_DECIMALS_UNAVAILABLE');
+  if(!Number.isInteger(input.tokenYDecimals)||input.tokenYDecimals!<0)reasons.push('TOKEN_Y_DECIMALS_UNAVAILABLE');
+  let feeXValue:bigint|undefined=input.preCloseFeeXRaw===0n?0n:undefined;
+  let feeYValue:bigint|undefined=input.preCloseFeeYRaw===0n?0n:undefined;
+  if(input.tokenXMint===WSOL_MINT)feeXValue=input.preCloseFeeXRaw;
+  else if(input.preCloseFeeXRaw>0n&&input.closeTokenXRaw!==undefined&&input.closeTokenXRaw>0n&&input.swapProceedsLamports>=0n)feeXValue=(input.swapProceedsLamports*input.preCloseFeeXRaw)/input.closeTokenXRaw;
+  else if(input.preCloseFeeXRaw>0n)reasons.push('FEE_X_VALUATION_UNAVAILABLE');
+  if(input.tokenYMint===WSOL_MINT)feeYValue=input.preCloseFeeYRaw;
+  else if(input.preCloseFeeYRaw>0n)reasons.push('FEE_Y_VALUATION_UNAVAILABLE');
+  if(feeXValue===undefined||feeYValue===undefined)return{status:'PARTIAL',reasonCodes:[...new Set(reasons)].sort(),embeddedRemoveFeeXRaw:input.preCloseFeeXRaw,embeddedRemoveFeeYRaw:input.preCloseFeeYRaw};
+  const feeValue=feeXValue+feeYValue;
+  const closeValue=input.closeNativeLamports+input.swapProceedsLamports;
+  const principal=closeValue-feeValue;
+  const inventory=principal-input.initialCapitalLamports;
+  const explained=inventory+feeValue+input.explicitClaimLamports+input.rewardLamports+input.rentRecoveredLamports-input.rentLockedLamports-input.transactionCostLamports;
+  return{status:reasons.length?'PARTIAL':'COMPLETE',reasonCodes:[...new Set(reasons)].sort(),embeddedRemoveFeeXRaw:input.preCloseFeeXRaw,embeddedRemoveFeeYRaw:input.preCloseFeeYRaw,realizedLpFeeValueLamports:feeValue,principalReturnedValueLamports:principal,inventoryUnwindResultLamports:inventory,accountingReconciliationDifferenceLamports:input.realizedSolPnlLamports-explained};
+}
+
 export function assertLifecycleTransactionsTerminal(transactions:ReadonlyArray<LifecycleChildTransaction>):string[]{
   return transactions.filter(tx=>!SETTLEMENT_TERMINAL_TRANSACTION_STATES.has(tx.state)).map(tx=>`SETTLEMENT_TX_${tx.state}:${tx.transactionId}`);
 }
@@ -1007,6 +1059,7 @@ export interface Phase1Store {
     rangeState: string;
     tokenXAmount?: string;
     tokenYAmount?: string;
+
     unclaimedFeeX?: string;
     unclaimedFeeY?: string;
     walletTruth: Record<string, unknown>;
@@ -1066,6 +1119,9 @@ export interface Phase1Store {
   loadTerminalCloseRentRecoveryCandidates(limit?:number):Promise<Array<{planId:string;positionAddress:string}>>;
   loadPendingPositionManagementDecisionAuditCompactions(limit?:number):Promise<string[]>;
   compactPositionManagementDecisionAudit(value:{positionAddress:string;at:string}):Promise<{compacted:boolean}>;
+  upsertCloseFeeAttributionSnapshot(value:{closePlanId:string;positionAddress:string;poolAddress:string;ownerAddress:string;observedSlot?:bigint;observedAt:string;commitment:string;tokenXMint:string;tokenYMint:string;tokenXDecimals?:number;tokenYDecimals?:number;preCloseFeeXRaw:bigint;preCloseFeeYRaw:bigint;preCloseRewardOneRaw:bigint;preCloseRewardTwoRaw:bigint}):Promise<void>;
+  finalizeCloseFeeAttribution(value:{closePlanId:string;positionAddress:string;removeSignature:string;claimSignature?:string;terminalSettlementId:string;at:string}):Promise<{status:'COMPLETE'|'PARTIAL'|'UNAVAILABLE';reasonCodes:string[]}>;
+
   createLiveSolSettledLearningOutcome(value:{positionAddress:string;at:string}):Promise<{created:boolean;outcome?:LiveLearningOutcome;reasonCodes:string[]}>;
   createLiveEntryAbortedLearningOutcome(value:{planId:string;at:string}):Promise<{created:boolean;outcome?:LiveLearningOutcome;reasonCodes:string[]}>;
   loadPendingLiveSolSettledLearningOutcomes(limit?:number):Promise<string[]>;
@@ -3119,6 +3175,33 @@ return 'APPLIED';
         await db.query("COMMIT");return{lifecycleId:input.lifecycle.lifecycleId,settlementId,created:true,...(prior?{superseded:true}:{})};
       }catch(error){try{await db.query("ROLLBACK");}catch{}throw error;}
     },
+    async upsertCloseFeeAttributionSnapshot(v){
+      await db.query("BEGIN");
+      try{
+        const existing=await db.query("SELECT position_address,pool_address,owner_address,observed_slot,token_x_mint,token_y_mint,pre_close_fee_x_raw,pre_close_fee_y_raw FROM execution.close_fee_attributions WHERE close_plan_id=$1 FOR UPDATE",[v.closePlanId]);
+        if(existing.rows[0]){
+          const row=existing.rows[0],same=String(row.position_address)===v.positionAddress&&String(row.pool_address)===v.poolAddress&&String(row.owner_address)===v.ownerAddress&&String(row.observed_slot??'')===String(v.observedSlot??'')&&String(row.token_x_mint)===v.tokenXMint&&String(row.token_y_mint)===v.tokenYMint&&BigInt(String(row.pre_close_fee_x_raw))===v.preCloseFeeXRaw&&BigInt(String(row.pre_close_fee_y_raw))===v.preCloseFeeYRaw;
+          if(!same)throw new Error('LPFORGE_CLOSE_FEE_SNAPSHOT_IDENTITY_CONFLICT');
+          await db.query("COMMIT");return;
+        }
+        await db.query("INSERT INTO execution.close_fee_attributions(close_plan_id,position_address,pool_address,owner_address,observed_slot,observed_at,rpc_commitment,token_x_mint,token_y_mint,token_x_decimals,token_y_decimals,pre_close_fee_x_raw,pre_close_fee_y_raw,pre_close_reward_one_raw,pre_close_reward_two_raw,attribution_method,attribution_status,reason_codes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'POSITION_V2_PRE_CLOSE_REMOVE','PENDING',$16::jsonb)",[v.closePlanId,v.positionAddress,v.poolAddress,v.ownerAddress,v.observedSlot?.toString()??null,v.observedAt,v.commitment,v.tokenXMint,v.tokenYMint,v.tokenXDecimals??null,v.tokenYDecimals??null,v.preCloseFeeXRaw.toString(),v.preCloseFeeYRaw.toString(),v.preCloseRewardOneRaw.toString(),v.preCloseRewardTwoRaw.toString(),json([...(v.tokenXDecimals===undefined?['TOKEN_X_DECIMALS_UNAVAILABLE']:[]),...(v.tokenYDecimals===undefined?['TOKEN_Y_DECIMALS_UNAVAILABLE']:[])])]);
+        await db.query("COMMIT");
+      }catch(error){try{await db.query("ROLLBACK");}catch{}throw error;}
+    },
+    async finalizeCloseFeeAttribution(v){
+      const snapshot=await db.query("SELECT * FROM execution.close_fee_attributions WHERE close_plan_id=$1",[v.closePlanId]),row=snapshot.rows[0];
+      if(!row)return{status:'UNAVAILABLE' as const,reasonCodes:['PRE_CLOSE_POSITION_STATE_UNAVAILABLE']};
+      if(row.finalized_at)return{status:String(row.attribution_status) as 'COMPLETE'|'PARTIAL'|'UNAVAILABLE',reasonCodes:Array.isArray(row.reason_codes)?row.reason_codes.map(String):[]};
+      const [life,flows,settlement]=await Promise.all([db.query("SELECT l.lifecycle_id,o.initial_capital_lamports FROM execution.position_lifecycles l JOIN execution.owned_positions o ON o.position_address=l.position_address WHERE l.position_address=$1",[v.positionAddress]),db.query("SELECT plan_id,flow_type,lamports,token_mint,token_amount_raw FROM execution.position_cashflows WHERE position_address=$1 ORDER BY observed_at,cashflow_id",[v.positionAddress]),db.query("SELECT realized_sol_pnl_lamports FROM execution.lifecycle_sol_settlements WHERE settlement_id=$1",[v.terminalSettlementId])]);
+      if(!life.rows[0]||!settlement.rows[0])return{status:'UNAVAILABLE' as const,reasonCodes:['TERMINAL_SETTLEMENT_UNAVAILABLE']};
+      const amount=(f:Record<string,unknown>)=>f.lamports!==null&&f.lamports!==undefined?BigInt(String(f.lamports)):f.token_mint===WSOL_MINT&&f.token_amount_raw!==null&&f.token_amount_raw!==undefined?BigInt(String(f.token_amount_raw)):0n;
+      const rows=flows.rows,closeRows=rows.filter(flow=>String(flow.plan_id)===v.closePlanId),findRaw=(mint:string)=>closeRows.filter(flow=>String(flow.flow_type)==='CLOSE_WITHDRAWAL'&&String(flow.token_mint??'')===mint).reduce((n,flow)=>n+BigInt(String(flow.token_amount_raw??0)),0n),closeNative=closeRows.filter(flow=>String(flow.flow_type)==='CLOSE_WITHDRAWAL').reduce((n,flow)=>n+amount(flow),0n),swap=closeRows.filter(flow=>String(flow.flow_type)==='SWAP_PROCEEDS').reduce((n,flow)=>n+amount(flow),0n),claims=rows.filter(flow=>String(flow.flow_type)==='FEE_CLAIM').reduce((n,flow)=>n+amount(flow),0n),rewards=rows.filter(flow=>String(flow.flow_type)==='REWARD_CLAIM').reduce((n,flow)=>n+amount(flow),0n),txCosts=rows.filter(flow=>['TX_COST','SWAP_COST'].includes(String(flow.flow_type))).reduce((n,flow)=>n+amount(flow),0n),rentLocked=rows.filter(flow=>String(flow.flow_type)==='RENT_LOCK').reduce((n,flow)=>n+amount(flow),0n),rentRecovered=rows.filter(flow=>String(flow.flow_type)==='RENT_RECOVERY').reduce((n,flow)=>n+amount(flow),0n);
+      const accounting=deriveCloseFeeAttributionAccounting({tokenXMint:String(row.token_x_mint),tokenYMint:String(row.token_y_mint),preCloseFeeXRaw:BigInt(String(row.pre_close_fee_x_raw)),preCloseFeeYRaw:BigInt(String(row.pre_close_fee_y_raw)),...(row.token_x_decimals===null?{}:{tokenXDecimals:Number(row.token_x_decimals)}),...(row.token_y_decimals===null?{}:{tokenYDecimals:Number(row.token_y_decimals)}),closeTokenXRaw:findRaw(String(row.token_x_mint)),closeTokenYRaw:findRaw(String(row.token_y_mint)),closeNativeLamports:closeNative,swapProceedsLamports:swap,explicitClaimLamports:claims,rewardLamports:rewards,initialCapitalLamports:BigInt(String(life.rows[0].initial_capital_lamports)),transactionCostLamports:txCosts,rentLockedLamports:rentLocked,rentRecoveredLamports:rentRecovered,realizedSolPnlLamports:BigInt(String(settlement.rows[0].realized_sol_pnl_lamports))});
+      const reasons=[...accounting.reasonCodes,...(BigInt(String(row.pre_close_reward_one_raw))>0n||BigInt(String(row.pre_close_reward_two_raw))>0n?['REWARD_ATTRIBUTION_UNAVAILABLE']:[])],status: 'COMPLETE'|'PARTIAL'=reasons.length?'PARTIAL':accounting.status;
+      await db.query("UPDATE execution.close_fee_attributions SET claimed_fee_x_raw=0,claimed_fee_y_raw=0,embedded_remove_fee_x_raw=$2,embedded_remove_fee_y_raw=$3,total_realized_fee_x_raw=$2,total_realized_fee_y_raw=$3,realized_lp_fee_value_lamports=$4,realized_rewards_value_lamports=$5,principal_returned_value_lamports=$6,inventory_unwind_result_lamports=$7,transaction_cost_lamports=$8,rent_recovered_lamports=$9,accounting_reconciliation_difference_lamports=$10,attribution_status=$11,reason_codes=$12::jsonb,remove_signature=$13,claim_signature=$14,terminal_settlement_id=$15,valuation_payload=$16::jsonb,finalized_at=$17 WHERE close_plan_id=$1",[v.closePlanId,accounting.embeddedRemoveFeeXRaw.toString(),accounting.embeddedRemoveFeeYRaw.toString(),accounting.realizedLpFeeValueLamports?.toString()??null,rewards.toString(),accounting.principalReturnedValueLamports?.toString()??null,accounting.inventoryUnwindResultLamports?.toString()??null,txCosts.toString(),rentRecovered.toString(),accounting.accountingReconciliationDifferenceLamports?.toString()??null,status,json([...new Set(reasons)].sort()),v.removeSignature,v.claimSignature??null,v.terminalSettlementId,json({valuationMethod:'WSOL_RAW_OR_CONFIRMED_UNWIND_PRO_RATA',swapProceedsLamports:swap.toString(),closeTokenXRaw:findRaw(String(row.token_x_mint)).toString(),closeTokenYRaw:findRaw(String(row.token_y_mint)).toString()}),v.at]);
+      return{status,reasonCodes:[...new Set(reasons)].sort()};
+    },
+
     async loadTerminalCloseRentRecoveryCandidates(limit=16){const bounded=Math.max(1,Math.min(100,Math.floor(limit)));const r=await db.query("SELECT p.plan_id,l.position_address FROM execution.position_lifecycles l JOIN execution.lifecycle_plan_links link ON link.lifecycle_id=l.lifecycle_id AND link.role='CLOSE' JOIN execution.transaction_plans p ON p.plan_id=link.plan_id JOIN LATERAL (SELECT realized_sol_pnl_lamports FROM execution.lifecycle_sol_settlements s WHERE s.lifecycle_id=l.lifecycle_id ORDER BY settlement_version DESC LIMIT 1) settlement ON true LEFT JOIN execution.position_management_summaries summary ON summary.position_address=l.position_address WHERE l.status='SOL_SETTLED' AND p.state=ANY($1::text[]) AND p.payload #>> '{autonomous_dispatch,builder}'='closePositionIfEmpty' AND p.payload #>> '{autonomous_dispatch,signature}' IS NOT NULL AND ((EXISTS(SELECT 1 FROM execution.position_management_decision_audit audit WHERE audit.position_address=l.position_address) AND NOT EXISTS(SELECT 1 FROM execution.position_cashflows f WHERE f.lifecycle_id=l.lifecycle_id AND f.flow_type='RENT_RECOVERY')) OR (summary.position_address IS NOT NULL AND (summary.final_realized_pnl_lamports IS DISTINCT FROM settlement.realized_sol_pnl_lamports OR NOT EXISTS(SELECT 1 FROM execution.position_cashflows f WHERE f.lifecycle_id=l.lifecycle_id AND f.cashflow_id=p.plan_id||':close-native-withdrawal:'||(p.payload #>> '{autonomous_dispatch,removeTransactionId}'))))) ORDER BY l.settled_at ASC NULLS LAST LIMIT $2",[EXECUTION_TERMINAL_PLAN_STATES,bounded]);return r.rows.map(row=>({planId:String(row.plan_id),positionAddress:String(row.position_address)}));},
     async loadPendingPositionManagementDecisionAuditCompactions(limit=16){const bounded=Math.max(1,Math.min(100,Math.floor(limit)));const r=await db.query("SELECT l.position_address FROM execution.position_lifecycles l JOIN execution.lifecycle_sol_settlements s ON s.lifecycle_id=l.lifecycle_id LEFT JOIN execution.position_management_summaries summary ON summary.position_address=l.position_address WHERE l.status='SOL_SETTLED' AND summary.position_address IS NULL AND EXISTS(SELECT 1 FROM execution.position_management_decision_audit audit WHERE audit.position_address=l.position_address) ORDER BY l.settled_at ASC NULLS LAST LIMIT $1",[bounded]);return r.rows.map(row=>String(row.position_address));},
     async compactPositionManagementDecisionAudit(v){await db.query("BEGIN");try{const eligible=await db.query("SELECT l.lifecycle_id,l.created_at,l.settled_at,s.realized_sol_pnl_lamports FROM execution.position_lifecycles l JOIN LATERAL (SELECT realized_sol_pnl_lamports FROM execution.lifecycle_sol_settlements s WHERE s.lifecycle_id=l.lifecycle_id ORDER BY settlement_version DESC LIMIT 1) s ON true WHERE l.position_address=$1 AND l.status=$2 AND NOT EXISTS(SELECT 1 FROM execution.owned_positions o WHERE o.position_address=$1 AND o.lifecycle_state<>$3) FOR UPDATE",[v.positionAddress,"SOL_SETTLED","SOL_SETTLED"]),row=eligible.rows[0];if(!row){await db.query("COMMIT");return{compacted:false};}const refreshed=await db.query("UPDATE execution.position_management_summaries SET final_realized_pnl_lamports=$2,compacted_at=$3,payload=payload||jsonb_build_object('settlementRefresh','LATEST_IMMUTABLE_SETTLEMENT') WHERE position_address=$1 AND final_realized_pnl_lamports IS DISTINCT FROM $2 RETURNING position_address",[v.positionAddress,String(row.realized_sol_pnl_lamports),v.at]);if(refreshed.rows[0]){await db.query("COMMIT");return{compacted:true};}const auditExists=await db.query("SELECT EXISTS(SELECT 1 FROM execution.position_management_decision_audit audit WHERE audit.position_address=$1) AS present",[v.positionAddress]);if(!auditExists.rows[0]?.present){await db.query("COMMIT");return{compacted:false};}const pending=await db.query("SELECT EXISTS(SELECT 1 FROM execution.lifecycle_plan_links x JOIN execution.transaction_plans p ON p.plan_id=x.plan_id WHERE x.lifecycle_id=$1 AND p.state<>ALL($2::text[])) AS pending",[String(row.lifecycle_id),EXECUTION_TERMINAL_PLAN_STATES]);if(pending.rows[0]?.pending){await db.query("COMMIT");return{compacted:false};}const summary=await db.query("INSERT INTO execution.position_management_summaries(position_address,lifecycle_id,entry_timestamp,exit_timestamp,hold_duration_seconds,monitor_cycle_count,positive_continuation_ev_count,negative_continuation_ev_count,minimum_continuation_ev_lamports,maximum_continuation_ev_lamports,longest_confirmed_negative_sequence,terminal_continuation_ev_lamports,terminal_expected_close_cost_lamports,terminal_action,terminal_reason,entry_candidate_id,entry_geometry_identity,claim_count,realized_fees_lamports,final_realized_pnl_lamports,settlement_state,compacted_at,payload) SELECT $1,$2,$3,$4,GREATEST(0::bigint,EXTRACT(EPOCH FROM ($4::timestamptz-$3::timestamptz))::bigint),count(*),count(*) FILTER(WHERE position_continuation_ev_lamports>0),count(*) FILTER(WHERE position_continuation_ev_lamports<=0),min(position_continuation_ev_lamports),max(position_continuation_ev_lamports),COALESCE(max(confirmation_sequence_count),0),(array_agg(position_continuation_ev_lamports ORDER BY observed_at DESC))[1],(array_agg(expected_close_cost_lamports ORDER BY observed_at DESC))[1],(array_agg(management_action ORDER BY observed_at DESC))[1],(array_agg((reason_codes->>0) ORDER BY observed_at DESC))[1],(array_agg(source_economics_id ORDER BY observed_at ASC))[1],(array_agg(geometry_identity ORDER BY observed_at ASC))[1],count(*) FILTER(WHERE management_action=$5),COALESCE((SELECT sum(COALESCE(lamports,0)) FROM execution.position_cashflows WHERE position_address=$1 AND flow_type=$6),0),$7,$8,$9,'{}'::jsonb FROM execution.position_management_decision_audit WHERE position_address=$1 ON CONFLICT(position_address) DO NOTHING RETURNING position_address",[v.positionAddress,String(row.lifecycle_id),row.created_at,row.settled_at,"CLAIM","FEE_CLAIM",String(row.realized_sol_pnl_lamports),"SOL_SETTLED",v.at]);if(summary.rows[0])await db.query("DELETE FROM execution.position_management_decision_audit WHERE position_address=$1",[v.positionAddress]);await db.query("COMMIT");return{compacted:Boolean(summary.rows[0])};}catch(error){try{await db.query("ROLLBACK");}catch{}throw error;}},
@@ -4242,6 +4325,8 @@ export function createMemoryStore(): Phase1Store {
     async linkPositionLifecyclePlan() {},
     async loadLifecycleSettlementInput() { return undefined; },
     async persistLifecycleSolSettlement(v) { if(!v.assessment.ready)throw new Error("LPFORGE_SETTLEMENT_NOT_READY");return{lifecycleId:v.input.lifecycle.lifecycleId,settlementId:`settlement:${v.input.lifecycle.lifecycleId}:v1`,created:true}; },
+    async upsertCloseFeeAttributionSnapshot() {},
+    async finalizeCloseFeeAttribution() { return {status:'UNAVAILABLE' as const,reasonCodes:['FIXTURE_CLOSE_FEE_ATTRIBUTION_UNAVAILABLE']}; },
     async loadTerminalCloseRentRecoveryCandidates() { return []; },
     async loadPendingPositionManagementDecisionAuditCompactions() { return []; },
     async compactPositionManagementDecisionAudit() { return {compacted:false}; },

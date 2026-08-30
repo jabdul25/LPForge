@@ -172,7 +172,10 @@ export function normalizePosition(poolAddress:string, positionAddress:string, ra
   const upper=asNumber(field(pd,['upperBinId'],['upper_bin_id']));
   const owner=publicKeyString(field(pd,['owner'],['positionData','owner']));
   if(lower===undefined||upper===undefined||!owner)throw new Error('LPFORGE_METEORA_SDK_SHAPE:POSITION_FIELDS');
-  return {address:positionAddress,pool:poolAddress,owner,...(field(pd,['feeOwner'])?{feeOwner:publicKeyString(field(pd,['feeOwner']))}:{}),lowerBinId:lower,upperBinId:upper,totalXAmount:asString(field(pd,['totalXAmount'],['totalX']))||'0',totalYAmount:asString(field(pd,['totalYAmount'],['totalY']))||'0',feeX:asString(field(pd,['feeX'],['feeXAmount']))||'0',feeY:asString(field(pd,['feeY'],['feeYAmount']))||'0',stamp:{source:'METEORA_SDK',chainSlot:slot,observedAt:nowIso()},raw:{sdkPosition:true}};
+  // Meteora PositionData exposes swap fees and liquidity-mining rewards as
+  // different raw-unit balances. Preserve that distinction at the adapter
+  // boundary; callers must never book rewardOne/rewardTwo as LP swap fees.
+  return {address:positionAddress,pool:poolAddress,owner,...(field(pd,['feeOwner'])?{feeOwner:publicKeyString(field(pd,['feeOwner']))}:{}),lowerBinId:lower,upperBinId:upper,totalXAmount:asString(field(pd,['totalXAmount'],['totalX']))||'0',totalYAmount:asString(field(pd,['totalYAmount'],['totalY']))||'0',feeX:asString(field(pd,['feeX'],['feeXAmount']))||'0',feeY:asString(field(pd,['feeY'],['feeYAmount']))||'0',rewardOne:asString(field(pd,['rewardOne'],['rewardOneAmount']))||'0',rewardTwo:asString(field(pd,['rewardTwo'],['rewardTwoAmount']))||'0',stamp:{source:'METEORA_SDK',chainSlot:slot,observedAt:nowIso()},raw:{sdkPosition:true}};
 }
 
 async function loadSdk() {

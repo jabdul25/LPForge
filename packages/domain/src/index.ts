@@ -71,6 +71,8 @@ export interface PositionV2Fact {
   totalYAmount: string;
   feeX?: string;
   feeY?: string;
+  rewardOne?: string;
+  rewardTwo?: string;
   claimedFeeX?: string;
   claimedFeeY?: string;
   stamp: SourceStamp;
