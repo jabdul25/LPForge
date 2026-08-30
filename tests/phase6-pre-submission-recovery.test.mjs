@@ -100,7 +100,7 @@ test('P6 expires an absent close child without resending and releases the manage
 
 test('P6 reconciles an expired no-effect close only through an exact SOL_SETTLED lifecycle identity',async()=>{
   const calls=[];
-  const plan={planId:'historical-close',idempotencyKey:'historical-close-idem',action:'CLOSE',poolAddress:'pool',ownerAddress:'owner',positionAddress:'8HU47vhj6ciFv7nhHsby4iQD68s8NpBKSNZbb9C81Pzw',positionIdentitySource:'LIFECYCLE_SOL_SETTLED',expiresAt:'2030-01-01T00:00:00.000Z',planPayload:{autonomous_dispatch:{pendingStage:'CLOSE_REMOVE_SUBMITTED',pendingSignature:'expired-remove'}}};
+  const plan={planId:'historical-close',idempotencyKey:'historical-close-idem',action:'CLOSE',poolAddress:'pool',ownerAddress:'owner',positionAddress:'8HU47vhj6ciFv7nhHsby4iQD68s8NpBKSNZbb9C81Pzw',positionIdentitySource:'LIFECYCLE_SOL_SETTLED',positionLifecycleSettled:true,expiresAt:'2030-01-01T00:00:00.000Z',planPayload:{autonomous_dispatch:{pendingStage:'CLOSE_REMOVE_SUBMITTED',pendingSignature:'expired-remove'}}};
   const store={
     async loadUnresolvedAutonomousPlans(){return[plan];},
     async getExecutionJournal(){return{journal_id:'journal-historical',idempotency_key:plan.idempotencyKey,plan_id:plan.planId,state:'SUBMITTED',signature:'expired-remove',last_valid_block_height:1,version:1,updated_at:'2026-08-29T00:00:00.000Z',payload:{action:'CLOSE'}};},
