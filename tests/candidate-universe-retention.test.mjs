@@ -36,6 +36,8 @@ test('full-universe canonical coverage is bounded, oldest-first, and protects M0
  assert.match(learning,/frozenDecisionSourceSha/);
  assert.match(learning,/LPFORGE_FULL_UNIVERSE_BACKFILL_MAX_CANDIDATES/);
  assert.match(learning,/LPFORGE_FULL_UNIVERSE_COUNTERFACTUAL_MAX_BATCH/);
+ assert.match(learning,/outcomeCreatedAt:universe\.decisionAt/);
+ assert.match(db,/COALESCE\(\$3::timestamptz,now\(\)\)/);
  assert.match(operator,/const detailedRows=rows,outcomeRows=rows/);
 });
 
