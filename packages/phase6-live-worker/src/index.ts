@@ -3753,7 +3753,7 @@ async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:Au
   await input.store.compactPositionManagementDecisionAudit({positionAddress:input.positionAddress,at});
   // Existing research outcomes are immutable. A settlement supersession fixes
   // the accounting authority without mutating or duplicating V3 evidence.
-  if(!persisted.superseded){
+  if(persisted.created&&!persisted.superseded){
     const outcome=await input.store.createLiveSolSettledLearningOutcome({positionAddress:input.positionAddress,at});
     if(!outcome.outcome)throw new Error(`LPFORGE_LIVE_OUTCOME_MATERIALIZATION_FAILED:${outcome.reasonCodes.join(',')}`);
   }

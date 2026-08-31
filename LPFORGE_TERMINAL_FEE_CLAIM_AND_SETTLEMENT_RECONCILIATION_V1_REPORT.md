@@ -92,7 +92,16 @@ cashflow and five do not. The missing-cashflow candidates are:
   evidence.
 
 The remaining settled position had no terminal claim child; `8HU47...1Pzw`
-has a signature-linked claim cashflow. No historical row was altered.
+has a signature-linked claim cashflow.
+
+During the first deployment recovery pass, the new finalizer incorrectly
+included an already `SOL_SETTLED` lifecycle in terminal-close recovery. It
+append-only recorded the HVE terminal receipt and created immutable settlement
+version 2 (`-1,925,242`); version 1 remains unchanged. This was not a manual
+DB mutation, but it was an unintended automatic historical correction and is
+recorded here transparently. The follow-up release excludes `SOL_SETTLED`
+lifecycles from recovery, so only unfinalized `CLOSED` lifecycles can now be
+recovered. No other historical lifecycle was changed.
 
 ### Historical repair plan
 
@@ -113,8 +122,14 @@ regression.
 
 ## Deployment and limitations
 
-Deployment evidence and runtime verification are added after the migration and
-affected-worker release. This release intentionally does not repair historical
-records automatically and cannot retroactively obtain unavailable RPC receipt
-data. The external reconciliation is a final-close integrity guard; it does
-not create a trading decision or an autonomous exit rule.
+`M0067` was applied. The initial implementation was deployed from
+`2ae28f3f8ffcd8e65ad866ad5d54c32a1e8628f8`; the follow-up recovery selector
+guard is `9d6685ba4c0045c88344ab0f24270e11a54e57c7`. The latter makes live
+recovery forward-looking only and prevents further automated corrections to
+already-settled history. The external reconciliation is a final-close integrity
+guard; it does not create a trading decision or an autonomous exit rule.
+
+Historical repair remains separately controlled: the four remaining candidate
+lifecycles require receipt-level evidence and explicit approval for append-only
+corrective cashflows and superseding settlement versions. The release cannot
+retroactively obtain unavailable RPC receipt data.
