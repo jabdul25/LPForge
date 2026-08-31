@@ -1260,6 +1260,56 @@ async function fixtureOnce() {
   console.log(json(result));
   return result;
 }
+/**
+ * A deliberately narrow management-observation entry point.  It never
+ * evaluates candidates or constructs an economic action; it only refreshes
+ * owned PositionV2 facts and records the durable intelligence snapshot.
+ * Phase-7 invokes this even when its action lane is recovery-only or
+ * fail-closed, so transaction ambiguity cannot make an owned position
+ * economically invisible.
+ */
+async function observeOwnedPositionsOnce() {
+  const cfg = loadPhase1Config();
+  if (cfg.dataMode !== "LIVE_READ_ONLY")
+    throw new Error("LPFORGE_OPERATOR_REQUIRES_LIVE_READ_ONLY");
+  const log = new Logger("operator", cfg.logLevel);
+  const store = await createPostgresStore(cfg.databaseUrl);
+  try {
+    const adapter = createMeteoraReadAdapter({
+      rpcUrl: cfg.solanaRpcHttpUrl,
+      cluster: cfg.cluster,
+      programId: cfg.programId,
+      expectedSdkVersion: cfg.expectedSdkVersion,
+      rpcTimeoutMs: cfg.rpcTimeoutMs,
+    });
+    const api = createMeteoraDataApi({
+      baseUrl: cfg.meteoraDataApiUrl,
+      maxRps: cfg.dataApiMaxRps,
+      timeoutMs: cfg.httpTimeoutMs,
+    });
+    const result = await observeOwnedPositionsReadOnly({
+      store,
+      adapter,
+      api,
+      ...(process.env.LPFORGE_OPERATOR_OWNER_ADDRESS
+        ? { ownerAddress: process.env.LPFORGE_OPERATOR_OWNER_ADDRESS }
+        : {}),
+      observedAt: new Date().toISOString(),
+      log,
+    });
+    console.log(json({
+      event: "lpforge_operator_machine_summary",
+      operationalCycleComplete: true,
+      positionObservationOnly: true,
+      observedPositions: result.observed,
+      transactionsScanned: 0,
+      decodedSwapEvents: 0,
+      eventDecodeWarnings: 0,
+    }));
+  } finally {
+    await store.close();
+  }
+}
 async function liveRun() {
   const interval = Math.max(
     5000,
@@ -1284,5 +1334,9 @@ else if (cmd === "live-once") {
   // handles after the cycle is durable, so let the parent advance explicitly.
   process.exit(0);
 }
+else if (cmd === "observe-owned-positions") {
+  await observeOwnedPositionsOnce();
+  process.exit(0);
+}
 else if (cmd === "live-run") await liveRun();
-else throw new Error("Usage: operator fixture-once|live-once|live-run");
+else throw new Error("Usage: operator fixture-once|live-once|observe-owned-positions|live-run");
