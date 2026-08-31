@@ -69,6 +69,7 @@ import { assessLifecycleSettlement } from "../../db/src/index.js";
 import type {
   AutonomousPlan,
   AutonomousPlanAction,
+  LifecycleSettlementInput,
   OpenChunkDispositionRecord,
   Phase1Store,
   WalletPositionClassification,
@@ -2130,16 +2131,22 @@ export function assessExpiredClaimRecovery(input:{signaturePresent:boolean;signa
   if(input.confirmationStatus==='EXPIRED'||input.confirmationStatus==='FAILED')return{terminal:true,reasonCodes:['P6_CLAIM_EXPIRED_NO_CHAIN_EFFECT']};
   return{terminal:false,reasonCodes:['P6_CLAIM_RECOVERY_CHAIN_EFFECT_UNRESOLVED']};
 }
-async function persistRecoveredClaimReceipt(input:{store:Phase1Store;connection:Connection;plan:AutonomousPlan;positionAddress:string;signature:string;transactionId?:string;observedAt:string}):Promise<{ok:boolean;reasonCodes:string[]}>{
+/**
+ * A claim's receipt is the only authority for its cashflow.  This helper is
+ * shared by normal terminal-close execution and recovery so both paths use
+ * the same signature-bound idempotency key.
+ */
+async function persistConfirmedClaimReceipt(input:{store:Phase1Store;connection:Connection;plan:AutonomousPlan;positionAddress:string;signature:string;transactionId:string;observedAt:string;source:"CONFIRMED_CLAIM_RECEIPT_RECOVERY"|"CONFIRMED_TERMINAL_CLAIM_RECEIPT"}):Promise<{ok:boolean;reasonCodes:string[]}>{
   const receipt=await loadConfirmedExecutionReceipt(input.connection,input.signature);
   if(receipt.state!=='CONFIRMED_SUCCESS')return{ok:false,reasonCodes:[`P6_CLAIM_RECEIPT_${receipt.state}`]};
   const effects=deriveTransactionAssetEffects(receipt,{ownerAddress:input.plan.ownerAddress,...(receipt.staticAccountKeys[0]?{feePayerAddress:receipt.staticAccountKeys[0]}:{})});
   for(const effect of effects.tokenEffects.filter(effect=>effect.direction==='IN'&&effect.deltaRaw>0n)){
-    await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:recovered-claim-token:${effect.mint}:${effect.accountAddress}`,positionAddress:input.positionAddress,planId:input.plan.planId,flowType:'FEE_CLAIM',observedAt:input.observedAt,tokenMint:effect.mint,tokenAmountRaw:effect.deltaRaw.toString(),payload:{source:'CONFIRMED_CLAIM_RECEIPT_RECOVERY',signature:input.signature,transactionId:input.transactionId??null,effectClassification:effect.classification}});
-    if(effect.mint!==WSOL_MINT)await recordPositionTokenXLot({store:input.store,connection:input.connection,plan:input.plan,positionAddress:input.positionAddress,tokenMint:effect.mint,sourceEvent:'FEE_CLAIM',sourceCashflowId:`${input.plan.planId}:recovered-claim-token:${effect.mint}:${effect.accountAddress}`,rawAmount:effect.deltaRaw,observedAt:input.observedAt,signature:input.signature});
+    const cashflowId=`${input.plan.planId}:claim-token:${input.transactionId}:${effect.mint}:${effect.accountAddress}`;
+    await input.store.insertPositionCashflow({cashflowId,positionAddress:input.positionAddress,planId:input.plan.planId,flowType:'FEE_CLAIM',observedAt:input.observedAt,tokenMint:effect.mint,tokenAmountRaw:effect.deltaRaw.toString(),payload:{source:input.source,signature:input.signature,transactionId:input.transactionId,effectClassification:effect.classification}});
+    if(effect.mint!==WSOL_MINT)await recordPositionTokenXLot({store:input.store,connection:input.connection,plan:input.plan,positionAddress:input.positionAddress,tokenMint:effect.mint,sourceEvent:'FEE_CLAIM',sourceCashflowId:cashflowId,rawAmount:effect.deltaRaw,observedAt:input.observedAt,signature:input.signature});
   }
   const native=(effects.nativeWalletDeltaLamports??0n)+(receipt.feeLamports??0n);
-  if(native>0n)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:recovered-claim-native-sol`,positionAddress:input.positionAddress,planId:input.plan.planId,flowType:'FEE_CLAIM',observedAt:input.observedAt,lamports:native,tokenMint:WSOL_MINT,tokenAmountRaw:native.toString(),payload:{source:'CONFIRMED_CLAIM_RECEIPT_RECOVERY',signature:input.signature,transactionId:input.transactionId??null,receiptFeeLamports:(receipt.feeLamports??0n).toString(),classificationState:effects.classificationState,reasonCodes:effects.reasonCodes}});
+  if(native>0n)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:claim-native-sol:${input.transactionId}`,positionAddress:input.positionAddress,planId:input.plan.planId,flowType:'FEE_CLAIM',observedAt:input.observedAt,lamports:native,tokenMint:WSOL_MINT,tokenAmountRaw:native.toString(),payload:{source:input.source,signature:input.signature,transactionId:input.transactionId,receiptFeeLamports:(receipt.feeLamports??0n).toString(),classificationState:effects.classificationState,reasonCodes:effects.reasonCodes}});
   return{ok:true,reasonCodes:effects.reasonCodes};
 }
 /**
@@ -2206,6 +2213,92 @@ async function persistConfirmedPositionRentRecovery(input:{
     },
   });
   return{ok:true,lamports:before};
+}
+
+const settlementSolInFlowTypes=new Set(["FEE_CLAIM","REWARD_CLAIM","REDUCE_WITHDRAWAL","CLOSE_WITHDRAWAL","SWAP_PROCEEDS","RENT_RECOVERY"]);
+const settlementSolOutFlowTypes=new Set(["OPEN_CONTRIBUTION","ADD_CONTRIBUTION","SWAP_COST","TX_COST","RENT_LOCK"]);
+function settlementFlowAmount(flow:LifecycleSettlementInput["cashflows"][number]):bigint|undefined{
+  return flow.lamports??(flow.tokenMint===WSOL_MINT&&flow.tokenAmountRaw!==undefined?BigInt(flow.tokenAmountRaw):undefined);
+}
+function settlementFlowSignature(flow:LifecycleSettlementInput["cashflows"][number]):string|undefined{
+  const payload=flow.payload;
+  const signature=payload?.transactionSignature??payload?.signature;
+  return typeof signature==='string'?signature:undefined;
+}
+/**
+ * Independently recomputes terminal CLOSE-plan SOL effects from confirmed RPC
+ * receipts.  It intentionally does not trust the lifecycle cashflow total as
+ * proof: every receipt-derived effect must have a signature-bound cashflow.
+ */
+export async function reconcileTerminalSettlementChainEffects(input:{connection:Connection;plan:AutonomousPlan;positionAddress:string;settlementInput:Omit<LifecycleSettlementInput,"positionAbsent"|"positionCheckedAt"|"positionCheckedSlot">}):Promise<{ok:boolean;reasonCodes:string[];chainSolInLamports:bigint;chainSolOutLamports:bigint;dbSolInLamports:bigint;dbSolOutLamports:bigint;payload:Record<string,unknown>}>{
+  const reasons:string[]=[];
+  const terminalTransactions=input.settlementInput.transactions.filter(tx=>tx.planId===input.plan.planId&&tx.planRole==='CLOSE');
+  let chainSolInLamports=0n,chainSolOutLamports=0n,dbSolInLamports=0n,dbSolOutLamports=0n;
+  const closeFlows=input.settlementInput.cashflows.filter(flow=>flow.planId===input.plan.planId);
+  for(const flow of closeFlows){
+    const amount=settlementFlowAmount(flow);if(amount===undefined)continue;
+    if(settlementSolInFlowTypes.has(flow.flowType))dbSolInLamports+=amount;
+    if(settlementSolOutFlowTypes.has(flow.flowType))dbSolOutLamports+=amount;
+  }
+  const steps:Array<Record<string,unknown>>=[];
+  const exact=(flowType:string,signature:string,amount:bigint)=>closeFlows.some(flow=>flow.flowType===flowType&&settlementFlowSignature(flow)===signature&&settlementFlowAmount(flow)===amount);
+  for(const transaction of terminalTransactions){
+    if(transaction.state!=="CONFIRMED"||!transaction.signature){reasons.push(`SETTLEMENT_CHAIN_RECEIPT_UNAVAILABLE:${transaction.transactionId}`);continue;}
+    const receipt=await loadConfirmedExecutionReceipt(input.connection,transaction.signature);
+    if(receipt.state!=="CONFIRMED_SUCCESS"){reasons.push(`SETTLEMENT_CHAIN_RECEIPT_${receipt.state}:${transaction.transactionId}`);continue;}
+    const txFee=receipt.feeLamports??0n;
+    chainSolOutLamports+=txFee;
+    if(!exact("TX_COST",transaction.signature,txFee))reasons.push(`SETTLEMENT_CHAIN_TX_COST_MISSING:${transaction.transactionId}`);
+    const kind=transaction.kind??"UNKNOWN";
+    if(kind==='METEORA_CLAIM'){
+      const ownerIndex=receipt.resolvedAccountKeys.indexOf(input.plan.ownerAddress),pre=ownerIndex>=0?receipt.preBalancesLamports[ownerIndex]:undefined,post=ownerIndex>=0?receipt.postBalancesLamports[ownerIndex]:undefined;
+      if(pre===undefined||post===undefined){reasons.push(`SETTLEMENT_CHAIN_CLAIM_OWNER_UNPROVEN:${transaction.transactionId}`);continue;}
+      const gross=post-pre+txFee;
+      if(gross<0n){reasons.push(`SETTLEMENT_CHAIN_CLAIM_NEGATIVE:${transaction.transactionId}`);continue;}
+      chainSolInLamports+=gross;
+      if(gross>0n&&!exact("FEE_CLAIM",transaction.signature,gross))reasons.push(`SETTLEMENT_CHAIN_TERMINAL_CLAIM_MISSING:${transaction.transactionId}`);
+      const effects=deriveTransactionAssetEffects(receipt,{ownerAddress:input.plan.ownerAddress,...(receipt.staticAccountKeys[0]?{feePayerAddress:receipt.staticAccountKeys[0]}:{})}),wsolClaim=effects.tokenEffects.filter(effect=>effect.direction==='IN'&&effect.mint===WSOL_MINT&&effect.deltaRaw>0n).reduce((total,effect)=>total+effect.deltaRaw,0n);
+      chainSolInLamports+=wsolClaim;
+      if(wsolClaim>0n&&!closeFlows.some(flow=>flow.flowType==='FEE_CLAIM'&&settlementFlowSignature(flow)===transaction.signature&&flow.tokenMint===WSOL_MINT&&flow.tokenAmountRaw===wsolClaim.toString()))reasons.push(`SETTLEMENT_CHAIN_TERMINAL_WSOL_CLAIM_MISSING:${transaction.transactionId}`);
+      steps.push({transactionId:transaction.transactionId,kind,signature:transaction.signature,feeLamports:txFee.toString(),grossClaimLamports:gross.toString(),wsolClaimLamports:wsolClaim.toString()});
+      continue;
+    }
+    if(kind==='METEORA_REMOVE'){
+      const ownerIndex=receipt.resolvedAccountKeys.indexOf(input.plan.ownerAddress),pre=ownerIndex>=0?receipt.preBalancesLamports[ownerIndex]:undefined,post=ownerIndex>=0?receipt.postBalancesLamports[ownerIndex]:undefined;
+      if(pre===undefined||post===undefined){reasons.push(`SETTLEMENT_CHAIN_REMOVE_OWNER_UNPROVEN:${transaction.transactionId}`);continue;}
+      const gross=post-pre+txFee;
+      if(gross<0n){reasons.push(`SETTLEMENT_CHAIN_REMOVE_NEGATIVE:${transaction.transactionId}`);continue;}
+      chainSolInLamports+=gross;
+      if(gross>0n&&!exact("CLOSE_WITHDRAWAL",transaction.signature,gross))reasons.push(`SETTLEMENT_CHAIN_REMOVE_WITHDRAWAL_MISSING:${transaction.transactionId}`);
+      steps.push({transactionId:transaction.transactionId,kind,signature:transaction.signature,feeLamports:txFee.toString(),grossNativeWithdrawalLamports:gross.toString()});
+      continue;
+    }
+    if(kind==='JUPITER_UNWIND'){
+      const flow=closeFlows.find(candidate=>candidate.flowType==='SWAP_PROCEEDS'&&settlementFlowSignature(candidate)===transaction.signature);
+      const payload=flow?.payload??{},inputMint=typeof payload.inputMint==='string'?payload.inputMint:undefined,inputAmountRaw=typeof payload.inputAmountRaw==='string'?BigInt(payload.inputAmountRaw):undefined;
+      if(!flow||!inputMint||inputAmountRaw===undefined){reasons.push(`SETTLEMENT_CHAIN_UNWIND_CASHFLOW_MISSING:${transaction.transactionId}`);continue;}
+      const effects=deriveTransactionAssetEffects(receipt,{ownerAddress:input.plan.ownerAddress,...(receipt.staticAccountKeys[0]?{feePayerAddress:receipt.staticAccountKeys[0]}:{}),inputMint,outputMint:WSOL_MINT,jupiterProgramIds:[JUPITER_SWAP_V6_PROGRAM_ID],positionAddress:input.positionAddress});
+      const result=deriveCloseUnwindSettlement({receipt,effects,ownerAddress:input.plan.ownerAddress,inputMint,inputAmountRaw,outputMint:WSOL_MINT,jupiterProgramIds:[JUPITER_SWAP_V6_PROGRAM_ID]});
+      if(result.state!=="SETTLED"||result.swapProceedsLamports===undefined){reasons.push(...result.reasonCodes.map(code=>`${code}:${transaction.transactionId}`));continue;}
+      chainSolInLamports+=result.swapProceedsLamports;
+      if(settlementFlowAmount(flow)!==result.swapProceedsLamports)reasons.push(`SETTLEMENT_CHAIN_UNWIND_PROCEEDS_MISMATCH:${transaction.transactionId}`);
+      steps.push({transactionId:transaction.transactionId,kind,signature:transaction.signature,feeLamports:txFee.toString(),swapProceedsLamports:result.swapProceedsLamports.toString()});
+      continue;
+    }
+    if(kind==='METEORA_CLOSE'){
+      const index=receipt.resolvedAccountKeys.indexOf(input.positionAddress),before=index>=0?receipt.preBalancesLamports[index]:undefined,after=index>=0?receipt.postBalancesLamports[index]:undefined;
+      if(before===undefined||after!==0n||before<=0n){reasons.push(`SETTLEMENT_CHAIN_RENT_UNPROVEN:${transaction.transactionId}`);continue;}
+      chainSolInLamports+=before;
+      if(!exact("RENT_RECOVERY",transaction.signature,before))reasons.push(`SETTLEMENT_CHAIN_RENT_RECOVERY_MISSING:${transaction.transactionId}`);
+      steps.push({transactionId:transaction.transactionId,kind,signature:transaction.signature,feeLamports:txFee.toString(),rentRecoveryLamports:before.toString()});
+      continue;
+    }
+    reasons.push(`SETTLEMENT_CHAIN_EFFECT_KIND_UNSUPPORTED:${kind}:${transaction.transactionId}`);
+  }
+  if(!terminalTransactions.length)reasons.push("SETTLEMENT_CHAIN_CLOSE_TRANSACTIONS_MISSING");
+  const chainNet=chainSolInLamports-chainSolOutLamports,dbNet=dbSolInLamports-dbSolOutLamports;
+  if(chainNet!==dbNet)reasons.push("SETTLEMENT_CHAIN_CASHFLOW_TOTAL_MISMATCH");
+  return{ok:reasons.length===0,reasonCodes:[...new Set(reasons)].sort(),chainSolInLamports,chainSolOutLamports,dbSolInLamports,dbSolOutLamports,payload:{implementation:'external-settlement-reconciliation-v1',steps,chainNetSolLamports:chainNet.toString(),dbNetSolLamports:dbNet.toString(),differenceLamports:(chainNet-dbNet).toString()}};
 }
 function mutationRange(
   plan: AutonomousPlan,
@@ -3338,6 +3431,10 @@ async function executeCloseSettlement(input: {
           pendingStage: "CLOSE_CLAIM_SUBMITTED",
           pendingSignature: signature,
         }),
+        afterConfirmed: async ({signature}) => {
+          const receipt=await persistConfirmedClaimReceipt({store:input.store,connection,plan:input.plan,positionAddress:input.positionAddress,signature,transactionId,observedAt:new Date().toISOString(),source:"CONFIRMED_TERMINAL_CLAIM_RECEIPT"});
+          if(!receipt.ok)throw new Error(receipt.reasonCodes.join(","));
+        },
       });
       if (claimed.status !== "RECONCILED") return incomplete(claimed.reasonCodes, "CLOSE_CLAIM_PENDING");
     }
@@ -3616,6 +3713,13 @@ async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:Au
   if(!rent.ok)return{ready:false,reasonCodes:rent.reasonCodes};
   let settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
   if(!settlementInput)return{ready:false,reasonCodes:["SETTLEMENT_LIFECYCLE_MISSING"]};
+  const terminalClaim=settlementInput.transactions.find(transaction=>transaction.planId===input.plan.planId&&transaction.planRole==='CLOSE'&&transaction.kind==='METEORA_CLAIM');
+  if(terminalClaim?.signature){
+    const claim=await persistConfirmedClaimReceipt({store:input.store,connection:input.connection,plan:input.plan,positionAddress:input.positionAddress,signature:terminalClaim.signature,transactionId:terminalClaim.transactionId,observedAt:new Date().toISOString(),source:"CONFIRMED_TERMINAL_CLAIM_RECEIPT"});
+    if(!claim.ok)return{ready:false,reasonCodes:claim.reasonCodes};
+    settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
+    if(!settlementInput)return{ready:false,reasonCodes:["SETTLEMENT_LIFECYCLE_MISSING"]};
+  }
   const removeTransactionId=typeof dispatch.removeTransactionId==="string"?dispatch.removeTransactionId:undefined,removeSignature=removeTransactionId?settlementInput.transactions.find(transaction=>transaction.transactionId===removeTransactionId)?.signature:undefined;
   if(!removeTransactionId||!removeSignature)return{ready:false,reasonCodes:["SETTLEMENT_REMOVE_RECEIPT_MISSING"]};
   const native=await persistConfirmedCloseNativeWithdrawal({store:input.store,connection:input.connection,plan:input.plan,positionAddress:input.positionAddress,signature:removeSignature,transactionId:removeTransactionId,observedAt:new Date().toISOString()});
@@ -3623,6 +3727,14 @@ async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:Au
   settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
   if(!settlementInput)return{ready:false,reasonCodes:["SETTLEMENT_LIFECYCLE_MISSING"]};
   const at=new Date().toISOString(),positionCheckedAt=at,positionCheckedSlot=BigInt(positionCheck.context.slot),settlementEvidence={positionCheckedAt,positionCheckedSlot:positionCheckedSlot.toString(),rpcUrl:input.config.rpcUrl,commitment:"confirmed"};
+  const chainReconciliation=await reconcileTerminalSettlementChainEffects({connection:input.connection,plan:input.plan,positionAddress:input.positionAddress,settlementInput});
+  await input.store.upsertLifecycleSettlementChainReconciliation({positionAddress:input.positionAddress,closePlanId:input.plan.planId,status:chainReconciliation.ok?'RECONCILED_CHAIN':'RECONCILIATION_REQUIRED',chainSolInLamports:chainReconciliation.chainSolInLamports,chainSolOutLamports:chainReconciliation.chainSolOutLamports,dbSolInLamports:chainReconciliation.dbSolInLamports,dbSolOutLamports:chainReconciliation.dbSolOutLamports,reasonCodes:chainReconciliation.reasonCodes,payload:chainReconciliation.payload,observedAt:at});
+  if(!chainReconciliation.ok){
+    const reasonCodes=["SETTLEMENT_CASHFLOW_RECONCILIATION_REQUIRED",...chainReconciliation.reasonCodes];
+    await input.store.markOwnedPositionLifecycle({positionAddress:input.positionAddress,lifecycleState:"RECONCILIATION_REQUIRED",reconciliationStatus:"SETTLEMENT_CHAIN_RECONCILIATION_REQUIRED",lastPlanId:input.plan.planId,at,payload:{stage:"SOL_SETTLEMENT_CHAIN_RECONCILIATION_BLOCKED",reasonCodes,lifecycleId:settlementInput.lifecycle.lifecycleId,settlementEvidence,chainReconciliation:chainReconciliation.payload}});
+    await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:"RECONCILIATION_REQUIRED",at,reasonCodes,payload:{stage:"SOL_SETTLEMENT_CHAIN_RECONCILIATION_BLOCKED",lifecycleId:settlementInput.lifecycle.lifecycleId,chainReconciliation:chainReconciliation.payload}});
+    return{ready:false,reasonCodes};
+  }
   // A close is intentionally marked RECONCILIATION_REQUIRED until this
   // terminal boundary proves it can become SOL_SETTLED. Once the PositionV2
   // account is authoritatively absent, that marker is self-referential: its
@@ -3635,7 +3747,7 @@ async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:Au
     await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:"RECONCILIATION_REQUIRED",at,reasonCodes:assessment.reasonCodes,payload:{stage:"SOL_SETTLEMENT_BLOCKED",lifecycleId:settlementInput.lifecycle.lifecycleId}});
     return{ready:false,reasonCodes:assessment.reasonCodes};
   }
-  const persisted=await input.store.persistLifecycleSolSettlement({assessment,input:{...settlementInput,positionAbsent:true,positionCheckedAt,positionCheckedSlot},...(process.env.LPFORGE_SOURCE_COMMIT?{sourceCommit:process.env.LPFORGE_SOURCE_COMMIT}:{}),...(process.env.LPFORGE_P7_POLICY_HASH?{policyHash:process.env.LPFORGE_P7_POLICY_HASH}:{}),migrationHead:"M0063_close_fee_attribution.sql",...(process.env.LPFORGE_BUILD_ID?{buildId:process.env.LPFORGE_BUILD_ID}:{}),at});
+  const persisted=await input.store.persistLifecycleSolSettlement({assessment,input:{...settlementInput,positionAbsent:true,positionCheckedAt,positionCheckedSlot},...(process.env.LPFORGE_SOURCE_COMMIT?{sourceCommit:process.env.LPFORGE_SOURCE_COMMIT}:{}),...(process.env.LPFORGE_P7_POLICY_HASH?{policyHash:process.env.LPFORGE_P7_POLICY_HASH}:{}),migrationHead:"M0067_terminal_fee_claim_settlement_reconciliation.sql",...(process.env.LPFORGE_BUILD_ID?{buildId:process.env.LPFORGE_BUILD_ID}:{}),at});
   const claimSignature=settlementInput.transactions.find(transaction=>transaction.transactionId.endsWith(':claim'))?.signature;
   await input.store.finalizeCloseFeeAttribution({closePlanId:input.plan.planId,positionAddress:input.positionAddress,removeSignature,...(claimSignature===undefined?{}:{claimSignature}),terminalSettlementId:persisted.settlementId,at});
   await input.store.compactPositionManagementDecisionAudit({positionAddress:input.positionAddress,at});
@@ -4430,7 +4542,8 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         continue;
       }
       if((confirmationStatus==='CONFIRMED'||confirmationStatus==='FINALIZED')&&recoverySignature&&connection&&recoveryPositionAddress){
-        const accounted=await persistRecoveredClaimReceipt({store:input.store,connection,plan,positionAddress:recoveryPositionAddress,signature:recoverySignature,...(journal.transactionId?{transactionId:journal.transactionId}:{}),observedAt:input.now});
+        if(!journal.transactionId)throw new Error("LPFORGE_CLAIM_RECOVERY_TRANSACTION_ID_MISSING");
+        const accounted=await persistConfirmedClaimReceipt({store:input.store,connection,plan,positionAddress:recoveryPositionAddress,signature:recoverySignature,transactionId:journal.transactionId,observedAt:input.now,source:"CONFIRMED_CLAIM_RECEIPT_RECOVERY"});
         if(accounted.ok){
           await input.store.insertExecutionReconciliation({reconciliationId:`${plan.planId}:claim-confirmed`,planId:plan.planId,observedAt:input.now,status:'MATCH',expected:{action:'CLAIM',signature:recoverySignature},actual:{confirmationStatus,claimEffect:'PRESENT',positionTruth},discrepancies:[],payload:{recovery:'CLAIM_CONFIRMED',receiptReasonCodes:accounted.reasonCodes}});
           await input.store.completeAutonomousPlan({planId:plan.planId,state:'RECONCILED',at:input.now,payload:{recovery:'CLAIM_CONFIRMED',confirmationStatus,signature:recoverySignature,receiptReasonCodes:accounted.reasonCodes}});
