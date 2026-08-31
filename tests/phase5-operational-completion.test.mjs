@@ -1,8 +1,29 @@
 import test from 'node:test';import assert from 'node:assert/strict';
-import {evaluateOperationalCycle,deriveAggregateRateEvidence,resolvePhase4DataCompleteness,OPERATIONAL_COMPLETION_POLICY_V1} from '../.build/packages/operational-runtime/src/index.js';
+import {evaluateOperationalCycle,deriveAggregateRateEvidence,deriveEventPathRateEvidence,resolvePhase4DataCompleteness,OPERATIONAL_COMPLETION_POLICY_V1} from '../.build/packages/operational-runtime/src/index.js';
+import {percentagePointsToFraction} from '../.build/packages/discovery-metrics/src/index.js';
 import {fixtureBins,fixtureDataApiPool,fixturePool,fixtureSwaps} from '../.build/packages/test-fixtures/src/index.js';
 const at='2026-08-12T12:00:00Z';const pool={...fixturePool,stamp:{...fixturePool.stamp,observedAt:at}};const bins=fixtureBins.map(b=>({...b,stamp:{...b.stamp,observedAt:at}}));
-test('operational completion derives explicitly aggregate/uncertain live economics evidence',()=>{const assessment={toxicityProbability:.2};const r=deriveAggregateRateEvidence({...fixtureDataApiPool,fee_tvl_ratio:{'1h':.002}},assessment,OPERATIONAL_COMPLETION_POLICY_V1);assert.equal(r.fidelity,'AGGREGATE_ESTIMATE');assert.equal(r.feeRatePerCapitalHour,.002);assert.equal(r.uncertainty,.55);});
+test('canonical fee/TVL percentage points convert once to decimal fractions',()=>{
+ assert.equal(percentagePointsToFraction(.02),.0002);
+ assert.equal(percentagePointsToFraction(.5),.005);
+ assert.equal(percentagePointsToFraction(1),.01);
+ assert.equal(percentagePointsToFraction(0),0);
+ assert.equal(percentagePointsToFraction(undefined),undefined);
+ assert.equal(percentagePointsToFraction(-.02),undefined);
+});
+test('aggregate economics converts canonical percentage points and prevents the 100x fee-rate error',()=>{
+ const assessment={toxicityProbability:.2};const r=deriveAggregateRateEvidence({...fixtureDataApiPool,fee_tvl_ratio:{'1h':.02}},assessment,OPERATIONAL_COMPLETION_POLICY_V1);
+ assert.equal(r.fidelity,'AGGREGATE_ESTIMATE');assert.equal(r.feeRatePerCapitalHour,.0002);assert.equal(r.uncertainty,.55);
+ assert.equal(.03*r.feeRatePerCapitalHour,.000006,'0.03 SOL at 0.02% hourly fee/TVL is 0.000006 SOL, not 0.000600 SOL');
+});
+test('aggregate fee fallback does not double-convert direct fees divided by TVL',()=>{
+ const assessment={toxicityProbability:.2};const r=deriveAggregateRateEvidence({address:'fallback',tvl:100_000,fees:{'1h':20}},assessment,OPERATIONAL_COMPLETION_POLICY_V1);
+ assert.equal(r.feeRatePerCapitalHour,.0002);
+});
+test('event-path rate evidence is unchanged by aggregate percentage-point conversion',()=>{
+ const assessment={toxicityProbability:.2};const r=deriveEventPathRateEvidence({fidelity:'EVENT_PATH_ESTIMATE',effectiveSampleCount:7,feeRatePerCapitalHour:.0002,uncertainty:.4,evidenceAgeSeconds:30,rawObservationCount:24,independentEpisodeCount:7,feeObservationCount:12,eventPathObservationCount:12},assessment,OPERATIONAL_COMPLETION_POLICY_V1);
+ assert.equal(r.fidelity,'EVENT_PATH_ESTIMATE');assert.equal(r.feeRatePerCapitalHour,.0002);assert.equal(r.uncertainty,.4);
+});
 test('operational cycle warms instead of fabricating history',async()=>{const r=await evaluateOperationalCycle({observedAt:at,pool,bins,dataApiPool:fixtureDataApiPool,history:{marketObservations:[],activeBins:[],binFrames:[],swapEvents:[]},protocolCompatible:true,walletCapital:1});assert.equal(r.phase3Status,'WARMING');assert.equal(r.phase4Status,'WARMING');assert.equal(r.phase5Status,'NOT_REACHED');});
 test('Phase 4 consumes collector-proven backfill plus live confirmation without lowering its .60 threshold',()=>{
  const mature=resolvePhase4DataCompleteness(.23,{state:'MATURE',historicalState:'MATURE',liveConfirmationState:'CONFIRMED'});

@@ -16,6 +16,8 @@ export interface CanonicalDiscoveryMetrics {
 const finite=(value:unknown):number|undefined=>{const n=Number(value);return Number.isFinite(n)?n:undefined;};
 const nonNegative=(value:unknown):number|undefined=>{const n=finite(value);return n!==undefined&&n>=0?n:undefined;};
 const timestamp=(value:unknown):string|undefined=>{if(typeof value==='string'&&Number.isFinite(Date.parse(value)))return new Date(Date.parse(value)).toISOString();if(typeof value==='number'&&Number.isFinite(value))return new Date(value>10_000_000_000?value:value*1000).toISOString();return undefined;};
+/** Converts the canonical percentage-point contract to a decimal fraction: 0.02% -> 0.0002. */
+export function percentagePointsToFraction(value:unknown):number|undefined{const points=nonNegative(value);return points===undefined?undefined:points/100;}
 export function ratioPct(numerator:unknown,denominator:unknown):number|undefined{const n=nonNegative(numerator),d=finite(denominator);return n!==undefined&&d!==undefined&&d>0?n/d*100:undefined;}
 /** Standard DLMM API supplies ratio values in percentage points when present. */
 export function standardPoolDiscoveryMetrics(pool:DataApiPool,ingestedAt:string):CanonicalDiscoveryMetrics{

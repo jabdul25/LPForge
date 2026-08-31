@@ -16,6 +16,7 @@ import type { OpportunityRateEvidence, Phase3QualificationPolicyId } from '../..
 import type { RegimeHistorySample } from '../../regime/src/index.js';
 import { resolveProtectedPhase6ExactSolEntryFunding, type Phase6EntryFundingPlan } from '../../phase6-inventory-routing/src/index.js';
 import type { SwapQuoteAssessment } from '../../phase6-swap-quote/src/index.js';
+import { percentagePointsToFraction } from '../../discovery-metrics/src/index.js';
 
 export interface OperationalHistory {
   marketObservations:MarketObservation[];
@@ -147,9 +148,13 @@ export function deriveCandidateValuationCalibration(pool:PoolStateFact,dataApiPo
 }
 export function deriveAggregateRateEvidence(pool:DataApiPool,assessment:PoolAssessment,policy:OperationalRuntimePolicy=OPERATIONAL_COMPLETION_POLICY_V1):OpportunityRateEvidence{
   const tvl=Math.max(0,numeric(pool.tvl));
-  const ratio1h=numeric(pool.fee_tvl_ratio?.['1h'],NaN);
+  // Data API fee_tvl_ratio is percentage points under the canonical discovery
+  // contract (0.02 means 0.02%, never 2%). Opportunity economics requires a
+  // decimal fraction per capital-hour.
+  const feeTvl1hPercentagePoints=pool.fee_tvl_ratio?.['1h'];
+  const ratio1hFraction=percentagePointsToFraction(feeTvl1hPercentagePoints);
   const fee1h=numeric(pool.fees?.['1h']);
-  const feeRate=Number.isFinite(ratio1h)&&ratio1h>=0?ratio1h:(tvl>0?fee1h/tvl:0);
+  const feeRate=ratio1hFraction!==undefined?ratio1hFraction:(tvl>0?fee1h/tvl:0);
   const adverse=Math.max(policy.adverseInventoryRateFloor,.0005+assessment.toxicityProbability*.003);
   return{feeRatePerCapitalHour:Math.max(0,feeRate),adverseInventoryRatePerCapitalHour:adverse,repositionRatePerCapitalHour:policy.repositionRatePerCapitalHour,tailRiskRatePerCapitalHour:policy.tailRiskRatePerCapitalHour,executionCostFixed:policy.executionCostFixed,sampleCount:Math.max(1,Object.values(pool.fees??{}).filter(v=>typeof v==='number').length),uncertainty:policy.aggregateUncertainty,fidelity:'AGGREGATE_ESTIMATE'};
 }

@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {discoveryEconomicPriority,discoveryPoolMetricPatch,feeEfficiencyScorePct,mergeDiscoveryMetrics,ratioPct,standardPoolDiscoveryMetrics} from '../.build/packages/discovery-metrics/src/index.js';
+import {discoveryEconomicPriority,discoveryPoolMetricPatch,feeEfficiencyScorePct,mergeDiscoveryMetrics,percentagePointsToFraction,ratioPct,standardPoolDiscoveryMetrics} from '../.build/packages/discovery-metrics/src/index.js';
 
 const at='2026-08-23T00:00:00.000Z';
 const base={ratioUnit:'PERCENTAGE_POINTS',source:'METEORA_DISCOVERY_API',ingestedAt:at};
 
 test('canonical fee ratios use percentage points for provider and fallback paths',()=>{
  assert.equal(ratioPct(500,100_000),.5);
+ assert.equal(percentagePointsToFraction(.5),.005);
  const provider=standardPoolDiscoveryMetrics({address:'provider',tvl:100_000,fees:{'30m':500},fee_tvl_ratio:{'30m':.5}},at);
  const fallback=standardPoolDiscoveryMetrics({address:'fallback',tvl:100_000,fees:{'30m':500}},at);
  assert.equal(provider.feeTotalTvlRatio30mPct,.5);
