@@ -110,9 +110,31 @@ focused run.
 stored discovery metrics are already correctly percentage-point values, and
 no historical value was altered.
 
+## Deployment and runtime verification
+
+The immutable production artifact for source
+`394bd546365f06e00429243a8355b54bb94717f6` passed runtime release identity
+verification with build identity
+`18a0dc432b8bb82ee43cf4f840bf2807e653d600d37c38fa4b19a3b293bcf927` and the
+unchanged M0065 migration head.  Only `lpforge-production` was reloaded;
+`lpforge-execution`, discovery, and discovery-learning were not restarted.
+
+Post-deploy, production is online without restarts and the verified runtime
+identity is the corrected source commit.  P7 reports `PRODUCTION / HEALTHY`.
+There is one pre-existing active position, zero reserved lamports, zero UNKNOWN
+submissions, and zero unresolved reconciliation debt.  Its existing lifecycle
+was not altered.  Execution remains online with its normal autonomous signer,
+sign, submit, close, and recovery paths available; no transaction was manually
+sent for this correction.
+
+The current automatic-capital entry path still requires fresh event-path
+evidence and does not promote aggregate fallback economics into an
+entry-authoritative decision.  No safe live aggregate-fallback example existed
+to force during verification, so the conversion boundary was exercised through
+the deterministic regression fixture rather than by altering live conditions.
+
 ## Scope preserved
 
 * Fee-productivity admission remains `HOLD_INSUFFICIENT_FEE_THRESHOLD_EVIDENCE`.
 * No candidate fee-credibility/admission policy was added.
 * No active position was altered; this fix is not a retroactive close signal.
-
