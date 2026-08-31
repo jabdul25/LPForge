@@ -226,6 +226,8 @@ importers:
 
   packages/pool-intelligence: {}
 
+  packages/production-global-selection: {}
+
   packages/range-survival: {}
 
   packages/rangeforge: {}

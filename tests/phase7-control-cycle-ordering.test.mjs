@@ -6,7 +6,7 @@ import {validateFreshPhase7ExecutionControl} from '../.build/packages/phase6-cla
 const production='packages/phase7-production-service/src/index.ts';
 const claimGuard='packages/phase6-claim-guard/src/index.ts';
 
-test('health, drift and the control decision persist before the operator probes run',()=>{
+test('health, drift and the control decision persist before the canonical global Production cycle',()=>{
   const src=fs.readFileSync(production,'utf8');
   // Success-path ids end in a backtick+comma; the :failure-suffixed variants
   // in the catch block must not satisfy these anchors.
@@ -14,11 +14,11 @@ test('health, drift and the control decision persist before the operator probes 
   const driftAt=src.indexOf('insertPhase7DriftAssessment({assessmentId:`${input.runtimeId}:${input.cycleKey}:drift`,');
   const controlAt=src.indexOf('insertPhase7ControlDecision({decisionId:`${input.runtimeId}:${input.cycleKey}:control`,');
   const probeAt=src.indexOf('let operator:Phase7OperatorProbe;');
-  const runAt=src.indexOf('runAutonomousDecisionProbe({cwd:input.cwd');
+  const runAt=src.indexOf('runProductionGlobalSelectionCycle({store:input.store');
   assert.ok(healthAt>=0&&driftAt>healthAt&&controlAt>driftAt,'health → drift → control assessment order');
   assert.ok(probeAt>controlAt,'the operator probe starts only after the control decision is durable');
-  assert.ok(runAt>probeAt,'the probe run lives inside the post-control block');
-  assert.ok(probeAt<src.indexOf('runPhase7RecoveryRuntimeTick({store:input.store,runtimeId:input.runtimeId,instanceId:input.instanceId,cycleKey:input.cycleKey,now:new Date().toISOString(),leaseTtlMs:ttl,restarted:input.restarted,control:{authorityMode:control.authorityMode,healthStatus:control.healthStatus'),'the runtime tick follows the probes');
+  assert.ok(runAt>probeAt,'the global cycle lives inside the post-control block');
+  assert.ok(probeAt<src.indexOf('runPhase7RecoveryRuntimeTick({store:input.store,runtimeId:input.runtimeId,instanceId:input.instanceId,cycleKey:input.cycleKey,now:new Date().toISOString(),leaseTtlMs:ttl,restarted:input.restarted,control:{authorityMode:control.authorityMode,healthStatus:control.healthStatus'),'the runtime tick follows the global cycle');
 });
 
 test('drift reads lagged decoder telemetry from the prior evidence snapshot, falling back to the prior drift payload',()=>{
@@ -30,11 +30,11 @@ test('drift reads lagged decoder telemetry from the prior evidence snapshot, fal
   assert.match(src,/const decoderSkipRate=Number\.isFinite\(telemetryWarnings\)&&Number\.isFinite\(telemetrySwaps\)\?telemetryWarnings\/Math\.max\(1,telemetryWarnings\+telemetrySwaps\):undefined;/,'skip rate is undefined, not assumed, when telemetry has never been observed');
 });
 
-test('drift folds the immutable universe while the serialized decision producer probes one bounded target',()=>{
+test('drift folds the immutable universe while the Production selector evaluates its bounded fair set',()=>{
   const src=fs.readFileSync(production,'utf8');
   assert.match(src,/const evaluationPoolAddresses=await productionEvaluationPoolAddresses\(input\.store,input\.env,input\.cycleKey,\[\.\.\.openPools\]\),driftPoolAddresses=\[\.\.\.new Set\(\[input\.cfg\.smokePoolAddress,\.\.\.evaluationPoolAddresses\]\)\];/,'one immutable evaluation-pool snapshot, including owned pools, feeds drift and probes');
-  assert.ok(src.includes('watch.activate&&watch.authorization?[watch.authorization.poolAddress]:phase7BoundedDecisionHealthProbePoolAddresses'), 'a canary probes its single authorized pool; ordinary cycles probe one deterministic target from the immutable evaluation universe');
-  assert.ok(src.includes('Schedule exactly one deterministic target per cycle instead.'),'the decision producer cannot serially consume its own 120-second freshness window');
+  assert.ok(src.includes('runProductionGlobalSelectionCycle'),'the immutable universe is passed to the canonical global selector');
+  assert.ok(src.includes('fairProductionPoolOrder'),'the selector has deterministic fair rotation rather than a static first pool');
   assert.ok(src.includes('significant:poolAddress===input.cfg.smokePoolAddress||capitalPools.has(poolAddress)||openPools.has(poolAddress)'),'smoke pool, deployed capital and open positions are the significance criteria');
   assert.ok(src.includes("rank(p.status)>rank('WATCH')?'WATCH':p.status"),'idle pools are capped at WATCH');
   assert.ok(src.includes('`P7_LIVE_DRIFT_POOL_${p.status}`'),'non-stable pools surface a per-pool reason code');

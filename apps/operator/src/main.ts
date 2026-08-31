@@ -1114,7 +1114,14 @@ async function liveOnce() {
           }
         : {}),
     });
-    await persistResult(store, result, allowRiskIncreasingPlans);
+    // A globally selected entry is re-evaluated immediately before plan
+    // persistence. A changed Candidate-Primary winner is fail-closed rather
+    // than allowing this per-pool construction pass to become a second pool
+    // selector.
+    const requiredGlobalCandidateId=process.env.LPFORGE_GLOBAL_SELECTED_CANDIDATE_ID?.trim();
+    const selectedCandidateId=result.shadow?.thesis?.selectedCandidate.id;
+    const globalSelectionMatches=!requiredGlobalCandidateId||requiredGlobalCandidateId===selectedCandidateId;
+    await persistResult(store, result, allowRiskIncreasingPlans&&globalSelectionMatches);
     const management = await observeAndPlanOwnedPositions({
       store,
       adapter,

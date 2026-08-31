@@ -766,6 +766,10 @@ export interface Phase1Store {
   }): Promise<void>;
   /** Immutable decision-wide RESET-3C source; never an authority input. */
   loadShadowRecommendationPayload(recommendationId:string):Promise<Record<string,unknown>|undefined>;
+  /** Canonical Production global-selection evidence. This is the only pool-selection lane. */
+  loadProductionGlobalCandidateFacts(poolAddresses:string[],cycleStartedAt:string,decisionCutoff:string):Promise<Array<Record<string,unknown>>>;
+  loadProductionPoolSettlementHistory(poolAddresses:string[],decisionCutoff:string):Promise<Array<Record<string,unknown>>>;
+  insertProductionGlobalSelection(value:{globalCycleId:string;policyVersion:string;reentryContextPolicyVersion:string;decisionCutoff:string;startedAt:string;completedAt:string;eligiblePoolCount:number;evaluatedPoolCount:number;candidatePoolCount:number;coverageState:string;outcome:string;winnerPoolAddress?:string;winnerCandidateId?:string;runnerUpPoolAddress?:string;rankingMetric:string;crossPoolMetricsComparable:boolean;reasonCodes:string[];sourceCommit?:string;buildId?:string;payload:Record<string,unknown>;candidates:Array<{poolAddress:string;evaluationOrder:number;candidateRank?:number;candidateState:string;recommendationId?:string;thesisId?:string;candidateId?:string;strategy?:string;orientation?:string;lowerBinId?:number;upperBinId?:number;activeBinId?:number;riskAdjustedExpectedNetEv?:number;predictedFees?:number;predictedInventoryPnl?:number;capitalValue?:number;horizonMinutes?:number;decisionAt?:string;expiresAt?:string;phase3State?:string;phase4State?:string;reasonCodes:string[];historyContext:Record<string,unknown>;payload:Record<string,unknown>}>}):Promise<void>;
   /** Shadow-only Phase-3 forward-validation capture. It has no authority path. */
   /** RESET-3C append-only full-universe evidence. It is never read by authority paths. */
   insertReset3cValidationUniverse(value:{recommendationId:string;decisionId:string;decisionAt:string;samplingContractVersion:string;storageContractVersion:string;capitalLamports:string;expectedCandidateCount:number;capturedCandidateCount:number;universeComplete:boolean;universeManifestHash:string;detailedCandidateCount:number;outcomeEligibleCandidateCount:number;detailedCandidateIds:string[];selectionManifest:Record<string,unknown>;detailedSelectionManifestHash:string;census:Record<string,unknown>;sharedEvidenceHash:string;temporarySharedEvidence:Record<string,unknown>;contentHash:string;}):Promise<'INSERTED'|'IDEMPOTENT'>;
@@ -2263,6 +2267,50 @@ export async function createPostgresStore(
     async loadShadowRecommendationPayload(recommendationId) {
       const r=await db.query('SELECT payload FROM research.shadow_recommendations WHERE recommendation_id=$1',[recommendationId]);
       return r.rows[0]?.payload as Record<string,unknown>|undefined;
+    },
+    async loadProductionGlobalCandidateFacts(poolAddresses,cycleStartedAt,decisionCutoff) {
+      if(!poolAddresses.length)return [];
+      const r=await db.query(`WITH latest AS (
+        SELECT DISTINCT ON (t.pool_address)
+          t.pool_address,r.recommendation_id,t.thesis_id,r.decision_at,r.expires_at,r.state AS phase3_state,
+          t.selected_candidate_id,t.thesis,r.ranking,r.economics,
+          e.decision AS phase4_state,e.confidence,e.payload AS entry_payload
+        FROM research.lp_theses t
+        JOIN research.shadow_recommendations r ON r.recommendation_id=t.recommendation_id
+        LEFT JOIN LATERAL (
+          SELECT decision,confidence,payload FROM research.entry_evaluations
+          WHERE thesis_id=t.thesis_id AND observed_at>=$2::timestamptz AND observed_at<=$3::timestamptz
+          ORDER BY observed_at DESC,entry_evaluation_id DESC LIMIT 1
+        ) e ON true
+        WHERE t.pool_address=ANY($1::text[]) AND r.decision_at>=$2::timestamptz AND r.decision_at<=$3::timestamptz
+        ORDER BY t.pool_address,r.decision_at DESC,r.recommendation_id DESC
+      ) SELECT * FROM latest ORDER BY pool_address`,[poolAddresses,cycleStartedAt,decisionCutoff]);
+      return r.rows as Array<Record<string,unknown>>;
+    },
+    async loadProductionPoolSettlementHistory(poolAddresses,decisionCutoff) {
+      if(!poolAddresses.length)return [];
+      const r=await db.query(`WITH latest AS (
+        SELECT DISTINCT ON (lifecycle_id) lifecycle_id,settlement_version,realized_sol_pnl_lamports,settled_at
+        FROM execution.lifecycle_sol_settlements ORDER BY lifecycle_id,settlement_version DESC
+      ) SELECT l.lifecycle_id,l.pool_address,l.position_address,s.settled_at,s.realized_sol_pnl_lamports,
+        o.initial_capital_lamports,re.close_reason,oor.direction AS oor_direction,oor.inventory_classification,
+        COALESCE(re.gross_lp_fee_lamports,0) AS gross_fees,COALESCE(re.inventory_unwind_pnl_lamports,0) AS inventory_pnl
+        FROM execution.position_lifecycles l
+        JOIN latest s ON s.lifecycle_id=l.lifecycle_id
+        LEFT JOIN execution.owned_positions o ON o.position_address=l.position_address
+        LEFT JOIN execution.position_realized_economics re ON re.position_address=l.position_address
+        LEFT JOIN execution.position_oor_lifecycle_state oor ON oor.position_address=l.position_address
+        WHERE l.pool_address=ANY($1::text[]) AND s.settled_at<=$2::timestamptz
+        ORDER BY l.pool_address,s.settled_at DESC,l.lifecycle_id DESC`,[poolAddresses,decisionCutoff]);
+      return r.rows as Array<Record<string,unknown>>;
+    },
+    async insertProductionGlobalSelection(v) {
+      await db.query('BEGIN');
+      try{
+        await db.query(`INSERT INTO execution.production_global_selection_cycles(global_cycle_id,policy_version,reentry_context_policy_version,decision_cutoff,started_at,completed_at,eligible_pool_count,evaluated_pool_count,candidate_pool_count,coverage_state,outcome,winner_pool_address,winner_candidate_id,runner_up_pool_address,ranking_metric,cross_pool_metrics_comparable,reason_codes,source_commit,build_id,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,$18,$19,$20::jsonb) ON CONFLICT(global_cycle_id) DO NOTHING`,[v.globalCycleId,v.policyVersion,v.reentryContextPolicyVersion,v.decisionCutoff,v.startedAt,v.completedAt,v.eligiblePoolCount,v.evaluatedPoolCount,v.candidatePoolCount,v.coverageState,v.outcome,v.winnerPoolAddress??null,v.winnerCandidateId??null,v.runnerUpPoolAddress??null,v.rankingMetric,v.crossPoolMetricsComparable,json(v.reasonCodes),v.sourceCommit??null,v.buildId??null,json(v.payload)]);
+        for(const c of v.candidates)await db.query(`INSERT INTO execution.production_global_pool_candidates(global_cycle_id,pool_address,evaluation_order,candidate_rank,candidate_state,recommendation_id,thesis_id,candidate_id,strategy,orientation,lower_bin_id,upper_bin_id,active_bin_id,risk_adjusted_expected_net_ev,predicted_fees,predicted_inventory_pnl,capital_value,horizon_minutes,decision_at,expires_at,phase3_state,phase4_state,reason_codes,history_context,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23::jsonb,$24::jsonb,$25::jsonb) ON CONFLICT(global_cycle_id,pool_address) DO NOTHING`,[v.globalCycleId,c.poolAddress,c.evaluationOrder,c.candidateRank??null,c.candidateState,c.recommendationId??null,c.thesisId??null,c.candidateId??null,c.strategy??null,c.orientation??null,c.lowerBinId??null,c.upperBinId??null,c.activeBinId??null,c.riskAdjustedExpectedNetEv??null,c.predictedFees??null,c.predictedInventoryPnl??null,c.capitalValue??null,c.horizonMinutes??null,c.decisionAt??null,c.expiresAt??null,c.phase3State??null,c.phase4State??null,json(c.reasonCodes),json(c.historyContext),json(c.payload)]);
+        await db.query('COMMIT');
+      }catch(error){await db.query('ROLLBACK');throw error;}
     },
     async insertReset3cValidationUniverse(v) {
       const inserted=await db.query(
@@ -4352,6 +4400,9 @@ export function createMemoryStore(): Phase1Store {
     async insertExperimentResult() {},
     async insertShadowRecommendation() {},
     async loadShadowRecommendationPayload() { return undefined; },
+    async loadProductionGlobalCandidateFacts() { return []; },
+    async loadProductionPoolSettlementHistory() { return []; },
+    async insertProductionGlobalSelection() {},
     async insertReset3cValidationUniverse() { return 'INSERTED' as const; },
     async loadReset3cValidationUniverse() { return undefined; },
     async markTerminalEligibleReset3cValidationUniverses() { return 0; },
