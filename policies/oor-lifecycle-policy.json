@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "policyVersion": "oor-lifecycle-v1",
+  "transientMinutes": 10,
+  "sustainedMinutes": 30,
+  "actionRequiredMinutes": 60
+}

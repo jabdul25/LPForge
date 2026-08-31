@@ -10,6 +10,78 @@ export type LiveManagementAction =
   | "REDUCE"
   | "CLOSE"
   | "EMERGENCY_CLOSE";
+
+/**
+ * A separate, durable post-entry policy.  This is deliberately not an entry
+ * policy and cannot generate a replacement range.  A replacement, if ever
+ * justified after settlement, must come from a new production thesis.
+ */
+export type OorLifecycleState =
+  | "IN_RANGE"
+  | "TRANSIENT_OOR"
+  | "SUSTAINED_OOR"
+  | "OOR_ACTION_REQUIRED"
+  | "OOR_STALE_CAPITAL";
+export type OorDirection = "ABOVE_MAX" | "BELOW_MIN";
+export type OorInventoryClassification =
+  | "SAFE_OOR_SOL"
+  | "OOR_TOKEN_EXPOSURE"
+  | "MIXED_INVENTORY"
+  | "INVENTORY_UNAVAILABLE";
+export type OorLifecycleAction =
+  | "HOLD"
+  | "FRESH_EVALUATION"
+  | "TEMPORARY_HOLD"
+  | "CLOSE"
+  | "CLOSE_AND_REEVALUATE"
+  | "HOLD_CHAIN_RECONCILIATION";
+
+export interface OorLifecyclePolicy {
+  schemaVersion: 1;
+  policyVersion: "oor-lifecycle-v1";
+  transientMinutes: number;
+  /** Start of mandatory documented fresh evaluation. */
+  sustainedMinutes: number;
+  /** Start of mandatory action; this is also the stale-capital boundary. */
+  actionRequiredMinutes: number;
+}
+export interface OorLifecyclePriorState {
+  rangeState: "IN_RANGE" | "OUT_OF_RANGE";
+  firstOorDetectedAt?: string;
+  continuousOorStartedAt?: string;
+  latestObservedAt?: string;
+  lastReenteredAt?: string;
+  excursionCount: number;
+  totalOorDurationSeconds: number;
+}
+export interface OorLifecycleObservation {
+  observedAt: string;
+  rangeState: "IN_RANGE" | "OUT_OF_RANGE";
+  activeBinId: number;
+  lowerBinId: number;
+  upperBinId: number;
+  /** A full same-cycle SDK position + pool read, never a cached DB value. */
+  chainTruthFresh: boolean;
+  reconciliationClean: boolean;
+  noActiveManagementPlan: boolean;
+  inventoryClassification: OorInventoryClassification;
+  feeValueLamports?: bigint;
+}
+export interface OorLifecycleAssessment {
+  state: OorLifecycleState;
+  action: OorLifecycleAction;
+  direction?: OorDirection;
+  inventoryClassification: OorInventoryClassification;
+  firstOorDetectedAt?: string;
+  continuousOorStartedAt?: string;
+  latestObservedAt: string;
+  lastReenteredAt?: string;
+  excursionCount: number;
+  totalOorDurationSeconds: number;
+  continuousOorDurationSeconds: number;
+  feeValueLamports?: bigint;
+  reasonCodes: string[];
+}
 export interface LivePositionManagementPolicy {
   schemaVersion: 1;
   enabled: boolean;
@@ -61,9 +133,12 @@ export function assessLiveManagementContext(input: {
   positionPoolAddress: string;
   managementPoolAddress?: string;
   action: LiveManagementAction;
+  /** Fresh chain-backed stale-capital close is a terminal lifecycle action,
+   * never a replacement OPEN and therefore does not need a stale candidate. */
+  oorLifecycleClose?: boolean;
 }) {
   const matchingPoolContext = input.managementPoolAddress === input.positionPoolAddress;
-  const independentlyProtective = input.action === "EMERGENCY_CLOSE";
+  const independentlyProtective = input.action === "EMERGENCY_CLOSE" || input.oorLifecycleClose === true;
   const normalManagementAllowed = matchingPoolContext && input.action !== "HOLD";
   const protectiveManagementAllowed = independentlyProtective;
   return {
@@ -76,7 +151,7 @@ export function assessLiveManagementContext(input: {
     reasonCodes: matchingPoolContext
       ? ["LIVE_MANAGEMENT_CONTEXT_POOL_MATCH"]
       : independentlyProtective
-        ? ["LIVE_MANAGEMENT_CONTEXT_EMERGENCY_INDEPENDENT"]
+        ? [input.oorLifecycleClose?"LIVE_MANAGEMENT_CONTEXT_OOR_LIFECYCLE_INDEPENDENT":"LIVE_MANAGEMENT_CONTEXT_EMERGENCY_INDEPENDENT"]
         : ["LIVE_MANAGEMENT_CONTEXT_POOL_MISMATCH"],
   };
 }
@@ -124,6 +199,68 @@ export function loadLivePositionManagementPolicy(
     JSON.parse(readFileSync(path, "utf8")),
   );
 }
+export function parseOorLifecyclePolicy(raw: unknown): OorLifecyclePolicy {
+  const v = object(raw);
+  const values = [
+    v.transientMinutes,
+    v.sustainedMinutes,
+    v.actionRequiredMinutes,
+  ];
+  if (
+    v.schemaVersion !== 1 ||
+    v.policyVersion !== "oor-lifecycle-v1" ||
+    values.some((value) => !Number.isSafeInteger(value) || Number(value) <= 0) ||
+    !(Number(v.transientMinutes) < Number(v.sustainedMinutes)) ||
+    !(Number(v.sustainedMinutes) < Number(v.actionRequiredMinutes))
+  ) throw new Error("LPFORGE_OOR_LIFECYCLE_POLICY_INVALID");
+  return {
+    schemaVersion: 1,
+    policyVersion: "oor-lifecycle-v1",
+    transientMinutes: Number(v.transientMinutes),
+    sustainedMinutes: Number(v.sustainedMinutes),
+    actionRequiredMinutes: Number(v.actionRequiredMinutes),
+  };
+}
+export function loadOorLifecyclePolicy(path = "policies/oor-lifecycle-policy.json") {
+  return parseOorLifecyclePolicy(JSON.parse(readFileSync(path, "utf8")));
+}
+const validTime=(value:string|undefined)=>value!==undefined&&Number.isFinite(Date.parse(value));
+const elapsedSeconds=(from:string|undefined,to:string)=>{
+  if(!validTime(from)||!validTime(to))return 0;
+  return Math.max(0,Math.floor((Date.parse(to)-Date.parse(from!))/1000));
+};
+/**
+ * Advance the persisted OOR aggregate only from a fresh position/pool read.
+ * It is idempotent for a repeated observation timestamp and deliberately
+ * retains the timer across process restarts because `prior` comes from SQL.
+ */
+export function assessOorLifecycle(input:{policy:OorLifecyclePolicy;prior?:OorLifecyclePriorState;observation:OorLifecycleObservation}):OorLifecycleAssessment {
+  const {policy,prior,observation}=input, now=observation.observedAt;
+  const baseTotal=Math.max(0,Math.floor(prior?.totalOorDurationSeconds??0));
+  const wasOor=prior?.rangeState==='OUT_OF_RANGE'&&validTime(prior.continuousOorStartedAt);
+  const delta=wasOor?elapsedSeconds(prior?.latestObservedAt,now):0;
+  const total=baseTotal+delta;
+  if(!observation.chainTruthFresh||!observation.reconciliationClean||!observation.noActiveManagementPlan){
+    return {state:wasOor?"SUSTAINED_OOR":"IN_RANGE",action:"HOLD_CHAIN_RECONCILIATION",inventoryClassification:observation.inventoryClassification,...(prior?.firstOorDetectedAt?{firstOorDetectedAt:prior.firstOorDetectedAt}:{}),...(prior?.continuousOorStartedAt?{continuousOorStartedAt:prior.continuousOorStartedAt}:{}),latestObservedAt:now,...(prior?.lastReenteredAt?{lastReenteredAt:prior.lastReenteredAt}:{}),excursionCount:Math.max(0,Math.floor(prior?.excursionCount??0)),totalOorDurationSeconds:baseTotal,continuousOorDurationSeconds:wasOor?elapsedSeconds(prior?.continuousOorStartedAt,now):0,...(observation.feeValueLamports===undefined?{}:{feeValueLamports:observation.feeValueLamports}),reasonCodes:[!observation.chainTruthFresh?"POSITION_OOR_CHAIN_TRUTH_UNAVAILABLE":!observation.reconciliationClean?"POSITION_OOR_RECONCILIATION_REQUIRED":"POSITION_OOR_MANAGEMENT_PLAN_PENDING"]};
+  }
+  if(observation.rangeState==='IN_RANGE'){
+    const reentered=wasOor;
+    return {state:"IN_RANGE",action:"HOLD",inventoryClassification:observation.inventoryClassification,...(prior?.firstOorDetectedAt?{firstOorDetectedAt:prior.firstOorDetectedAt}:{}),latestObservedAt:now,...(reentered?{lastReenteredAt:now}:prior?.lastReenteredAt?{lastReenteredAt:prior.lastReenteredAt}:{}),excursionCount:Math.max(0,Math.floor(prior?.excursionCount??0)),totalOorDurationSeconds:total,continuousOorDurationSeconds:0,...(observation.feeValueLamports===undefined?{}:{feeValueLamports:observation.feeValueLamports}),reasonCodes:[reentered?"POSITION_OOR_REENTERED":"POSITION_IN_RANGE"]};
+  }
+  const started=wasOor?prior!.continuousOorStartedAt!:now;
+  const continuous=elapsedSeconds(started,now);
+  const direction:OorDirection=observation.activeBinId>observation.upperBinId?"ABOVE_MAX":"BELOW_MIN";
+  const excursions=Math.max(0,Math.floor(prior?.excursionCount??0))+(wasOor?0:1);
+  const common={direction,inventoryClassification:observation.inventoryClassification,firstOorDetectedAt:prior?.firstOorDetectedAt??now,continuousOorStartedAt:started,latestObservedAt:now,excursionCount:excursions,totalOorDurationSeconds:total,continuousOorDurationSeconds:continuous,...(observation.feeValueLamports===undefined?{}:{feeValueLamports:observation.feeValueLamports})};
+  const minutes=continuous/60;
+  if(minutes<policy.transientMinutes)return{state:"TRANSIENT_OOR",action:"HOLD",...common,reasonCodes:["POSITION_OOR_ENTERED","POSITION_OOR_TRANSIENT"]};
+  if(minutes<policy.sustainedMinutes)return{state:"SUSTAINED_OOR",action:"FRESH_EVALUATION",...common,reasonCodes:["POSITION_OOR_SUSTAINED","POSITION_OOR_FRESH_EVALUATION_REQUIRED"]};
+  if(minutes<policy.actionRequiredMinutes){
+    if(observation.inventoryClassification==='OOR_TOKEN_EXPOSURE')return{state:"OOR_ACTION_REQUIRED",action:"CLOSE",...common,reasonCodes:["POSITION_OOR_ACTION_REQUIRED","POSITION_OOR_TOKEN_RISK"]};
+    return{state:"OOR_ACTION_REQUIRED",action:"TEMPORARY_HOLD",...common,reasonCodes:["POSITION_OOR_ACTION_REQUIRED","POSITION_OOR_BOUNDED_HOLD"]};
+  }
+  return{state:"OOR_STALE_CAPITAL",action:"CLOSE_AND_REEVALUATE",...common,reasonCodes:["POSITION_OOR_STALE_CAPITAL","POSITION_CLOSE_AND_REEVALUATE_REQUIRED",...(observation.inventoryClassification==='OOR_TOKEN_EXPOSURE'?["POSITION_OOR_TOKEN_RISK"]:["POSITION_SAFE_OOR_SOL_IDLE_CAPITAL"])]};
+}
 function positive(raw: string | undefined) {
   try {
     return raw !== undefined && BigInt(raw) > 0n;
@@ -145,6 +282,8 @@ export function decideLivePositionManagement(input: {
   exitDecision?: LiveExitGovernorDecision;
   claimExpectedValueLamports?: bigint | undefined;
   currentForwardEv?: number | undefined;
+  /** OOR authority is supplied by the persistent oor-lifecycle-v1 layer. */
+  oor?: OorLifecycleAssessment;
 }): LivePositionManagementDecision {
   const { policy, owned, position, activeBinId } = input;
   if (!policy.enabled)
@@ -177,23 +316,12 @@ export function decideLivePositionManagement(input: {
     return { action, reasonCodes: input.exitDecision.reasonCodes };
   }
   if (activeBinId < position.lowerBinId || activeBinId > position.upperBinId) {
-    if(input.currentForwardEv===undefined||!Number.isFinite(input.currentForwardEv))return{action:"HOLD",reasonCodes:["POSITION_OOR_FORWARD_EV_UNAVAILABLE"]};
-    if(input.currentForwardEv<=0)return{action:"CLOSE",reasonCodes:["POSITION_OOR_FORWARD_EV_NON_POSITIVE"]};
-    if (policy.outOfRangeAction === "HOLD")
-      return {
-        action: "HOLD",
-        reasonCodes: ["POSITION_OUT_OF_RANGE_HOLD_POLICY"],
-      };
-    if (policy.outOfRangeAction === "CLOSE")
-      return {
-        action: "CLOSE",
-        reasonCodes: ["POSITION_OUT_OF_RANGE_CLOSE_POLICY"],
-      };
-    return {
-      action: policy.outOfRangeAction,
-      reasonCodes: ["POSITION_OUT_OF_RANGE_REPLACEMENT_POLICY"],
-      replacementRange: replacement(owned, activeBinId),
-    };
+    // Old policy could recenter the current range using stale entry evidence.
+    // That path is intentionally removed: OOR is managed by a durable timer,
+    // then any later entry must be a new current-time production thesis.
+    if(!input.oor)return{action:"HOLD",reasonCodes:["POSITION_OOR_LIFECYCLE_DECISION_REQUIRED"]};
+    if(input.oor.action==='CLOSE'||input.oor.action==='CLOSE_AND_REEVALUATE')return{action:"CLOSE",reasonCodes:input.oor.reasonCodes};
+    return{action:"HOLD",reasonCodes:input.oor.reasonCodes};
   }
   if (policy.claimAccruedFees && (positive(position.feeX) || positive(position.feeY))) {
     const claim=assessClaimEconomics({expectedClaimValueLamports:input.claimExpectedValueLamports,estimatedClaimCostLamports:policy.estimatedClaimCostLamports,minimumClaimNetBenefitLamports:policy.minimumClaimNetBenefitLamports});
