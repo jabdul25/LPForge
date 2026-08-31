@@ -67,6 +67,15 @@ export function derivePositionMarkToMarket(input:{position:PositionV2Fact;pool:D
   return{evidenceState:'AVAILABLE',observedAt,currentPositionValueUsd:xv!+yv!+fux!+fuy!,reasonCodes:['EXIT_VALUATION_POSITION_MARK_TO_MARKET']};
 }
 export interface ExitHighWaterState {peakNetReturnFraction:number;peakEconomicValueUsd?:number;peakObservedAt:string;}
+/**
+ * Market evidence is deliberately distinct from chain/lifecycle truth.  The
+ * latter is handled by live-position-management; this structure makes it
+ * impossible for aliases such as FREEFALL -> thesis EMERGENCY to be counted
+ * twice as independent confirmation.
+ */
+export type MarketExitEvidenceFamily='REGIME_DIRECTIONAL'|'TOXICITY'|'LIQUIDITY'|'COMPLETE_NAV'|'MARKET_RISK'|'THESIS';
+export interface MarketExitEvidence {family:MarketExitEvidenceFamily;code:string;severe:boolean;quality:'TRUSTWORTHY'|'LOW_CONFIDENCE'|'INCOMPLETE'|'STALE'|'UNKNOWN';}
+export interface MarketExitConfirmationState {families:Partial<Record<MarketExitEvidenceFamily,number>>;}
 export interface LiveExitGovernorInput {
   policy:LiveExitGovernorPolicy;
   economics:PositionEconomicsSnapshot;
@@ -83,6 +92,11 @@ export interface LiveExitGovernorInput {
   toxicityProbability?:number;
   liquidityCollapse?:boolean;
   positionAgeMinutes?:number;
+  /** True only when the PositionV2 and valuation inputs were fetched for this management cycle. */
+  completeNavFresh?:boolean;
+  /** Model/market evidence with source-family provenance, supplied by the live operator. */
+  marketEvidence?:readonly MarketExitEvidence[];
+  marketConfirmation?:MarketExitConfirmationState;
 }
 export interface LiveExitGovernorDecision {
   action:LiveExitAction;
@@ -93,6 +107,7 @@ export interface LiveExitGovernorDecision {
   economics:PositionEconomicsSnapshot;
   highWater:ExitHighWaterState;
   peakGivebackFraction:number|null;
+  marketConfirmation:MarketExitConfirmationState;
 }
 const clamp=(x:number,min=0,max=1)=>Math.max(min,Math.min(max,x));
 const finite=(x:unknown):x is number=>typeof x==='number'&&Number.isFinite(x);
@@ -172,16 +187,44 @@ function nextHighWater(e:PositionEconomicsSnapshot,prior?:ExitHighWaterState):Ex
   if(!prior||current>prior.peakNetReturnFraction)return{peakNetReturnFraction:Number.isFinite(current)?current:prior?.peakNetReturnFraction??0,...(e.currentEconomicValueUsd!==undefined?{peakEconomicValueUsd:e.currentEconomicValueUsd}:{}),peakObservedAt:e.observedAt};
   return prior;
 }
+function completeNav(input:LiveExitGovernorInput){const e=input.economics;return input.completeNavFresh===true&&e.evidenceState==='AVAILABLE'&&e.reasonCodes.includes('EXIT_VALUATION_COMPLETE_MANAGED_NAV')&&finite(e.netReturnFraction);}
+function marketAuthority(input:LiveExitGovernorInput):{confirmed:boolean;pending:boolean;reasonCodes:string[];confirmation:MarketExitConfirmationState}{
+  const prior=input.marketConfirmation?.families??{}, next:Partial<Record<MarketExitEvidenceFamily,number>>={}, trustworthy=new Map<MarketExitEvidenceFamily,MarketExitEvidence>();
+  for(const evidence of input.marketEvidence??[]){
+    if(!evidence.severe)continue;
+    if(evidence.quality==='TRUSTWORTHY'&&!trustworthy.has(evidence.family))trustworthy.set(evidence.family,evidence);
+  }
+  for(const family of trustworthy.keys())next[family]=Math.max(0,Math.floor(prior[family]??0))+1;
+  const active=[...trustworthy.values()], persistent=active.filter(e=>(next[e.family]??0)>=2);
+  const confirmed=active.length>=2||persistent.length>0;
+  const codes=[...active.map(e=>e.code),...((input.marketEvidence??[]).filter(e=>e.severe&&e.quality!=='TRUSTWORTHY').map(e=>`EXIT_MARKET_EVIDENCE_${e.quality}`))];
+  if(confirmed)codes.push('EXIT_MARKET_AUTHORITY_CONFIRMED');
+  else if(active.length||codes.length)codes.push('EXIT_CONFIRMATION_PENDING');
+  return{confirmed,pending:!confirmed&&(active.length>0||codes.length>0),reasonCodes:[...new Set(codes)].sort(),confirmation:{families:next}};
+}
 export function assessLiveExit(input:LiveExitGovernorInput):LiveExitGovernorDecision{
   const p=input.policy,e=input.economics,hw=nextHighWater(e,input.highWater),current=e.netReturnFraction,giveback=finite(current)?Math.max(0,hw.peakNetReturnFraction-current):null;
-  const out=(action:LiveExitAction,family:LiveExitGovernorDecision['reasonFamily'],codes:string[],urgency:number,reduceFraction=0):LiveExitGovernorDecision=>({action,reasonFamily:family,reasonCodes:[...new Set(codes)].sort(),urgency:clamp(urgency),reduceFraction,economics:e,highWater:hw,peakGivebackFraction:giveback});
+  let authority=marketAuthority(input);
+  const out=(action:LiveExitAction,family:LiveExitGovernorDecision['reasonFamily'],codes:string[],urgency:number,reduceFraction=0):LiveExitGovernorDecision=>({action,reasonFamily:family,reasonCodes:[...new Set(codes)].sort(),urgency:clamp(urgency),reduceFraction,economics:e,highWater:hw,peakGivebackFraction:giveback,marketConfirmation:authority.confirmation});
   if(!p.enabled)return out('HOLD','NONE',['EXIT_GOVERNOR_DISABLED'],0);
   const tox=finite(input.toxicityProbability)?input.toxicityProbability:0;
-  if(input.liquidityCollapse||input.riskDecision==='EMERGENCY'||input.thesisStatus==='EMERGENCY'||tox>=p.toxicityEmergencyThreshold||(finite(current)&&current<=-p.emergencyStopLossFraction))return out('EMERGENCY_CLOSE','EMERGENCY',[input.liquidityCollapse?'EXIT_LIQUIDITY_COLLAPSE':'',input.riskDecision==='EMERGENCY'?'EXIT_EMERGENCY_RISK':'',input.thesisStatus==='EMERGENCY'?'EXIT_THESIS_EMERGENCY':'',tox>=p.toxicityEmergencyThreshold?'EXIT_TOXICITY_EMERGENCY':'',finite(current)&&current<=-p.emergencyStopLossFraction?'EXIT_EMERGENCY_STOP_LOSS':''].filter(Boolean),1,1);
-  if(finite(current)&&current<=-p.hardStopLossFraction)return out('CLOSE','CAPITAL_PROTECTION',['EXIT_HARD_POSITION_STOP_LOSS'],.95,1);
+  // The -20% stop is a verified complete-NAV safety boundary.  Market-model
+  // signals, including liquidity, toxicity, thesis, and risk labels, are
+  // deliberately below it and must pass marketAuthority().
+  if(completeNav(input)&&finite(current)&&current<=-p.emergencyStopLossFraction)return out('EMERGENCY_CLOSE','EMERGENCY',['EXIT_EMERGENCY_STOP_LOSS'],1,1);
+  const defaultEvidence:MarketExitEvidence[]=[
+    ...(input.liquidityCollapse?[{family:'LIQUIDITY' as const,code:'EXIT_LIQUIDITY_COLLAPSE',severe:true,quality:'TRUSTWORTHY' as const}]:[]),
+    ...(tox>=p.toxicityEmergencyThreshold?[{family:'TOXICITY' as const,code:'EXIT_TOXICITY_EMERGENCY',severe:true,quality:'TRUSTWORTHY' as const}]:tox>=p.toxicityCloseThreshold?[{family:'TOXICITY' as const,code:'EXIT_TOXICITY_TOO_HIGH',severe:true,quality:'TRUSTWORTHY' as const}]:[]),
+    ...(completeNav(input)&&finite(current)&&current<=-p.hardStopLossFraction?[{family:'COMPLETE_NAV' as const,code:'EXIT_HARD_POSITION_STOP_LOSS',severe:true,quality:'TRUSTWORTHY' as const}]:[]),
+    ...((input.thesisStatus==='EMERGENCY'||(p.closeOnThesisInvalidated&&input.thesisStatus==='INVALIDATED'))?[{family:'THESIS' as const,code:input.thesisStatus==='EMERGENCY'?'EXIT_THESIS_EMERGENCY':'EXIT_THESIS_INVALIDATED',severe:true,quality:'TRUSTWORTHY' as const}]:[]),
+  ];
+  // Callers that provide provenance own the complete evidence set.  The
+  // fallback preserves safe behaviour for non-operator callers and tests.
+  const governed=marketAuthority({...input,marketEvidence:[...(input.marketEvidence??[]),...defaultEvidence]});
+  authority=governed;
+  if(governed.confirmed)return out('CLOSE','EMERGENCY',governed.reasonCodes,.9,1);
+  if(governed.pending)return out('HOLD','EMERGENCY',governed.reasonCodes,.35,0);
   if(p.takeProfitFraction>0&&finite(current)&&current>=p.takeProfitFraction)return out('CLOSE','PROFIT_PROTECTION',['EXIT_TAKE_PROFIT_TARGET'],.88,1);
-  if(p.closeOnThesisInvalidated&&input.thesisStatus==='INVALIDATED')return out('CLOSE','THESIS',['EXIT_THESIS_INVALIDATED'],.9,1);
-  if(tox>=p.toxicityCloseThreshold)return out('CLOSE','RISK',['EXIT_TOXICITY_TOO_HIGH'],.85,1);
   if(p.profitProtection.enabled&&finite(current)&&hw.peakNetReturnFraction>=p.profitProtection.triggerFraction&&giveback!==null&&giveback>=p.profitProtection.maxGivebackFraction&&current>=p.profitProtection.minRetainedProfitFraction)return out('CLOSE','PROFIT_PROTECTION',['EXIT_PROFIT_GIVEBACK_LIMIT'],.82,1);
   if(p.closeOnNonPositiveForwardEv&&finite(input.currentForwardEv)){if(input.forwardEvEvidenceAvailable===false)return out('HOLD','NONE',['EXIT_POSITION_CONTINUATION_EVIDENCE_UNAVAILABLE'],.1,0);if(!finite(input.closeCost))return out('HOLD','NONE',['EXIT_CLOSE_COST_UNAVAILABLE'],.1,0);const closeCost=Math.max(0,input.closeCost);if(input.currentForwardEv<=-closeCost){const confirmations=Math.max(0,Math.floor(input.forwardEvConfirmationCount??0));if(confirmations<2)return out('HOLD','FORWARD_EV',['EXIT_FORWARD_EV_CONFIRMATION_PENDING'],.1,0);return out('CLOSE','FORWARD_EV',['EXIT_FORWARD_EV_INFERIOR_TO_CLOSE'],.75,1);}}
   if(p.reduceOnRiskBlock&&input.riskDecision==='BLOCK')return out('REDUCE','RISK',['EXIT_REDUCE_RISK_BLOCK',...(input.riskReasonCodes??[])],.7,p.reduceFraction);

@@ -36,6 +36,8 @@ import {
   derivePositionEconomics,
   loadLiveExitGovernorPolicy,
   type ExitHighWaterState,
+  type MarketExitConfirmationState,
+  type MarketExitEvidence,
 } from "../../../packages/live-exit-governor/src/index.js";
 import {
   fixtureBins,
@@ -395,23 +397,42 @@ async function observeAndPlanOwnedPositions(input: {
       peakObservedAt:String(priorExitRow.peak_observed_at??input.observedAt),
     }:undefined;
     const current=input.currentResult?.poolAddress===position.poolAddress?input.currentResult:undefined;
-    const regime=current?.shadow?.regime.primary;
-    const thesisStatus=regime==='FREEFALL'?'EMERGENCY':regime==='DISTRIBUTION'||regime==='TREND_DOWN'?'DETERIORATING':'VALID';
+    const regimeAssessment=current?.shadow?.regime;
+    const regime=regimeAssessment?.primary;
+    // FREEFALL is a regime-model observation, not an independent thesis fact.
+    // It enters the unified market authority with its explicit evidence quality
+    // and may not self-confirm through thesisStatus=EMERGENCY.
+    const thesisStatus=regime==='DISTRIBUTION'||regime==='TREND_DOWN'||regime==='FREEFALL'?'DETERIORATING':'VALID';
     const continuation=fact?await loadPositionContinuationEconomics(position,fact,current,economics):undefined;
     const closeCostLamports=fact&&apiPool?await estimateExpectedCloseCostLamports(fact,apiPool,input.swapQuoteProvider):undefined;
     const currentForwardEv=continuation?Number(continuation.continuationEvLamports)/1_000_000_000:undefined;
     const priorPayload=(priorExitRow?.payload&&typeof priorExitRow.payload==="object"?priorExitRow.payload:{}) as Record<string,unknown>;
     const priorConfirmation=Number(priorPayload.continuationConfirmationCount??0);
+    const storedMarketConfirmation=priorPayload.marketExitConfirmation;
+    const marketConfirmation:MarketExitConfirmationState={families:{}};
+    if(storedMarketConfirmation&&typeof storedMarketConfirmation==='object'&&!Array.isArray(storedMarketConfirmation)){
+      const families=(storedMarketConfirmation as Record<string,unknown>).families;
+      if(families&&typeof families==='object'&&!Array.isArray(families))for(const [family,count] of Object.entries(families as Record<string,unknown>)){
+        if(['REGIME_DIRECTIONAL','TOXICITY','LIQUIDITY','COMPLETE_NAV','MARKET_RISK','THESIS'].includes(family)&&Number.isSafeInteger(Number(count))&&Number(count)>=0)marketConfirmation.families[family as keyof MarketExitConfirmationState['families']]=Number(count);
+      }
+    }
     const inferior=continuation!==undefined&&closeCostLamports!==undefined&&continuation.continuationEvLamports<=-closeCostLamports;
     const confirmationCount=inferior?Math.max(0,Math.floor(priorConfirmation))+1:0;
     const toxicity=current?.poolAssessment.toxicityProbability;
     const liquidityChange=Number(current?.poolAssessment.evidence.recentLiquidityChangePct??0);
+    const marketEvidence:MarketExitEvidence[]=[];
+    if(regime==='FREEFALL'){
+      const reasons=new Set(regimeAssessment?.reasonCodes??[]);
+      marketEvidence.push({family:'REGIME_DIRECTIONAL',code:'EXIT_REGIME_FREEFALL',severe:true,quality:reasons.has('REGIME_DATA_INCOMPLETE')?'INCOMPLETE':reasons.has('REGIME_LOW_CONFIDENCE')?'LOW_CONFIDENCE':'TRUSTWORTHY'});
+    }
+    const completeNavFresh=Boolean(fact&&fact.stamp.source==='METEORA_SDK'&&Number.isFinite(Date.parse(fact.stamp.observedAt))&&Date.parse(fact.stamp.observedAt)>=Date.parse(input.observedAt));
     const exitDecision=assessLiveExit({
       policy:exitPolicy,economics,...(priorHighWater?{highWater:priorHighWater}:{}),thesisStatus,
       ...(typeof currentForwardEv==="number"?{currentForwardEv,forwardEvEvidenceAvailable:true,forwardEvConfirmationCount:confirmationCount}:{}),
       ...(closeCostLamports!==undefined?{closeCost:Number(closeCostLamports)/1_000_000_000}:{}),
       ...(current?.risk?{riskDecision:current.risk.decision,riskReasonCodes:current.risk.reasonCodes}:{}),
       ...(typeof toxicity==="number"?{toxicityProbability:toxicity}:{}),liquidityCollapse:Number.isFinite(liquidityChange)&&liquidityChange<=-50,
+      marketEvidence,marketConfirmation,completeNavFresh,
       ...(position.enteredAt&&Number.isFinite(Date.parse(position.enteredAt))?{positionAgeMinutes:Math.max(0,(Date.parse(input.observedAt)-Date.parse(position.enteredAt))/60000)}:{}),
     });
     const claimExpectedValueLamports=fact&&apiPool?claimValueLamports({feeX:fact.feeX,feeY:fact.feeY,pool:apiPool}):undefined;
@@ -438,7 +459,7 @@ async function observeAndPlanOwnedPositions(input: {
       peakNetReturnFraction:exitDecision.highWater.peakNetReturnFraction,
       ...(exitDecision.highWater.peakEconomicValueUsd!==undefined?{peakEconomicValueUsd:exitDecision.highWater.peakEconomicValueUsd}:{}),
       peakObservedAt:exitDecision.highWater.peakObservedAt,lastAction:exitDecision.action,reasonCodes:exitDecision.reasonCodes,
-      payload:{peakGivebackFraction:exitDecision.peakGivebackFraction,reasonFamily:exitDecision.reasonFamily,urgency:exitDecision.urgency,continuationEvLamports:continuation?.continuationEvLamports.toString()??null,expectedCloseCostLamports:closeCostLamports?.toString()??null,continuationCandidateId:continuation?.candidateId??null,geometryIdentity:continuation?.geometryIdentity??null,continuationConfirmationCount:confirmationCount,regime:regime??null,toxicity:toxicity??null}
+      payload:{peakGivebackFraction:exitDecision.peakGivebackFraction,reasonFamily:exitDecision.reasonFamily,urgency:exitDecision.urgency,continuationEvLamports:continuation?.continuationEvLamports.toString()??null,expectedCloseCostLamports:closeCostLamports?.toString()??null,continuationCandidateId:continuation?.candidateId??null,geometryIdentity:continuation?.geometryIdentity??null,continuationConfirmationCount:confirmationCount,marketExitConfirmation:exitDecision.marketConfirmation,regime:regime??null,toxicity:toxicity??null}
     });
     await input.store.insertPositionManagementDecisionAudit({lpforgePositionId:position.lpforgePositionId,positionAddress:position.positionAddress,observedAt:input.observedAt,activeBinId,lowerBinId:position.lowerBinId,upperBinId:position.upperBinId,...(continuation?{positionContinuationEvLamports:continuation.continuationEvLamports,forecastHorizonMinutes:continuation.forecastHorizonMinutes}:{}),...(current?.shadow?.recommendationId?{sourceDecisionId:current.shadow.recommendationId}:{}),...(continuation?{sourceEconomicsId:continuation.candidateId}:{}),...(continuation?.uncertainty!==undefined?{uncertainty:continuation.uncertainty}:{}),...(closeCostLamports!==undefined?{expectedCloseCostLamports:closeCostLamports}:{}),geometryIdentity:continuation?.geometryIdentity??`${position.positionAddress}:${position.strategy}:${position.orientation}:${position.lowerBinId}:${position.upperBinId}`,managementAction:decision.action,exitReasonFamily:exitDecision.reasonFamily,reasonCodes:exitDecision.reasonCodes,confirmationSequenceCount:confirmationCount,validContinuationEvidence:continuation!==undefined&&closeCostLamports!==undefined});
     await input.store.insertPositionObservation({
