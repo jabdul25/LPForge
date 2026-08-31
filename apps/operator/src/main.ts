@@ -709,6 +709,36 @@ function shadowPayloadForPersistence(shadow:NonNullable<OperationalCycleResult['
  return persistent as unknown as Record<string,unknown>;
 }
 const finiteNumber=(value:unknown):number|null=>typeof value==='number'&&Number.isFinite(value)?value:null;
+const recordValue=(value:unknown):Record<string,unknown>=>value&&typeof value==='object'&&!Array.isArray(value)?value as Record<string,unknown>:{};
+
+/**
+ * Canonical Production bridge from the authoritative operational result to the
+ * global selector.  It deliberately runs for WARMING and NO_TRADE outcomes as
+ * well as ENTRY_READY: recommendation/reporting rows are not selector input.
+ */
+function productionGlobalCandidateFromOperationalResult(globalCycleId:string,r:OperationalCycleResult){
+ const shadow=r.shadow,thesis=shadow?.thesis,selected=thesis?.selectedCandidate,economics=thesis?.expectedEconomics,poolEvidence=recordValue(r.poolAssessment.evidence),diagnostics=recordValue(recordValue(r.entry).diagnostics),allocation=r.allocation?.allocations[0];
+ const operationalState:'ENTRY_READY'|'NO_TRADE'|'WARMING'|'REJECTED'=r.phase3Status==='ENTRY_READY'?'ENTRY_READY':r.phase3Status==='NO_TRADE'?'NO_TRADE':r.phase3Status==='WARMING'?'WARMING':'REJECTED';
+ return{
+  globalCycleId,poolAddress:r.poolAddress,operationalCycleId:r.cycleId,observedAt:r.observedAt,operationalState,phase4State:r.phase4Status,
+  ...(shadow?{recommendationId:shadow.recommendationId}:{}),...(thesis?{thesisId:thesis.thesisId}:{}),...(selected?{candidateId:selected.id,strategy:selected.strategy,orientation:selected.orientation,lowerBinId:selected.lowerBinId,upperBinId:selected.upperBinId}:{}),...(finiteNumber(shadow?.forwardValidation.activeBinIdAtDecision)===null?{}:{activeBinId:finiteNumber(shadow?.forwardValidation.activeBinIdAtDecision)!}),
+  ...(finiteNumber(shadow?.forwardValidation.capitalValue)??finiteNumber(allocation?.requested)??undefined)===undefined?{}:{capitalValue:(finiteNumber(shadow?.forwardValidation.capitalValue)??finiteNumber(allocation?.requested))!},
+  ...(finiteNumber(thesis?.horizonMinutes)??finiteNumber(shadow?.forwardValidation.horizonMinutes)??undefined)===undefined?{}:{horizonMinutes:(finiteNumber(thesis?.horizonMinutes)??finiteNumber(shadow?.forwardValidation.horizonMinutes))!},
+  ...(finiteNumber(economics?.candidateExpectedFees)??finiteNumber(shadow?.economics.expectedFeeValue)??undefined)===undefined?{}:{predictedGrossFees:(finiteNumber(economics?.candidateExpectedFees)??finiteNumber(shadow?.economics.expectedFeeValue))!},
+  ...(finiteNumber(economics?.candidateExpectedInventoryPnl)??finiteNumber(shadow?.economics.expectedInventoryPnl)??undefined)===undefined?{}:{predictedInventoryPnl:(finiteNumber(economics?.candidateExpectedInventoryPnl)??finiteNumber(shadow?.economics.expectedInventoryPnl))!},
+  ...(finiteNumber(economics?.candidateExpectedNetEV)??finiteNumber(shadow?.economics.expectedNetLpValue)??undefined)===undefined?{}:{predictedNetEv:(finiteNumber(economics?.candidateExpectedNetEV)??finiteNumber(shadow?.economics.expectedNetLpValue))!},
+  ...(finiteNumber(economics?.riskAdjustedExpectedNetEV)??finiteNumber(shadow?.qualification.riskAdjustedExpectedNetEV)??undefined)===undefined?{}:{riskAdjustedExpectedNetEv:(finiteNumber(economics?.riskAdjustedExpectedNetEV)??finiteNumber(shadow?.qualification.riskAdjustedExpectedNetEV))!},
+  ...(finiteNumber(economics?.uncertainty)??finiteNumber(shadow?.economics.uncertainty)??undefined)===undefined?{}:{uncertainty:(finiteNumber(economics?.uncertainty)??finiteNumber(shadow?.economics.uncertainty))!},
+  ...(finiteNumber(thesis?.confidence)??finiteNumber(r.entry?.confidence)??undefined)===undefined?{}:{confidence:(finiteNumber(thesis?.confidence)??finiteNumber(r.entry?.confidence))!},
+  ...(finiteNumber(diagnostics.immediateOorRisk)===null?{}:{oorRisk:finiteNumber(diagnostics.immediateOorRisk)!}),
+  ...(finiteNumber(poolEvidence.tvl)===null?{}:{tvl:finiteNumber(poolEvidence.tvl)!}),
+  ...(finiteNumber(poolEvidence.fee1hTvl)===null?{}:{feeTvl1h:finiteNumber(poolEvidence.fee1hTvl)!}),
+  ...(finiteNumber(poolEvidence.fee24hTvl)===null?{}:{feeTvl24h:finiteNumber(poolEvidence.fee24hTvl)!}),
+  reasonCodes:[...new Set(r.reasonCodes)].sort(),
+  evidence:{history:r.evidence.history,rateEvidence:r.evidence.rateEvidence,valuation:r.evidence.valuation,poolAssessmentEvidence:r.poolAssessment.evidence},
+  payload:{phase3Status:r.phase3Status,phase4Status:r.phase4Status,phase5Status:r.phase5Status,entryDecision:r.entry?.decision??null,entryReasonCodes:r.entry?.reasonCodes??[],riskDecision:r.risk?.decision??null,riskReasonCodes:r.risk?.reasonCodes??[],allocation:r.allocation??null}
+ };
+}
 
 async function persistReset3cUniverse(store:Phase1Store,r:OperationalCycleResult,frozen:ReturnType<typeof freezePhase3ForwardDecision>){
  const universe=r.shadow?.candidateUniverseEvidence;if(!universe||!universe.frames.length)return;
@@ -872,6 +902,8 @@ async function persistResult(
         : {}),
     },
   });
+  const globalCycleId=process.env.LPFORGE_PRODUCTION_GLOBAL_SELECTION_CYCLE_ID?.trim();
+  if(globalCycleId)await store.insertProductionGlobalCandidate(productionGlobalCandidateFromOperationalResult(globalCycleId,r));
   await store.recordPostEvidenceEvaluationOutcome({poolAddress:r.poolAddress,observedAt:r.observedAt,phase3Status:r.phase3Status});
 }
 async function liveOnce() {

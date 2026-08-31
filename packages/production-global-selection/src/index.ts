@@ -2,10 +2,10 @@
 export const GLOBAL_POOL_SELECTION_POLICY_V1='global-pool-selection-v1';
 export const POOL_REENTRY_CONTEXT_POLICY_V1='pool-reentry-context-v1';
 export const GLOBAL_SELECTION_MAX_EVIDENCE_AGE_SECONDS=300;
-export type CandidateState='INCLUDED'|'EXCLUDED_STALE'|'EXCLUDED_REENTRY_EVIDENCE'|'NO_VALID_CANDIDATE'|'INCOMPARABLE';
+export type CandidateState='INCLUDED'|'WARMING'|'NO_TRADE'|'REJECTED'|'EXCLUDED_STALE'|'EXCLUDED_REENTRY_EVIDENCE'|'NO_VALID_CANDIDATE'|'INCOMPARABLE';
 export interface SettledPoolOutcome {lifecycleId:string;poolAddress:string;settledAt:string;realizedNetLamports:bigint;realizedReturnFraction?:number;closeReason?:string;oorDirection?:string;inventoryClassification?:string;grossFeesLamports?:bigint;inventoryPnlLamports?:bigint;}
 export interface PoolHistoryContext {poolAddress:string;asOf:string;sourceLifecycleIds:string[];lastSettlementAt?:string;timeSinceLastSettlementSeconds?:number;lastRealizedNetLamports?:bigint;lastRealizedReturnFraction?:number;lastCloseReason?:string;lastOorDirection?:string;lastInventoryClassification?:string;entriesToday:number;recentWins:number;recentLosses:number;recentCumulativeNetLamports:bigint;recentTokenRiskCloseCount:number;recentBelowMinCloseCount:number;recentFeeCaptureLamports:bigint;recentInventoryPnlLamports:bigint;historyWindow:'UTC_DAY';}
-export interface PoolCandidate {poolAddress:string;recommendationId?:string;thesisId?:string;candidateId?:string;strategy?:string;orientation?:string;lowerBinId?:number;upperBinId?:number;activeBinId?:number;decisionAt?:string;expiresAt?:string;phase3State:string;phase4State?:string;capitalValue?:number;horizonMinutes?:number;riskAdjustedExpectedNetEv?:number;predictedFees?:number;predictedInventoryPnl?:number;uncertainty?:number;confidence?:number;oorRisk?:number;rankingPolicyId?:string;history:PoolHistoryContext;state:CandidateState;reasonCodes:string[];}
+export interface PoolCandidate {poolAddress:string;operationalState?:'ENTRY_READY'|'NO_TRADE'|'WARMING'|'REJECTED';operationalReasonCodes?:string[];recommendationId?:string;thesisId?:string;candidateId?:string;strategy?:string;orientation?:string;lowerBinId?:number;upperBinId?:number;activeBinId?:number;decisionAt?:string;expiresAt?:string;phase3State:string;phase4State?:string;capitalValue?:number;horizonMinutes?:number;riskAdjustedExpectedNetEv?:number;predictedFees?:number;predictedInventoryPnl?:number;uncertainty?:number;confidence?:number;oorRisk?:number;rankingPolicyId?:string;history:PoolHistoryContext;state:CandidateState;reasonCodes:string[];}
 export interface GlobalSelection {policyVersion:string;decisionCutoff:string;crossPoolMetricsComparable:boolean;outcome:'GLOBAL_WINNER'|'GLOBAL_NO_TRADE';reasonCodes:string[];ranked:PoolCandidate[];winner?:PoolCandidate;}
 const at=(s?:string)=>Date.parse(s??'');
 const dayStart=(iso:string)=>{const d=new Date(iso);return new Date(Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate())).getTime();};
@@ -18,16 +18,20 @@ export function deriveProductionPoolHistory(input:{poolAddress:string;asOf:strin
 }
 export function classifyProductionPoolCandidate(input:{candidate:Omit<PoolCandidate,'state'|'reasonCodes'>;cycleStartedAt:string;decisionCutoff:string}):PoolCandidate{
   const c=input.candidate,reasons:string[]=[];const decision=at(c.decisionAt),cutoff=at(input.decisionCutoff),started=at(input.cycleStartedAt),expires=at(c.expiresAt);
+  const operationalReasons=c.operationalReasonCodes??[];
+  if(c.operationalState==='WARMING')return{...c,state:'WARMING',reasonCodes:[...new Set([...operationalReasons,'GLOBAL_POOL_WARMING'])].sort()};
+  if(c.operationalState==='NO_TRADE')return{...c,state:'NO_TRADE',reasonCodes:[...new Set([...operationalReasons,'GLOBAL_POOL_NO_TRADE'])].sort()};
+  if(c.operationalState==='REJECTED')return{...c,state:'REJECTED',reasonCodes:[...new Set([...operationalReasons,'GLOBAL_POOL_REJECTED'])].sort()};
   // Candidate-Primary/P3 establishes the per-pool economic winner.  P4 is
   // deliberately retained as the existing downstream authorization gate after
   // the global selector chooses a pool; a P4 WAIT must not erase an otherwise
   // comparable per-pool candidate from the production decision record.
   if(c.phase3State!=='ENTRY_READY'||!c.candidateId)reasons.push('GLOBAL_NO_VALID_POOL_CANDIDATE');
-  if(!Number.isFinite(decision)||decision<started||decision>cutoff||!Number.isFinite(expires)||expires<=cutoff||cutoff-decision>GLOBAL_SELECTION_MAX_EVIDENCE_AGE_SECONDS*1000)reasons.push('GLOBAL_CANDIDATE_EVIDENCE_STALE');
+  if(!Number.isFinite(decision)||decision<started||decision>cutoff||cutoff-decision>GLOBAL_SELECTION_MAX_EVIDENCE_AGE_SECONDS*1000||Number.isFinite(expires)&&expires<=cutoff)reasons.push('GLOBAL_CANDIDATE_EVIDENCE_STALE');
   if(c.history.lastSettlementAt&&decision<=at(c.history.lastSettlementAt))reasons.push('GLOBAL_SAME_POOL_POST_SETTLEMENT_EVIDENCE_REQUIRED');
-  if(!Number.isFinite(c.capitalValue)||!Number.isFinite(c.horizonMinutes)||!Number.isFinite(c.riskAdjustedExpectedNetEv))reasons.push('GLOBAL_CANDIDATE_METRICS_INCOMPLETE');
+  if(!Number.isFinite(c.capitalValue)||!Number.isFinite(c.horizonMinutes)||!Number.isFinite(c.riskAdjustedExpectedNetEv))reasons.push('GLOBAL_ENTRY_READY_METRICS_INCOMPLETE');
   const state:CandidateState=reasons.includes('GLOBAL_CANDIDATE_EVIDENCE_STALE')?'EXCLUDED_STALE':reasons.includes('GLOBAL_SAME_POOL_POST_SETTLEMENT_EVIDENCE_REQUIRED')?'EXCLUDED_REENTRY_EVIDENCE':reasons.length?'NO_VALID_CANDIDATE':'INCLUDED';
-  return{...c,state,reasonCodes:reasons.sort()};
+  return{...c,state,reasonCodes:[...new Set([...operationalReasons,...reasons])].sort()};
 }
 export function selectProductionGlobalWinner(input:{decisionCutoff:string;candidates:readonly PoolCandidate[]}):GlobalSelection{
   const included=input.candidates.filter(x=>x.state==='INCLUDED');const capitals=new Set(included.map(x=>String(x.capitalValue))),horizons=new Set(included.map(x=>String(x.horizonMinutes)));

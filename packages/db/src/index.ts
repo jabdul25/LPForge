@@ -767,7 +767,8 @@ export interface Phase1Store {
   /** Immutable decision-wide RESET-3C source; never an authority input. */
   loadShadowRecommendationPayload(recommendationId:string):Promise<Record<string,unknown>|undefined>;
   /** Canonical Production global-selection evidence. This is the only pool-selection lane. */
-  loadProductionGlobalCandidateFacts(poolAddresses:string[],cycleStartedAt:string,decisionCutoff:string):Promise<Array<Record<string,unknown>>>;
+  insertProductionGlobalCandidate(value:{globalCycleId:string;poolAddress:string;operationalCycleId:string;observedAt:string;operationalState:'ENTRY_READY'|'NO_TRADE'|'WARMING'|'REJECTED';phase4State:string;recommendationId?:string;thesisId?:string;candidateId?:string;strategy?:string;orientation?:string;lowerBinId?:number;upperBinId?:number;activeBinId?:number;capitalValue?:number;horizonMinutes?:number;predictedGrossFees?:number;predictedInventoryPnl?:number;predictedNetEv?:number;riskAdjustedExpectedNetEv?:number;uncertainty?:number;confidence?:number;oorRisk?:number;eventPathEvidenceAt?:string;feeEvidenceAt?:string;volumeEvidenceAt?:string;tvl?:number;feeTvl1h?:number;feeTvl24h?:number;reasonCodes:string[];evidence:Record<string,unknown>;payload:Record<string,unknown>}):Promise<void>;
+  loadProductionGlobalCandidateFacts(globalCycleId:string,poolAddresses:string[]):Promise<Array<Record<string,unknown>>>;
   loadProductionPoolSettlementHistory(poolAddresses:string[],decisionCutoff:string):Promise<Array<Record<string,unknown>>>;
   insertProductionGlobalSelection(value:{globalCycleId:string;policyVersion:string;reentryContextPolicyVersion:string;decisionCutoff:string;startedAt:string;completedAt:string;eligiblePoolCount:number;evaluatedPoolCount:number;candidatePoolCount:number;coverageState:string;outcome:string;winnerPoolAddress?:string;winnerCandidateId?:string;runnerUpPoolAddress?:string;rankingMetric:string;crossPoolMetricsComparable:boolean;reasonCodes:string[];sourceCommit?:string;buildId?:string;payload:Record<string,unknown>;candidates:Array<{poolAddress:string;evaluationOrder:number;candidateRank?:number;candidateState:string;recommendationId?:string;thesisId?:string;candidateId?:string;strategy?:string;orientation?:string;lowerBinId?:number;upperBinId?:number;activeBinId?:number;riskAdjustedExpectedNetEv?:number;predictedFees?:number;predictedInventoryPnl?:number;capitalValue?:number;horizonMinutes?:number;decisionAt?:string;expiresAt?:string;phase3State?:string;phase4State?:string;reasonCodes:string[];historyContext:Record<string,unknown>;payload:Record<string,unknown>}>}):Promise<void>;
   /** Shadow-only Phase-3 forward-validation capture. It has no authority path. */
@@ -2268,23 +2269,12 @@ export async function createPostgresStore(
       const r=await db.query('SELECT payload FROM research.shadow_recommendations WHERE recommendation_id=$1',[recommendationId]);
       return r.rows[0]?.payload as Record<string,unknown>|undefined;
     },
-    async loadProductionGlobalCandidateFacts(poolAddresses,cycleStartedAt,decisionCutoff) {
+    async insertProductionGlobalCandidate(v) {
+      await db.query(`INSERT INTO execution.production_global_candidates(global_cycle_id,pool_address,operational_cycle_id,observed_at,operational_state,phase4_state,recommendation_id,thesis_id,candidate_id,strategy,orientation,lower_bin_id,upper_bin_id,active_bin_id,capital_value,horizon_minutes,predicted_gross_fees,predicted_inventory_pnl,predicted_net_ev,risk_adjusted_expected_net_ev,uncertainty,confidence,oor_risk,event_path_evidence_at,fee_evidence_at,volume_evidence_at,tvl,fee_tvl_1h,fee_tvl_24h,reason_codes,evidence,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30::jsonb,$31::jsonb,$32::jsonb) ON CONFLICT(global_cycle_id,pool_address) DO NOTHING`,[v.globalCycleId,v.poolAddress,v.operationalCycleId,v.observedAt,v.operationalState,v.phase4State,v.recommendationId??null,v.thesisId??null,v.candidateId??null,v.strategy??null,v.orientation??null,v.lowerBinId??null,v.upperBinId??null,v.activeBinId??null,v.capitalValue??null,v.horizonMinutes??null,v.predictedGrossFees??null,v.predictedInventoryPnl??null,v.predictedNetEv??null,v.riskAdjustedExpectedNetEv??null,v.uncertainty??null,v.confidence??null,v.oorRisk??null,v.eventPathEvidenceAt??null,v.feeEvidenceAt??null,v.volumeEvidenceAt??null,v.tvl??null,v.feeTvl1h??null,v.feeTvl24h??null,json(v.reasonCodes),json(v.evidence),json(v.payload)]);
+    },
+    async loadProductionGlobalCandidateFacts(globalCycleId,poolAddresses) {
       if(!poolAddresses.length)return [];
-      const r=await db.query(`WITH latest AS (
-        SELECT DISTINCT ON (t.pool_address)
-          t.pool_address,r.recommendation_id,t.thesis_id,r.decision_at,r.expires_at,r.state AS phase3_state,
-          t.selected_candidate_id,t.thesis,r.ranking,r.economics,
-          e.decision AS phase4_state,e.confidence,e.payload AS entry_payload
-        FROM research.lp_theses t
-        JOIN research.shadow_recommendations r ON r.recommendation_id=t.recommendation_id
-        LEFT JOIN LATERAL (
-          SELECT decision,confidence,payload FROM research.entry_evaluations
-          WHERE thesis_id=t.thesis_id AND observed_at>=$2::timestamptz AND observed_at<=$3::timestamptz
-          ORDER BY observed_at DESC,entry_evaluation_id DESC LIMIT 1
-        ) e ON true
-        WHERE t.pool_address=ANY($1::text[]) AND r.decision_at>=$2::timestamptz AND r.decision_at<=$3::timestamptz
-        ORDER BY t.pool_address,r.decision_at DESC,r.recommendation_id DESC
-      ) SELECT * FROM latest ORDER BY pool_address`,[poolAddresses,cycleStartedAt,decisionCutoff]);
+      const r=await db.query(`SELECT * FROM execution.production_global_candidates WHERE global_cycle_id=$1 AND pool_address=ANY($2::text[]) ORDER BY pool_address`,[globalCycleId,poolAddresses]);
       return r.rows as Array<Record<string,unknown>>;
     },
     async loadProductionPoolSettlementHistory(poolAddresses,decisionCutoff) {
@@ -4400,6 +4390,7 @@ export function createMemoryStore(): Phase1Store {
     async insertExperimentResult() {},
     async insertShadowRecommendation() {},
     async loadShadowRecommendationPayload() { return undefined; },
+    async insertProductionGlobalCandidate() {},
     async loadProductionGlobalCandidateFacts() { return []; },
     async loadProductionPoolSettlementHistory() { return []; },
     async insertProductionGlobalSelection() {},

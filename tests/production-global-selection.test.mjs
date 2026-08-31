@@ -4,7 +4,7 @@ import {classifyProductionPoolCandidate,deriveProductionPoolHistory,fairProducti
 
 const cutoff='2026-08-31T20:00:00.000Z',started='2026-08-31T19:58:00.000Z';
 const outcome=(x={})=>({lifecycleId:'hve',poolAddress:'EsR3',settledAt:'2026-08-31T19:00:00.000Z',realizedNetLamports:-1_925_242n,realizedReturnFraction:-.064174733,closeReason:'OOR_TOKEN_EXPOSURE',oorDirection:'BELOW_MIN',inventoryClassification:'OOR_TOKEN_EXPOSURE',grossFeesLamports:924_642n,...x});
-const candidate=(pool,ev,opts={})=>classifyProductionPoolCandidate({cycleStartedAt:started,decisionCutoff:cutoff,candidate:{poolAddress:pool,recommendationId:`r-${pool}`,thesisId:`t-${pool}`,candidateId:`c-${pool}`,decisionAt:'2026-08-31T19:59:00.000Z',expiresAt:'2026-08-31T20:04:00.000Z',phase3State:'ENTRY_READY',phase4State:'ENTRY_READY',capitalValue:.03,horizonMinutes:60,riskAdjustedExpectedNetEv:ev,history:deriveProductionPoolHistory({poolAddress:pool,asOf:cutoff,outcomes:opts.outcomes??[]}),...opts}});
+const candidate=(pool,ev,opts={})=>classifyProductionPoolCandidate({cycleStartedAt:started,decisionCutoff:cutoff,candidate:{poolAddress:pool,operationalState:'ENTRY_READY',recommendationId:`r-${pool}`,thesisId:`t-${pool}`,candidateId:`c-${pool}`,decisionAt:'2026-08-31T19:59:00.000Z',expiresAt:'2026-08-31T20:04:00.000Z',phase3State:'ENTRY_READY',phase4State:'ENTRY_READY',capitalValue:.03,horizonMinutes:60,riskAdjustedExpectedNetEv:ev,history:deriveProductionPoolHistory({poolAddress:pool,asOf:cutoff,outcomes:opts.outcomes??[]}),...opts}});
 
 test('one best Candidate-Primary result per pool is globally ranked by comparable risk-adjusted net EV',()=>{
   const r=selectProductionGlobalWinner({decisionCutoff:cutoff,candidates:[candidate('A',.0001),candidate('B',.0003),candidate('C',.0002)]});
@@ -19,6 +19,22 @@ test('missing, stale, or incompatible pool facts fail closed rather than falling
   const stale=candidate('A',.1,{decisionAt:'2026-08-31T19:50:00.000Z'});assert.equal(stale.state,'EXCLUDED_STALE');
   const incomplete=selectProductionGlobalWinner({decisionCutoff:cutoff,candidates:[stale]});assert.equal(incomplete.outcome,'GLOBAL_NO_TRADE');
   const mismatch=selectProductionGlobalWinner({decisionCutoff:cutoff,candidates:[candidate('A',.1),candidate('B',.2,{capitalValue:.05})]});assert.equal(mismatch.outcome,'GLOBAL_NO_TRADE');assert.equal(mismatch.crossPoolMetricsComparable,false);
+});
+test('WARMING and NO_TRADE are canonical global states, not missing or stale candidates',()=>{
+  const history=deriveProductionPoolHistory({poolAddress:'W',asOf:cutoff,outcomes:[]});
+  const warming=classifyProductionPoolCandidate({cycleStartedAt:started,decisionCutoff:cutoff,candidate:{poolAddress:'W',operationalState:'WARMING',operationalReasonCodes:['OPERATIONAL_EVIDENCE_MATURITY_PENDING'],phase3State:'WARMING',phase4State:'WARMING',history}});
+  const noTrade=classifyProductionPoolCandidate({cycleStartedAt:started,decisionCutoff:cutoff,candidate:{poolAddress:'N',operationalState:'NO_TRADE',operationalReasonCodes:['CANDIDATE_PRIMARY_NO_LOCALLY_ACTIONABLE_WINNER'],phase3State:'NO_TRADE',phase4State:'NO_TRADE',history:deriveProductionPoolHistory({poolAddress:'N',asOf:cutoff,outcomes:[]})}});
+  assert.equal(warming.state,'WARMING');assert.ok(warming.reasonCodes.includes('OPERATIONAL_EVIDENCE_MATURITY_PENDING'));assert.equal(noTrade.state,'NO_TRADE');assert.ok(noTrade.reasonCodes.includes('CANDIDATE_PRIMARY_NO_LOCALLY_ACTIONABLE_WINNER'));
+});
+test('one ENTRY_READY candidate can rank while other pools are explicitly WARMING',()=>{
+  const history=deriveProductionPoolHistory({poolAddress:'W',asOf:cutoff,outcomes:[]});
+  const warming=classifyProductionPoolCandidate({cycleStartedAt:started,decisionCutoff:cutoff,candidate:{poolAddress:'W',operationalState:'WARMING',phase3State:'WARMING',phase4State:'WARMING',history}});
+  const r=selectProductionGlobalWinner({decisionCutoff:cutoff,candidates:[candidate('A',.0003),warming]});
+  assert.equal(r.outcome,'GLOBAL_WINNER');assert.equal(r.winner?.poolAddress,'A');
+});
+test('ENTRY_READY without its canonical capital record is explicitly rejected',()=>{
+  const broken=candidate('A',.1,{capitalValue:undefined});
+  assert.equal(broken.state,'NO_VALID_CANDIDATE');assert.ok(broken.reasonCodes.includes('GLOBAL_ENTRY_READY_METRICS_INCOMPLETE'));
 });
 test('authoritative corrected settlements are visible only after settlement and remain isolated per canonical pool',()=>{
   const hve=outcome(),history=deriveProductionPoolHistory({poolAddress:'EsR3',asOf:cutoff,outcomes:[hve,outcome({lifecycleId:'future',settledAt:'2026-08-31T20:01:00.000Z'}),outcome({lifecycleId:'other',poolAddress:'other',realizedNetLamports:320_468n})]});
