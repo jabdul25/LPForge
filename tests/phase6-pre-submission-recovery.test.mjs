@@ -1,6 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {recoverUnfinishedAutonomousPlans,reconcileWalletWidePositions} from '../.build/packages/phase6-live-worker/src/index.js';
+import {recoverUnfinishedAutonomousPlans,reconcileWalletWidePositions,assessExpiredNoEffectOpenRecovery} from '../.build/packages/phase6-live-worker/src/index.js';
+
+test("expired no-effect OPEN is terminal only with complete absence evidence",()=>{
+  const clean={confirmationStatus:"EXPIRED",economicEffect:"ABSENT",positionAbsenceProven:true,signatureStatusReadUnknown:false,hasFundingChild:false,partialEntryRecoveryPresent:false,planCashflowCount:0,chunkDispositions:[]};
+  assert.equal(assessExpiredNoEffectOpenRecovery(clean).terminal,true);
+  assert.equal(assessExpiredNoEffectOpenRecovery({...clean,signatureStatusReadUnknown:true}).terminal,false);
+  assert.equal(assessExpiredNoEffectOpenRecovery({...clean,hasFundingChild:true}).terminal,false);
+  assert.equal(assessExpiredNoEffectOpenRecovery({...clean,partialEntryRecoveryPresent:true}).terminal,false);
+  assert.equal(assessExpiredNoEffectOpenRecovery({...clean,planCashflowCount:1}).terminal,false);
+  assert.equal(assessExpiredNoEffectOpenRecovery({...clean,chunkDispositions:["UNKNOWN_SUBMISSION"]}).terminal,false);
+});
 
 test('orphan sweep targets the installed Meteora SDK wallet-position API',async()=>{
   const fs=await import('node:fs/promises');

@@ -281,6 +281,33 @@ export function assessFreshOpenPortfolioTruth(input:{openPositions:number;pendin
   if(input.unresolvedReconciliationDebt!==0)reasons.push("P6_FRESH_EXECUTION_RECONCILIATION_DEBT");
   return{clean:reasons.length===0,expectedPendingExecutionCount:1,reasonCodes:reasons};
 }
+/**
+ * A submitted OPEN can release capacity only after durable, independent
+ * evidence proves that every economic effect is absent. This deliberately
+ * excludes swap-funded and chunked cases: those have their own partial-entry
+ * recovery evidence and must never be collapsed into a no-effect terminal.
+ */
+export function assessExpiredNoEffectOpenRecovery(input:{
+  confirmationStatus:string;
+  economicEffect:"PRESENT"|"ABSENT"|"UNKNOWN";
+  positionAbsenceProven:boolean;
+  signatureStatusReadUnknown:boolean;
+  hasFundingChild:boolean;
+  partialEntryRecoveryPresent:boolean;
+  planCashflowCount:number;
+  chunkDispositions:string[];
+}):{terminal:boolean;reasonCodes:string[]}{
+  const reasons:string[]=[];
+  if(input.confirmationStatus!=="EXPIRED")reasons.push("P6_NO_EFFECT_SIGNATURE_NOT_EXPIRED");
+  if(input.economicEffect!=="ABSENT")reasons.push("P6_NO_EFFECT_ECONOMIC_EFFECT_NOT_ABSENT");
+  if(!input.positionAbsenceProven)reasons.push("P6_NO_EFFECT_POSITION_ABSENCE_UNPROVEN");
+  if(input.signatureStatusReadUnknown)reasons.push("P6_NO_EFFECT_SIGNATURE_STATUS_UNKNOWN");
+  if(input.hasFundingChild)reasons.push("P6_NO_EFFECT_FUNDING_CHILD_REQUIRES_PARTIAL_RECOVERY");
+  if(input.partialEntryRecoveryPresent)reasons.push("P6_NO_EFFECT_PARTIAL_ENTRY_RECOVERY_PRESENT");
+  if(input.planCashflowCount!==0)reasons.push("P6_NO_EFFECT_PLAN_CASHFLOW_PRESENT");
+  if(input.chunkDispositions.some(disposition=>!["PROVEN_NOT_LANDED","FAILED_PRE_SIGN"].includes(disposition)))reasons.push("P6_NO_EFFECT_CHILD_DISPOSITION_NOT_PROVEN");
+  return{terminal:reasons.length===0,reasonCodes:reasons};
+}
 /** Loads the live authorities immediately before economic signing. Nothing in
  * this snapshot is a favorable default: an unavailable source fails closed. */
 export async function loadFreshExecutionSafetyFacts(input:{store:Pick<Phase1Store,'loadLatestPhase7ControlDecision'|'loadPhase7ControlDecision'|'loadPhase7PortfolioFacts'>;plan:AutonomousOpenPlan;config:Pick<LiveWorkerConfig,'rpcUrl'|'programId'>;connection?:Pick<Connection,'getLatestBlockhash'>;now?:string;phase7RuntimeId?:string;protocolCompatibility?:()=>Promise<boolean>}):Promise<FreshExecutionSafetyFacts>{
@@ -4486,6 +4513,46 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         reasonCodes: ["P6_RECOVERY_OPEN_POSITION_ADOPTION_BLOCKED"],
       });
     };
+    // This is intentionally narrower than generic expiry recovery. A fresh
+    // OPEN may only replace this stale thesis after the original submitted
+    // plan is terminalized and its reservation released; it is never replayed.
+    if(plan.action==="OPEN"){
+      const noEffectStore=input.store as Partial<Pick<Phase1Store,"loadPartialEntryRecovery"|"loadPlanCashflows"|"loadOpenChunkDispositions">>;
+      const [partialEntryRecovery,planCashflows,chunkDispositions]=await Promise.all([
+        noEffectStore.loadPartialEntryRecovery?.(plan.planId),
+        noEffectStore.loadPlanCashflows?.(plan.planId)??[],
+        noEffectStore.loadOpenChunkDispositions?.(plan.planId)??[],
+      ]);
+      const noEffect=assessExpiredNoEffectOpenRecovery({
+        confirmationStatus,
+        economicEffect,
+        positionAbsenceProven:positionTruth.absenceProven===true,
+        signatureStatusReadUnknown,
+        hasFundingChild:plan.steps.some(step=>step.kind==="JUPITER_SWAP"),
+        partialEntryRecoveryPresent:partialEntryRecovery!==undefined,
+        planCashflowCount:planCashflows.length,
+        chunkDispositions:chunkDispositions.map(child=>child.disposition),
+      });
+      if(noEffect.terminal){
+        await input.store.transitionAutonomousPlan({
+          planId:plan.planId,
+          state:"EXPIRED",
+          at:input.now,
+          reasonCodes:["P6_OPEN_EXPIRED_NO_CHAIN_EFFECT"],
+          payload:{
+            recovery:"OPEN_EXPIRED_NO_CHAIN_EFFECT",
+            journalId:journal.journalId,
+            confirmationStatus,
+            economicEffect,
+            positionTruth,
+            noEffectProof:{planCashflowCount:planCashflows.length,chunkDispositionCount:chunkDispositions.length},
+          },
+        });
+        await input.store.releaseExecutionCapital(plan.planId,input.now,["P6_OPEN_EXPIRED_NO_CHAIN_EFFECT"]);
+        results.push({planId:plan.planId,action:"RETURN_EXISTING_PLAN",reasonCodes:["P6_OPEN_EXPIRED_NO_CHAIN_EFFECT"]});
+        continue;
+      }
+    }
     // RETURN_EXISTING_PLAN means no transaction was submitted. Leaving a
     // claimed pre-submission plan unresolved would indefinitely block the
     // worker and invite a stale trade to be resumed later. Finalize it
