@@ -2120,6 +2120,28 @@ async function confirmedTransactionFeeLamports(connection:Connection,signature:s
   const receipt=await loadConfirmedExecutionReceipt(connection,signature);
   return receipt.state==='CONFIRMED_SUCCESS'||receipt.state==='CONFIRMED_FAILURE'?receipt.feeLamports:undefined;
 }
+/** Claim recovery is deliberately action-scoped.  An expired signature whose
+ * status was read successfully and whose blockhash is past validity has no
+ * chain effect; it must retire that CLAIM without authorizing a replacement.
+ * UNKNOWN remains blocking. */
+export function assessExpiredClaimRecovery(input:{signaturePresent:boolean;signatureStatusReadUnknown:boolean;confirmationStatus:"PROCESSED"|"CONFIRMED"|"FINALIZED"|"EXPIRED"|"FAILED"|"UNKNOWN"}){
+  if(!input.signaturePresent)return{terminal:false,reasonCodes:['P6_CLAIM_RECOVERY_SIGNATURE_MISSING']};
+  if(input.signatureStatusReadUnknown)return{terminal:false,reasonCodes:['P6_CLAIM_RECOVERY_SIGNATURE_STATUS_UNKNOWN']};
+  if(input.confirmationStatus==='EXPIRED'||input.confirmationStatus==='FAILED')return{terminal:true,reasonCodes:['P6_CLAIM_EXPIRED_NO_CHAIN_EFFECT']};
+  return{terminal:false,reasonCodes:['P6_CLAIM_RECOVERY_CHAIN_EFFECT_UNRESOLVED']};
+}
+async function persistRecoveredClaimReceipt(input:{store:Phase1Store;connection:Connection;plan:AutonomousPlan;positionAddress:string;signature:string;transactionId?:string;observedAt:string}):Promise<{ok:boolean;reasonCodes:string[]}>{
+  const receipt=await loadConfirmedExecutionReceipt(input.connection,input.signature);
+  if(receipt.state!=='CONFIRMED_SUCCESS')return{ok:false,reasonCodes:[`P6_CLAIM_RECEIPT_${receipt.state}`]};
+  const effects=deriveTransactionAssetEffects(receipt,{ownerAddress:input.plan.ownerAddress,...(receipt.staticAccountKeys[0]?{feePayerAddress:receipt.staticAccountKeys[0]}:{})});
+  for(const effect of effects.tokenEffects.filter(effect=>effect.direction==='IN'&&effect.deltaRaw>0n)){
+    await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:recovered-claim-token:${effect.mint}:${effect.accountAddress}`,positionAddress:input.positionAddress,planId:input.plan.planId,flowType:'FEE_CLAIM',observedAt:input.observedAt,tokenMint:effect.mint,tokenAmountRaw:effect.deltaRaw.toString(),payload:{source:'CONFIRMED_CLAIM_RECEIPT_RECOVERY',signature:input.signature,transactionId:input.transactionId??null,effectClassification:effect.classification}});
+    if(effect.mint!==WSOL_MINT)await recordPositionTokenXLot({store:input.store,connection:input.connection,plan:input.plan,positionAddress:input.positionAddress,tokenMint:effect.mint,sourceEvent:'FEE_CLAIM',sourceCashflowId:`${input.plan.planId}:recovered-claim-token:${effect.mint}:${effect.accountAddress}`,rawAmount:effect.deltaRaw,observedAt:input.observedAt,signature:input.signature});
+  }
+  const native=(effects.nativeWalletDeltaLamports??0n)+(receipt.feeLamports??0n);
+  if(native>0n)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:recovered-claim-native-sol`,positionAddress:input.positionAddress,planId:input.plan.planId,flowType:'FEE_CLAIM',observedAt:input.observedAt,lamports:native,tokenMint:WSOL_MINT,tokenAmountRaw:native.toString(),payload:{source:'CONFIRMED_CLAIM_RECEIPT_RECOVERY',signature:input.signature,transactionId:input.transactionId??null,receiptFeeLamports:(receipt.feeLamports??0n).toString(),classificationState:effects.classificationState,reasonCodes:effects.reasonCodes}});
+  return{ok:true,reasonCodes:effects.reasonCodes};
+}
 /**
  * PositionV2 rent is an attributable lifecycle asset, not an inferred owner
  * wallet delta. The closing receipt must prove that the exact position
@@ -4390,6 +4412,34 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         action: "RESUME_CLOSE_SETTLEMENT",
         reasonCodes: ["P6_RECOVERY_CLOSE_STAGE_RESUME_READY", closeStage ?? "UNKNOWN"],
       });
+      continue;
+    }
+    // CLAIM has no position-existence side effect, so generic recovery cannot
+    // infer it from PositionV2 truth.  Resolve its exact submitted signature
+    // independently: a proven expired claim becomes terminal no-effect while
+    // UNKNOWN remains recovery-blocking.  This never rebuilds/replays a claim.
+    if(plan.action==='CLAIM'&&(Boolean(recoverySignature)||journal.state==='SUBMITTED'||journal.state==='UNKNOWN_SUBMISSION'||journal.state==='SIGNED')){
+      const claimRecovery=assessExpiredClaimRecovery({signaturePresent:Boolean(recoverySignature),signatureStatusReadUnknown,confirmationStatus});
+      if(claimRecovery.terminal&&recoverySignature){
+        await input.store.markSubmissionExpired(recoverySignature,input.now,'P6_CLAIM_EXPIRED_NO_CHAIN_EFFECT');
+        await input.store.updateExecutionJournal({idempotencyKey:plan.idempotencyKey,expectedVersion:journal.version,state:'HOLD',updatedAt:input.now,payload:{...journal.payload,recovery:'CLAIM_NOT_EXECUTED',confirmationStatus,signature:recoverySignature,positionTruth}});
+        await input.store.insertExecutionReconciliation({reconciliationId:`${plan.planId}:claim-no-effect`,planId:plan.planId,observedAt:input.now,status:'MATCH',expected:{action:'CLAIM',signature:recoverySignature},actual:{confirmationStatus,claimEffect:'ABSENT',positionTruth},discrepancies:[],payload:{recovery:'CLAIM_NOT_EXECUTED',chainEffect:'NONE'}});
+        await input.store.transitionAutonomousPlan({planId:plan.planId,state:'EXPIRED',at:input.now,reasonCodes:claimRecovery.reasonCodes,payload:{recovery:'CLAIM_NOT_EXECUTED',confirmationStatus,signature:recoverySignature,chainEffect:'NONE'}});
+        await input.store.releaseExecutionCapital(plan.planId,input.now,claimRecovery.reasonCodes);
+        results.push({planId:plan.planId,action:'RETURN_EXISTING_PLAN',reasonCodes:claimRecovery.reasonCodes});
+        continue;
+      }
+      if((confirmationStatus==='CONFIRMED'||confirmationStatus==='FINALIZED')&&recoverySignature&&connection&&recoveryPositionAddress){
+        const accounted=await persistRecoveredClaimReceipt({store:input.store,connection,plan,positionAddress:recoveryPositionAddress,signature:recoverySignature,...(journal.transactionId?{transactionId:journal.transactionId}:{}),observedAt:input.now});
+        if(accounted.ok){
+          await input.store.insertExecutionReconciliation({reconciliationId:`${plan.planId}:claim-confirmed`,planId:plan.planId,observedAt:input.now,status:'MATCH',expected:{action:'CLAIM',signature:recoverySignature},actual:{confirmationStatus,claimEffect:'PRESENT',positionTruth},discrepancies:[],payload:{recovery:'CLAIM_CONFIRMED',receiptReasonCodes:accounted.reasonCodes}});
+          await input.store.completeAutonomousPlan({planId:plan.planId,state:'RECONCILED',at:input.now,payload:{recovery:'CLAIM_CONFIRMED',confirmationStatus,signature:recoverySignature,receiptReasonCodes:accounted.reasonCodes}});
+          results.push({planId:plan.planId,action:'MARK_RECONCILED',reasonCodes:['P6_CLAIM_CONFIRMED']});
+          continue;
+        }
+      }
+      await input.store.transitionAutonomousPlan({planId:plan.planId,state:'RECOVERING',at:input.now,reasonCodes:claimRecovery.reasonCodes,payload:{journalId:journal.journalId,recovery:'CLAIM_RECONCILIATION_REQUIRED',confirmationStatus,signature:recoverySignature??null,positionTruth}});
+      results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:claimRecovery.reasonCodes});
       continue;
     }
     const action = determineRecoveryAction({

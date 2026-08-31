@@ -122,6 +122,26 @@ export interface LivePositionManagementDecision {
   reasonCodes: string[];
   replacementRange?: { lowerBinId: number; upperBinId: number };
 }
+
+/**
+ * Observational only: this deliberately carries no close/claim authority.
+ * It makes the economic result of accepting DLMM inventory conversion durable
+ * without promoting a single live lifecycle into a new exit policy.
+ */
+export function assessFeeCompensationObservation(input:{
+  mfeInventoryValue?:number;
+  currentInventoryValue?:number;
+  mfeCumulativeGrossFees?:number;
+  currentCumulativeGrossFees?:number;
+}) {
+  const finite=(value:number|undefined)=>typeof value==='number'&&Number.isFinite(value)&&value>=0;
+  if(!finite(input.mfeInventoryValue)||!finite(input.currentInventoryValue)||!finite(input.mfeCumulativeGrossFees)||!finite(input.currentCumulativeGrossFees))return{economicClassification:'INSUFFICIENT_EVIDENCE',reasonCodes:['FEE_COMPENSATION_EVIDENCE_UNAVAILABLE']};
+  const deterioration=Math.max(0,input.mfeInventoryValue!-input.currentInventoryValue!);
+  const fees=Math.max(0,input.currentCumulativeGrossFees!-input.mfeCumulativeGrossFees!);
+  if(deterioration===0)return{inventoryDeteriorationSinceMfe:deterioration,grossFeesSinceMfe:fees,economicClassification:'NO_INVENTORY_DETERIORATION',reasonCodes:['NO_INVENTORY_DETERIORATION']};
+  const ratio=fees/deterioration;
+  return{inventoryDeteriorationSinceMfe:deterioration,grossFeesSinceMfe:fees,feeCompensationRatio:ratio,economicClassification:ratio>=1?'FULLY_FEE_COMPENSATED':ratio>0?'PARTIALLY_FEE_COMPENSATED':'UNCOMPENSATED_INVENTORY_DETERIORATION',reasonCodes:[ratio>=1?'FULLY_FEE_COMPENSATED':ratio>0?'PARTIALLY_FEE_COMPENSATED':'UNCOMPENSATED_INVENTORY_DETERIORATION']};
+}
 /**
  * Normal management actions are economic decisions and must be bound to the
  * pool result that produced their regime, flow, and forward-EV context.  An

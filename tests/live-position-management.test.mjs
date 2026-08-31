@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
-import {assessClaimEconomics,assessLiveManagementContext,assessOorLifecycle,decideLivePositionManagement,parseLivePositionManagementPolicy,parseOorLifecyclePolicy} from '../.build/packages/live-position-management/src/index.js';
+import {assessClaimEconomics,assessFeeCompensationObservation,assessLiveManagementContext,assessOorLifecycle,decideLivePositionManagement,parseLivePositionManagementPolicy,parseOorLifecyclePolicy} from '../.build/packages/live-position-management/src/index.js';
 
 const policy=parseLivePositionManagementPolicy({schemaVersion:1,enabled:true,outOfRangeAction:'RESHAPE',claimAccruedFees:true,estimatedClaimCostLamports:'10',minimumClaimNetBenefitLamports:'10',missingPositionAction:'HOLD',replacementRange:'PRESERVE_WIDTH_CENTER_ACTIVE',planTtlMs:300000});
 const oorPolicy=parseOorLifecyclePolicy({schemaVersion:1,policyVersion:'oor-lifecycle-v1',transientMinutes:10,sustainedMinutes:30,actionRequiredMinutes:60});
@@ -25,6 +25,7 @@ test('stale or unreconciled chain truth never authorizes OOR close',()=>{
   const r=assessOorLifecycle({policy:oorPolicy,observation:{observedAt:'2026-08-13T01:01:00Z',rangeState:'OUT_OF_RANGE',activeBinId:120,lowerBinId:90,upperBinId:110,chainTruthFresh:false,reconciliationClean:true,noActiveManagementPlan:true,inventoryClassification:'SAFE_OOR_SOL'}});assert.equal(r.action,'HOLD_CHAIN_RECONCILIATION');
 });
 test('owned-position management claims only economically sufficient accrued fees and holds on unknown chain truth',()=>{assert.equal(decideLivePositionManagement({policy,owned,position:{...fact,feeY:'1'},activeBinId:100,claimExpectedValueLamports:20n}).action,'CLAIM');assert.equal(decideLivePositionManagement({policy,owned,position:{...fact,feeY:'1'},activeBinId:100,claimExpectedValueLamports:19n}).action,'HOLD');assert.equal(decideLivePositionManagement({policy,owned,activeBinId:100}).action,'HOLD');});
+test('fee compensation is observational, restart-safe math and never emits an action',()=>{const r=assessFeeCompensationObservation({mfeInventoryValue:.03,currentInventoryValue:.029038831,mfeCumulativeGrossFees:.0001774,currentCumulativeGrossFees:.000661998});assert.equal(r.economicClassification,'PARTIALLY_FEE_COMPENSATED');assert.ok(Math.abs(r.feeCompensationRatio-.5042)<.0002);assert.ok(Math.abs(r.inventoryDeteriorationSinceMfe-.000961169)<1e-15);assert.ok(Math.abs(r.grossFeesSinceMfe-.000484598)<1e-15);assert.equal(assessFeeCompensationObservation({mfeInventoryValue:1,currentInventoryValue:1,mfeCumulativeGrossFees:0,currentCumulativeGrossFees:.1}).economicClassification,'NO_INVENTORY_DETERIORATION');});
 test('partial entry bypasses ordinary claim, reshape, and replacement management into one protective close',()=>{
   const partial={...owned,partialEntry:true};
   const hold=decideLivePositionManagement({policy,owned:partial,position:{...fact,feeY:'1'},activeBinId:120,claimExpectedValueLamports:20n,currentForwardEv:.01});

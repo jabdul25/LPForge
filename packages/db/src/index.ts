@@ -1077,6 +1077,18 @@ export interface Phase1Store {
     staleData: boolean;
     payload: Record<string, unknown>;
   }): Promise<void>;
+  loadLatestPositionManagementMetrics(lpforgePositionId:string): Promise<Record<string,unknown>|null>;
+  insertPositionManagementMetrics(value:{
+    lpforgePositionId:string; observedAt:string; policyVersion:string;
+    managedNavUsd?:number; currentReturnFraction?:number; inventoryValueUsd?:number; cumulativeGrossFeesUsd?:number;
+    mfeManagedNavUsd?:number; mfeReturnFraction?:number; mfeObservedAt?:string; mfeActiveBin?:number;
+    mfeInventoryValueUsd?:number; mfeCumulativeGrossFeesUsd?:number;
+    inventoryDeteriorationSinceMfeUsd?:number; grossFeesSinceMfeUsd?:number; feeCompensationRatio?:number;
+    economicClassification:string; tokenInventoryShare?:number; solInventoryShare?:number;
+    flowEvidenceStatus:string; continuationEvidenceAvailable:boolean; continuationEvidenceAgeSeconds?:number;
+    continuationExpectedNetEvLamports?:bigint; continuationUncertainty?:number; continuationReasonCodes:string[];
+    managementHoldClassification:string; actionLaneState:string; payload:Record<string,unknown>;
+  }): Promise<void>;
   loadPositionOorLifecycleState(positionAddress:string): Promise<Record<string,unknown>|null>;
   /** Reconstructs only from durable monitor observations when M0065 first
    * encounters an already-open position; it never uses current market data. */
@@ -1111,6 +1123,7 @@ export interface Phase1Store {
     lastAction:string; reasonCodes:string[]; payload:Record<string,unknown>;
   }): Promise<void>;
   hasActiveAutonomousPlan(positionAddress: string): Promise<boolean>;
+  loadActiveAutonomousPlansForPosition(positionAddress:string): Promise<Array<{planId:string;action:AutonomousPlanAction;state:string;createdAt:string;expiresAt:string}>>;
   markOwnedPositionLifecycle(value: {
     positionAddress: string;
     lifecycleState:
@@ -3112,6 +3125,16 @@ return 'APPLIED';
         ],
       );
     },
+    async loadLatestPositionManagementMetrics(lpforgePositionId) {
+      const r=await db.query("SELECT * FROM execution.position_management_metrics WHERE lpforge_position_id=$1 ORDER BY observed_at DESC LIMIT 1",[lpforgePositionId]);
+      return (r.rows[0] as Record<string,unknown>|undefined)??null;
+    },
+    async insertPositionManagementMetrics(v) {
+      await db.query(
+        `INSERT INTO execution.position_management_metrics(lpforge_position_id,observed_at,policy_version,managed_nav_usd,current_return_fraction,inventory_value_usd,cumulative_gross_fees_usd,mfe_managed_nav_usd,mfe_return_fraction,mfe_observed_at,mfe_active_bin,mfe_inventory_value_usd,mfe_cumulative_gross_fees_usd,inventory_deterioration_since_mfe_usd,gross_fees_since_mfe_usd,fee_compensation_ratio,economic_classification,token_inventory_share,sol_inventory_share,flow_evidence_status,continuation_evidence_available,continuation_evidence_age_seconds,continuation_expected_net_ev_lamports,continuation_uncertainty,continuation_reason_codes,management_hold_classification,action_lane_state,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25::jsonb,$26,$27,$28::jsonb) ON CONFLICT(lpforge_position_id,observed_at) DO UPDATE SET managed_nav_usd=COALESCE(EXCLUDED.managed_nav_usd,execution.position_management_metrics.managed_nav_usd),current_return_fraction=COALESCE(EXCLUDED.current_return_fraction,execution.position_management_metrics.current_return_fraction),inventory_value_usd=COALESCE(EXCLUDED.inventory_value_usd,execution.position_management_metrics.inventory_value_usd),cumulative_gross_fees_usd=COALESCE(EXCLUDED.cumulative_gross_fees_usd,execution.position_management_metrics.cumulative_gross_fees_usd),mfe_managed_nav_usd=COALESCE(EXCLUDED.mfe_managed_nav_usd,execution.position_management_metrics.mfe_managed_nav_usd),mfe_return_fraction=COALESCE(EXCLUDED.mfe_return_fraction,execution.position_management_metrics.mfe_return_fraction),mfe_observed_at=COALESCE(EXCLUDED.mfe_observed_at,execution.position_management_metrics.mfe_observed_at),mfe_active_bin=COALESCE(EXCLUDED.mfe_active_bin,execution.position_management_metrics.mfe_active_bin),mfe_inventory_value_usd=COALESCE(EXCLUDED.mfe_inventory_value_usd,execution.position_management_metrics.mfe_inventory_value_usd),mfe_cumulative_gross_fees_usd=COALESCE(EXCLUDED.mfe_cumulative_gross_fees_usd,execution.position_management_metrics.mfe_cumulative_gross_fees_usd),inventory_deterioration_since_mfe_usd=COALESCE(EXCLUDED.inventory_deterioration_since_mfe_usd,execution.position_management_metrics.inventory_deterioration_since_mfe_usd),gross_fees_since_mfe_usd=COALESCE(EXCLUDED.gross_fees_since_mfe_usd,execution.position_management_metrics.gross_fees_since_mfe_usd),fee_compensation_ratio=COALESCE(EXCLUDED.fee_compensation_ratio,execution.position_management_metrics.fee_compensation_ratio),economic_classification=EXCLUDED.economic_classification,token_inventory_share=COALESCE(EXCLUDED.token_inventory_share,execution.position_management_metrics.token_inventory_share),sol_inventory_share=COALESCE(EXCLUDED.sol_inventory_share,execution.position_management_metrics.sol_inventory_share),flow_evidence_status=EXCLUDED.flow_evidence_status,continuation_evidence_available=EXCLUDED.continuation_evidence_available,continuation_evidence_age_seconds=EXCLUDED.continuation_evidence_age_seconds,continuation_expected_net_ev_lamports=EXCLUDED.continuation_expected_net_ev_lamports,continuation_uncertainty=EXCLUDED.continuation_uncertainty,continuation_reason_codes=EXCLUDED.continuation_reason_codes,management_hold_classification=EXCLUDED.management_hold_classification,action_lane_state=EXCLUDED.action_lane_state,payload=EXCLUDED.payload`,
+        [v.lpforgePositionId,v.observedAt,v.policyVersion,v.managedNavUsd??null,v.currentReturnFraction??null,v.inventoryValueUsd??null,v.cumulativeGrossFeesUsd??null,v.mfeManagedNavUsd??null,v.mfeReturnFraction??null,v.mfeObservedAt??null,v.mfeActiveBin??null,v.mfeInventoryValueUsd??null,v.mfeCumulativeGrossFeesUsd??null,v.inventoryDeteriorationSinceMfeUsd??null,v.grossFeesSinceMfeUsd??null,v.feeCompensationRatio??null,v.economicClassification,v.tokenInventoryShare??null,v.solInventoryShare??null,v.flowEvidenceStatus,v.continuationEvidenceAvailable,v.continuationEvidenceAgeSeconds??null,v.continuationExpectedNetEvLamports?.toString()??null,v.continuationUncertainty??null,json(v.continuationReasonCodes),v.managementHoldClassification,v.actionLaneState,json(v.payload)],
+      );
+    },
     async loadPositionOorLifecycleState(positionAddress) {
       const r=await db.query("SELECT * FROM execution.position_oor_lifecycle_state WHERE position_address=$1",[positionAddress]);
       return (r.rows[0] as Record<string,unknown>|undefined)??null;
@@ -3174,6 +3197,10 @@ return 'APPLIED';
         [positionAddress],
       );
       return Boolean(r.rows[0]?.active);
+    },
+    async loadActiveAutonomousPlansForPosition(positionAddress) {
+      const r=await db.query(`SELECT p.plan_id,i.action,p.state,p.created_at,p.expires_at FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id WHERE i.position_address=$1 AND p.cluster='mainnet-beta' AND p.state IN ('PLANNED','CLAIMED','DISPATCHING','BUILDING','BUILT','SIMULATING','SIMULATED','RISK_APPROVED','SIGNING','SIGNED','SUBMITTING','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILING','RECOVERING','RECONCILIATION_REQUIRED') ORDER BY p.created_at ASC`,[positionAddress]);
+      return r.rows.map(row=>({planId:String(row.plan_id),action:String(row.action) as AutonomousPlanAction,state:String(row.state),createdAt:toIsoTimestamp(row.created_at),expiresAt:toIsoTimestamp(row.expires_at)}));
     },
     async markOwnedPositionLifecycle(v) {
       await db.query(
@@ -4375,6 +4402,8 @@ export function createMemoryStore(): Phase1Store {
     async completeAutonomousPlan() {},
     async upsertOwnedPosition() {},
     async insertPositionObservation() {},
+    async loadLatestPositionManagementMetrics() { return null; },
+    async insertPositionManagementMetrics() {},
     async loadPositionOorLifecycleState() { return null; },
     async reconstructPositionOorLifecycleState() { return null; },
     async upsertPositionOorLifecycleState() {},
@@ -4394,6 +4423,7 @@ export function createMemoryStore(): Phase1Store {
     async hasActiveAutonomousPlan() {
       return false;
     },
+    async loadActiveAutonomousPlansForPosition() { return []; },
     async markOwnedPositionLifecycle() {},
     async adjustOwnedPositionCapital() {},
     async insertPositionCashflow() {},

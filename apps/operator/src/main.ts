@@ -27,6 +27,7 @@ import { computePlanProvenanceHmac } from "../../../packages/execution-contracts
 import type { TransactionPlan } from "../../../packages/execution-contracts/src/index.js";
 import {
   assessLiveManagementContext,
+  assessFeeCompensationObservation,
   assessOorLifecycle,
   decideLivePositionManagement,
   loadOorLifecyclePolicy,
@@ -125,6 +126,58 @@ function oorPrior(row:Record<string,unknown>|null):OorLifecyclePriorState|undefi
 }
 async function loadPositionContinuationEconomics(position:OwnedLivePosition,fact:NonNullable<Awaited<ReturnType<ReturnType<typeof createMeteoraReadAdapter>["getPositionV2"]>>>,current:OperationalCycleResult|undefined,economics:{evidenceState:string;currentEconomicValueUsd?:number;contributedCapitalUsd?:number}){const universe=current?.shadow?.candidateUniverseEvidence;if(!universe||position.lowerBinId!==fact.lowerBinId||position.upperBinId!==fact.upperBinId)return undefined;const candidate=universe.candidates.find(candidate=>candidate.strategy===position.strategy&&candidate.orientation===position.orientation&&candidate.lowerBinId===position.lowerBinId&&candidate.upperBinId===position.upperBinId),simulation=candidate?universe.simulations.find(row=>row.candidateId===candidate.id):undefined;if(!candidate||!simulation||!simulation.evidenceActionable||economics.evidenceState!=="AVAILABLE"||!(typeof economics.currentEconomicValueUsd==="number")||!(typeof economics.contributedCapitalUsd==="number")||!(economics.contributedCapitalUsd>0))return undefined;const ev=(simulation.feeValue+simulation.inventoryChangeValue)*(economics.currentEconomicValueUsd/economics.contributedCapitalUsd);if(!Number.isFinite(ev))return undefined;return{candidateId:candidate.id,geometryIdentity:`${position.positionAddress}:${position.strategy}:${position.orientation}:${position.lowerBinId}:${position.upperBinId}`,continuationEvLamports:BigInt(Math.trunc(ev*1_000_000_000)),forecastHorizonMinutes:current.shadow?.forwardValidation.horizonMinutes??60,uncertainty:current.shadow?.qualification.uncertainty};}
 async function estimateExpectedCloseCostLamports(fact:NonNullable<Awaited<ReturnType<ReturnType<typeof createMeteoraReadAdapter>["getPositionV2"]>>>,pool:DataApiPool,quoteProvider:{quote(request:{inputMint:string;outputMint:string;inputAmount:bigint;requiredOutputAmount:bigint}):Promise<{status:string;quote?:{outAmount:bigint}}> }|undefined):Promise<bigint|undefined>{const sol=pool.token_x?.address===WSOL_MINT?pool.token_x:pool.token_y?.address===WSOL_MINT?pool.token_y:undefined;if(!sol||typeof sol.price!=="number"||!Number.isFinite(sol.price)||sol.price<=0)return undefined;let result=20_000n;for(const [token,raw] of [[pool.token_x,BigInt(fact.totalXAmount??"0")+BigInt(fact.feeX??"0")],[pool.token_y,BigInt(fact.totalYAmount??"0")+BigInt(fact.feeY??"0")]] as const){if(!token||token.address===WSOL_MINT||raw<=0n)continue;if(!quoteProvider||!Number.isInteger(token.decimals)||typeof token.price!=="number"||!Number.isFinite(token.price)||token.price<0)return undefined;const quote=await quoteProvider.quote({inputMint:token.address,outputMint:WSOL_MINT,inputAmount:raw,requiredOutputAmount:1n});if(quote.status!=="APPROVED"||!quote.quote)return undefined;const marked=BigInt(Math.max(0,Math.floor(Number(raw)/10**token.decimals!*token.price/sol.price*1_000_000_000)));result+=marked>quote.quote.outAmount?marked-quote.quote.outAmount:0n;}return result;}
+const finite=(value:unknown):number|undefined=>typeof value==='number'&&Number.isFinite(value)?value:undefined;
+const dbNumber=(value:unknown):number|undefined=>{const number=Number(value);return Number.isFinite(number)?number:undefined;};
+function rawTokenValueUsd(raw:string|undefined,token:DataApiPool['token_x']|undefined){
+  let amount:bigint;try{amount=BigInt(raw??'0');}catch{return undefined;}
+  const decimals=token?.decimals;
+  if(!token||!Number.isInteger(decimals)||decimals===undefined||typeof token.price!=="number"||!Number.isFinite(token.price)||token.price<0)return undefined;
+  const value=Number(amount)/10**decimals*token.price;
+  return Number.isFinite(value)&&value>=0?value:undefined;
+}
+function inventoryValuation(input:{fact:PositionV2Fact;pool:DataApiPool;lots:Array<{tokenMint:string;remainingRawAmount:bigint;decimals:number}>}){
+  const x=rawTokenValueUsd(input.fact.totalXAmount,input.pool.token_x),y=rawTokenValueUsd(input.fact.totalYAmount,input.pool.token_y);
+  if(x===undefined||y===undefined)return{};
+  let wallet=0,tokenValue=0,solValue=0;
+  const add=(mint:string,raw:bigint,decimals:number)=>{
+    const token=[input.pool.token_x,input.pool.token_y].find(row=>row?.address===mint);
+    if(!token||typeof token.price!=="number"||!Number.isFinite(token.price)||token.price<0)return false;
+    const value=Number(raw)/10**decimals*token.price;if(!Number.isFinite(value)||value<0)return false;
+    wallet+=value;if(mint===WSOL_MINT)solValue+=value;else tokenValue+=value;return true;
+  };
+  if(input.pool.token_x?.address===WSOL_MINT)solValue+=x;else tokenValue+=x;
+  if(input.pool.token_y?.address===WSOL_MINT)solValue+=y;else tokenValue+=y;
+  for(const lot of input.lots)if(!add(lot.tokenMint,lot.remainingRawAmount,lot.decimals))return{};
+  const inventory=x+y+wallet;
+  return{inventoryValueUsd:inventory,tokenInventoryShare:inventory>0?tokenValue/inventory:undefined,solInventoryShare:inventory>0?solValue/inventory:undefined};
+}
+function metricFlowEvidence(current:OperationalCycleResult|undefined){
+  const shadow=(current?.shadow??{}) as unknown as Record<string,unknown>, economic=shadow.economicEvidence as Record<string,unknown>|undefined;
+  const source=typeof economic?.fidelity==='string'?economic.fidelity:undefined;
+  return source==='EVENT_PATH_ESTIMATE'?'FLOW_EVIDENCE_COMPLETE':source?'FLOW_EVIDENCE_PARTIAL':'FLOW_EVIDENCE_UNAVAILABLE';
+}
+async function persistFeeCompensationMetrics(input:{store:Phase1Store;position:OwnedLivePosition;observedAt:string;activeBinId:number;fact?:PositionV2Fact;apiPool?:DataApiPool;economics:{evidenceState:string;currentEconomicValueUsd?:number;netReturnFraction?:number;feesValueUsd?:number};lots:Array<{tokenMint:string;remainingRawAmount:bigint;decimals:number}>;continuation?:{continuationEvLamports:bigint;uncertainty?:number};current?:OperationalCycleResult;activePlans:Array<{planId:string;action:string;state:string}>;managementAction?:string;source:string;}){
+  const prior=await input.store.loadLatestPositionManagementMetrics(input.position.lpforgePositionId);
+  const inventory=input.fact&&input.apiPool?inventoryValuation({fact:input.fact,pool:input.apiPool,lots:input.lots}):{};
+  const nav=finite(input.economics.currentEconomicValueUsd),ret=finite(input.economics.netReturnFraction),fees=finite(input.economics.feesValueUsd),inventoryValue=finite(inventory.inventoryValueUsd);
+  const priorMfeNav=dbNumber(prior?.mfe_managed_nav_usd),isNewMfe=nav!==undefined&&(priorMfeNav===undefined||nav>priorMfeNav);
+  const mfeNav=isNewMfe?nav:priorMfeNav;
+  const mfeReturn=isNewMfe?ret:dbNumber(prior?.mfe_return_fraction);
+  const mfeObservedAt=isNewMfe?input.observedAt:(prior?.mfe_observed_at?String(prior.mfe_observed_at):undefined);
+  const mfeBin=isNewMfe?input.activeBinId:(prior?.mfe_active_bin===null||prior?.mfe_active_bin===undefined?undefined:Number(prior.mfe_active_bin));
+  const mfeInventory=isNewMfe?inventoryValue:dbNumber(prior?.mfe_inventory_value_usd);
+  const mfeFees=isNewMfe?fees:dbNumber(prior?.mfe_cumulative_gross_fees_usd);
+  const compensation=assessFeeCompensationObservation({...((mfeInventory===undefined)?{}:{mfeInventoryValue:mfeInventory}),...((inventoryValue===undefined)?{}:{currentInventoryValue:inventoryValue}),...((mfeFees===undefined)?{}:{mfeCumulativeGrossFees:mfeFees}),...((fees===undefined)?{}:{currentCumulativeGrossFees:fees})});
+  const activeClaim=input.activePlans.find(plan=>plan.action==='CLAIM');
+  const continuationReasons:string[]=[];
+  if(!input.continuation)continuationReasons.push(input.current?'CONTINUATION_EVENT_PATH_UNAVAILABLE':'CONTINUATION_CURRENT_POOL_CONTEXT_UNAVAILABLE');
+  if(input.economics.evidenceState!=='AVAILABLE')continuationReasons.push('CONTINUATION_VALUATION_UNAVAILABLE');
+  if(activeClaim)continuationReasons.push('CLAIM_RECONCILIATION_BLOCKS_ACTION');
+  const actionLaneState=activeClaim?'CLAIM_RECONCILIATION_REQUIRED':input.activePlans.length?'MANAGEMENT_PLAN_ACTIVE':'ACTION_AVAILABLE';
+  const holdClassification=activeClaim?'HOLD_RECONCILIATION_ONLY':input.managementAction==='HOLD'&&input.continuation?'HOLD_ECONOMICALLY_SUPPORTED':input.managementAction==='HOLD'||!input.managementAction?'HOLD_INSUFFICIENT_EVIDENCE':'ACTION_NOT_HOLD';
+  await input.store.insertPositionManagementMetrics({lpforgePositionId:input.position.lpforgePositionId,observedAt:input.observedAt,policyVersion:'fee-compensation-observability-v1',...(nav===undefined?{}:{managedNavUsd:nav}),...(ret===undefined?{}:{currentReturnFraction:ret}),...(inventoryValue===undefined?{}:{inventoryValueUsd:inventoryValue}),...(fees===undefined?{}:{cumulativeGrossFeesUsd:fees}),...(mfeNav===undefined?{}:{mfeManagedNavUsd:mfeNav}),...(mfeReturn===undefined?{}:{mfeReturnFraction:mfeReturn}),...(mfeObservedAt===undefined?{}:{mfeObservedAt}),...(mfeBin===undefined?{}:{mfeActiveBin:mfeBin}),...(mfeInventory===undefined?{}:{mfeInventoryValueUsd:mfeInventory}),...(mfeFees===undefined?{}:{mfeCumulativeGrossFeesUsd:mfeFees}),...(compensation.inventoryDeteriorationSinceMfe===undefined?{}:{inventoryDeteriorationSinceMfeUsd:compensation.inventoryDeteriorationSinceMfe}),...(compensation.grossFeesSinceMfe===undefined?{}:{grossFeesSinceMfeUsd:compensation.grossFeesSinceMfe}),...(compensation.feeCompensationRatio===undefined?{}:{feeCompensationRatio:compensation.feeCompensationRatio}),economicClassification:compensation.economicClassification,...(inventory.tokenInventoryShare===undefined?{}:{tokenInventoryShare:inventory.tokenInventoryShare}),...(inventory.solInventoryShare===undefined?{}:{solInventoryShare:inventory.solInventoryShare}),flowEvidenceStatus:metricFlowEvidence(input.current),continuationEvidenceAvailable:Boolean(input.continuation),...(input.continuation?{continuationExpectedNetEvLamports:input.continuation.continuationEvLamports,...(input.continuation.uncertainty===undefined?{}:{continuationUncertainty:input.continuation.uncertainty})}:{}),continuationReasonCodes:continuationReasons,managementHoldClassification:holdClassification,actionLaneState,payload:{source:input.source,activePlans:input.activePlans,observationOnly:input.managementAction===undefined}});
+  return{compensation,holdClassification,actionLaneState,isNewMfe,inventory};
+}
 function loadProductionCapitalEnvelope(poolAddress: string) {
   const deployment = loadDeploymentPolicyFile(
     process.env.LPFORGE_EXECUTION_POLICY_PATH ?? "policies/live-execution-policy.json",
@@ -364,6 +417,32 @@ function owned(row: Record<string, unknown>): OwnedLivePosition {
     enteredAt: String(row.entered_at ?? ''),
   };
 }
+/**
+ * This deliberately runs before discovery, decoding, forecasting, and plan
+ * construction.  It is read-only and therefore remains safe while a CLAIM or
+ * CLOSE has unresolved chain truth.  The later management pass may authorize
+ * an action; this pass can never do so.
+ */
+async function observeOwnedPositionsReadOnly(input:{store:Phase1Store;adapter:ReturnType<typeof createMeteoraReadAdapter>;api:ReturnType<typeof createMeteoraDataApi>;ownerAddress?:string;observedAt:string;log?:Logger}){
+  if(!input.ownerAddress)return{observed:0};
+  const positions=await input.store.loadOwnedPositions(input.ownerAddress);
+  for(const row of positions){
+    const position=owned(row);
+    let fact:PositionV2Fact|undefined,activeBinId=position.lowerBinId;
+    try{fact=await input.adapter.getPositionV2(position.poolAddress,position.positionAddress);}catch{}
+    try{activeBinId=(await input.adapter.getPool(position.poolAddress)).activeBinId;}catch{}
+    const lots=await input.store.loadPositionInventoryLots(position.positionAddress);
+    let apiPool:DataApiPool|undefined,economics:{evidenceState:string;currentEconomicValueUsd?:number;netReturnFraction?:number;feesValueUsd?:number}={evidenceState:'UNAVAILABLE'};
+    if(fact)try{const [pool,cashflows]=await Promise.all([input.api.getPool(position.poolAddress),input.store.loadPositionCashflows(position.positionAddress)]);apiPool=pool;economics=derivePositionEconomics({position:fact,pool,initialCapitalLamports:position.initialCapitalLamports,observedAt:input.observedAt,realizedFeeCashflows:cashflows,attributedWalletInventory:lots.map(lot=>({tokenMint:lot.tokenMint,tokenAmountRaw:lot.remainingRawAmount.toString()})),...(position.actualEconomicCapitalLamports===undefined?{}:{actualContributedLamports:position.actualEconomicCapitalLamports})});}catch{}
+    const activePlans=await input.store.loadActiveAutonomousPlansForPosition(position.positionAddress);
+    const rangeState=fact?(activeBinId<fact.lowerBinId||activeBinId>fact.upperBinId?'OUT_OF_RANGE':'IN_RANGE'):'UNKNOWN';
+    const metrics=await persistFeeCompensationMetrics({store:input.store,position,observedAt:input.observedAt,activeBinId,...(fact?{fact}:{}),...(apiPool?{apiPool}:{}),economics,lots,activePlans,source:'LPFORGE_CONTINUOUS_POSITION_OBSERVER'});
+    await input.store.insertPositionObservation({lpforgePositionId:position.lpforgePositionId,observedAt:input.observedAt,activeBinId,rangeState,...(fact?{tokenXAmount:fact.totalXAmount,tokenYAmount:fact.totalYAmount,unclaimedFeeX:fact.feeX,unclaimedFeeY:fact.feeY}:{}),walletTruth:lots.length?{source:'POSITION_INVENTORY_LOTS',required:true,lots:lots.map(lot=>({lotId:lot.lotId,tokenMint:lot.tokenMint,rawAmount:lot.remainingRawAmount.toString(),decimals:lot.decimals,status:lot.status}))}:{source:'NO_ATTRIBUTED_WALLET_INVENTORY'},positionTruth:fact??{missing:true},managementContext:{observationOnly:true,actionLaneState:metrics.actionLaneState,managementHoldClassification:metrics.holdClassification,activePlans},reconciliationDebt:!fact,staleData:false,payload:{source:'LPFORGE_CONTINUOUS_POSITION_OBSERVER',policyVersion:'continuous-position-management-v1',rangeState,activeBinId,activePlans,feeCompensation:metrics.compensation}});
+    input.log?.info('POSITION_MANAGEMENT_OBSERVED',{position:position.positionAddress,pool:position.poolAddress,activeBinId,rangeState,actionLaneState:metrics.actionLaneState,feeCompensationRatio:metrics.compensation.feeCompensationRatio??null,classification:metrics.compensation.economicClassification});
+    if(metrics.isNewMfe)input.log?.info('POSITION_MFE_UPDATED',{position:position.positionAddress,pool:position.poolAddress,activeBinId});
+  }
+  return{observed:positions.length};
+}
 async function observeAndPlanOwnedPositions(input: {
   store: Phase1Store;
   adapter: ReturnType<typeof createMeteoraReadAdapter>;
@@ -465,7 +544,8 @@ async function observeAndPlanOwnedPositions(input: {
       ...(position.enteredAt&&Number.isFinite(Date.parse(position.enteredAt))?{positionAgeMinutes:Math.max(0,(Date.parse(input.observedAt)-Date.parse(position.enteredAt))/60000)}:{}),
     });
     const claimExpectedValueLamports=fact&&apiPool?claimValueLamports({feeX:fact.feeX,feeY:fact.feeY,pool:apiPool}):undefined;
-    const activePlanForPosition=await input.store.hasActiveAutonomousPlan(position.positionAddress);
+    const activePlans=await input.store.loadActiveAutonomousPlansForPosition(position.positionAddress);
+    const activePlanForPosition=activePlans.length>0;
     const isOor=fact!==undefined&&(activeBinId<fact.lowerBinId||activeBinId>fact.upperBinId);
     const direction=isOor?(activeBinId>fact!.upperBinId?'ABOVE_MAX':'BELOW_MIN'):undefined;
     const inventoryClassification=fact?classifyOorInventory({fact,...(apiPool?{pool:apiPool}:{}),...(direction?{direction}:{})}):'INVENTORY_UNAVAILABLE';
@@ -508,6 +588,7 @@ async function observeAndPlanOwnedPositions(input: {
       payload:{peakGivebackFraction:exitDecision.peakGivebackFraction,reasonFamily:exitDecision.reasonFamily,urgency:exitDecision.urgency,continuationEvLamports:continuation?.continuationEvLamports.toString()??null,expectedCloseCostLamports:closeCostLamports?.toString()??null,continuationCandidateId:continuation?.candidateId??null,geometryIdentity:continuation?.geometryIdentity??null,continuationConfirmationCount:confirmationCount,marketExitConfirmation:exitDecision.marketConfirmation,regime:regime??null,toxicity:toxicity??null}
     });
     await input.store.insertPositionManagementDecisionAudit({lpforgePositionId:position.lpforgePositionId,positionAddress:position.positionAddress,observedAt:input.observedAt,activeBinId,lowerBinId:position.lowerBinId,upperBinId:position.upperBinId,...(continuation?{positionContinuationEvLamports:continuation.continuationEvLamports,forecastHorizonMinutes:continuation.forecastHorizonMinutes}:{}),...(current?.shadow?.recommendationId?{sourceDecisionId:current.shadow.recommendationId}:{}),...(continuation?{sourceEconomicsId:continuation.candidateId}:{}),...(continuation?.uncertainty!==undefined?{uncertainty:continuation.uncertainty}:{}),...(closeCostLamports!==undefined?{expectedCloseCostLamports:closeCostLamports}:{}),geometryIdentity:continuation?.geometryIdentity??`${position.positionAddress}:${position.strategy}:${position.orientation}:${position.lowerBinId}:${position.upperBinId}`,managementAction:decision.action,exitReasonFamily:exitDecision.reasonFamily,reasonCodes:exitDecision.reasonCodes,confirmationSequenceCount:confirmationCount,validContinuationEvidence:continuation!==undefined&&closeCostLamports!==undefined});
+    const metrics=await persistFeeCompensationMetrics({store:input.store,position,observedAt:input.observedAt,activeBinId,...(fact?{fact}:{}),...(apiPool?{apiPool}:{}),economics,lots:attributedWalletInventory,...(continuation?{continuation:{continuationEvLamports:continuation.continuationEvLamports,...(continuation.uncertainty===undefined?{}:{uncertainty:continuation.uncertainty})}}:{}),...(current?{current}:{}),activePlans,managementAction:decision.action,source:'LPFORGE_PRODUCTION_OWNED_POSITION_MONITOR'});
     await input.store.insertPositionObservation({
       lpforgePositionId: position.lpforgePositionId,
       observedAt: input.observedAt,
@@ -542,7 +623,7 @@ async function observeAndPlanOwnedPositions(input: {
       },
       reconciliationDebt: !fact,
       staleData: false,
-      payload: { source: "LPFORGE_PRODUCTION_OWNED_POSITION_MONITOR",oorLifecycle:{policyVersion:oorPolicy.policyVersion,state:oor.state,action:oor.action,direction:oor.direction??null,inventoryClassification:oor.inventoryClassification,continuousOorDurationSeconds:oor.continuousOorDurationSeconds,totalOorDurationSeconds:oor.totalOorDurationSeconds,reasonCodes:oor.reasonCodes} },
+      payload: { source: "LPFORGE_PRODUCTION_OWNED_POSITION_MONITOR",activePlans,managementObservation:{actionLaneState:metrics.actionLaneState,holdClassification:metrics.holdClassification,feeCompensation:metrics.compensation},oorLifecycle:{policyVersion:oorPolicy.policyVersion,state:oor.state,action:oor.action,direction:oor.direction??null,inventoryClassification:oor.inventoryClassification,continuousOorDurationSeconds:oor.continuousOorDurationSeconds,totalOorDurationSeconds:oor.totalOorDurationSeconds,reasonCodes:oor.reasonCodes} },
     });
     const riskIncreasing = ["ADD", "RESHAPE", "REBALANCE"].includes(decision.action);
     // A reshape/rebalance includes a replacement OPEN. Under containment, do
@@ -848,6 +929,13 @@ async function liveOnce() {
       maxRps: cfg.dataApiMaxRps,
       timeoutMs: cfg.httpTimeoutMs,
     });
+    // The observation lane is intentionally ahead of the expensive discovery
+    // and event-path pipeline.  A stalled/blocked action or evidence path may
+    // fail closed, but cannot blind an owned position.
+    const preEvaluationManagementObservation=await observeOwnedPositionsReadOnly({
+      store,adapter,api,...(process.env.LPFORGE_OPERATOR_OWNER_ADDRESS?{ownerAddress:process.env.LPFORGE_OPERATOR_OWNER_ADDRESS}:{}),
+      observedAt:new Date().toISOString(),log,
+    });
     const [apiPool, ohlcv] = await Promise.all([
       api.getPool(cfg.smokePoolAddress),
       api.getOhlcv(cfg.smokePoolAddress, { timeframe: "5m" }),
@@ -1060,6 +1148,7 @@ async function liveOnce() {
           reconciliation: assessPostEntryAuthority(postEntryAuthorityInput, "RECONCILIATION"),
           monitoring: assessPostEntryAuthority(postEntryAuthorityInput, "MONITORING"),
         },
+        preEvaluationManagementObservation,
         openPlanCapacity: {
           approved: openPlanCapacity.approved,
           availableWalletLamports: openPlanCapacity.availableWalletLamports?.toString(),
