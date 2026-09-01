@@ -40,6 +40,38 @@ export function executionPlanCountsAsPendingForPortfolio(state: string): boolean
   return !isExecutionPlanTerminalState(state);
 }
 
+/**
+ * A non-MATCH plan reconciliation remains audit evidence forever.  It is only
+ * operationally superseded when a later lifecycle-level chain reconciliation
+ * proves the same lifecycle terminal and no newer unresolved effect exists.
+ */
+export interface Phase7ReconciliationDebtArtifact {
+  planReconciliationStatus: string;
+  lifecycleStatus?: string;
+  authoritativeLifecycleReconciliationStatus?: string;
+  planReconciliationObservedAt?: string;
+  authoritativeLifecycleReconciliationObservedAt?: string;
+  newerUnresolvedEffect: boolean;
+}
+
+export function isPhase7SupersededReconciliationDebtArtifact(
+  artifact: Phase7ReconciliationDebtArtifact,
+): boolean {
+  const planObservedAt = artifact.planReconciliationObservedAt
+    ? Date.parse(artifact.planReconciliationObservedAt)
+    : Number.NaN;
+  const authorityObservedAt = artifact.authoritativeLifecycleReconciliationObservedAt
+    ? Date.parse(artifact.authoritativeLifecycleReconciliationObservedAt)
+    : Number.NaN;
+  return artifact.planReconciliationStatus !== "MATCH"
+    && artifact.lifecycleStatus === "SOL_SETTLED"
+    && artifact.authoritativeLifecycleReconciliationStatus === "RECONCILED_CHAIN"
+    && Number.isFinite(planObservedAt)
+    && Number.isFinite(authorityObservedAt)
+    && authorityObservedAt > planObservedAt
+    && !artifact.newerUnresolvedEffect;
+}
+
 export interface IngestionCheckpoint {
   stream: string;
   lastSeenSlot?: bigint;
@@ -1600,6 +1632,7 @@ export interface Phase1Store {
     recoveryQueueCount: number;
     unknownSubmissionCount: number;
     unresolvedReconciliationDebt: number;
+    supersededReconciliationHistoryCount: number;
     partialEntryRecoveryCount: number;
   }>;
   loadPhase7EvidenceFacts(runtimeId: string): Promise<{
@@ -1609,6 +1642,7 @@ export interface Phase1Store {
     latestRuntimePlan?: string;
     runtimeCycleCount: number;
     unresolvedReconciliationDebt: number;
+    supersededReconciliationHistoryCount: number;
     canaryRunCount: number;
     fullyReconciledCanaryCount: number;
     latestDrStatus?: string;
@@ -1638,6 +1672,72 @@ async function newPgClient(url: string): Promise<PgClient> {
 }
 const json = (v: unknown) =>
   JSON.stringify(v, (_, x) => (typeof x === "bigint" ? x.toString() : x));
+
+/**
+ * Canonical P7 operational debt view.  Historical plan-level UNKNOWN rows are
+ * retained, but are non-blocking only after a later lifecycle reconciliation
+ * authoritatively proves SOL_SETTLED / RECONCILED_CHAIN and no subsequent
+ * linked effect is still unresolved.  This is deliberately a derived query:
+ * it never rewrites reconciliation evidence.
+ */
+const phase7ReconciliationDebtQuery = `
+  WITH latest_plan_reconciliation AS (
+    SELECT DISTINCT ON (plan_id) plan_id,status,observed_at
+    FROM execution.reconciliations
+    ORDER BY plan_id,observed_at DESC
+  ),
+  latest_lifecycle_reconciliation AS (
+    SELECT DISTINCT ON (lifecycle_id) lifecycle_id,status,observed_at
+    FROM execution.lifecycle_settlement_chain_reconciliations
+    ORDER BY lifecycle_id,observed_at DESC,updated_at DESC
+  ),
+  unresolved AS (
+    SELECT plan.plan_id,plan.status AS plan_status,plan.observed_at AS plan_observed_at,
+           link.lifecycle_id,lifecycle.status AS lifecycle_status,
+           authority.status AS authority_status,authority.observed_at AS authority_observed_at
+    FROM latest_plan_reconciliation plan
+    LEFT JOIN execution.lifecycle_plan_links link ON link.plan_id=plan.plan_id
+    LEFT JOIN execution.position_lifecycles lifecycle ON lifecycle.lifecycle_id=link.lifecycle_id
+    LEFT JOIN latest_lifecycle_reconciliation authority ON authority.lifecycle_id=link.lifecycle_id
+    WHERE plan.status<>'MATCH'
+  ),
+  classified AS (
+    SELECT unresolved.*,
+      EXISTS (
+        SELECT 1
+        FROM execution.execution_journal journal
+        JOIN execution.lifecycle_plan_links later_link ON later_link.plan_id=journal.plan_id
+        WHERE later_link.lifecycle_id=unresolved.lifecycle_id
+          AND journal.updated_at>unresolved.authority_observed_at
+          AND journal.state IN ('SIGNED','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED')
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM latest_plan_reconciliation later_plan
+        JOIN execution.lifecycle_plan_links later_link ON later_link.plan_id=later_plan.plan_id
+        WHERE later_link.lifecycle_id=unresolved.lifecycle_id
+          AND later_plan.observed_at>unresolved.authority_observed_at
+          AND later_plan.status<>'MATCH'
+      ) AS newer_unresolved_effect
+    FROM unresolved
+  )
+  SELECT
+    count(*) FILTER (
+      WHERE NOT (
+        lifecycle_status='SOL_SETTLED'
+        AND authority_status='RECONCILED_CHAIN'
+        AND authority_observed_at>plan_observed_at
+        AND NOT newer_unresolved_effect
+      )
+    )::int AS blocking_debt,
+    count(*) FILTER (
+      WHERE lifecycle_status='SOL_SETTLED'
+        AND authority_status='RECONCILED_CHAIN'
+        AND authority_observed_at>plan_observed_at
+        AND NOT newer_unresolved_effect
+    )::int AS superseded_history
+  FROM classified
+`;
 /**
  * PostgreSQL timestamptz values arrive as Date instances. Do not round-trip a
  * Date through String(date): that presentation omits milliseconds and breaks
@@ -4134,7 +4234,7 @@ return 'APPLIED';
             `SELECT count(*)::int AS n FROM execution.submission_attempts WHERE state='UNKNOWN'`,
           ),
           db.query(
-            `WITH latest AS (SELECT DISTINCT ON (plan_id) plan_id,status FROM execution.reconciliations ORDER BY plan_id,observed_at DESC) SELECT count(*)::int AS n FROM latest WHERE status<>'MATCH'`,
+            phase7ReconciliationDebtQuery,
           ),
           db.query(
             `SELECT count(*)::int AS n FROM execution.execution_journal j JOIN execution.transaction_plans p ON p.plan_id=j.plan_id WHERE j.state NOT IN ('RECONCILED','EXPIRED','FAILED','HOLD') AND p.state NOT IN ('BLOCKED','FAILED','EXPIRED','RECONCILED')`,
@@ -4151,7 +4251,7 @@ return 'APPLIED';
       return {
         ...(d ? { latestDecisionAt: new Date(String(d)).toISOString() } : {}),
         unknownSubmissionCount: Number(unknown.rows[0]?.n ?? 0),
-        unresolvedReconciliationDebt: Number(recon.rows[0]?.n ?? 0),
+        unresolvedReconciliationDebt: Number(recon.rows[0]?.blocking_debt ?? 0),
         activeExecutionJournalCount: Number(journal.rows[0]?.n ?? 0),
         openCanarySessionCount: Number(canary.rows[0]?.n ?? 0),
         ...(p
@@ -4205,7 +4305,7 @@ return 'APPLIED';
             `SELECT count(*)::int AS n FROM execution.submission_attempts WHERE state='UNKNOWN'`,
           ),
           db.query(
-            `WITH latest AS (SELECT DISTINCT ON (plan_id) plan_id,status FROM execution.reconciliations ORDER BY plan_id,observed_at DESC) SELECT count(*)::int AS n FROM latest WHERE status<>'MATCH'`,
+            phase7ReconciliationDebtQuery,
           ),
           db.query(
             `SELECT count(*)::int AS n FROM execution.partial_entry_recovery WHERE state NOT IN ('RESOLVED','OPEN_RECOVERED','ABORTED_SOL_SETTLED')`,
@@ -4218,7 +4318,8 @@ return 'APPLIED';
         ),
         recoveryQueueCount: Number(queue.rows[0]?.n ?? 0),
         unknownSubmissionCount: Number(unknown.rows[0]?.n ?? 0),
-        unresolvedReconciliationDebt: Number(recon.rows[0]?.n ?? 0),
+        unresolvedReconciliationDebt: Number(recon.rows[0]?.blocking_debt ?? 0),
+        supersededReconciliationHistoryCount: Number(recon.rows[0]?.superseded_history ?? 0),
         partialEntryRecoveryCount: Number(partial.rows[0]?.n ?? 0),
       };
     },
@@ -4252,8 +4353,8 @@ return 'APPLIED';
           `SELECT plan,count(*) OVER()::int AS total FROM operations.phase7_runtime_cycles WHERE runtime_id=$1 ORDER BY observed_at DESC LIMIT 1`,
           [runtimeId],
         ),
-        db.query(
-          `WITH latest AS (SELECT DISTINCT ON (plan_id) plan_id,status FROM execution.reconciliations ORDER BY plan_id,observed_at DESC) SELECT count(*) FILTER (WHERE status<>'MATCH')::int AS n FROM latest`,
+          db.query(
+          phase7ReconciliationDebtQuery,
         ),
         db.query(
           `SELECT count(*)::int AS n,count(*) FILTER (WHERE status='CLOSED' AND open_reconciliation_status='MATCH' AND close_reconciliation_status='MATCH')::int AS reconciled FROM operations.phase6_canary_sessions`,
@@ -4289,7 +4390,8 @@ return 'APPLIED';
           ? { latestRuntimePlan: String(runtime.rows[0].plan) }
           : {}),
         runtimeCycleCount: Number(runtime.rows[0]?.total ?? 0),
-        unresolvedReconciliationDebt: Number(recon.rows[0]?.n ?? 0),
+        unresolvedReconciliationDebt: Number(recon.rows[0]?.blocking_debt ?? 0),
+        supersededReconciliationHistoryCount: Number(recon.rows[0]?.superseded_history ?? 0),
         canaryRunCount: Number(canary.rows[0]?.n ?? 0),
         fullyReconciledCanaryCount: Number(canary.rows[0]?.reconciled ?? 0),
         ...(dr.rows[0]?.status
@@ -4622,6 +4724,7 @@ export function createMemoryStore(): Phase1Store {
         recoveryQueueCount: 0,
         unknownSubmissionCount: 0,
         unresolvedReconciliationDebt: 0,
+        supersededReconciliationHistoryCount: 0,
         partialEntryRecoveryCount: 0,
       };
     },
@@ -4629,6 +4732,7 @@ export function createMemoryStore(): Phase1Store {
       return {
         runtimeCycleCount: 0,
         unresolvedReconciliationDebt: 0,
+        supersededReconciliationHistoryCount: 0,
         canaryRunCount: 0,
         fullyReconciledCanaryCount: 0,
         phase7ExitPass: false,
