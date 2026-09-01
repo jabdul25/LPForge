@@ -3056,6 +3056,12 @@ export function accountCloseOnlySuccessorIdentity(input:{planId:string;generatio
   return{planId:`${input.planId}:${suffix}`,intentId:`${input.planId}:intent:${suffix}`,transactionId:`${input.planId}:tx:${suffix}`,idempotencyKey:`${input.planId}:${suffix}`};
 }
 
+/** Deterministically choose one recovery action if repeated ticks raced. */
+export function selectCanonicalAccountCloseOnlySuccessor<T extends {planId:string;createdAt:string}>(plans:readonly T[]):{canonical?:T;duplicates:T[]}{
+  const ordered=[...plans].sort((a,b)=>a.createdAt.localeCompare(b.createdAt)||a.planId.localeCompare(b.planId));
+  return ordered[0]?{canonical:ordered[0],duplicates:ordered.slice(1)}:{duplicates:[]};
+}
+
 function isAccountCloseOnlyPlan(plan:AutonomousPlan):boolean{
   return closeSettlementDispatch(plan).accountCloseOnly===true;
 }
@@ -4022,14 +4028,13 @@ async function createAccountCloseOnlySuccessor(input:{store:Phase1Store;plan:Aut
   // Repeated ticks and restarts must converge on that successor, never fan
   // out into several account-close transactions.
   const activeSuccessors=(await input.store.loadActiveAutonomousPlansForPosition(input.positionAddress))
-    .filter(plan=>plan.action==='CLOSE'&&plan.planId.startsWith(`${input.plan.planId}:account-close-only:`))
-    .sort((a,b)=>a.createdAt.localeCompare(b.createdAt)||a.planId.localeCompare(b.planId));
-  if(activeSuccessors.length>0){
-    const canonical=activeSuccessors[0]!;
-    for(const duplicate of activeSuccessors.slice(1)){
+    .filter(plan=>plan.action==='CLOSE'&&plan.planId.startsWith(`${input.plan.planId}:account-close-only:`)),selected=selectCanonicalAccountCloseOnlySuccessor(activeSuccessors);
+  if(selected.canonical){
+    const canonical=selected.canonical;
+    for(const duplicate of selected.duplicates){
       await input.store.completeAutonomousPlan({planId:duplicate.planId,state:'FAILED',at:input.now,payload:{action:'CLOSE',recovery:'ACCOUNT_CLOSE_ONLY_DUPLICATE_SUPERSEDED',accountCloseOnly:true,canonicalSuccessorPlanId:canonical.planId,reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_DUPLICATE_SUPPRESSED']}});
     }
-    return{created:false,planId:canonical.planId,reasonCodes:[...(activeSuccessors.length>1?['P6_ACCOUNT_CLOSE_ONLY_DUPLICATE_SUPPRESSED']:[]),'P6_ACCOUNT_CLOSE_ONLY_SUCCESSOR_ALREADY_ACTIVE']};
+    return{created:false,planId:canonical.planId,reasonCodes:[...(selected.duplicates.length>0?['P6_ACCOUNT_CLOSE_ONLY_DUPLICATE_SUPPRESSED']:[]),'P6_ACCOUNT_CLOSE_ONLY_SUCCESSOR_ALREADY_ACTIVE']};
   }
   const dispatch=closeSettlementDispatch(input.plan),settlement=await input.store.loadLifecycleSettlementInput(input.positionAddress);
   if(!settlement)return{created:false,reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_LIFECYCLE_MISSING']};

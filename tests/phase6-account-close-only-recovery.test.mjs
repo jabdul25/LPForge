@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {assessAccountCloseOnlyRecovery,accountCloseOnlySuccessorIdentity} from '../.build/packages/phase6-live-worker/src/index.js';
+import {assessAccountCloseOnlyRecovery,accountCloseOnlySuccessorIdentity,selectCanonicalAccountCloseOnlySuccessor} from '../.build/packages/phase6-live-worker/src/index.js';
 
 const ready={priorAccountClose:'EXPIRED_NO_EFFECT',remove:'CONFIRMED_EFFECT',claim:'NOT_REQUIRED',primaryUnwind:'CONFIRMED_EFFECT',residualUnwind:'CONFIRMED_EFFECT',positionExists:true,totalXAmount:0n,totalYAmount:0n,feeX:0n,feeY:0n,rewardOne:0n,rewardTwo:0n,unresolvedInventoryLots:0};
 
@@ -25,4 +25,13 @@ test('the recovery identity is stable across repeated observations and cannot fa
   const again=accountCloseOnlySuccessorIdentity({planId:'plan-close',generation:1});
   assert.equal(once.planId,again.planId);
   assert.equal(once.idempotencyKey,again.idempotencyKey);
+});
+
+test('a duplicate recovery trigger retains only the deterministic earliest successor',()=>{
+  const selected=selectCanonicalAccountCloseOnlySuccessor([
+    {planId:'plan-close:account-close-only:2',createdAt:'2026-09-01T00:00:02.000Z'},
+    {planId:'plan-close:account-close-only:1',createdAt:'2026-09-01T00:00:01.000Z'},
+  ]);
+  assert.equal(selected.canonical.planId,'plan-close:account-close-only:1');
+  assert.deepEqual(selected.duplicates.map(row=>row.planId),['plan-close:account-close-only:2']);
 });
