@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {assessHistoryMaturity,deriveEventPathEconomicEstimate,collectActiveCandidateEvidence,selectActiveCandidateCollectionSlice,requiredActiveCandidateCollectionCapacity,calculateServiceableActiveCandidateCapacity,calculateCompletionAwareCollectionSliceSize,completionAwareCollectorDelayMs,assessCollectorRevisitBudget} from '../.build/packages/active-candidate-evidence/src/index.js';
 import {estimateOpportunityEconomics} from '../.build/packages/opportunity/src/index.js';
 import {evaluateEntry,ENTRY_RESEARCH_POLICY_V1} from '../.build/packages/entry-intelligence/src/index.js';
-import {ACTIVE_EVIDENCE_LEASE_TIMEOUT_MS,LIVE_EVIDENCE_MIN_ACTIVE_DWELL_MS,POST_EVIDENCE_EVALUATION_WINDOW_MS,dynamicLiveEvidenceAdmissionCapacity,freshDiscoveryEconomicPriority,freshLiveEvidenceEconomicQuality,isLiveEvidenceAdmissionTerminal,isLiveEvidenceLeaseActive,isPhase3ReadyConsumptionPending,isPostEvidenceEvaluationEligible,liveEvidenceLeaseExpiresAt,liveEvidenceLeaseReleaseReason,selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
+import {ACTIVE_EVIDENCE_LEASE_TIMEOUT_MS,LIVE_EVIDENCE_MIN_ACTIVE_DWELL_MS,POST_EVIDENCE_EVALUATION_WINDOW_MS,dynamicLiveEvidenceAdmissionCapacity,freshDiscoveryEconomicPriority,freshLiveEvidenceEconomicQuality,isLiveEvidenceAdmissionTerminal,isLiveEvidenceAdmissionTerminalForCurrentLease,isLiveEvidenceLeaseActive,isPhase3ReadyConsumptionPending,isPostEvidenceEvaluationEligible,liveEvidenceLeaseExpiresAt,liveEvidenceLeaseReleaseReason,selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
 import {decisionTimeEconomicEvidenceAgeSeconds,hasPhase3FreshHistoricalEvidence,summarizePhase3RecentLiveObservations} from '../.build/packages/operational-runtime/src/index.js';
 
 const at='2026-08-13T16:00:00.000Z',atMs=Date.parse(at);
@@ -67,6 +67,11 @@ test('economic NO_TRADE remains eligible for reserve observation and later dynam
  assert.equal(isLiveEvidenceAdmissionTerminal('ENTRY_READY'),true);
  const candidate={poolAddress:'economic-no-trade',state:'QUALIFIED',priorityScore:1,firstSeenAt:at,matureForPhase3:false,phase3Terminal:isLiveEvidenceAdmissionTerminal('NO_TRADE')};
  assert.deepEqual(selectLiveEvidenceAdmissionCandidates([candidate],1).map(x=>x.poolAddress),['economic-no-trade']);
+});
+
+test('a completed and cooled QUALIFIED lease can begin fresh evidence despite an auditable prior ENTRY_READY',()=>{
+ assert.equal(isLiveEvidenceAdmissionTerminalForCurrentLease({state:'ACTIVE_CANDIDATE',phase3Status:'ENTRY_READY'}),true);
+ assert.equal(isLiveEvidenceAdmissionTerminalForCurrentLease({state:'QUALIFIED',phase3Status:'ENTRY_READY'}),false);
 });
 
 test('confirmed mature QUALIFIED pool retains a bounded collector slot for fresh Phase-3 economics',()=>{
