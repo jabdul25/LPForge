@@ -4018,6 +4018,19 @@ export async function executeAutonomousPlan(input: {
   throw new Error(`LPFORGE_P6_ACTION_UNSUPPORTED:${input.plan.action}`);
 }
 async function createAccountCloseOnlySuccessor(input:{store:Phase1Store;plan:AutonomousPlan;positionAddress:string;positionTruth:Record<string,unknown>;now:string}):Promise<{created:boolean;planId?:string;reasonCodes:string[]}>{
+  // The failed parent remains recoverable only until one successor exists.
+  // Repeated ticks and restarts must converge on that successor, never fan
+  // out into several account-close transactions.
+  const activeSuccessors=(await input.store.loadActiveAutonomousPlansForPosition(input.positionAddress))
+    .filter(plan=>plan.action==='CLOSE'&&plan.planId.startsWith(`${input.plan.planId}:account-close-only:`))
+    .sort((a,b)=>a.createdAt.localeCompare(b.createdAt)||a.planId.localeCompare(b.planId));
+  if(activeSuccessors.length>0){
+    const canonical=activeSuccessors[0]!;
+    for(const duplicate of activeSuccessors.slice(1)){
+      await input.store.completeAutonomousPlan({planId:duplicate.planId,state:'FAILED',at:input.now,payload:{action:'CLOSE',recovery:'ACCOUNT_CLOSE_ONLY_DUPLICATE_SUPERSEDED',accountCloseOnly:true,canonicalSuccessorPlanId:canonical.planId,reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_DUPLICATE_SUPPRESSED']}});
+    }
+    return{created:false,planId:canonical.planId,reasonCodes:[...(activeSuccessors.length>1?['P6_ACCOUNT_CLOSE_ONLY_DUPLICATE_SUPPRESSED']:[]),'P6_ACCOUNT_CLOSE_ONLY_SUCCESSOR_ALREADY_ACTIVE']};
+  }
   const dispatch=closeSettlementDispatch(input.plan),settlement=await input.store.loadLifecycleSettlementInput(input.positionAddress);
   if(!settlement)return{created:false,reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_LIFECYCLE_MISSING']};
   const closeTransactions=settlement.transactions.filter(transaction=>transaction.planRole==='CLOSE'),stateFor=(kind:string):TerminalActionEffectState=>{
@@ -4504,7 +4517,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
           if(closePending.stage==='CLOSE_POSITION_SUBMITTED'&&recoveryPositionAddress){
             await input.store.markSubmissionExpired(closePending.signature,input.now,'P6_CLOSE_PENDING_STAGE_EXPIRED_NO_CHAIN_EFFECT');
             const successor=await createAccountCloseOnlySuccessor({store:input.store,plan,positionAddress:recoveryPositionAddress,positionTruth,now:input.now});
-            if(successor.created){
+            if(successor.created||successor.planId){
               results.push({planId:plan.planId,action:'RETURN_EXISTING_PLAN',reasonCodes:successor.reasonCodes});
               continue;
             }

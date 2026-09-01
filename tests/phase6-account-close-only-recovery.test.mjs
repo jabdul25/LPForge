@@ -19,3 +19,10 @@ test('confirmed economic children and not-required claim are never replayed by e
 test('account close only fails closed on residual chain economics or inventory',()=>{
   for(const input of [{...ready,totalXAmount:1n},{...ready,feeX:1n},{...ready,rewardOne:1n},{...ready,unresolvedInventoryLots:1},{...ready,positionExists:'UNKNOWN'}])assert.equal(assessAccountCloseOnlyRecovery(input).eligible,false);
 });
+
+test('the recovery identity is stable across repeated observations and cannot fan out into close attempts',()=>{
+  const once=accountCloseOnlySuccessorIdentity({planId:'plan-close',generation:1});
+  const again=accountCloseOnlySuccessorIdentity({planId:'plan-close',generation:1});
+  assert.equal(once.planId,again.planId);
+  assert.equal(once.idempotencyKey,again.idempotencyKey);
+});
