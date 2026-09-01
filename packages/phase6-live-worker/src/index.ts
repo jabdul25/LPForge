@@ -2232,9 +2232,20 @@ function settlementFlowSignature(flow:LifecycleSettlementInput["cashflows"][numb
  */
 export async function reconcileTerminalSettlementChainEffects(input:{connection:Connection;plan:AutonomousPlan;positionAddress:string;settlementInput:Omit<LifecycleSettlementInput,"positionAbsent"|"positionCheckedAt"|"positionCheckedSlot">}):Promise<{ok:boolean;reasonCodes:string[];chainSolInLamports:bigint;chainSolOutLamports:bigint;dbSolInLamports:bigint;dbSolOutLamports:bigint;payload:Record<string,unknown>}>{
   const reasons:string[]=[];
-  const terminalTransactions=input.settlementInput.transactions.filter(tx=>tx.planId===input.plan.planId&&tx.planRole==='CLOSE');
+  // A terminalization successor contributes only the final account-close
+  // receipt.  Reconciliation must therefore cover every CLOSE-plan child in
+  // the same lifecycle, not only the plan that happened to finalize it.
+  const allTerminalTransactions=input.settlementInput.transactions.filter(tx=>tx.planRole==='CLOSE');
+  // `FAILED_FINAL`/`PROVEN_NOT_LANDED` are durable no-effect attempts. They
+  // remain in settlement evidence, but are not economic receipts and must not
+  // be treated as a missing cashflow once an isolated successor has completed.
+  const terminalTransactions=allTerminalTransactions.filter(tx=>tx.state==='CONFIRMED');
+  for(const transaction of allTerminalTransactions)
+    if(transaction.state!=='CONFIRMED'&&transaction.state!=='FAILED_FINAL'&&transaction.state!=='PROVEN_NOT_LANDED')
+      reasons.push(`SETTLEMENT_CHAIN_RECEIPT_UNAVAILABLE:${transaction.transactionId}`);
   let chainSolInLamports=0n,chainSolOutLamports=0n,dbSolInLamports=0n,dbSolOutLamports=0n;
-  const closeFlows=input.settlementInput.cashflows.filter(flow=>flow.planId===input.plan.planId);
+  const closePlanIds=new Set(allTerminalTransactions.map(transaction=>transaction.planId));
+  const closeFlows=input.settlementInput.cashflows.filter(flow=>closePlanIds.has(flow.planId));
   for(const flow of closeFlows){
     const amount=settlementFlowAmount(flow);if(amount===undefined)continue;
     if(settlementSolInFlowTypes.has(flow.flowType))dbSolInLamports+=amount;
@@ -3000,6 +3011,55 @@ type CloseSettlementPendingStage =
   | "CLOSE_OPEN_RESIDUAL_UNWIND_SUBMITTED"
   | "CLOSE_POSITION_SUBMITTED";
 
+/**
+ * A terminal CLOSE is a sequence of independently observable chain effects.
+ * Parent-plan terminal state is never sufficient authority to replay a child.
+ */
+export type TerminalActionEffectState =
+  | "PLANNED"
+  | "SUBMITTED"
+  | "CONFIRMED_EFFECT"
+  | "EXPIRED_NO_EFFECT"
+  | "UNKNOWN_EFFECT"
+  | "NOT_REQUIRED";
+
+export function assessAccountCloseOnlyRecovery(input:{
+  priorAccountClose:TerminalActionEffectState;
+  remove:TerminalActionEffectState;
+  claim:TerminalActionEffectState;
+  primaryUnwind:TerminalActionEffectState;
+  residualUnwind:TerminalActionEffectState;
+  positionExists:boolean|"UNKNOWN";
+  totalXAmount:bigint;
+  totalYAmount:bigint;
+  feeX:bigint;
+  feeY:bigint;
+  rewardOne:bigint;
+  rewardTwo:bigint;
+  unresolvedInventoryLots:number;
+}):{eligible:boolean;reasonCodes:string[]}{
+  const reasons:string[]=[];
+  if(input.priorAccountClose!=="EXPIRED_NO_EFFECT")reasons.push("P6_ACCOUNT_CLOSE_ONLY_PRIOR_EFFECT_NOT_EXPIRED_NO_EFFECT");
+  for(const [name,state] of [["REMOVE",input.remove],["CLAIM",input.claim],["PRIMARY_UNWIND",input.primaryUnwind],["RESIDUAL_UNWIND",input.residualUnwind]] as const)
+    if(state!=="CONFIRMED_EFFECT"&&state!=="NOT_REQUIRED")reasons.push(`P6_ACCOUNT_CLOSE_ONLY_${name}_UNRESOLVED`);
+  if(input.positionExists!==true)reasons.push(input.positionExists===false?"P6_ACCOUNT_CLOSE_ONLY_ACCOUNT_ABSENT":"P6_ACCOUNT_CLOSE_ONLY_ACCOUNT_UNKNOWN");
+  if(input.totalXAmount!==0n||input.totalYAmount!==0n)reasons.push("P6_ACCOUNT_CLOSE_ONLY_LIQUIDITY_REMAINS");
+  if(input.feeX!==0n||input.feeY!==0n)reasons.push("P6_ACCOUNT_CLOSE_ONLY_FEES_REMAIN");
+  if(input.rewardOne!==0n||input.rewardTwo!==0n)reasons.push("P6_ACCOUNT_CLOSE_ONLY_REWARDS_REMAIN");
+  if(input.unresolvedInventoryLots!==0)reasons.push("P6_ACCOUNT_CLOSE_ONLY_INVENTORY_REMAINS");
+  return{eligible:reasons.length===0,reasonCodes:reasons};
+}
+
+export function accountCloseOnlySuccessorIdentity(input:{planId:string;generation:number}):{planId:string;intentId:string;transactionId:string;idempotencyKey:string}{
+  if(!Number.isInteger(input.generation)||input.generation<1)throw new Error("LPFORGE_ACCOUNT_CLOSE_ONLY_GENERATION_INVALID");
+  const suffix=`account-close-only:${input.generation}`;
+  return{planId:`${input.planId}:${suffix}`,intentId:`${input.planId}:intent:${suffix}`,transactionId:`${input.planId}:tx:${suffix}`,idempotencyKey:`${input.planId}:${suffix}`};
+}
+
+function isAccountCloseOnlyPlan(plan:AutonomousPlan):boolean{
+  return closeSettlementDispatch(plan).accountCloseOnly===true;
+}
+
 function closeSettlementDispatch(plan: AutonomousPlan): Record<string, unknown> {
   const value = plan.planPayload && plan.planPayload.autonomous_dispatch;
   return value && typeof value === "object"
@@ -3713,7 +3773,7 @@ async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:Au
   if(!rent.ok)return{ready:false,reasonCodes:rent.reasonCodes};
   let settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
   if(!settlementInput)return{ready:false,reasonCodes:["SETTLEMENT_LIFECYCLE_MISSING"]};
-  const terminalClaim=settlementInput.transactions.find(transaction=>transaction.planId===input.plan.planId&&transaction.planRole==='CLOSE'&&transaction.kind==='METEORA_CLAIM');
+  const terminalClaim=settlementInput.transactions.find(transaction=>transaction.planRole==='CLOSE'&&transaction.kind==='METEORA_CLAIM');
   if(terminalClaim?.signature){
     const claim=await persistConfirmedClaimReceipt({store:input.store,connection:input.connection,plan:input.plan,positionAddress:input.positionAddress,signature:terminalClaim.signature,transactionId:terminalClaim.transactionId,observedAt:new Date().toISOString(),source:"CONFIRMED_TERMINAL_CLAIM_RECEIPT"});
     if(!claim.ok)return{ready:false,reasonCodes:claim.reasonCodes};
@@ -3748,8 +3808,9 @@ async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:Au
     return{ready:false,reasonCodes:assessment.reasonCodes};
   }
   const persisted=await input.store.persistLifecycleSolSettlement({assessment,input:{...settlementInput,positionAbsent:true,positionCheckedAt,positionCheckedSlot},...(process.env.LPFORGE_SOURCE_COMMIT?{sourceCommit:process.env.LPFORGE_SOURCE_COMMIT}:{}),...(process.env.LPFORGE_P7_POLICY_HASH?{policyHash:process.env.LPFORGE_P7_POLICY_HASH}:{}),migrationHead:"M0067_terminal_fee_claim_settlement_reconciliation.sql",...(process.env.LPFORGE_BUILD_ID?{buildId:process.env.LPFORGE_BUILD_ID}:{}),at});
-  const claimSignature=settlementInput.transactions.find(transaction=>transaction.transactionId.endsWith(':claim'))?.signature;
-  await input.store.finalizeCloseFeeAttribution({closePlanId:input.plan.planId,positionAddress:input.positionAddress,removeSignature,...(claimSignature===undefined?{}:{claimSignature}),terminalSettlementId:persisted.settlementId,at});
+  const claimSignature=settlementInput.transactions.find(transaction=>transaction.planRole==='CLOSE'&&transaction.transactionId.endsWith(':claim'))?.signature,
+    rootClosePlanId=typeof dispatch.terminalRootClosePlanId==='string'?dispatch.terminalRootClosePlanId:input.plan.planId;
+  await input.store.finalizeCloseFeeAttribution({closePlanId:rootClosePlanId,positionAddress:input.positionAddress,removeSignature,...(claimSignature===undefined?{}:{claimSignature}),terminalSettlementId:persisted.settlementId,at});
   await input.store.compactPositionManagementDecisionAudit({positionAddress:input.positionAddress,at});
   // Existing research outcomes are immutable. A settlement supersession fixes
   // the accounting authority without mutating or duplicating V3 evidence.
@@ -3758,6 +3819,53 @@ async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:Au
     if(!outcome.outcome)throw new Error(`LPFORGE_LIVE_OUTCOME_MATERIALIZATION_FAILED:${outcome.reasonCodes.join(',')}`);
   }
   return{ready:true,reasonCodes:[]};
+}
+
+/**
+ * A successor produced after an expired account-close child is intentionally
+ * incapable of removing liquidity, claiming fees, or invoking Jupiter.  It
+ * re-reads PositionV2 immediately before the one remaining action.
+ */
+async function executeAccountCloseOnlyRecovery(input:{
+  store:Phase1Store; plan:AutonomousPlan; signer:MainnetSignerBackend; config:LiveWorkerConfig;
+  pool:MeteoraOpenAddPoolLike & MeteoraRemoveClaimPoolLike; positionAddress:string;
+}):Promise<LiveWorkerResult>{
+  const closeStep=input.plan.steps.find(step=>step.kind==='METEORA_CLOSE');
+  if(!closeStep||input.plan.steps.some(step=>step.kind!=='METEORA_CLOSE'))throw new Error('LPFORGE_ACCOUNT_CLOSE_ONLY_STEP_INVALID');
+  const connection=createGovernedConnection({rpcUrl:input.config.rpcUrl,priority:'P0_EXECUTION_CRITICAL'}),at=new Date().toISOString();
+  let account;
+  try{account=await connection.getAccountInfo(new PublicKey(input.positionAddress),'confirmed');}catch{
+    await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECONCILIATION_REQUIRED',at,reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_ACCOUNT_READ_UNKNOWN'],payload:{stage:'ACCOUNT_CLOSE_ONLY_CHAIN_READ_UNKNOWN'}});
+    return{status:'UNKNOWN',planId:input.plan.planId,reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_ACCOUNT_READ_UNKNOWN'],transactionSubmitted:false};
+  }
+  if(account===null){
+    await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECONCILIATION_REQUIRED',at,reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_ACCOUNT_ALREADY_ABSENT_RECONCILE'],payload:{stage:'ACCOUNT_CLOSE_ONLY_ACCOUNT_ABSENT'}});
+    return{status:'UNKNOWN',planId:input.plan.planId,reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_ACCOUNT_ALREADY_ABSENT_RECONCILE'],transactionSubmitted:false};
+  }
+  let fact:Awaited<ReturnType<ReturnType<typeof createMeteoraReadAdapter>['getPositionV2']>>;
+  try{fact=await createMeteoraReadAdapter({rpcUrl:input.config.rpcUrl,cluster:'mainnet-beta',programId:input.config.programId,priority:'P0_EXECUTION_CRITICAL'}).getPositionV2(input.plan.poolAddress,input.positionAddress);}catch{
+    await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECONCILIATION_REQUIRED',at,reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_POSITION_READ_UNKNOWN'],payload:{stage:'ACCOUNT_CLOSE_ONLY_POSITION_READ_UNKNOWN'}});
+    return{status:'UNKNOWN',planId:input.plan.planId,reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_POSITION_READ_UNKNOWN'],transactionSubmitted:false};
+  }
+  if(fact.owner!==input.plan.ownerAddress||fact.pool!==input.plan.poolAddress){
+    await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECONCILIATION_REQUIRED',at,reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_POSITION_IDENTITY_MISMATCH'],payload:{stage:'ACCOUNT_CLOSE_ONLY_IDENTITY_MISMATCH'}});
+    return{status:'BLOCKED',planId:input.plan.planId,reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_POSITION_IDENTITY_MISMATCH'],transactionSubmitted:false};
+  }
+  const lots=await input.store.loadPositionInventoryLots(input.positionAddress),unresolvedLots=lots.filter(lot=>lot.remainingRawAmount>0n).length;
+  const check=assessAccountCloseOnlyRecovery({priorAccountClose:'EXPIRED_NO_EFFECT',remove:'CONFIRMED_EFFECT',claim:'NOT_REQUIRED',primaryUnwind:'CONFIRMED_EFFECT',residualUnwind:'CONFIRMED_EFFECT',positionExists:true,totalXAmount:BigInt(fact.totalXAmount??'0'),totalYAmount:BigInt(fact.totalYAmount??'0'),feeX:BigInt(fact.feeX??'0'),feeY:BigInt(fact.feeY??'0'),rewardOne:BigInt(fact.rewardOne??'0'),rewardTwo:BigInt(fact.rewardTwo??'0'),unresolvedInventoryLots:unresolvedLots});
+  if(!check.eligible){
+    await input.store.markOwnedPositionLifecycle({positionAddress:input.positionAddress,lifecycleState:'RECONCILIATION_REQUIRED',reconciliationStatus:'TERMINALIZATION_DEBT',lastPlanId:input.plan.planId,at,payload:{stage:'ACCOUNT_CLOSE_ONLY_PRECONDITION_FAILED',reasonCodes:check.reasonCodes,accountCloseOnly:true}});
+    await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECONCILIATION_REQUIRED',at,reasonCodes:check.reasonCodes,payload:{stage:'ACCOUNT_CLOSE_ONLY_PRECONDITION_FAILED'}});
+    return{status:'BLOCKED',planId:input.plan.planId,reasonCodes:check.reasonCodes,transactionSubmitted:false};
+  }
+  const built=await buildClosePositionTransaction(input.pool,{userAddress:input.plan.ownerAddress,positionAddress:input.positionAddress});
+  built.metadata.transactionId=closeStep.transactionId;
+  const closed=await executeMeteoraMutation({...input,built,action:'CLOSE',deferCompletion:true,afterSubmit:async({signature})=>input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECONCILING',at:new Date().toISOString(),payload:{stage:'ACCOUNT_CLOSE_ONLY_SUBMITTED',accountCloseOnly:true,pendingStage:'ACCOUNT_CLOSE_ONLY_SUBMITTED',pendingSignature:signature,signature,transactionId:closeStep.transactionId}}),afterConfirmed:async({signature})=>{const rent=await persistConfirmedPositionRentRecovery({store:input.store,connection,plan:input.plan,positionAddress:input.positionAddress,signature,transactionId:closeStep.transactionId});if(!rent.ok)throw new Error(rent.reasonCodes.join(','));}});
+  if(closed.status!=='RECONCILED')return closed;
+  const settlement=await finalizeClosedPositionSettlement({store:input.store,plan:input.plan,positionAddress:input.positionAddress,connection,config:{rpcUrl:input.config.rpcUrl}});
+  if(!settlement.ready)return{status:'UNKNOWN',planId:input.plan.planId,reasonCodes:settlement.reasonCodes,transactionSubmitted:true};
+  await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'COMPLETED',at:new Date().toISOString(),payload:{action:'CLOSE',recovery:'ACCOUNT_CLOSE_ONLY_SETTLED',accountCloseOnly:true}});
+  return closed;
 }
 
 /** Generic plan entrypoint. Every mutation is claimed through the same durable queue. */
@@ -3870,8 +3978,11 @@ export async function executeAutonomousPlan(input: {
   if (
     input.plan.action === "CLOSE" ||
     input.plan.action === "EMERGENCY_CLOSE"
-  )
+  ) {
+    if (isAccountCloseOnlyPlan(input.plan))
+      return executeAccountCloseOnlyRecovery({ ...input, pool, positionAddress });
     return executeCloseSettlement({ ...input, pool, positionAddress });
+  }
   if (input.plan.action === "ADD") {
     const range = mutationRange(input.plan),
       funding = input.plan.intentPayload.entryFunding as
@@ -3906,6 +4017,27 @@ export async function executeAutonomousPlan(input: {
     return executeManagementReplacement({ ...input, pool, positionAddress });
   throw new Error(`LPFORGE_P6_ACTION_UNSUPPORTED:${input.plan.action}`);
 }
+async function createAccountCloseOnlySuccessor(input:{store:Phase1Store;plan:AutonomousPlan;positionAddress:string;positionTruth:Record<string,unknown>;now:string}):Promise<{created:boolean;planId?:string;reasonCodes:string[]}>{
+  const dispatch=closeSettlementDispatch(input.plan),settlement=await input.store.loadLifecycleSettlementInput(input.positionAddress);
+  if(!settlement)return{created:false,reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_LIFECYCLE_MISSING']};
+  const closeTransactions=settlement.transactions.filter(transaction=>transaction.planRole==='CLOSE'),stateFor=(kind:string):TerminalActionEffectState=>{
+    const rows=closeTransactions.filter(transaction=>transaction.kind===kind);
+    if(rows.length===0)return 'NOT_REQUIRED';
+    return rows.every(row=>row.state==='CONFIRMED'&&Boolean(row.signature))?'CONFIRMED_EFFECT':'UNKNOWN_EFFECT';
+  },lots=await input.store.loadPositionInventoryLots(input.positionAddress),check=assessAccountCloseOnlyRecovery({
+    priorAccountClose:'EXPIRED_NO_EFFECT',remove:stateFor('METEORA_REMOVE'),claim:dispatch.claimTransactionSkipped===true?'NOT_REQUIRED':stateFor('METEORA_CLAIM'),primaryUnwind:stateFor('JUPITER_UNWIND'),residualUnwind:stateFor('JUPITER_UNWIND'),positionExists:input.positionTruth.exists===true?true:input.positionTruth.exists===false?false:'UNKNOWN',totalXAmount:BigInt(String(input.positionTruth.totalXAmount??'0')),totalYAmount:BigInt(String(input.positionTruth.totalYAmount??'0')),feeX:BigInt(String(input.positionTruth.feeX??'0')),feeY:BigInt(String(input.positionTruth.feeY??'0')),rewardOne:BigInt(String(input.positionTruth.rewardOne??'0')),rewardTwo:BigInt(String(input.positionTruth.rewardTwo??'0')),unresolvedInventoryLots:lots.filter(lot=>lot.remainingRawAmount>0n).length,
+  });
+  if(!check.eligible)return{created:false,reasonCodes:check.reasonCodes};
+  const priorGeneration=Number(dispatch.accountCloseOnlyRecoveryGeneration??0),generation=Number.isInteger(priorGeneration)&&priorGeneration>=0?priorGeneration+1:1,id=accountCloseOnlySuccessorIdentity({planId:input.plan.planId,generation}),capitalLamports=String((input.plan.planPayload.intent as Record<string,unknown>|undefined)?.capitalLamports??'');
+  if(!/^\d+$/.test(capitalLamports)||BigInt(capitalLamports)<=0n)return{created:false,reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_CAPITAL_MISSING']};
+  const expiresAt=new Date(Date.parse(input.now)+300_000).toISOString();
+  await input.store.insertExecutionIntent({intentId:id.intentId,idempotencyKey:id.idempotencyKey,action:'CLOSE',poolAddress:input.plan.poolAddress,ownerAddress:input.plan.ownerAddress,positionAddress:input.positionAddress,thesisId:input.plan.thesisId,observedAt:input.now,expiresAt,payload:{terminalRecovery:true,accountCloseOnly:true,predecessorPlanId:input.plan.planId,capitalLamports,reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_SUCCESSOR']}});
+  await input.store.insertTransactionPlan({planId:id.planId,intentId:id.intentId,cluster:'mainnet-beta',state:'PLANNED',createdAt:input.now,expiresAt,payload:{reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_SUCCESSOR'],authority:'AUTONOMOUS_TERMINAL_RECOVERY',provenance:{producer:'LPFORGE_PRODUCTION',schemaVersion:1,terminalRecovery:true,predecessorPlanId:input.plan.planId,observedAt:input.now,poolAddress:input.plan.poolAddress},immutablePlanVersion:1,intent:{capitalLamports,candidateId:null},autonomous_dispatch:{accountCloseOnly:true,terminalRootClosePlanId:input.plan.planId,accountCloseOnlyRecoveryGeneration:generation,stage:'ACCOUNT_CLOSE_ONLY_READY',removeTransactionId:dispatch.removeTransactionId,unwindTransactionId:dispatch.unwindTransactionId,recoveredOpenResidualUnwindTransactionId:dispatch.recoveredOpenResidualUnwindTransactionId,claimTransactionSkipped:dispatch.claimTransactionSkipped===true,closeSettlementIncomplete:true}},steps:[{transactionId:id.transactionId,sequence:1,kind:'METEORA_CLOSE',state:'PLANNED',requiredSignerAddresses:[input.plan.ownerAddress],metadata:{accountCloseOnly:true,recoveryGeneration:generation,predecessorPlanId:input.plan.planId}}]});
+  await input.store.markOwnedPositionLifecycle({positionAddress:input.positionAddress,lifecycleState:'RECONCILIATION_REQUIRED',reconciliationStatus:'TERMINALIZATION_DEBT',lastPlanId:id.planId,at:input.now,payload:{stage:'ACCOUNT_CLOSE_ONLY_SUCCESSOR_PLANNED',terminalizationDebt:true,predecessorPlanId:input.plan.planId,successorPlanId:id.planId,reasonCodes:['P6_TERMINALIZATION_DEBT_ACCOUNT_CLOSE_ONLY']}});
+  await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'FAILED',at:input.now,payload:{action:input.plan.action,recovery:'ACCOUNT_CLOSE_ONLY_SUCCESSOR_CREATED',accountCloseOnlySuccessorPlanId:id.planId,accountCloseOnlyRecoveryGeneration:generation,pendingStage:'CLOSE_POSITION_SUBMITTED'}});
+  return{created:true,planId:id.planId,reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_SUCCESSOR_CREATED','P6_TERMINALIZATION_DEBT_ACCOUNT_CLOSE_ONLY']};
+}
+
 /** Startup/periodic recovery is deliberately non-resubmitting until chain truth is reconciled. */
 export async function recoverUnfinishedAutonomousPlans(input: {
   store: Phase1Store;
@@ -4074,6 +4206,12 @@ export async function recoverUnfinishedAutonomousPlans(input: {
           pool: position.pool,
           lowerBinId: position.lowerBinId,
           upperBinId: position.upperBinId,
+          totalXAmount: position.totalXAmount,
+          totalYAmount: position.totalYAmount,
+          feeX: position.feeX,
+          feeY: position.feeY,
+          rewardOne: position.rewardOne,
+          rewardTwo: position.rewardTwo,
         };
         if (plan.action === "OPEN") economicEffect = "PRESENT";
         else if (
@@ -4363,6 +4501,18 @@ export async function recoverUnfinishedAutonomousPlans(input: {
           (confirmationStatus === "EXPIRED" || confirmationStatus === "FAILED") &&
           positionTruth.exists === true
         ) {
+          if(closePending.stage==='CLOSE_POSITION_SUBMITTED'&&recoveryPositionAddress){
+            await input.store.markSubmissionExpired(closePending.signature,input.now,'P6_CLOSE_PENDING_STAGE_EXPIRED_NO_CHAIN_EFFECT');
+            const successor=await createAccountCloseOnlySuccessor({store:input.store,plan,positionAddress:recoveryPositionAddress,positionTruth,now:input.now});
+            if(successor.created){
+              results.push({planId:plan.planId,action:'RETURN_EXISTING_PLAN',reasonCodes:successor.reasonCodes});
+              continue;
+            }
+            await input.store.markOwnedPositionLifecycle({positionAddress:recoveryPositionAddress,lifecycleState:'RECONCILIATION_REQUIRED',reconciliationStatus:'TERMINALIZATION_DEBT',lastPlanId:plan.planId,at:input.now,payload:{stage:'ACCOUNT_CLOSE_ONLY_SUCCESSOR_BLOCKED',terminalizationDebt:true,reasonCodes:successor.reasonCodes}});
+            await input.store.transitionAutonomousPlan({planId:plan.planId,state:'RECONCILIATION_REQUIRED',at:input.now,reasonCodes:['P6_TERMINALIZATION_DEBT_ACCOUNT_CLOSE_ONLY_BLOCKED',...successor.reasonCodes],payload:{stage:'ACCOUNT_CLOSE_ONLY_SUCCESSOR_BLOCKED',pendingStage:closePending.stage,pendingSignature:closePending.signature}});
+            results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:['P6_TERMINALIZATION_DEBT_ACCOUNT_CLOSE_ONLY_BLOCKED',...successor.reasonCodes]});
+            continue;
+          }
           const reason = "P6_CLOSE_PENDING_STAGE_EXPIRED_NO_CHAIN_EFFECT";
           await input.store.markSubmissionExpired(closePending.signature, input.now, reason);
           await input.store.updateExecutionJournal({
