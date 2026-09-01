@@ -4522,10 +4522,13 @@ export async function recoverUnfinishedAutonomousPlans(input: {
           if(closePending.stage==='CLOSE_POSITION_SUBMITTED'&&recoveryPositionAddress){
             await input.store.markSubmissionExpired(closePending.signature,input.now,'P6_CLOSE_PENDING_STAGE_EXPIRED_NO_CHAIN_EFFECT');
             const successor=await createAccountCloseOnlySuccessor({store:input.store,plan,positionAddress:recoveryPositionAddress,positionTruth,now:input.now});
-            if(successor.created||successor.planId){
+            if(successor.created){
               results.push({planId:plan.planId,action:'RETURN_EXISTING_PLAN',reasonCodes:successor.reasonCodes});
               continue;
             }
+            // An already-created successor is dispatchable through the normal
+            // plan queue. It must not keep recovery in RECOVERY_PENDING.
+            if(successor.planId)continue;
             await input.store.markOwnedPositionLifecycle({positionAddress:recoveryPositionAddress,lifecycleState:'RECONCILIATION_REQUIRED',reconciliationStatus:'TERMINALIZATION_DEBT',lastPlanId:plan.planId,at:input.now,payload:{stage:'ACCOUNT_CLOSE_ONLY_SUCCESSOR_BLOCKED',terminalizationDebt:true,reasonCodes:successor.reasonCodes}});
             await input.store.transitionAutonomousPlan({planId:plan.planId,state:'RECONCILIATION_REQUIRED',at:input.now,reasonCodes:['P6_TERMINALIZATION_DEBT_ACCOUNT_CLOSE_ONLY_BLOCKED',...successor.reasonCodes],payload:{stage:'ACCOUNT_CLOSE_ONLY_SUCCESSOR_BLOCKED',pendingStage:closePending.stage,pendingSignature:closePending.signature}});
             results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:['P6_TERMINALIZATION_DEBT_ACCOUNT_CLOSE_ONLY_BLOCKED',...successor.reasonCodes]});
