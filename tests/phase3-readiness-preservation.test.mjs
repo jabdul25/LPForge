@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import {ACTIVE_EVIDENCE_LEASE_TIMEOUT_MS,isPhase3ReadyConsumptionPending,isLiveEvidenceLeaseActive,liveEvidenceLeaseReleaseReason,dynamicLiveEvidenceAdmissionCapacity,selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
-import {isPhase3ReadyProductionEvaluationCandidate,productionEvaluationPoolAddresses} from '../.build/packages/phase7-production-service/src/index.js';
+import {isPhase3ReadyProductionEvaluationCandidate,getProductionNewEntryEligiblePools} from '../.build/packages/phase7-production-service/src/index.js';
 const policy=new URL('../policies/live-execution-policy.json',import.meta.url).pathname;
 const at='2026-08-22T10:00:00.000Z';
 const payload=(readyAt='2026-08-22T09:59:00.000Z')=>({liveEvidencePhase3ConsumptionState:'PENDING',liveEvidencePhase3ReadyAt:readyAt,liveEvidenceLeaseStartedAt:'2026-08-22T09:30:00.000Z',liveEvidenceLeaseExpiresAt:'2026-08-22T10:15:00.000Z'});
@@ -24,7 +24,7 @@ test('ready dynamic candidates retain active slots and deterministic production 
  assert.equal(isPhase3ReadyProductionEvaluationCandidate(candidates[0],at),true);
  const selected=selectLiveEvidenceAdmissionCandidates(candidates.map((x,i)=>({...x,rank:i,firstSeenAt:at,matureForPhase3:false,phase3Terminal:false,evidenceLeaseActive:x.state==='ACTIVE_CANDIDATE'})),2);
  assert.deepEqual(selected.map(x=>x.poolAddress).sort(),['ready-new','ready-old']);
- const pools=await productionEvaluationPoolAddresses({listDiscoveryCandidates:async()=>candidates},{LPFORGE_DISCOVERY_OPERATOR_ENABLED:'true',LPFORGE_EXECUTION_POLICY_PATH:policy,LPFORGE_PRODUCTION_OPERATOR_MAX_POOLS:'1'},'x');
+ const pools=await getProductionNewEntryEligiblePools({listDiscoveryCandidates:async()=>candidates},{LPFORGE_DISCOVERY_OPERATOR_ENABLED:'true',LPFORGE_EXECUTION_POLICY_PATH:policy,LPFORGE_PRODUCTION_OPERATOR_MAX_POOLS:'1'},'x');
  assert.ok(pools.includes('ready-old'));assert.equal(pools.includes('ready-new'),false);assert.equal(pools.includes('higher-ranked-waiter'),false);
 });
 test('static policy reads write canonical LIVE_OBSERVED evidence without using dynamic capacity',()=>{

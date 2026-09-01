@@ -54,11 +54,11 @@ test('wallet token balances join the NAV through the same pool price feed',()=>{
   assert.match(src,/if\(!mint\|\|!amount\|\|typeof decimals!=='number'\)continue;/,'unknown or unparsable rows are skipped, not guessed');
 });
 
-test('owned positions are mandatory probe targets even when the Tier-A rotation is bounded',()=>{
+test('owned positions remain mandatory management/drift targets without bypassing dynamic new-entry admission',()=>{
   const src=fs.readFileSync(production,'utf8');
-  assert.match(src,/ownedPoolAddresses:readonly string\[\]=\[\]/,'probe-universe helper accepts durable owned pools');
-  assert.match(src,/productionEvaluationPoolAddresses\(input\.store,input\.env,input\.cycleKey,\[\.\.\.openPools\]\)/,'one immutable cycle universe includes every open position');
-  assert.match(src,/\[\.\.\.manual,\.\.\.owned,\.\.\.selected\.map/,'owned pools cannot be rotated out behind candidate-only work');
+  assert.match(src,/productionManagementPoolAddresses\(input\.env,\[\.\.\.openPools\]\)/,'owned positions remain in the management/drift universe');
+  assert.match(src,/getProductionNewEntryEligiblePools\(input\.store,input\.env,input\.cycleKey\)/,'new-entry evaluation remains dynamically admitted');
+  assert.match(src,/eligiblePoolAddresses:newEntryPoolAddresses/,'owned pools cannot be injected into global new-entry ranking merely by lifecycle state');
 });
 
 test('rent locked in open position accounts is exact recoverable book-value equity and policy precedes valuation',()=>{

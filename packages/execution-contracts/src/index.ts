@@ -136,6 +136,8 @@ export interface PlanProvenanceFields {
    * contain a new P7 snapshot, but cannot retarget this exact open.
    */
   controlledCanaryAuthorization?:Record<string,unknown>|null;
+  /** Canonical global-selection identity for an ordinary Production OPEN. */
+  globalSelection?:Record<string,unknown>|null;
 }
 /**
  * Match JSON persistence before authenticating plan provenance.  Execution

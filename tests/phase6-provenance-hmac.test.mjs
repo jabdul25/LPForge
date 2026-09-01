@@ -22,6 +22,10 @@ test('provenance HMACs round-trip over a canonical sorted serialization and reje
   assert.equal(verifyPlanProvenanceHmac({...fields,ownerAddress:'OTHER'},secret,hmac),false,'a changed owner breaks the stamp');
   assert.equal(verifyPlanProvenanceHmac({...fields,positionAddress:'POS'},secret,hmac),false,'a changed position breaks the stamp');
   assert.equal(verifyPlanProvenanceHmac({...fields,phase7Control:{...phase7Control,decisionId:'forged-control'}},secret,hmac),false,'a changed P7 binding breaks the stamp');
+  const globalSelection={globalCycleId:'production-global:cycle-1',selectedCandidateId:'candidate-1'};
+  const globalHmac=computePlanProvenanceHmac({...fields,globalSelection},secret);
+  assert.equal(verifyPlanProvenanceHmac({...fields,globalSelection},secret,globalHmac),true,'global winner identity is authenticated');
+  assert.equal(verifyPlanProvenanceHmac({...fields,globalSelection:{...globalSelection,selectedCandidateId:'forged-candidate'}},secret,globalHmac),false,'the plan cannot be retargeted to a different global winner');
   assert.equal(verifyPlanProvenanceHmac({...fields,expiresAt:'2026-08-13T00:06:00.000Z'},secret,hmac),false,'a changed expiry breaks the stamp');
   assert.equal(verifyPlanProvenanceHmac(fields,'wrong-secret',hmac),false,'a different secret breaks the stamp');
   assert.equal(verifyPlanProvenanceHmac(fields,secret,'deadbeef'),false,'non-hex input fails closed');
@@ -58,6 +62,7 @@ test('the operator stamps the complete immutable plan when the provenance secret
   assert.ok(src.includes('expiresAt: plan.expiresAt'),'the stamp covers plan expiry');
   assert.ok(src.includes('immutablePlan'),'the stamp covers immutable plan economics and transaction instructions');
   assert.ok(src.includes('controlledCanaryAuthorization'),'the stamp includes the single-plan canary envelope when present');
+  assert.ok(src.includes('globalSelection'),'the stamp includes global winner provenance when present');
 });
 
 test('the claim guard verifies the stamp fail-closed once the secret is configured and stays backward compatible without it',()=>{
@@ -65,20 +70,21 @@ test('the claim guard verifies the stamp fail-closed once the secret is configur
   assert.ok(src.includes('P6_CLAIM_PROVENANCE_HMAC_MISSING')&&src.includes('P6_CLAIM_PROVENANCE_HMAC_INVALID'),'missing and invalid stamps get distinct reason codes');
   assert.ok(src.includes('input.provenanceSecret'),'verification only runs when the secret is provided');
   assert.ok(src.includes('positionAddress: p.positionAddress ?? null'),'the guard recomputes over the row it is about to authorize');
-  const policy={schemaVersion:1,policyId:'p',status:'ENABLED',approvalTtlMs:15000,minDevnetConfirmedRuns:1,maxActionsPerDay:2,maxOpenPositions:2,pools:[{address:'POOL',maxCapitalLamports:20_000_000n,maxOpenPositions:1}]};
+  const policy={schemaVersion:1,policyId:'p',status:'ENABLED',approvalTtlMs:15000,minDevnetConfirmedRuns:1,maxActionsPerDay:2,maxOpenPositions:2,pools:[{address:'POOL',maxCapitalLamports:20_000_000n,maxOpenPositions:1}],productionAdmission:{enabled:true,eligibleTiers:['A'],maxCandidates:1,maxCandidateAgeMs:900000,maxCapitalLamports:20_000_000n,maxOpenPositions:1}};
   const control={decisionId:'control-1',cycleKey:'cycle-1',authorityMode:'PRODUCTION',healthStatus:'HEALTHY',driftStatus:'WATCH',safetyMode:'NORMAL',newEconomicActionAllowed:true,observedAt:'2026-08-13T00:04:30.000Z'};
   const plan={planId:'p',intentId:'i',idempotencyKey:'k',action:'OPEN',poolAddress:'POOL',ownerAddress:'OWNER',thesisId:'t',observedAt:fields.observedAt,expiresAt:fields.expiresAt,intentPayload:{},planPayload:{provenance:{producer:'LPFORGE_PRODUCTION',schemaVersion:1,intentId:'i',poolAddress:'POOL',observedAt:fields.observedAt,phase7Control:{decisionId:'control-1',cycleKey:'cycle-1',observedAt:control.observedAt}},intent:{capitalLamports:'20000000',activeBinId:100,binStep:80}},steps:[]};
   const now='2026-08-13T00:05:00.000Z';
-  assert.equal(validateClaimedPlan({plan,policy,ownedPositions:[],phase7Control:control,now}).approved,true,'without the secret the guard keeps prior behavior');
+  const productionCandidates=[{poolAddress:'POOL',state:'ACTIVE_CANDIDATE',tier:'A',lastSeenAt:'2026-08-13T00:04:00.000Z',tokenYMint:'So11111111111111111111111111111111111111112',pairedTokenMint:'TOKEN'}];
+  assert.equal(validateClaimedPlan({plan,policy,ownedPositions:[],productionCandidates,phase7Control:control,now}).approved,true,'without the secret the guard keeps prior behavior');
   const stamped={...plan,planPayload:{...plan.planPayload,provenance:{...plan.planPayload.provenance,hmac:computePlanProvenanceHmac(fields,secret)}}};
-  assert.equal(validateClaimedPlan({plan:stamped,policy,ownedPositions:[],phase7Control:control,provenanceSecret:secret,now}).approved,true,'a valid stamp passes');
-  assert.ok(validateClaimedPlan({plan,policy,ownedPositions:[],phase7Control:control,provenanceSecret:secret,now}).reasonCodes.includes('P6_CLAIM_PROVENANCE_HMAC_MISSING'),'a missing stamp fails closed');
+  assert.equal(validateClaimedPlan({plan:stamped,policy,ownedPositions:[],productionCandidates,phase7Control:control,provenanceSecret:secret,now}).approved,true,'a valid stamp passes');
+  assert.ok(validateClaimedPlan({plan,policy,ownedPositions:[],productionCandidates,phase7Control:control,provenanceSecret:secret,now}).reasonCodes.includes('P6_CLAIM_PROVENANCE_HMAC_MISSING'),'a missing stamp fails closed');
   const forged={...stamped,planPayload:{...stamped.planPayload,intent:{capitalLamports:'19999999'}}};
-  assert.ok(validateClaimedPlan({plan:forged,policy,ownedPositions:[],phase7Control:control,provenanceSecret:secret,now}).reasonCodes.includes('P6_CLAIM_PROVENANCE_HMAC_INVALID'),'a stamp over different fields fails closed');
+  assert.ok(validateClaimedPlan({plan:forged,policy,ownedPositions:[],productionCandidates,phase7Control:control,provenanceSecret:secret,now}).reasonCodes.includes('P6_CLAIM_PROVENANCE_HMAC_INVALID'),'a stamp over different fields fails closed');
   const forgedMarket={...stamped,planPayload:{...stamped.planPayload,intent:{...stamped.planPayload.intent,activeBinId:101}}};
-  assert.ok(validateClaimedPlan({plan:forgedMarket,policy,ownedPositions:[],phase7Control:control,provenanceSecret:secret,now}).reasonCodes.includes('P6_CLAIM_PROVENANCE_HMAC_INVALID'),'the planned market state is authenticated too');
+  assert.ok(validateClaimedPlan({plan:forgedMarket,policy,ownedPositions:[],productionCandidates,phase7Control:control,provenanceSecret:secret,now}).reasonCodes.includes('P6_CLAIM_PROVENANCE_HMAC_INVALID'),'the planned market state is authenticated too');
   const forgedControl={...stamped,planPayload:{...stamped.planPayload,provenance:{...stamped.planPayload.provenance,phase7Control:{...phase7Control,decisionId:'forged-control'}}}};
-  assert.ok(validateClaimedPlan({plan:forgedControl,policy,ownedPositions:[],phase7Control:control,provenanceSecret:secret,now}).reasonCodes.includes('P6_CLAIM_PROVENANCE_HMAC_INVALID'),'P7-control provenance is authenticated too');
+  assert.ok(validateClaimedPlan({plan:forgedControl,policy,ownedPositions:[],productionCandidates,phase7Control:control,provenanceSecret:secret,now}).reasonCodes.includes('P6_CLAIM_PROVENANCE_HMAC_INVALID'),'P7-control provenance is authenticated too');
 });
 
 test('the executor forwards the configured provenance secret into the claim guard',()=>{

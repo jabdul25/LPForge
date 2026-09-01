@@ -48,10 +48,15 @@ function capital(plan: AutonomousPlan) {
 function isRiskIncreasingAction(action: string) {
   return ["OPEN", "ADD", "RESHAPE", "REBALANCE"].includes(action);
 }
-function policyPoolForPlan(input:{plan:AutonomousPlan;policy:MainnetCanaryDeploymentPolicy;productionCandidates:ProductionAdmissionCandidate[];now:string},reasons:string[]){
- const staticPool=input.policy.pools.find(x=>x.address===input.plan.poolAddress);if(staticPool)return staticPool;
+function policyPoolForPlan(input:{plan:AutonomousPlan;policy:MainnetCanaryDeploymentPolicy;productionCandidates:ProductionAdmissionCandidate[];now:string;controlledCanary:boolean},reasons:string[]){
+ // A static policy pool is a bounded canary/healthcheck identity, not a
+ // general new-entry admission.  Ordinary risk-increasing plans, including
+ // plans targeting a listed pool, must prove the same fresh dynamic admission
+ // as every discovered pool.  The separately authenticated canary envelope
+ // remains its explicit exception and is validated below.
+ const staticPool=input.policy.pools.find(x=>x.address===input.plan.poolAddress);if(input.controlledCanary&&staticPool)return staticPool;
  const admission=input.policy.productionAdmission;
- if(!admission?.enabled){reasons.push('P6_CLAIM_POOL_NOT_ALLOWLISTED');return undefined;}
+ if(!admission?.enabled){reasons.push('P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return undefined;}
  const candidate=input.productionCandidates.find(x=>x.poolAddress===input.plan.poolAddress),age=candidate?Date.parse(input.now)-Date.parse(candidate.lastSeenAt):NaN;
  if(!candidate||candidate.state!=='ACTIVE_CANDIDATE'||!admission.eligibleTiers.includes(candidate.tier as 'A'|'B'|'C')||!Number.isFinite(age)||age<0||age>admission.maxCandidateAgeMs||input.productionCandidates.indexOf(candidate)>=admission.maxCandidates){reasons.push('P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return undefined;}
  if(candidate.tokenYMint!==WSOL_MINT){reasons.push('P6_PRODUCTION_REQUIRES_WSOL_TOKEN_Y');return undefined;}
@@ -117,7 +122,7 @@ export function validateClaimedPlan(input: {
     provenance = record(record(p.planPayload).provenance),
     riskIncreasing = isRiskIncreasingAction(p.action),
     policyPool = riskIncreasing
-      ? policyPoolForPlan({plan:p,policy:input.policy,productionCandidates:input.productionCandidates??[],now:input.now??new Date().toISOString()},reasons)
+      ? policyPoolForPlan({plan:p,policy:input.policy,productionCandidates:input.productionCandidates??[],now:input.now??new Date().toISOString(),controlledCanary:Boolean(input.controlledCanary)},reasons)
       : undefined;
   if (
     provenance.producer !== "LPFORGE_PRODUCTION" ||
@@ -151,6 +156,7 @@ export function validateClaimedPlan(input: {
           // instruction. A database edit cannot retarget a valid economic
           // plan to a different control decision without invalidating HMAC.
           phase7Control:record(provenance.phase7Control),
+          ...(Object.keys(record(provenance.globalSelection)).length?{globalSelection:record(provenance.globalSelection)}:{}),
           ...(Object.keys(record(provenance.controlledCanaryAuthorization)).length?{controlledCanaryAuthorization:record(provenance.controlledCanaryAuthorization)}:{}),
         },
         input.provenanceSecret,

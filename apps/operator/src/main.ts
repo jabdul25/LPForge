@@ -288,6 +288,9 @@ async function persistTransactionPlan(
       throw new Error('LPFORGE_P6_CONTROLLED_CANARY_REPLACEMENT_OPEN_BLOCKED');
   }
   const provenanceSecret=(process.env.LPFORGE_PLAN_PROVENANCE_SECRET??'').trim();
+  const globalSelectionCycleId=(process.env.LPFORGE_GLOBAL_SELECTION_CYCLE_ID??'').trim(),globalSelectedCandidateId=(process.env.LPFORGE_GLOBAL_SELECTED_CANDIDATE_ID??'').trim();
+  const globalSelection=globalSelectionCycleId||globalSelectedCandidateId?{globalCycleId:globalSelectionCycleId,selectedCandidateId:globalSelectedCandidateId}:undefined;
+  if(globalSelection&&plan.intent.action==='OPEN'&&(!globalSelection.globalCycleId||!globalSelection.selectedCandidateId||globalSelection.selectedCandidateId!==plan.intent.candidateId))throw new Error('LPFORGE_GLOBAL_SELECTION_PROVENANCE_MISMATCH');
   const phase7RuntimeId=(process.env.LPFORGE_P7_RUNTIME_ID??'lpforge-production').trim(),control=await store.loadLatestPhase7ControlDecision(phase7RuntimeId),phase7Control=control?{decisionId:String(control.decision_id),cycleKey:String(control.cycle_key),observedAt:new Date(String(control.observed_at)).toISOString()}:undefined;
   const controlledCanaryPlan=!boundedUnattended&&(process.env.LPFORGE_MAINNET_CANARY==='true'||process.env.LPFORGE_CONTROLLED_CANARY_PLAN==='true')&&plan.intent.action==='OPEN'&&Boolean(deployment.controlledCanary);
   const controlledCanaryAuthorization=controlledCanaryPlan&&phase7Control?{
@@ -343,6 +346,7 @@ async function persistTransactionPlan(
         poolAddress: plan.intent.poolAddress,
         observedAt: plan.intent.observedAt,
         ...(phase7Control?{phase7Control}:{}),
+        ...(globalSelection?{globalSelection}:{}),
         ...(controlledCanaryAuthorization?{controlledCanaryAuthorization}:{}),
         // Stamped only when the provenance secret is configured; the claim
         // guard verifies it fail-closed from that moment on.
@@ -365,6 +369,7 @@ async function persistTransactionPlan(
                   // non-entry protective plan remains verifiable after JSONB
                   // read-back.
                   phase7Control: phase7Control ?? {},
+                  ...(globalSelection?{globalSelection}:{}),
                   ...(controlledCanaryAuthorization?{controlledCanaryAuthorization}:{}),
                 },
                 provenanceSecret,
@@ -973,8 +978,12 @@ async function liveOnce() {
       api.getOhlcv(cfg.smokePoolAddress, { timeframe: "5m" }),
     ]);
     const apiObservedAt = new Date().toISOString();
-    const staticProductionPool=deploymentPolicy.pools.some(entry=>entry.address===cfg.smokePoolAddress);
-    if(!staticProductionPool){
+    // Static policy membership has no ordinary new-entry authority.  The
+    // special policy-monitoring evidence path is available only to an
+    // explicitly invoked read-only healthcheck; global new-entry evaluation
+    // always uses the dynamic admission/evidence path below.
+    const policyHealthcheckPool=process.env.LPFORGE_POLICY_HEALTHCHECK_POOL==='true'&&deploymentPolicy.pools.some(entry=>entry.address===cfg.smokePoolAddress);
+    if(!policyHealthcheckPool){
       await store.insertPoolSnapshot(pool);
       await store.insertBins(bins);
       await store.insertDataApiPool(apiPool as Record<string, unknown>,apiObservedAt);
@@ -1024,7 +1033,7 @@ async function liveOnce() {
       decodedSwapEvents,
       eventDecodeWarnings,
     });
-    if(staticProductionPool){
+    if(policyHealthcheckPool){
       // A static pool owns no dynamic ACTIVE slot, but it uses the same
       // bounded historical backfill lifecycle before projecting Phase-3 facts.
       await refreshCanonicalHistoricalBackfill({api,adapter,rpc,store,poolAddress:cfg.smokePoolAddress,apiPool,observedAt:apiObservedAt,authority:'PRODUCTION_POLICY_MONITORING'});
