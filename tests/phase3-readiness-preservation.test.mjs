@@ -42,3 +42,9 @@ test('WARMING cannot complete a ready lease through the durable outcome path',()
  assert.ok(body.includes("phase3Status!=='ENTRY_READY'&&v.phase3Status!=='NO_TRADE')return"));
  assert.ok(body.indexOf("phase3Status!=='ENTRY_READY'&&v.phase3Status!=='NO_TRADE')return")<body.indexOf('LIVE_EVIDENCE_LEASE_TERMINAL_PHASE3'));
 });
+test('a continuity tracker resumes when its temporary economic lease is demoted before its replay TTL',()=>{
+ const db=fs.readFileSync(new URL('../packages/db/src/index.ts',import.meta.url),'utf8');
+ assert.match(db,/evidenceContinuityTrackingState','CONSUMED_BY_ACTIVE_ECONOMIC_LEASE'/);
+ assert.match(db,/evidenceContinuityTrackingState','TRACKING','evidenceContinuityTrackingResumedAt'/);
+ assert.match(db,/current_state='QUALIFIED' AND source_auto=true/);
+});
