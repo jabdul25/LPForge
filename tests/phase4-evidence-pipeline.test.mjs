@@ -29,17 +29,17 @@ test('completion-aware collection services both ACTIVE leases within the existin
  const budget=assessCollectorRevisitBudget({activePoolCount:2,collectionSliceSize:slice,maxConcurrentPoolReads:1,p95PoolCollectionMs:90_000,revisitBudgetMs:180_000});
  assert.deepEqual(budget,{projectedRevisitMs:180_000,capacityViolation:false});
 });
-test('evidence-maturity NO_TRADE is eligible for one bounded continuity lane through its existing replay horizon',()=>{
- assert.equal(EVIDENCE_CONTINUITY_TRACKING_CAP,1);
+test('evidence-maturity NO_TRADE is eligible for two bounded continuity lanes through its existing replay horizon',()=>{
+ assert.equal(EVIDENCE_CONTINUITY_TRACKING_CAP,2);
  assert.equal(EVIDENCE_CONTINUITY_TRACKING_TTL_MS,60*60_000);
  assert.equal(isEvidenceMaturityNoTrade('NO_TRADE',['RANGE_SURVIVAL_EVIDENCE_INSUFFICIENT']),true);
  assert.equal(isEvidenceMaturityNoTrade('NO_TRADE',['NON_POSITIVE_RISK_ADJUSTED_EV']),false);
  assert.equal(Date.parse(evidenceContinuityTrackingExpiresAt(at))-Date.parse(at),60*60_000);
 });
-test('continuity service uses the unchanged 450-second hard gap rather than consuming an economic slot',()=>{
- const budget=assessCollectorRevisitBudget({activePoolCount:3,collectionSliceSize:3,maxConcurrentPoolReads:1,p95PoolCollectionMs:90_000,revisitBudgetMs:450_000});
+test('two continuity lanes use the unchanged 450-second hard gap rather than consuming an economic slot',()=>{
+ const budget=assessCollectorRevisitBudget({activePoolCount:4,collectionSliceSize:4,maxConcurrentPoolReads:1,p95PoolCollectionMs:90_000,revisitBudgetMs:450_000});
  assert.equal(budget.capacityViolation,false);
- assert.equal(budget.projectedRevisitMs,270_000);
+ assert.equal(budget.projectedRevisitMs,360_000);
  assert.equal(calculateServiceableActiveCandidateCapacity({p3BudgetRps:3,estimatedP3CallsPerPool:12,p95PoolCollectionMs:90_000,maxConcurrentPoolReads:1,targetCoverageMs:180_000,serviceabilitySafetyMargin:.70,hardCap:30}),2);
 });
 test('completion accounting never adds a nominal sleep after an overrun',()=>{
@@ -65,16 +65,17 @@ test('cap two with one RPC reader collects both active leases in the same comple
  const result=await collectActiveCandidateEvidence({api,adapter,rpc,store,observedAt:new Date().toISOString(),policy:{maxConcurrentPoolReads:1,p95PoolCollectionMs:90_000,liveConfirmationTargetCoverageMs:180_000}});
  assert.equal(result.serviceableCapacity,2);assert.equal(result.collectionSliceSize,2);assert.equal(result.results.length,2);assert.equal(result.capacityViolation,false);assert.equal(writes.length,1);
 });
-test('continuity tracking preserves full-frame collection through cooldown without becoming a third economic lease',async()=>{
+test('two continuity trackers preserve full-frame collection through cooldown without becoming economic leases',async()=>{
  const candidates=[
   {poolAddress:'A',state:'ACTIVE_CANDIDATE',tier:'A',priorityScore:2,lastSeenAt:at,payload:{}},
   {poolAddress:'B',state:'ACTIVE_CANDIDATE',tier:'A',priorityScore:1,lastSeenAt:at,payload:{}},
-  {poolAddress:'CONT',state:'QUALIFIED',tier:'A',priorityScore:0,lastSeenAt:at,payload:{evidenceContinuityTrackingState:'TRACKING'}},
+  {poolAddress:'CONT_A',state:'QUALIFIED',tier:'A',priorityScore:0,lastSeenAt:at,payload:{evidenceContinuityTrackingState:'TRACKING'}},
+  {poolAddress:'CONT_B',state:'QUALIFIED',tier:'A',priorityScore:0,lastSeenAt:at,payload:{evidenceContinuityTrackingState:'TRACKING'}},
  ],live=[],continuity=[];
- const store={listDiscoveryCandidates:async()=>candidates,reconcileLiveEvidenceAdmission:async()=>({}),reconcileEvidenceContinuityTracking:async()=>({capacity:1,trackedPoolAddresses:['CONT'],expiredPoolAddresses:[],evictedPoolAddresses:[]}),insertPoolSnapshot:async()=>{},insertBins:async()=>{},insertDataApiPool:async()=>{},insertOhlcv:async()=>{},insertFeeVolumeObservations:async()=>{},loadFeeVolumeObservations:async()=>feeBuckets(48).map(x=>({bucketAt:new Date(x.timestamp*1000).toISOString(),fees:x.fees,protocolFees:x.protocol_fees,volume:x.volume})),insertCandidateMarketObservations:async()=>{},loadCandidateMarketObservations:async()=>[{observedAt:at,sourceType:'HISTORICAL_API_BACKFILL',sourceProvider:'test',price:1,resolutionMs:300000}],loadActiveCandidateBackfill:async()=>({last_successful_at:at}),upsertActiveCandidateBackfill:async()=>{},insertSwapEvent:async()=>{},loadOperationalHistory:async()=>history(61),upsertActiveCandidateHistoryMaturity:async()=>{},insertEconomicEstimate:async()=>{},recordLiveEvidenceCollectionOutcome:async x=>live.push(x),recordEvidenceContinuityCollectionOutcome:async x=>continuity.push(x),recordActiveCandidateEvidenceCollectorPass:async()=>{}};
+ const store={listDiscoveryCandidates:async()=>candidates,reconcileLiveEvidenceAdmission:async()=>({}),reconcileEvidenceContinuityTracking:async()=>({capacity:2,trackedPoolAddresses:['CONT_A','CONT_B'],expiredPoolAddresses:[],evictedPoolAddresses:['CONT_C']}),insertPoolSnapshot:async()=>{},insertBins:async()=>{},insertDataApiPool:async()=>{},insertOhlcv:async()=>{},insertFeeVolumeObservations:async()=>{},loadFeeVolumeObservations:async()=>feeBuckets(48).map(x=>({bucketAt:new Date(x.timestamp*1000).toISOString(),fees:x.fees,protocolFees:x.protocol_fees,volume:x.volume})),insertCandidateMarketObservations:async()=>{},loadCandidateMarketObservations:async()=>[{observedAt:at,sourceType:'HISTORICAL_API_BACKFILL',sourceProvider:'test',price:1,resolutionMs:300000}],loadActiveCandidateBackfill:async()=>({last_successful_at:at}),upsertActiveCandidateBackfill:async()=>{},insertSwapEvent:async()=>{},loadOperationalHistory:async()=>history(61),upsertActiveCandidateHistoryMaturity:async()=>{},insertEconomicEstimate:async()=>{},recordLiveEvidenceCollectionOutcome:async x=>live.push(x),recordEvidenceContinuityCollectionOutcome:async x=>continuity.push(x),recordActiveCandidateEvidenceCollectorPass:async()=>{}};
  const api={getPool:async address=>({address,tvl:100000}),getHistoricalVolume:async()=>({data:feeBuckets(48)}),getOhlcv:async()=>({data:[]})},adapter={getPool:async address=>({address,activeBinId:1}),getBinsAroundActive:async()=>[],decodeEvents:async()=>[]},rpc={getSignaturesForAddress:async()=>[],getTransaction:async()=>null};
  const result=await collectActiveCandidateEvidence({api,adapter,rpc,store,observedAt:new Date().toISOString(),policy:{maxConcurrentPoolReads:1,p95PoolCollectionMs:90_000,liveConfirmationTargetCoverageMs:180_000,liveConfirmationMaxGapMs:450_000}});
- assert.equal(result.serviceableCapacity,2);assert.equal(result.economicCollectionSliceSize,2);assert.equal(result.continuityCollectionSliceSize,1);assert.equal(result.results.filter(x=>x.collectionTarget==='ACTIVE_ECONOMIC').length,2);assert.equal(result.results.filter(x=>x.collectionTarget==='EVIDENCE_CONTINUITY').length,1);assert.equal(live.length,2);assert.equal(continuity.length,1);assert.equal(result.capacityViolation,false);
+ assert.equal(result.serviceableCapacity,2);assert.equal(result.economicCollectionSliceSize,2);assert.equal(result.continuityCollectionSliceSize,2);assert.equal(result.collectionSliceSize,4);assert.equal(result.results.filter(x=>x.collectionTarget==='ACTIVE_ECONOMIC').length,2);assert.equal(result.results.filter(x=>x.collectionTarget==='EVIDENCE_CONTINUITY').length,2);assert.equal(live.length,2);assert.equal(continuity.length,2);assert.equal(result.continuity?.capacity,2);assert.deepEqual(result.continuity?.evictedPoolAddresses,['CONT_C']);assert.equal(result.capacityViolation,false);
 });
 test('serviceable admission is bounded by measured p95 collection cadence before RPC headroom',()=>{
  const capacity=calculateServiceableActiveCandidateCapacity({p3BudgetRps:3,estimatedP3CallsPerPool:12,p95PoolCollectionMs:90_000,maxConcurrentPoolReads:3,targetCoverageMs:180_000,serviceabilitySafetyMargin:.70,hardCap:30});

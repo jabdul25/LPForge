@@ -188,8 +188,9 @@ export const ACTIVE_EVIDENCE_LEASE_RETRY_COOLDOWN_MS=15*60_000;
  * bounded cooldown, but cannot become an unbounded background collector.
  */
 export const EVIDENCE_CONTINUITY_TRACKING_TTL_MS=60*60_000;
-/** One bounded lane preserves the two-slot economic lease contract. */
-export const EVIDENCE_CONTINUITY_TRACKING_CAP=1;
+/** Two bounded lanes preserve the two-slot economic lease contract while
+ * avoiding immediate FIFO eviction of near-mature dynamic pools. */
+export const EVIDENCE_CONTINUITY_TRACKING_CAP=2;
 const EVIDENCE_CONTINUITY_NO_TRADE_REASONS=new Set([
   'CANDIDATE_REPLAY_COVERAGE_INSUFFICIENT',
   'CANDIDATE_REPLAY_CONTINUITY_INSUFFICIENT',
