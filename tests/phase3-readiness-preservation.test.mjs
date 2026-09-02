@@ -33,7 +33,7 @@ test('static policy reads write canonical LIVE_OBSERVED evidence without using d
  const db=fs.readFileSync(new URL('../packages/db/src/index.ts',import.meta.url),'utf8');
  assert.match(operator,/productionPolicyPool:true/);assert.match(operator,/sourceProvider:'OPERATOR_METEORA_API\+RPC'/);
  assert.match(active,/summarizePhase3RecentLiveObservations/);assert.match(active,/hasPhase3FreshHistoricalEvidence/);
- assert.match(db,/liveEvidencePhase3ConsumptionState','PENDING/);assert.match(db,/current_state='ACTIVE_CANDIDATE' AND payload->>'liveEvidencePhase3ConsumptionState'='PENDING'/);
+ assert.match(db,/liveEvidencePhase3ConsumptionState','PENDING/);assert.match(db,/current_state='ACTIVE_CANDIDATE' AND source_auto=true AND payload->>'liveEvidencePhase3ConsumptionState'='PENDING'/);
  assert.equal(dynamicLiveEvidenceAdmissionCapacity({serviceableCapacity:2,staticPolicyPoolCount:5}),2);
 });
 test('WARMING cannot complete a ready lease through the durable outcome path',()=>{

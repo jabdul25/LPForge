@@ -182,6 +182,28 @@ export const LIVE_EVIDENCE_ECONOMIC_RANKING_FRESHNESS_SECONDS=300;
 export const ACTIVE_EVIDENCE_LEASE_TIMEOUT_MS=3*15*60_000;
 export const ACTIVE_EVIDENCE_LEASE_MAX_FAILURES=3;
 export const ACTIVE_EVIDENCE_LEASE_RETRY_COOLDOWN_MS=15*60_000;
+/**
+ * Dynamic raw-frame continuity is deliberately separate from economic ACTIVE
+ * admission. Its TTL is exactly the existing replay horizon: it can bridge a
+ * bounded cooldown, but cannot become an unbounded background collector.
+ */
+export const EVIDENCE_CONTINUITY_TRACKING_TTL_MS=60*60_000;
+/** One bounded lane preserves the two-slot economic lease contract. */
+export const EVIDENCE_CONTINUITY_TRACKING_CAP=1;
+const EVIDENCE_CONTINUITY_NO_TRADE_REASONS=new Set([
+  'CANDIDATE_REPLAY_COVERAGE_INSUFFICIENT',
+  'CANDIDATE_REPLAY_CONTINUITY_INSUFFICIENT',
+  'RANGE_SURVIVAL_EVIDENCE_INSUFFICIENT',
+  'NO_TRADE_EVIDENCE_NON_ACTIONABLE',
+  'FEE_CALIBRATION_RAW_REPLAY_NOT_ACTIONABLE',
+  'RANK_EVIDENCE_NON_ACTIONABLE',
+]);
+export function evidenceContinuityTrackingExpiresAt(startedAt:string):string|undefined{
+ const start=Date.parse(startedAt);return Number.isFinite(start)?new Date(start+EVIDENCE_CONTINUITY_TRACKING_TTL_MS).toISOString():undefined;
+}
+export function isEvidenceMaturityNoTrade(phase3Status:string|undefined,reasonCodes:readonly string[]|undefined):boolean{
+ return phase3Status==='NO_TRADE'&&Boolean(reasonCodes?.some(code=>EVIDENCE_CONTINUITY_NO_TRADE_REASONS.has(code)));
+}
 /** A completed EVENT_PATH estimate is consumable only while its existing
  * economic-freshness window remains open. This is an evaluation handoff,
  * never an additional evidence lease or admission slot. */
@@ -734,10 +756,12 @@ export interface Phase1Store {
     poolAddress: string; state: string; tier: string; priorityScore: number; rank?: number | undefined; lastSeenAt: string; tokenXMint?:string|undefined;tokenYMint?:string|undefined;pairedTokenMint?:string|undefined; payload: Record<string, unknown>;
   }>>;
   reconcileLiveEvidenceAdmission(value:{observedAt:string;serviceableCapacity:number;productionMonitoredPoolAddresses?:string[]}):Promise<{serviceableCapacity:number;productionMonitoredCount:number;activeCount:number;qualifiedWaitingCount:number;promotedPoolAddresses:string[];demotedPoolAddresses:string[];replacements:Array<{incumbentPoolAddress:string;challengerPoolAddress:string;priorityDelta:number}>}>;
+  reconcileEvidenceContinuityTracking(value:{observedAt:string;capacity:number}):Promise<{capacity:number;trackedPoolAddresses:string[];expiredPoolAddresses:string[];evictedPoolAddresses:string[]}>;
   recordLiveEvidenceCollectionOutcome(value:{poolAddress:string;observedAt:string;success:boolean;eventPathEstimate?:boolean;phase3CurrentLiveReady?:boolean;poolReadStartedAt?:string;poolReadCompletedAt?:string;poolReadElapsedMs?:number;serviceGapMs?:number}):Promise<void>;
+  recordEvidenceContinuityCollectionOutcome(value:{poolAddress:string;observedAt:string;success:boolean;poolReadStartedAt?:string;poolReadCompletedAt?:string;poolReadElapsedMs?:number;serviceGapMs?:number}):Promise<void>;
   loadActiveCandidateEvidenceCollectorTiming?():Promise<{p95PoolCollectionMs?:number}|undefined>;
-  recordActiveCandidateEvidenceCollectorPass?(value:{observedAt:string;completedAt:string;elapsedMs:number;collectionSliceSize:number;effectivePoolCollectionMs:number;measuredP95PoolCollectionMs:number;projectedRevisitMs:number;capacityViolation:boolean;maxServiceGapMs:number;activePoolCount:number;successfulPoolCount:number}):Promise<void>;
-  recordPostEvidenceEvaluationOutcome(value:{poolAddress:string;observedAt:string;phase3Status:string}):Promise<void>;
+  recordActiveCandidateEvidenceCollectorPass?(value:{observedAt:string;completedAt:string;elapsedMs:number;collectionSliceSize:number;effectivePoolCollectionMs:number;measuredP95PoolCollectionMs:number;projectedRevisitMs:number;capacityViolation:boolean;maxServiceGapMs:number;activePoolCount:number;successfulPoolCount:number;continuityPoolCount?:number;economicProjectedRevisitMs?:number;continuityProjectedRevisitMs?:number;economicTargetViolation?:boolean}):Promise<void>;
+  recordPostEvidenceEvaluationOutcome(value:{poolAddress:string;observedAt:string;phase3Status:string;reasonCodes?:readonly string[]}):Promise<void>;
   markDiscoveryPoolsStale(cutoff: string, observedAt: string): Promise<number>;
   insertFeeVolumeObservations(value:{poolAddress:string; observedAt:string; source:string; rows:Array<{bucketAt:string;fees?:number;protocolFees?:number;volume?:number;payload?:Record<string,unknown>}>;}):Promise<void>;
   loadFeeVolumeObservations(poolAddress:string,since:string,limit?:number):Promise<Array<{bucketAt:string;fees:number;protocolFees:number;volume:number;source:string;sourceHash:string}>>;
@@ -2251,7 +2275,7 @@ export async function createPostgresStore(
         // start/expiry unset lets a later reconciliation treat a newly
         // promoted pool as an expired lease before it gets its first read.
         const promotedLeaseExpiresAt=liveEvidenceLeaseExpiresAt(v.observedAt)??v.observedAt;
-        if(promoted.length)await tx.query(`UPDATE market.pool_discovery_registry SET current_state='ACTIVE_CANDIDATE',reason_codes=(reason_codes - 'LIVE_EVIDENCE_WAITING_FOR_CAPACITY') || '["LIVE_EVIDENCE_ADMITTED"]'::jsonb,payload=payload||jsonb_build_object('liveEvidenceAdmission','ADMITTED','liveEvidenceAdmissionAt',$2::text,'liveEvidenceLeaseStartedAt',$2::text,'liveEvidenceLeaseExpiresAt',$3::text,'liveEvidenceLeaseFailures',0,'liveEvidencePhase3ConsumptionState','NONE','liveEvidencePhase3ReadyAt',NULL,'liveEvidencePhase3ReadyEventPathAt',NULL,'postEvidenceEvaluationState','NONE') WHERE pool_address=ANY($1::text[])`,[promoted.map(x=>x.poolAddress),v.observedAt,promotedLeaseExpiresAt]);
+        if(promoted.length)await tx.query(`UPDATE market.pool_discovery_registry SET current_state='ACTIVE_CANDIDATE',reason_codes=(reason_codes - 'LIVE_EVIDENCE_WAITING_FOR_CAPACITY') || '["LIVE_EVIDENCE_ADMITTED"]'::jsonb,payload=payload||jsonb_build_object('liveEvidenceAdmission','ADMITTED','liveEvidenceAdmissionAt',$2::text,'liveEvidenceLeaseStartedAt',$2::text,'liveEvidenceLeaseExpiresAt',$3::text,'liveEvidenceLeaseFailures',0,'liveEvidencePhase3ConsumptionState','NONE','liveEvidencePhase3ReadyAt',NULL,'liveEvidencePhase3ReadyEventPathAt',NULL,'postEvidenceEvaluationState','NONE','evidenceContinuityTrackingState','CONSUMED_BY_ACTIVE_ECONOMIC_LEASE','evidenceContinuityTrackingConsumedAt',$2::text) WHERE pool_address=ANY($1::text[])`,[promoted.map(x=>x.poolAddress),v.observedAt,promotedLeaseExpiresAt]);
         const waitingCandidates=targets.filter(candidate=>!admittedSet.has(candidate.poolAddress));
         // jsonb_build_object is polymorphic: explicitly type the priority so PostgreSQL
         // never treats this prepared-statement parameter as an unknown value.
@@ -2262,12 +2286,35 @@ export async function createPostgresStore(
         return{serviceableCapacity:capacity,productionMonitoredCount:monitored.length,activeCount:admitted.length,qualifiedWaitingCount:targets.length-admitted.length,promotedPoolAddresses:promoted.map(x=>x.poolAddress),demotedPoolAddresses:demoted.map(x=>x.poolAddress),replacements:replacementPairs.map(pair=>({incumbentPoolAddress:pair.incumbent.poolAddress,challengerPoolAddress:pair.challenger.poolAddress,priorityDelta:Number(pair.challenger.evidencePriority)-Number(pair.incumbent.evidencePriority)}))};
       } catch(error) {try{await tx.query('ROLLBACK');}catch{} throw error;}
     },
+    async reconcileEvidenceContinuityTracking(v) {
+      const capacity=Math.max(0,Math.floor(v.capacity)),tx=db;
+      try {
+        await tx.query('BEGIN');
+        await tx.query("SELECT pg_advisory_xact_lock(hashtext('LPFORGE_LIVE_EVIDENCE_ADMISSION'))");
+        const expired=await tx.query(`UPDATE market.pool_discovery_registry
+          SET payload=payload||jsonb_build_object('evidenceContinuityTrackingState','EXPIRED','evidenceContinuityTrackingEvictedAt',$2::text,'evidenceContinuityTrackingEvictionReason','EVIDENCE_CONTINUITY_TTL_OR_ELIGIBILITY_EXPIRED')
+          WHERE payload->>'evidenceContinuityTrackingState'='TRACKING'
+            AND (COALESCE(NULLIF(payload->>'evidenceContinuityTrackingExpiresAt','')::timestamptz,'epoch'::timestamptz)<=$1::timestamptz OR current_state NOT IN ('QUALIFIED','ACTIVE_CANDIDATE') OR source_auto<>true)
+          RETURNING pool_address`,[v.observedAt,v.observedAt]);
+        const eligible=await tx.query(`SELECT pool_address FROM market.pool_discovery_registry
+          WHERE current_state='QUALIFIED' AND source_auto=true
+            AND payload->>'evidenceContinuityTrackingState'='TRACKING'
+            AND COALESCE(NULLIF(payload->>'evidenceContinuityTrackingExpiresAt','')::timestamptz,'epoch'::timestamptz)>$1::timestamptz
+          ORDER BY COALESCE(NULLIF(payload->>'evidenceContinuityTrackingStartedAt','')::timestamptz,'epoch'::timestamptz) ASC,pool_address ASC`,[v.observedAt]);
+        const retained=eligible.rows.slice(0,capacity).map(row=>String(row.pool_address)),evicted=eligible.rows.slice(capacity).map(row=>String(row.pool_address));
+        if(evicted.length)await tx.query(`UPDATE market.pool_discovery_registry
+          SET payload=payload||jsonb_build_object('evidenceContinuityTrackingState','EVICTED','evidenceContinuityTrackingEvictedAt',$2::text,'evidenceContinuityTrackingEvictionReason','EVIDENCE_CONTINUITY_CAPACITY_EVICTED')
+          WHERE pool_address=ANY($1::text[]) AND payload->>'evidenceContinuityTrackingState'='TRACKING'`,[evicted,v.observedAt]);
+        await tx.query('COMMIT');
+        return{capacity,trackedPoolAddresses:retained,expiredPoolAddresses:expired.rows.map(row=>String(row.pool_address)),evictedPoolAddresses:evicted};
+      } catch(error) {try{await tx.query('ROLLBACK');}catch{} throw error;}
+    },
     async loadActiveCandidateEvidenceCollectorTiming() {
       const r=await db.query(`SELECT payload->'collectorPass' AS pass FROM market.active_candidate_evidence_capacity_observations WHERE payload ? 'collectorPass' ORDER BY observed_at DESC LIMIT 1`),pass=r.rows[0]?.pass as Record<string,unknown>|undefined,p95=Number(pass?.measuredP95PoolCollectionMs);
       return Number.isFinite(p95)&&p95>0?{p95PoolCollectionMs:p95}:undefined;
     },
     async recordActiveCandidateEvidenceCollectorPass(v) {
-      await db.query(`UPDATE market.active_candidate_evidence_capacity_observations SET payload=payload||jsonb_build_object('collectorPass',jsonb_build_object('startedAt',$2::text,'completedAt',$3::text,'elapsedMs',$4::numeric,'collectionSliceSize',$5::int,'effectivePoolCollectionMs',$6::numeric,'measuredP95PoolCollectionMs',$7::numeric,'projectedRevisitMs',$8::numeric,'capacityViolation',$9::boolean,'maxServiceGapMs',$10::numeric,'activePoolCount',$11::int,'successfulPoolCount',$12::int)) WHERE observed_at=$1::timestamptz`,[v.observedAt,v.observedAt,v.completedAt,v.elapsedMs,v.collectionSliceSize,v.effectivePoolCollectionMs,v.measuredP95PoolCollectionMs,v.projectedRevisitMs,v.capacityViolation,v.maxServiceGapMs,v.activePoolCount,v.successfulPoolCount]);
+      await db.query(`UPDATE market.active_candidate_evidence_capacity_observations SET payload=payload||jsonb_build_object('collectorPass',jsonb_build_object('startedAt',$2::text,'completedAt',$3::text,'elapsedMs',$4::numeric,'collectionSliceSize',$5::int,'effectivePoolCollectionMs',$6::numeric,'measuredP95PoolCollectionMs',$7::numeric,'projectedRevisitMs',$8::numeric,'capacityViolation',$9::boolean,'maxServiceGapMs',$10::numeric,'activePoolCount',$11::int,'successfulPoolCount',$12::int,'continuityPoolCount',$13::int,'economicProjectedRevisitMs',$14::numeric,'continuityProjectedRevisitMs',$15::numeric,'economicTargetViolation',$16::boolean)) WHERE observed_at=$1::timestamptz`,[v.observedAt,v.observedAt,v.completedAt,v.elapsedMs,v.collectionSliceSize,v.effectivePoolCollectionMs,v.measuredP95PoolCollectionMs,v.projectedRevisitMs,v.capacityViolation,v.maxServiceGapMs,v.activePoolCount,v.successfulPoolCount,Math.max(0,Math.floor(v.continuityPoolCount??0)),Math.max(0,Number(v.economicProjectedRevisitMs??v.projectedRevisitMs)),Math.max(0,Number(v.continuityProjectedRevisitMs??v.projectedRevisitMs)),Boolean(v.economicTargetViolation)]);
     },
     async recordLiveEvidenceCollectionOutcome(v) {
       const tx=db,now=Date.parse(v.observedAt),nextEligibleAt=new Date(now+ACTIVE_EVIDENCE_LEASE_RETRY_COOLDOWN_MS).toISOString();
@@ -2284,12 +2331,17 @@ export async function createPostgresStore(
         await tx.query('COMMIT');
       } catch(error) {try{await tx.query('ROLLBACK');}catch{} throw error;}
     },
+    async recordEvidenceContinuityCollectionOutcome(v) {
+      const payload=v.success?{evidenceContinuityTrackingState:'TRACKING',evidenceContinuityLastSuccessfulAt:v.observedAt,evidenceContinuityLastReadStartedAt:v.poolReadStartedAt??v.observedAt,evidenceContinuityLastReadCompletedAt:v.poolReadCompletedAt??v.observedAt,evidenceContinuityLastReadElapsedMs:Math.max(0,Number(v.poolReadElapsedMs??0)),...(v.serviceGapMs===undefined?{}:{evidenceContinuityLastServiceGapMs:Math.max(0,Number(v.serviceGapMs))})}:{evidenceContinuityTrackingState:'TRACKING',evidenceContinuityLastFailureAt:v.observedAt};
+      await db.query(`UPDATE market.pool_discovery_registry SET payload=payload||$2::jsonb WHERE pool_address=$1 AND current_state='QUALIFIED' AND source_auto=true AND payload->>'evidenceContinuityTrackingState'='TRACKING'`,[v.poolAddress,json(payload)]);
+    },
     async recordPostEvidenceEvaluationOutcome(v) {
       if(v.phase3Status!=='ENTRY_READY'&&v.phase3Status!=='NO_TRADE')return;
       const nextEligibleAt=new Date(Date.parse(v.observedAt)+ACTIVE_EVIDENCE_LEASE_RETRY_COOLDOWN_MS).toISOString(),clearReason='POST_EVIDENCE_PHASE3_'+v.phase3Status;
       // A ready ACTIVE lease is released only after a durable real economics
       // result. WARMING intentionally reaches neither update.
-      await db.query(`UPDATE market.pool_discovery_registry SET current_state='QUALIFIED',reason_codes=(reason_codes-'LIVE_EVIDENCE_ADMITTED')||'[\"LIVE_EVIDENCE_LEASE_TERMINAL_PHASE3\"]'::jsonb,payload=payload||jsonb_build_object('liveEvidenceAdmission','WAITING','liveEvidenceLeaseReleaseReason','LIVE_EVIDENCE_LEASE_TERMINAL_PHASE3','liveEvidenceLeaseReleasedAt',$2::text,'liveEvidenceLeaseNextEligibleAt',$3::text,'liveEvidencePhase3ConsumptionState','COMPLETED','liveEvidencePhase3ConsumedAt',$2::text,'postEvidenceEvaluationState','COMPLETED','postEvidenceEvaluationCompletedAt',$2::text,'postEvidenceEvaluationClearReason',$4::text) WHERE pool_address=$1 AND current_state='ACTIVE_CANDIDATE' AND payload->>'liveEvidencePhase3ConsumptionState'='PENDING'`,[v.poolAddress,v.observedAt,nextEligibleAt,clearReason]);
+      const continuity=isEvidenceMaturityNoTrade(v.phase3Status,v.reasonCodes),continuityPayload=continuity?{evidenceContinuityTrackingState:'TRACKING',evidenceContinuityTrackingStartedAt:v.observedAt,evidenceContinuityTrackingExpiresAt:evidenceContinuityTrackingExpiresAt(v.observedAt),evidenceContinuityTrackingReason:'P3_EVIDENCE_MATURITY_NO_TRADE',evidenceContinuityEconomicLeaseReleasedAt:v.observedAt,evidenceContinuityExecutionAuthority:false}:{evidenceContinuityTrackingState:'NOT_REQUIRED',evidenceContinuityTrackingEvictedAt:v.observedAt,evidenceContinuityTrackingEvictionReason:'P3_NON_EVIDENCE_TERMINAL'};
+      await db.query(`UPDATE market.pool_discovery_registry SET current_state='QUALIFIED',reason_codes=(reason_codes-'LIVE_EVIDENCE_ADMITTED')||'[\"LIVE_EVIDENCE_LEASE_TERMINAL_PHASE3\"]'::jsonb,payload=payload||jsonb_build_object('liveEvidenceAdmission','WAITING','liveEvidenceLeaseReleaseReason','LIVE_EVIDENCE_LEASE_TERMINAL_PHASE3','liveEvidenceLeaseReleasedAt',$2::text,'liveEvidenceLeaseNextEligibleAt',$3::text,'liveEvidencePhase3ConsumptionState','COMPLETED','liveEvidencePhase3ConsumedAt',$2::text,'postEvidenceEvaluationState','COMPLETED','postEvidenceEvaluationCompletedAt',$2::text,'postEvidenceEvaluationClearReason',$4::text)||$5::jsonb WHERE pool_address=$1 AND current_state='ACTIVE_CANDIDATE' AND source_auto=true AND payload->>'liveEvidencePhase3ConsumptionState'='PENDING'`,[v.poolAddress,v.observedAt,nextEligibleAt,clearReason,json(continuityPayload)]);
       // Preserve completion records for the bounded legacy QUALIFIED handoff.
       await db.query(`UPDATE market.pool_discovery_registry SET payload=payload||jsonb_build_object('postEvidenceEvaluationState','COMPLETED','postEvidenceEvaluationCompletedAt',$2::text,'postEvidenceEvaluationClearReason',$3::text) WHERE pool_address=$1 AND payload->>'postEvidenceEvaluationState'='ELIGIBLE' AND COALESCE(NULLIF(payload->>'postEvidenceEvaluationEligibleAt','')::timestamptz,'epoch'::timestamptz)<=$2::timestamptz`,[v.poolAddress,v.observedAt,clearReason]);
     },
@@ -4477,7 +4529,9 @@ export function createMemoryStore(): Phase1Store {
     async insertDiscoveryRanking() {},
     async listDiscoveryCandidates() { return []; },
     async reconcileLiveEvidenceAdmission(v) { return {serviceableCapacity:v.serviceableCapacity,productionMonitoredCount:0,activeCount:0,qualifiedWaitingCount:0,promotedPoolAddresses:[],demotedPoolAddresses:[],replacements:[]}; },
+    async reconcileEvidenceContinuityTracking(v) { return {capacity:v.capacity,trackedPoolAddresses:[],expiredPoolAddresses:[],evictedPoolAddresses:[]}; },
     async recordLiveEvidenceCollectionOutcome() {},
+    async recordEvidenceContinuityCollectionOutcome() {},
     async recordPostEvidenceEvaluationOutcome() {},
     async markDiscoveryPoolsStale() { return 0; },
     async insertFeeVolumeObservations() {},

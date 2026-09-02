@@ -909,7 +909,7 @@ async function persistResult(
   });
   const globalCycleId=process.env.LPFORGE_PRODUCTION_GLOBAL_SELECTION_CYCLE_ID?.trim();
   if(globalCycleId)await store.insertProductionGlobalCandidate(productionGlobalCandidateFromOperationalResult(globalCycleId,r));
-  await store.recordPostEvidenceEvaluationOutcome({poolAddress:r.poolAddress,observedAt:r.observedAt,phase3Status:r.phase3Status});
+  await store.recordPostEvidenceEvaluationOutcome({poolAddress:r.poolAddress,observedAt:r.observedAt,phase3Status:r.phase3Status,reasonCodes:r.reasonCodes});
 }
 async function liveOnce() {
   const cfg = loadPhase1Config();
