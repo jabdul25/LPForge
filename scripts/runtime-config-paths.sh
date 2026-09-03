@@ -23,6 +23,14 @@ export LPFORGE_LIVE_MANAGEMENT_POLICY_PATH="$LPFORGE_HOME/policy/live-position-m
 export LPFORGE_OOR_LIFECYCLE_POLICY_PATH="$LPFORGE_HOME/policy/oor-lifecycle-policy.json"
 export LPFORGE_LIVE_EXIT_POLICY_PATH="$LPFORGE_HOME/policy/live-exit-governor-policy.json"
 
+# Immutable runtime artifacts must live below the stable home. This prevents a
+# future activation from silently restoring the deprecated sibling layout.
+lpforge_release_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+case "$lpforge_release_dir" in
+  "$LPFORGE_HOME"/releases/*) ;;
+  *) echo "LPFORGE_RELEASE_LAYOUT_REQUIRED:${LPFORGE_HOME}/releases/<sha>" >&2; exit 1 ;;
+esac
+
 [[ -f "$LPFORGE_RUNTIME_ENV_SOURCE" ]] || { echo "LPFORGE_RUNTIME_ENV_REQUIRED:${LPFORGE_RUNTIME_ENV_SOURCE}" >&2; exit 1; }
 [[ -f "$LPFORGE_EXECUTION_POLICY_PATH" ]] || { echo "LPFORGE_RUNTIME_POLICY_REQUIRED:${LPFORGE_EXECUTION_POLICY_PATH}" >&2; exit 1; }
 for lpforge_policy in "$LPFORGE_DISCOVERY_POLICY_PATH" "$LPFORGE_AUTONOMOUS_ENTRY_POLICY_PATH" "$LPFORGE_LIVE_MANAGEMENT_POLICY_PATH" "$LPFORGE_OOR_LIFECYCLE_POLICY_PATH" "$LPFORGE_LIVE_EXIT_POLICY_PATH"; do

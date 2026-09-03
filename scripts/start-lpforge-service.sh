@@ -4,6 +4,7 @@ cd "$(dirname "$0")/.."
 release_dir="$PWD"
 # shellcheck source=runtime-config-paths.sh
 source "$release_dir/scripts/runtime-config-paths.sh"
+bash "$release_dir/scripts/verify-release-layout.sh" "$release_dir"
 
 service="${1:?LPFORGE_SERVICE_REQUIRED}"
 env_args=(--env-file="$LPFORGE_RUNTIME_ENV_SOURCE")

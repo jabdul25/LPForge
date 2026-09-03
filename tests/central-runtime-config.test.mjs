@@ -39,3 +39,15 @@ test('release integrity rejects release-local runtime environments', () => {
   assert.match(text, /\.env\.execution must not be present in release/);
   assert.match(text, /LPFORGE_RUNTIME_CONFIG_ENFORCED/);
 });
+
+test('nested immutable release layout is required for activation and installation', () => {
+  const paths = readFileSync('scripts/runtime-config-paths.sh', 'utf8');
+  const installer = readFileSync('scripts/install-production-release.sh', 'utf8');
+  const guard = readFileSync('scripts/verify-release-layout.sh', 'utf8');
+  assert.match(paths, /LPFORGE_RELEASE_LAYOUT_REQUIRED/);
+  assert.match(paths, /\$LPFORGE_HOME"\/releases\/\*/);
+  assert.match(installer, /\$lpforge_home\/releases\/\$source_sha/);
+  assert.doesNotMatch(installer, /LPForge-release-\$\{?source_sha/);
+  assert.match(guard, /LPFORGE_RELEASE_LAYOUT_FORBIDDEN/);
+  assert.match(guard, /LPFORGE_RELEASE_LAYOUT_NODE_MODULES_INVALID/);
+});

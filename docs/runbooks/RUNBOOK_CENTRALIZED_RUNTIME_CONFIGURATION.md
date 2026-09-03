@@ -6,7 +6,7 @@ to an immutable release directory.
 - Non-secret runtime settings: `/root/systems/LPForge/.env`
 - Protected execution settings: `/root/systems/LPForge/.env.execution`
 - Canonical trading/execution policy: `/root/systems/LPForge/policy/live-execution-policy.json`
-- Immutable release artifacts: `/root/systems/LPForge-release-<sha>/`
+- Immutable release artifacts: `/root/systems/LPForge/releases/<sha>/`
 
 Release artifacts contain source, compiled output, manifests, and checksums.
 They must not contain `.env`, `.env.execution`, or an authoritative runtime

@@ -2,6 +2,9 @@
 set -euo pipefail
 
 # Builds from Git's tracked tree, never from a recursive working-directory zip.
+# `install-production-release.sh` places validated artifacts below
+# $LPFORGE_HOME/releases/<source-sha>; sibling release directories are not a
+# supported deployment target.
 # Every provenance file below is generated inside the staging tree for this exact
 # commit.  Legacy root-level release metadata must never be carried forward.
 root="$(git rev-parse --show-toplevel)"
