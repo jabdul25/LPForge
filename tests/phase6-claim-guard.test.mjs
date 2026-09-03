@@ -65,20 +65,20 @@ test('a fresh authenticated Tier-A winner remains P6-admissible across Tier-A to
  assert.ok(validateClaimedPlan({...common,productionCandidates:[{...qualified[0],lastSeenAt:'2026-08-12T23:40:00.000Z'}],globalWinnerAdmission:selected}).reasonCodes.includes('P6_CLAIM_PRODUCTION_ADMISSION_INVALID'),'stale candidates remain blocked');
 });
 test('risk-increasing claims require fresh Phase-7 production control and enforce daily action limit',()=>{assert.deepEqual(validateFreshPhase7ExecutionControl(control,now),[]);assert.ok(validateClaimedPlan({plan:base,policy,ownedPositions:[],productionCandidates:admittedStatic,now}).reasonCodes.includes('P6_CLAIM_P7_CONTROL_MISSING'));assert.ok(validateClaimedPlan({plan:{...base,planPayload:{...base.planPayload,provenance:{...base.planPayload.provenance,phase7Control:undefined}}},policy,ownedPositions:[],productionCandidates:admittedStatic,phase7Control:control,now}).reasonCodes.includes('P6_CLAIM_P7_CONTROL_BINDING_MISSING'));assert.ok(validateFreshPhase7ExecutionControl({...control,safetyMode:'EMERGENCY_ONLY'},now).includes('P6_CLAIM_P7_SAFETY_NOT_NORMAL'));assert.ok(validateFreshPhase7ExecutionControl({...control,observedAt:'2026-08-12T23:00:00.000Z'},now).includes('P6_CLAIM_P7_CONTROL_STALE'));assert.ok(validateClaimedPlan({plan:base,policy,ownedPositions:[],productionCandidates:admittedStatic,phase7Control:{...control,newEconomicActionAllowed:false},actionsToday:2,now}).reasonCodes.includes('P6_CLAIM_P7_NEW_ACTION_BLOCKED'));assert.ok(validateClaimedPlan({plan:base,policy,ownedPositions:[],productionCandidates:admittedStatic,phase7Control:control,actionsToday:2,now}).reasonCodes.includes('P6_CLAIM_DAILY_ACTION_LIMIT'));});
-test('risk-increasing claims bind to the exact authenticated P7 decision across newer controls and recovery',()=>{
- const input={plan:base,policy,ownedPositions:[],productionCandidates:admittedStatic,now};
+test('risk-increasing claims retain the authenticated P7 authority across materially equivalent healthy refreshes',()=>{
+ const input={plan:base,policy,ownedPositions:[],productionCandidates:admittedStatic,boundPhase7Control:control,now};
  assert.equal(validateClaimedPlan({...input,phase7Control:control}).approved,true,'the exact fresh decision passes the binding check');
  const newer={...control,decisionId:'control-2',cycleKey:'cycle-2',observedAt:'2026-08-13T00:04:50.000Z'};
- const older={...control,decisionId:'control-0',cycleKey:'cycle-0',observedAt:'2026-08-13T00:04:20.000Z'};
- for(const phase7Control of [newer,older])assert.ok(validateClaimedPlan({...input,phase7Control}).reasonCodes.includes('P6_CLAIM_P7_CONTROL_BINDING_MISMATCH'),'a different P7 decision never substitutes for the bound decision');
+ const older={...control,decisionId:'control-0',cycleKey:'cycle-0',observedAt:'2026-08-13T00:03:20.000Z'};
+ for(const phase7Control of [newer,{...newer,decisionId:'control-3',cycleKey:'cycle-3',observedAt:'2026-08-13T00:04:55.000Z'}])assert.equal(validateClaimedPlan({...input,phase7Control}).approved,true,'a fresh equivalent P7 refresh retains the original authority binding');
+ assert.ok(validateClaimedPlan({...input,phase7Control:newer,boundPhase7Control:undefined}).reasonCodes.includes('P6_CLAIM_P7_BOUND_CONTROL_MISSING'),'a refreshed control cannot substitute when the authenticated plan-bound control is unavailable');
  assert.ok(validateClaimedPlan({...input,phase7Control:{...control,decisionId:undefined}}).reasonCodes.includes('P6_CLAIM_P7_CONTROL_ID_MISSING'),'a control without an id fails closed');
  assert.ok(validateClaimedPlan({...input,phase7Control:{...control,observedAt:'2026-08-13T00:00:00.000Z'}}).reasonCodes.includes('P6_CLAIM_P7_CONTROL_STALE'),'identity does not bypass freshness');
  assert.ok(validateClaimedPlan({...input,phase7Control:{...control,safetyMode:'EMERGENCY_ONLY'}}).reasonCodes.includes('P6_CLAIM_P7_SAFETY_NOT_NORMAL'),'identity does not bypass safety');
+ assert.ok(validateClaimedPlan({...input,phase7Control:{...control,healthStatus:'CRITICAL'}}).reasonCodes.includes('P6_CLAIM_P7_HEALTH_NOT_HEALTHY'),'critical health invalidates a refreshed control');
  assert.ok(validateClaimedPlan({...input,phase7Control:{...control,authorityMode:'OBSERVE_ONLY'}}).reasonCodes.includes('P6_CLAIM_P7_AUTHORITY_NOT_PRODUCTION'),'identity does not bypass authority');
  assert.ok(validateClaimedPlan({...input,phase7Control:{...control,newEconomicActionAllowed:false}}).reasonCodes.includes('P6_CLAIM_P7_NEW_ACTION_BLOCKED'),'identity does not bypass new-action policy');
- // validateClaimedPlan is stateless: this models a persisted A-bound plan
- // claimed after an execution-process restart under a newer control B.
- assert.ok(validateClaimedPlan({...input,phase7Control:newer}).reasonCodes.includes('P6_CLAIM_P7_CONTROL_BINDING_MISMATCH'),'restart/recovery cannot rebind the persisted plan');
+ assert.ok(validateClaimedPlan({...input,phase7Control:older}).reasonCodes.includes('P6_CLAIM_P7_CONTROL_STALE'),'stale current control cannot be accepted');
 });
 test('P7_CONTROLLED_CANARY_CONTROL_CONTINUITY keeps exactly one bound OPEN claimable across harmless snapshots',()=>{
  const canaryPolicy={...policy,maxOpenPositions:1,pools:[{address:'POOL',maxCapitalLamports:30_000_000n,maxOpenPositions:1}],controlledCanary:{maxConcurrentPositions:1,exactLiquidityCapitalLamports:30_000_000n,replacementOpenAllowed:false}};

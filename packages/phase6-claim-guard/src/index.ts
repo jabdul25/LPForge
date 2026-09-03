@@ -24,6 +24,32 @@ export function validateFreshPhase7ExecutionControl(control:Phase7ExecutionContr
  if(!Number.isFinite(age)||age<0||age>maxAgeMs)reasons.push('P6_CLAIM_P7_CONTROL_STALE');
  return reasons.sort();
 }
+/**
+ * A production OPEN is HMAC-bound to the P7 decision that governed plan
+ * preparation. P7 deliberately emits a new control record every cycle, so
+ * equality with the latest decision id would turn harmless healthy refreshes
+ * into a race. The bound record must have been valid when the plan was made;
+ * the current record must independently be fresh and entry-authorizing.
+ */
+function validateBoundProductionAuthority(input:{plan:AutonomousPlan;bound:Phase7ExecutionControl|undefined;current:Phase7ExecutionControl|undefined;now:string}):string[]{
+ const provenance=record(record(input.plan.planPayload).provenance),binding=record(provenance.phase7Control),boundDecisionId=String(binding.decisionId??''),boundObservedAt=String(binding.observedAt??'');
+ if(!boundDecisionId||!boundObservedAt)return ['P6_CLAIM_P7_CONTROL_BINDING_MISSING'];
+ if(!input.current)return ['P6_CLAIM_P7_CONTROL_MISSING'];
+ // The exact-current case remains valid without an additional database lookup;
+ // after a refresh, execution must supply the persisted plan-bound control.
+ const bound=input.bound??(input.current?.decisionId===boundDecisionId?input.current:undefined);
+ if(!bound)return ['P6_CLAIM_P7_BOUND_CONTROL_MISSING'];
+ const reasons:string[]=[];
+ if(!input.current?.decisionId)reasons.push('P6_CLAIM_P7_CONTROL_ID_MISSING');
+ if(bound.decisionId!==boundDecisionId)reasons.push('P6_CLAIM_P7_CONTROL_BINDING_MISMATCH');
+ if(!validTimestamp(boundObservedAt)||!validTimestamp(input.plan.observedAt)||Date.parse(boundObservedAt)>Date.parse(input.plan.observedAt)||bound.observedAt!==boundObservedAt)reasons.push('P6_CLAIM_P7_CONTROL_BINDING_INVALID');
+ // Validate the historical authority at the time it authorized this exact
+ // plan, rather than against wall-clock claim time.
+ reasons.push(...validateFreshPhase7ExecutionControl(bound,input.plan.observedAt));
+ // Current control remains a fresh, fail-closed hard-safety gate.
+ reasons.push(...validateFreshPhase7ExecutionControl(input.current,input.now));
+ return [...new Set(reasons)].sort();
+}
 function record(value: unknown) {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -234,11 +260,7 @@ export function validateClaimedPlan(input: {
       reasons.push(...validateBoundCanaryAuthorization({plan:p,provenance,bound:input.boundPhase7Control,current:control,now:input.now??new Date().toISOString()}));
       if(!boundDecisionId||!boundObservedAt||!Number.isFinite(Date.parse(boundObservedAt))||Date.parse(boundObservedAt)>Date.parse(p.observedAt))reasons.push('P6_CLAIM_P7_CONTROL_BINDING_INVALID');
     }else{
-      reasons.push(...validateFreshPhase7ExecutionControl(control,input.now??new Date().toISOString()));
-      if(!boundDecisionId||!boundObservedAt)reasons.push('P6_CLAIM_P7_CONTROL_BINDING_MISSING');
-      else if(!control?.decisionId)reasons.push('P6_CLAIM_P7_CONTROL_ID_MISSING');
-      else if(control.decisionId!==boundDecisionId)reasons.push('P6_CLAIM_P7_CONTROL_BINDING_MISMATCH');
-      else if(!Number.isFinite(Date.parse(boundObservedAt))||Date.parse(boundObservedAt)>Date.parse(p.observedAt))reasons.push('P6_CLAIM_P7_CONTROL_BINDING_INVALID');
+      reasons.push(...validateBoundProductionAuthority({plan:p,bound:input.boundPhase7Control,current:control,now:input.now??new Date().toISOString()}));
       if(control?.poolDrift?.[p.poolAddress]==='BLOCK')reasons.push('P6_CLAIM_P7_POOL_DRIFT_BLOCK');
     }
   }
