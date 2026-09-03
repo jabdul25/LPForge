@@ -18,6 +18,7 @@ import {
 import { PublicKey } from "@solana/web3.js";
 import { EXPECTED_DLMM_PROGRAM_ID } from "../../../packages/meteora/src/index.js";
 import { loadDeploymentPolicyFile } from "../../../packages/deployment-policy/src/index.js";
+import { resolveLiveExecutionPolicyPath } from "../../../packages/config/src/index.js";
 import { validateClaimedPlan, type Phase7ExecutionControl } from "../../../packages/phase6-claim-guard/src/index.js";
 import { createGovernedConnection, createMeteoraReadAdapter } from "../../../packages/meteora/src/index.js";
 import { assertPreinitializedMeteoraBinArrays } from "../../../packages/meteora-execution/src/index.js";
@@ -168,8 +169,7 @@ function workerConfig() {
     ),
     maxFeeFraction = Number(process.env.LPFORGE_P6_MAX_FEE_FRACTION ?? "0.02"),
     policy = loadDeploymentPolicyFile(
-      process.env.LPFORGE_EXECUTION_POLICY_PATH?.trim() ||
-        "policies/live-execution-policy.json",
+      resolveLiveExecutionPolicyPath(),
     ),
     construction = policy.positionConstruction,
     configuredLiquiditySlippageBps = construction?.liquiditySlippageBps,
@@ -222,8 +222,7 @@ async function dispatchOne() {
       };
     const baseConfig = workerConfig(),
       staticPolicy = loadDeploymentPolicyFile(
-        process.env.LPFORGE_EXECUTION_POLICY_PATH?.trim() ||
-          "policies/live-execution-policy.json",
+        resolveLiveExecutionPolicyPath(),
       ),
       [owned,productionCandidates] = await Promise.all([
         store.loadOwnedPositions(plan.ownerAddress),

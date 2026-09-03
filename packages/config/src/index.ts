@@ -25,6 +25,60 @@ export interface Phase1Config {
   logLevel: 'debug'|'info'|'warn'|'error';
 }
 
+/**
+ * Production releases are intentionally immutable.  Runtime configuration is
+ * mounted at this stable operational root rather than copied into a release
+ * directory.  Development and fixture callers may opt out of enforcement,
+ * but the service launcher always enables it.
+ */
+export const DEFAULT_LPFORGE_HOME = '/root/systems/LPForge';
+export interface RuntimeConfigPaths {
+  home: string;
+  envFile: string;
+  executionEnvFile: string;
+  executionPolicyFile: string;
+}
+function absolutePath(value: string, name: string): string {
+  if (!value.startsWith('/')) throw new Error(`LPFORGE_RUNTIME_CONFIG_ABSOLUTE_PATH_REQUIRED:${name}`);
+  return value.replace(/\/+$/, '') || '/';
+}
+export function resolveRuntimeConfigPaths(env: NodeJS.ProcessEnv = process.env): RuntimeConfigPaths {
+  const home = absolutePath((env.LPFORGE_HOME ?? DEFAULT_LPFORGE_HOME).trim() || DEFAULT_LPFORGE_HOME, 'LPFORGE_HOME');
+  return {
+    home,
+    envFile: `${home}/.env`,
+    executionEnvFile: `${home}/.env.execution`,
+    executionPolicyFile: `${home}/policy/live-execution-policy.json`,
+  };
+}
+/**
+ * An explicitly enforced runtime never accepts a cwd-relative or release-local
+ * policy path.  Non-enforced callers retain the existing explicit-path hook
+ * for fixtures and development tooling.
+ */
+export function resolveLiveExecutionPolicyPath(env: NodeJS.ProcessEnv = process.env): string {
+  const paths = resolveRuntimeConfigPaths(env);
+  if ((env.LPFORGE_RUNTIME_CONFIG_ENFORCED ?? 'false').toLowerCase() === 'true') return paths.executionPolicyFile;
+  return env.LPFORGE_EXECUTION_POLICY_PATH?.trim() || 'policies/live-execution-policy.json';
+}
+export function runtimeConfigDiagnostics(env: NodeJS.ProcessEnv = process.env) {
+  const paths = resolveRuntimeConfigPaths(env);
+  return {
+    configRoot: paths.home,
+    envSource: env.LPFORGE_RUNTIME_ENV_SOURCE?.trim() || paths.envFile,
+    executionEnvSource: env.LPFORGE_RUNTIME_EXECUTION_ENV_SOURCE?.trim() || paths.executionEnvFile,
+    policySource: resolveLiveExecutionPolicyPath(env),
+    runtimeConfigEnforced: (env.LPFORGE_RUNTIME_CONFIG_ENFORCED ?? 'false').toLowerCase() === 'true',
+    flags: {
+      boundedUnattendedProduction: (env.LPFORGE_BOUNDED_UNATTENDED_PRODUCTION ?? 'false').toLowerCase() === 'true',
+      p7PlanDispatchEnabled: (env.LPFORGE_P7_PLAN_DISPATCH_ENABLED ?? 'false').toLowerCase() === 'true',
+      liveExecution: (env.LPFORGE_LIVE_EXECUTION ?? 'false').toLowerCase() === 'true',
+      liveSigning: (env.LIVE_SIGNING ?? 'false').toLowerCase() === 'true',
+      mainnetExecution: (env.LPFORGE_MAINNET_CANARY ?? 'false').toLowerCase() === 'true',
+    },
+  };
+}
+
 const FORBIDDEN_SECRET_KEYS = ['PRIVATE_KEY','SEED_PHRASE','WALLET_SECRET','WALLET_PRIVATE_KEY','SIGNER_KEYPAIR'];
 
 function required(env: NodeJS.ProcessEnv, name: string): string {

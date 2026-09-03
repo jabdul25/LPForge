@@ -1,4 +1,4 @@
-import { loadPhase1Config } from "../../../packages/config/src/index.js";
+import { loadPhase1Config, resolveLiveExecutionPolicyPath } from "../../../packages/config/src/index.js";
 import { createMeteoraDataApi, type DataApiPool } from "../../../packages/data-api/src/index.js";
 import {
   createPostgresStore,
@@ -180,7 +180,7 @@ async function persistFeeCompensationMetrics(input:{store:Phase1Store;position:O
 }
 function loadProductionCapitalEnvelope(poolAddress: string) {
   const deployment = loadDeploymentPolicyFile(
-    process.env.LPFORGE_EXECUTION_POLICY_PATH ?? "policies/live-execution-policy.json",
+    resolveLiveExecutionPolicyPath(),
   );
   if (deployment.status !== "ENABLED" || !deployment.productionCapital)
     throw new Error("LPFORGE_PRODUCTION_CAPITAL_POLICY_REQUIRED");
@@ -220,8 +220,7 @@ async function loadLiveOpenPlanCapacity(input: {
       reasonCodes: ["P7_PLAN_OWNER_ADDRESS_MISSING"],
     };
   const deployment = loadDeploymentPolicyFile(
-    process.env.LPFORGE_EXECUTION_POLICY_PATH ??
-      "policies/live-execution-policy.json",
+      resolveLiveExecutionPolicyPath(),
   );
   const capital = deployment.productionCapital;
   if (!capital)
@@ -277,7 +276,7 @@ async function persistTransactionPlan(
   store: Phase1Store,
   plan: TransactionPlan,
 ) {
-  const deployment=loadDeploymentPolicyFile(process.env.LPFORGE_EXECUTION_POLICY_PATH??"policies/live-execution-policy.json");
+  const deployment=loadDeploymentPolicyFile(resolveLiveExecutionPolicyPath());
   const boundedUnattended=process.env.LPFORGE_BOUNDED_UNATTENDED_PRODUCTION==='true';
   // The controlled-canary probe remains read-only; its plan-only marker still
   // enforces the exact capital and no-replacement envelope before signing.
@@ -955,7 +954,7 @@ async function liveOnce() {
     await store.insertCompatibility(compat);
     if (compat.state !== "VERIFIED")
       throw new Error("LPFORGE_PROTOCOL_COMPATIBILITY_HOLD");
-    const deploymentPolicy=loadDeploymentPolicyFile(process.env.LPFORGE_EXECUTION_POLICY_PATH ?? "policies/live-execution-policy.json");
+    const deploymentPolicy=loadDeploymentPolicyFile(resolveLiveExecutionPolicyPath());
     const evidenceWidth=derivePhase3EvidenceWidthRequirement(deploymentPolicy.positionConstruction?.maxInitialPositionWidthBins ?? 100);
     const [pool, bins] = await Promise.all([
       adapter.getPool(cfg.smokePoolAddress),

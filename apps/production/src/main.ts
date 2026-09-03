@@ -3,7 +3,7 @@ import {readFileSync} from 'node:fs';
 import {spawnSync} from 'node:child_process';
 import {composePhase7RuntimeTick} from '../../../packages/phase7-runtime/src/index.js';
 import {assessPhase7Health,defaultPhase7HealthPolicy} from '../../../packages/phase7-health/src/index.js';
-import {loadPhase1Config} from '../../../packages/config/src/index.js';
+import {loadPhase1Config,resolveLiveExecutionPolicyPath,resolveRuntimeConfigPaths} from '../../../packages/config/src/index.js';
 import {createPostgresStore} from '../../../packages/db/src/index.js';
 import {createMeteoraDataApi} from '../../../packages/data-api/src/index.js';
 import {createSolanaRpcClient} from '../../../packages/meteora/src/index.js';
@@ -39,7 +39,7 @@ function requireVerifiedRuntimeArtifactIdentity():VerifiedRuntimeArtifactIdentit
   console.log(json({event:'lpforge_runtime_artifact_identity_verified',artifactDerived:true,...verifiedRuntimeArtifactIdentity}));
   return verifiedRuntimeArtifactIdentity;
 }
-function artifactBoundEnvironment(identity:VerifiedRuntimeArtifactIdentity):NodeJS.ProcessEnv{return {...process.env,LPFORGE_SOURCE_COMMIT:identity.sourceCommit,LPFORGE_BUILD_ID:identity.buildIdentity,LPFORGE_P7_POLICY_HASH:identity.policyHash,LPFORGE_EXECUTION_POLICY_PATH:'policies/live-execution-policy.json',LPFORGE_APPROVED_RELEASE_IDENTITY_PATH:'RELEASE_MANIFEST.json'};}
+function artifactBoundEnvironment(identity:VerifiedRuntimeArtifactIdentity):NodeJS.ProcessEnv{const runtime=resolveRuntimeConfigPaths(process.env);return {...process.env,LPFORGE_HOME:runtime.home,LPFORGE_RUNTIME_CONFIG_ENFORCED:'true',LPFORGE_RUNTIME_ENV_SOURCE:runtime.envFile,LPFORGE_RUNTIME_EXECUTION_ENV_SOURCE:runtime.executionEnvFile,LPFORGE_SOURCE_COMMIT:identity.sourceCommit,LPFORGE_BUILD_ID:identity.buildIdentity,LPFORGE_P7_POLICY_HASH:identity.policyHash,LPFORGE_EXECUTION_POLICY_PATH:resolveLiveExecutionPolicyPath({...process.env,LPFORGE_RUNTIME_CONFIG_ENFORCED:'true'}),LPFORGE_APPROVED_RELEASE_IDENTITY_PATH:'RELEASE_MANIFEST.json'};}
 const baseline={sampleCount:100,regimeBrier:.2,survivalBrier:.18,netValueMae:.001,noTradeRate:.7,entryReadyRate:.1,executionCostRate:.0005,reconciliationMismatchRate:0,featureMissingRate:.01,decoderSkipRate:.001};
 const driftPolicy={minSamples:50,maxForecastRelativeDegradation:.25,maxNetValueMaeRelativeDegradation:.5,maxDecisionRateShift:.2,maxExecutionCostRelativeDegradation:.5,maxReconciliationMismatchRate:.01,maxFeatureMissingRate:.05,maxDecoderSkipRate:.02};
 const telegramAlerter=new Phase7TelegramAlerter(loadPhase7TelegramConfig());

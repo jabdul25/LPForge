@@ -6,7 +6,7 @@ import path from 'node:path';
 import {PublicKey} from '@solana/web3.js';
 import {loadDeploymentPolicyFile,type MainnetCanaryDeploymentPolicy} from '../../deployment-policy/src/index.js';
 import {createMeteoraDataApi} from '../../data-api/src/index.js';
-import type {Phase1Config} from '../../config/src/index.js';
+import {resolveLiveExecutionPolicyPath,type Phase1Config} from '../../config/src/index.js';
 import {isPhase3ReadyConsumptionPending,isPostEvidenceEvaluationEligible,type Phase1Store} from '../../db/src/index.js';
 import {createGovernedConnection,createMeteoraReadAdapter,createSolanaRpcClient} from '../../meteora/src/index.js';
 import {derivePositionMarkToMarket} from '../../live-exit-governor/src/index.js';
@@ -121,7 +121,7 @@ export function resolveControlledCanaryWatch(input:{env:NodeJS.ProcessEnv;now:st
 }
 /** Compare the executing tree to the immutable release record. Any absence or
  * mismatch blocks only new exposure; protective paths remain available. */
-export function assessPhase7ReleaseIdentity(input:{cwd:string;env:NodeJS.ProcessEnv;sourceCommit?:string;policyHash?:string}){const reasons:string[]=[];let approved:ApprovedReleaseIdentity|undefined;try{approved=JSON.parse(readFileSync(path.resolve(input.cwd,input.env.LPFORGE_APPROVED_RELEASE_IDENTITY_PATH?.trim()||'RELEASE_MANIFEST.json'),'utf8')) as ApprovedReleaseIdentity;}catch{reasons.push('P7_RELEASE_IDENTITY_MISSING');return{valid:false,reasonCodes:reasons};}const migrations=readdirSync(path.resolve(input.cwd,'packages/db/migrations')).filter(x=>/^M\d{4}_.+\.sql$/.test(x)).sort();const runtimePolicyHash=input.policyHash?.trim()||sha(readFileSync(path.resolve(input.cwd,input.env.LPFORGE_EXECUTION_POLICY_PATH?.trim()||'policies/live-execution-policy.json'),'utf8'));const runtimeBuild=input.env.LPFORGE_BUILD_ID?.trim();if(!input.sourceCommit?.trim()||approved.sourceCommit!==input.sourceCommit.trim())reasons.push('P7_RELEASE_SOURCE_MISMATCH');if(approved.policyHash!==runtimePolicyHash)reasons.push('P7_RELEASE_POLICY_MISMATCH');if(approved.migrationCount!==migrations.length||approved.migrationHead!==migrations.at(-1))reasons.push('P7_RELEASE_MIGRATION_MISMATCH');if(!runtimeBuild||approved.buildIdentity!==runtimeBuild)reasons.push('P7_RELEASE_BUILD_MISMATCH');return{valid:reasons.length===0,reasonCodes:reasons.sort(),approved,runtime:{sourceCommit:input.sourceCommit??'',policyHash:runtimePolicyHash,migrationCount:migrations.length,migrationHead:migrations.at(-1)??'',buildIdentity:runtimeBuild??''}};}
+export function assessPhase7ReleaseIdentity(input:{cwd:string;env:NodeJS.ProcessEnv;sourceCommit?:string;policyHash?:string}){const reasons:string[]=[];let approved:ApprovedReleaseIdentity|undefined;try{approved=JSON.parse(readFileSync(path.resolve(input.cwd,input.env.LPFORGE_APPROVED_RELEASE_IDENTITY_PATH?.trim()||'RELEASE_MANIFEST.json'),'utf8')) as ApprovedReleaseIdentity;}catch{reasons.push('P7_RELEASE_IDENTITY_MISSING');return{valid:false,reasonCodes:reasons};}const migrations=readdirSync(path.resolve(input.cwd,'packages/db/migrations')).filter(x=>/^M\d{4}_.+\.sql$/.test(x)).sort();const runtimePolicyHash=input.policyHash?.trim()||sha(readFileSync(resolveLiveExecutionPolicyPath(input.env),'utf8'));const runtimeBuild=input.env.LPFORGE_BUILD_ID?.trim();if(!input.sourceCommit?.trim()||approved.sourceCommit!==input.sourceCommit.trim())reasons.push('P7_RELEASE_SOURCE_MISMATCH');if(approved.policyHash!==runtimePolicyHash)reasons.push('P7_RELEASE_POLICY_MISMATCH');if(approved.migrationCount!==migrations.length||approved.migrationHead!==migrations.at(-1))reasons.push('P7_RELEASE_MIGRATION_MISMATCH');if(!runtimeBuild||approved.buildIdentity!==runtimeBuild)reasons.push('P7_RELEASE_BUILD_MISMATCH');return{valid:reasons.length===0,reasonCodes:reasons.sort(),approved,runtime:{sourceCommit:input.sourceCommit??'',policyHash:runtimePolicyHash,migrationCount:migrations.length,migrationHead:migrations.at(-1)??'',buildIdentity:runtimeBuild??''}};}
 const WSOL_MINT='So11111111111111111111111111111111111111112';
 const TOKEN_PROGRAM_ID='TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 export function positionUsdValueToSolLamports(currentEconomicValueUsd:number,solPriceUsd:number):bigint{
@@ -140,7 +140,7 @@ async function assessLivePortfolioAuthority(input:{store:Phase1Store;cfg:Phase1C
   const owner=input.env.LPFORGE_OPERATOR_OWNER_ADDRESS?.trim();
   if(!owner)return{valid:false,reasonCodes:['P7_PORTFOLIO_OWNER_MISSING']};
   try{
-    const policy=loadDeploymentPolicyFile(input.env.LPFORGE_EXECUTION_POLICY_PATH?.trim()||'policies/live-execution-policy.json'),capital=policy.productionCapital;
+    const policy=loadDeploymentPolicyFile(resolveLiveExecutionPolicyPath(input.env)),capital=policy.productionCapital;
     if(!capital)return{valid:false,reasonCodes:['P7_PORTFOLIO_CAPITAL_POLICY_MISSING']};
     const connection=createGovernedConnection({rpcUrl:input.cfg.solanaRpcHttpUrl,priority:'P2_POSITION_MANAGEMENT'});
     const [facts,prior,wallet,walletTokenAccounts,positions,ownedPoolHistory,inventoryLots]=await Promise.all([
@@ -221,7 +221,7 @@ function incidentFromRow(row:Record<string,unknown>):Phase7Incident{return{incid
  * new-entry universe; discovery admission is the sole authority there.
  */
 export function productionPolicyHealthcheckPoolAddressesFromPolicy(policy:Pick<MainnetCanaryDeploymentPolicy,'pools'>){return[...new Set(policy.pools.map(pool=>pool.address))];}
-export function productionPolicyHealthcheckPoolAddresses(env:NodeJS.ProcessEnv){const path=env.LPFORGE_EXECUTION_POLICY_PATH?.trim()||'policies/live-execution-policy.json';return productionPolicyHealthcheckPoolAddressesFromPolicy(loadDeploymentPolicyFile(path));}
+export function productionPolicyHealthcheckPoolAddresses(env:NodeJS.ProcessEnv){return productionPolicyHealthcheckPoolAddressesFromPolicy(loadDeploymentPolicyFile(resolveLiveExecutionPolicyPath(env)));}
 /** Owned/open pools remain observable for management and recovery even after
  * their discovery admission expires.  They have no new-entry authority. */
 export function productionManagementPoolAddresses(env:NodeJS.ProcessEnv,ownedPoolAddresses:readonly string[]=[]){return[...new Set([...productionPolicyHealthcheckPoolAddresses(env),...ownedPoolAddresses].map(value=>value.trim()).filter(Boolean))];}

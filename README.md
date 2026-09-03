@@ -60,6 +60,12 @@ GitHub source checkout
 
 Release directories, `.build/`, `dist/`, dependency directories, logs, databases, position state, and secrets are intentionally excluded from Git. A release manifest, checksums, and source revision must be generated and verified for the exact release artifact; do not copy an old release directory as a generic deployment.
 
+Production runtime configuration is mounted at `/root/systems/LPForge`: `.env`
+for non-secret settings, `.env.execution` for protected execution settings,
+and `policy/live-execution-policy.json` for the canonical execution policy.
+Immutable `LPForge-release-<sha>` directories never own runtime environment
+files. See [the centralized runtime configuration runbook](docs/runbooks/RUNBOOK_CENTRALIZED_RUNTIME_CONFIGURATION.md).
+
 ## Development and validation
 
 Requirements: Node.js 24, Corepack/pnpm, and PostgreSQL for database-backed checks.

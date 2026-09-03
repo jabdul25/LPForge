@@ -71,6 +71,7 @@
     "pm2:restart": "bash scripts/pm2-restart.sh",
     "pm2:stop": "bash scripts/pm2-stop.sh",
     "pm2:status": "bash scripts/pm2-status.sh",
+    "runtime:config": "bash scripts/runtime-config-diagnostics.sh",
     "canary:gate-status": "node --enable-source-maps .build/apps/canary/src/main.js gate-status",
     "canary:assert-read-only": "node --enable-source-maps .build/apps/canary/src/main.js assert-read-only",
     "discovery:once": "node --enable-source-maps .build/apps/discovery/src/main.js once",

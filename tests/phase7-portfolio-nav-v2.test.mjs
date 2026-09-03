@@ -63,7 +63,7 @@ test('owned positions remain mandatory management/drift targets without bypassin
 
 test('rent locked in open position accounts is exact recoverable book-value equity and policy precedes valuation',()=>{
   const src=fs.readFileSync(production,'utf8');
-  const policyAt=src.indexOf("const policy=loadDeploymentPolicyFile(input.env.LPFORGE_EXECUTION_POLICY_PATH?.trim()||'policies/live-execution-policy.json'),capital=policy.productionCapital;");
+  const policyAt=src.indexOf('const policy=loadDeploymentPolicyFile(resolveLiveExecutionPolicyPath(input.env)),capital=policy.productionCapital;');
   const accountAt=src.indexOf('connection.getAccountInfo(new PublicKey(positionAddress)');
   const rentAt=src.indexOf('const rentReserveLamports=valuations.reduce((sum,value)=>sum+value.recoverableRentLamports,0n);');
   const currentAt=src.indexOf('current=BigInt(wallet)+positionValueLamports+walletTokenValueLamports+rentReserveLamports');
