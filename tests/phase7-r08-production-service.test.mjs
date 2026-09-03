@@ -14,3 +14,12 @@ test('P7-R08 position observation remains read-only and runs before recovery gat
 test('M0066 metric persistence normalizes a recovered MFE timestamp before PostgreSQL binding',()=>{const src=fs.readFileSync(new URL('../packages/db/src/index.ts',import.meta.url),'utf8');assert.match(src,/v\.mfeObservedAt\?toIsoTimestamp\(v\.mfeObservedAt\):null/);});
 test('global Production selection is canonical, deadline-bounded, fail-closed, and cannot prepare every evaluated pool',()=>{const service=fs.readFileSync(new URL('../packages/phase7-production-service/src/index.ts',import.meta.url),'utf8'),operator=fs.readFileSync(new URL('../apps/operator/src/main.ts',import.meta.url),'utf8');assert.match(service,/runProductionGlobalSelectionCycle/);assert.match(service,/P7_GLOBAL_SELECTION_CYCLE_DEADLINE_MS=120_000/);assert.match(service,/GLOBAL_CYCLE_DEADLINE_REACHED/);assert.match(service,/GLOBAL_COVERAGE_INCOMPLETE/);assert.match(service,/LPFORGE_P7_PLAN_DISPATCH_ENABLED:'false'/);assert.match(service,/LPFORGE_GLOBAL_SELECTED_CANDIDATE_ID/);assert.doesNotMatch(service,/GLOBAL_POOL_SELECTION_SHADOW|GLOBAL_POOL_SELECTION_AUTHORITATIVE/);assert.match(operator,/globalSelectionMatches/);});
 test('global selection reads the canonical Production candidate contract rather than recommendation tables',()=>{const service=fs.readFileSync(new URL('../packages/phase7-production-service/src/index.ts',import.meta.url),'utf8'),db=fs.readFileSync(new URL('../packages/db/src/index.ts',import.meta.url),'utf8'),operator=fs.readFileSync(new URL('../apps/operator/src/main.ts',import.meta.url),'utf8');assert.match(service,/LPFORGE_PRODUCTION_GLOBAL_SELECTION_CYCLE_ID/);assert.match(service,/operational_state/);assert.match(db,/SELECT \* FROM execution\.production_global_candidates/);assert.match(operator,/productionGlobalCandidateFromOperationalResult/);});
+
+
+
+test('P7 grants its operator only the scoped plan-provenance capability, never signing capability',()=>{
+ const src=fs.readFileSync(new URL('../packages/phase7-production-service/src/index.ts',import.meta.url),'utf8');
+ assert.match(src,/loadProducerPlanProvenanceSecret/);
+ assert.match(src,/childEnv\.LPFORGE_PLAN_PROVENANCE_SECRET=provenanceSecret/);
+ for(const key of ['LPFORGE_P6_PRIVATE_KEY','LPFORGE_P6_PRIVATE_WRITE_RPC_URL','LPFORGE_P6_SIGNER_BACKEND_ID','LIVE_SUBMISSION','LPFORGE_P6_EXECUTION_RUNNER_ENABLED'])assert.match(src,new RegExp('delete childEnv\\.'+key));
+});

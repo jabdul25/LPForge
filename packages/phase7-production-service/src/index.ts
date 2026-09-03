@@ -30,6 +30,15 @@ export interface ControlledCanaryPortfolioFacts {openPositions:number;pendingExe
 export interface ControlledCanaryWatchDecision {enabled:boolean;activate:boolean;reasonCodes:string[];authorization?:ControlledCanaryWatchAuthorization;approval?:{approvalId:string;action:'PROMOTE_PRODUCTION';operatorId:string;issuedAt:string;expiresAt:string;reason:string};}
 const sha=(value:string)=>createHash('sha256').update(value).digest('hex');
 const enabled=(value:string|undefined)=>String(value??'').trim().toLowerCase()==='true';
+/** P7 may read only the plan-authentication capability; signer material stays execution-only. */
+export function loadProducerPlanProvenanceSecret(env:NodeJS.ProcessEnv):string|undefined{
+  const source=(env.LPFORGE_RUNTIME_EXECUTION_ENV_SOURCE??"/root/systems/LPForge/.env.execution").trim();
+  try{
+    const line=readFileSync(source,"utf8").split(/\r?\n/).find(value=>value.trim().startsWith("LPFORGE_PLAN_PROVENANCE_SECRET="));
+    const secret=line?.slice(line.indexOf("=")+1).trim();
+    return secret||undefined;
+  }catch{return undefined;}
+}
 /**
  * P7's hard DECISION boundary is 120 seconds. A canary control must leave
  * enough of that unchanged boundary for the observed plan-persistence path
@@ -248,6 +257,11 @@ export async function runAutonomousDecisionProbe(input:{cwd:string;env:NodeJS.Pr
   // receives signing authority; the separately supervised execution worker is
   // the only process that loads the local signer configuration.
   const poolAddress=input.poolAddress??input.env.LPFORGE_SMOKE_POOL_ADDRESS?.trim();const configuredBackfill=Number(input.env.LPFORGE_P7_OPERATOR_EVENT_BACKFILL_LIMIT??input.env.EVENT_BACKFILL_LIMIT??10),productionRpcInterval=input.env.LPFORGE_PRODUCTION_RPC_MIN_INTERVAL_MS??input.env.RPC_MIN_INTERVAL_MS;const childEnv:{[key:string]:string|undefined}={...input.env,LIVE_SIGNING:'false',LPFORGE_LIVE_EXECUTION:'false',LPFORGE_MAINNET_CANARY:'false',LPFORGE_DATA_MODE:'LIVE_READ_ONLY',LPFORGE_OPERATOR_MACHINE_SUMMARY:'true',EVENT_BACKFILL_LIMIT:String(Math.max(1,Math.min(10,configuredBackfill)),),...(productionRpcInterval?{RPC_MIN_INTERVAL_MS:productionRpcInterval}:{}),...(poolAddress?{LPFORGE_SMOKE_POOL_ADDRESS:poolAddress}:{})};delete childEnv.LPFORGE_PREPARE_POSITION_ADDRESS;
+  const provenanceSecret=loadProducerPlanProvenanceSecret(input.env);
+  if(provenanceSecret)childEnv.LPFORGE_PLAN_PROVENANCE_SECRET=provenanceSecret;
+  delete childEnv.LPFORGE_P6_PRIVATE_KEY;delete childEnv.LPFORGE_P6_PRIVATE_WRITE_RPC_URL;
+  delete childEnv.LPFORGE_P6_SIGNER_BACKEND_ID;delete childEnv.LPFORGE_P6_SIGNER_MODE;delete childEnv.LPFORGE_P6_SIGNER_PUBLIC_KEY;
+  delete childEnv.LIVE_SUBMISSION;delete childEnv.LPFORGE_P6_EXECUTION_RUNNER_ENABLED;
   const timeoutMs=input.timeoutMs===undefined?Math.max(30_000,Math.min(300_000,Number(input.env.LPFORGE_P7_OPERATOR_PROBE_TIMEOUT_MS??120_000))):Math.max(30_000,Math.min(300_000,input.timeoutMs));
   return new Promise((resolve,reject)=>{const child=spawn('node',['--enable-source-maps','.build/apps/operator/src/main.js','live-once'],{cwd:input.cwd,env:childEnv,stdio:['ignore','pipe','pipe']});let out='',err='',settled=false;const timeout=setTimeout(()=>{if(settled)return;settled=true;(child as unknown as {kill:(signal:string)=>boolean}).kill('SIGTERM');reject(new Error(`LPFORGE_P7_OPERATOR_PROBE_TIMEOUT:${timeoutMs}:${redactProbeFailureDetail(err||out)}`));},timeoutMs);const done=(fn:()=>void)=>{if(settled)return;settled=true;clearTimeout(timeout);fn();};child.stdout?.on('data',x=>{out+=String(x);});child.stderr?.on('data',x=>{err+=String(x);});child.on('error',error=>done(()=>reject(error)));child.on('close',code=>done(()=>{const combined=out+'\n'+err;const exitCode=code??1;if(exitCode!==0)return reject(new Error(`LPFORGE_P7_OPERATOR_PROBE_FAILED:${exitCode}:${redactProbeFailureDetail(err||out)}`));resolve(parsePhase7OperatorProbeOutput(combined,exitCode,poolAddress));}));});
 }

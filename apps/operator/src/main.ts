@@ -287,6 +287,7 @@ async function persistTransactionPlan(
       throw new Error('LPFORGE_P6_CONTROLLED_CANARY_REPLACEMENT_OPEN_BLOCKED');
   }
   const provenanceSecret=(process.env.LPFORGE_PLAN_PROVENANCE_SECRET??'').trim();
+  if(plan.intent.action==="OPEN"&&!provenanceSecret)throw new Error("PLAN_PROVENANCE_HMAC_UNAVAILABLE");
   const globalSelectionCycleId=(process.env.LPFORGE_GLOBAL_SELECTION_CYCLE_ID??'').trim(),globalSelectedCandidateId=(process.env.LPFORGE_GLOBAL_SELECTED_CANDIDATE_ID??'').trim();
   const globalSelection=globalSelectionCycleId||globalSelectedCandidateId?{globalCycleId:globalSelectionCycleId,selectedCandidateId:globalSelectedCandidateId}:undefined;
   if(globalSelection&&plan.intent.action==='OPEN'&&(!globalSelection.globalCycleId||!globalSelection.selectedCandidateId||globalSelection.selectedCandidateId!==plan.intent.candidateId))throw new Error('LPFORGE_GLOBAL_SELECTION_PROVENANCE_MISMATCH');
