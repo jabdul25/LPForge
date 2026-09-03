@@ -7,7 +7,7 @@ const approval=(action)=>({approvalId:`a-${action}`,action,operatorId:'operator-
 
 test('P7-02 defaults to observe-only with no production authority or scaling',()=>{
   const c=loadPhase7ControlConfig({});
-  assert.deepEqual(c,{mode:'OBSERVE_ONLY',productionAuthorityRequested:false,scalingMode:'DISABLED',automaticPolicyPromotion:false,authorityTtlMs:60000});
+  assert.deepEqual(c,{mode:'OBSERVE_ONLY',productionAuthorityRequested:false,scalingMode:'DISABLED',automaticPolicyPromotion:false,authorityTtlMs:60000,boundedUnattendedProduction:false});
   const a=resolvePhase7Authority({config:c,now});
   const caps=phase7CapabilityModel(a);
   assert.equal(a.productionAuthorityIssued,false);assert.equal(caps.directSigner,false);assert.equal(caps.directTransactionSend,false);
@@ -33,6 +33,17 @@ test('P7-02 production envelope is explicit, expiring, and still has no direct s
   assert.equal(a.productionAuthorityIssued,true);
   assert.equal(a.expiresAt,'2026-08-13T00:12:00.000Z');
   const caps=phase7CapabilityModel(a);assert.equal(caps.directSigner,false);assert.equal(caps.directTransactionSend,false);assert.equal(caps.automaticPolicyPromotion,false);
+});
+
+test('P7-02 bounded unattended Production is explicit, non-expiring, and does not need a temporary approval',()=>{
+  const c=loadPhase7ControlConfig({LPFORGE_P7_MODE:'PRODUCTION',LPFORGE_P7_PRODUCTION_AUTHORITY:'true',LPFORGE_P7_SCALING_MODE:'DISABLED',LPFORGE_BOUNDED_UNATTENDED_PRODUCTION:'true'});
+  const a=resolvePhase7Authority({config:c,now});
+  assert.equal(a.authorityKind,'BOUNDED_UNATTENDED_PRODUCTION');
+  assert.equal(a.expiresAt,null);
+  assert.equal(a.approvalId,null);
+  assert.equal(a.productionAuthorityIssued,true);
+  assert.throws(()=>loadPhase7ControlConfig({LPFORGE_P7_MODE:'LIMITED_LIVE',LPFORGE_BOUNDED_UNATTENDED_PRODUCTION:'true'}),/BOUNDED_UNATTENDED_PRODUCTION_CONFIG/);
+  assert.throws(()=>loadPhase7ControlConfig({LPFORGE_P7_MODE:'PRODUCTION',LPFORGE_P7_PRODUCTION_AUTHORITY:'true',LPFORGE_P7_SCALING_MODE:'POLICY_BOUNDED',LPFORGE_BOUNDED_UNATTENDED_PRODUCTION:'true'}),/BOUNDED_UNATTENDED_PRODUCTION_CONFIG/);
 });
 
 test('P7-02 global capability declaration remains default deny',()=>{

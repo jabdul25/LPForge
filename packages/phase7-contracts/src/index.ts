@@ -2,6 +2,13 @@
 export type Phase7GateStatus='PASS'|'HOLD'|'BLOCK';
 export type Phase7OperationalMode='OBSERVE_ONLY'|'LIMITED_LIVE'|'PRODUCTION';
 export type Phase7ScalingMode='DISABLED'|'OPERATOR_STEP'|'POLICY_BOUNDED';
+/**
+ * TEMPORARY authorities always carry an expiring operator approval.  The
+ * bounded unattended variant is deliberately separate: it is allowed only for
+ * the already bounded Production path and remains subject to every runtime
+ * safety, portfolio, freshness, simulation, and reconciliation gate.
+ */
+export type Phase7AuthorityKind='TEMPORARY'|'BOUNDED_UNATTENDED_PRODUCTION';
 export type Phase7ControlAction=
   |'PAUSE_ENTRIES'
   |'PAUSE_ALL_WRITES'
@@ -17,8 +24,9 @@ export interface Phase7Authority {
   phase:'P7';
   cluster:'mainnet-beta';
   mode:Phase7OperationalMode;
+  authorityKind:Phase7AuthorityKind;
   issuedAt:string;
-  expiresAt:string;
+  expiresAt:string|null;
   approvalId:string|null;
   productionAuthorityIssued:boolean;
   scalingMode:Phase7ScalingMode;
@@ -52,7 +60,15 @@ export interface Phase7ManualApproval {
 
 export function assertPhase7Authority(authority:Phase7Authority,now:string):void {
   if(authority.phase!=='P7'||authority.cluster!=='mainnet-beta') throw new Error('LPFORGE_P7_AUTHORITY_CLUSTER');
-  if(Date.parse(authority.expiresAt)<=Date.parse(now)) throw new Error('LPFORGE_P7_AUTHORITY_EXPIRED');
+  const boundedUnattended=authority.authorityKind==='BOUNDED_UNATTENDED_PRODUCTION';
+  if(boundedUnattended){
+    if(authority.mode!=='PRODUCTION'||!authority.productionAuthorityIssued)throw new Error('LPFORGE_P7_UNATTENDED_PRODUCTION_AUTHORITY_REQUIRED');
+    if(authority.expiresAt!==null)throw new Error('LPFORGE_P7_UNATTENDED_AUTHORITY_MUST_NOT_EXPIRE');
+    if(authority.approvalId!==null)throw new Error('LPFORGE_P7_UNATTENDED_AUTHORITY_MUST_NOT_BIND_TEMPORARY_APPROVAL');
+    if(authority.scalingMode!=='DISABLED')throw new Error('LPFORGE_P7_UNATTENDED_SCALING_FORBIDDEN');
+  }else{
+    if(typeof authority.expiresAt!=='string'||Date.parse(authority.expiresAt)<=Date.parse(now)) throw new Error('LPFORGE_P7_AUTHORITY_EXPIRED');
+  }
   if(authority.automaticPolicyPromotion!==false) throw new Error('LPFORGE_P7_AUTOMATIC_POLICY_PROMOTION_FORBIDDEN');
   if(authority.mode==='OBSERVE_ONLY'){
     if(authority.productionAuthorityIssued) throw new Error('LPFORGE_P7_OBSERVE_PRODUCTION_AUTHORITY_FORBIDDEN');
@@ -64,7 +80,7 @@ export function assertPhase7Authority(authority:Phase7Authority,now:string):void
     if(authority.scalingMode==='POLICY_BOUNDED') throw new Error('LPFORGE_P7_LIMITED_LIVE_POLICY_SCALING_FORBIDDEN');
   }
   if(authority.mode==='PRODUCTION'){
-    if(!authority.approvalId) throw new Error('LPFORGE_P7_PRODUCTION_APPROVAL_REQUIRED');
+    if(!boundedUnattended&&!authority.approvalId) throw new Error('LPFORGE_P7_PRODUCTION_APPROVAL_REQUIRED');
     if(!authority.productionAuthorityIssued) throw new Error('LPFORGE_P7_PRODUCTION_AUTHORITY_REQUIRED');
   }
 }
@@ -75,6 +91,7 @@ export function issuePhase7ObserveAuthority(input:{now:string;ttlMs:number;reaso
     phase:'P7',
     cluster:'mainnet-beta',
     mode:'OBSERVE_ONLY',
+    authorityKind:'TEMPORARY',
     issuedAt:input.now,
     expiresAt:new Date(Date.parse(input.now)+input.ttlMs).toISOString(),
     approvalId:null,
