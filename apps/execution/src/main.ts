@@ -227,7 +227,7 @@ async function dispatchOne() {
       ),
       [owned,productionCandidates] = await Promise.all([
         store.loadOwnedPositions(plan.ownerAddress),
-        store.listDiscoveryCandidates([...(staticPolicy.productionAdmission?.eligibleTiers??['A'])]),
+        store.listDiscoveryCandidates(['A','B','C','COOLDOWN','REJECTED','QUARANTINED']),
       ]),
       config = {
         ...baseConfig,
@@ -235,7 +235,7 @@ async function dispatchOne() {
           staticPolicy.positionConstruction?.liquiditySlippageBps ?? 0,
       };
     const now=new Date().toISOString(), dayStart=new Date(Date.UTC(new Date(now).getUTCFullYear(),new Date(now).getUTCMonth(),new Date(now).getUTCDate())).toISOString(),runtimeId=(process.env.LPFORGE_P7_RUNTIME_ID??'lpforge-production').trim(),provenance=object(object(plan.planPayload).provenance),binding=object(provenance.phase7Control),globalSelection=object(provenance.globalSelection),boundControlDecisionId=String(binding.decisionId??''),globalCycleId=String(globalSelection.globalCycleId??''),globalCandidateId=String(globalSelection.selectedCandidateId??'');
-    const [controlRow,actionsToday,portfolioFacts,boundControlRow,globalWinnerVerified]=await Promise.all([store.loadLatestPhase7ControlDecision(runtimeId),store.countExecutionActionsSince(plan.ownerAddress,dayStart),store.loadPhase7PortfolioFacts(plan.ownerAddress),boundControlDecisionId?store.loadPhase7ControlDecision(runtimeId,boundControlDecisionId):Promise.resolve(undefined),globalCycleId&&globalCandidateId?store.verifyProductionGlobalWinnerAdmission({globalCycleId,poolAddress:plan.poolAddress,candidateId:globalCandidateId,now}):Promise.resolve(false)]);
+    const [controlRow,actionsToday,portfolioFacts,boundControlRow,globalWinnerAdmission]=await Promise.all([store.loadLatestPhase7ControlDecision(runtimeId),store.countExecutionActionsSince(plan.ownerAddress,dayStart),store.loadPhase7PortfolioFacts(plan.ownerAddress),boundControlDecisionId?store.loadPhase7ControlDecision(runtimeId,boundControlDecisionId):Promise.resolve(undefined),globalCycleId&&globalCandidateId?store.verifyProductionGlobalWinnerAdmission({globalCycleId,poolAddress:plan.poolAddress,candidateId:globalCandidateId,now}):Promise.resolve(undefined)]);
     const phase7Control=phase7ExecutionControlFromRow(controlRow),boundPhase7Control=phase7ExecutionControlFromRow(boundControlRow);
     const provenanceSecret=(process.env.LPFORGE_PLAN_PROVENANCE_SECRET??'').trim();
     let positionTruth;
@@ -256,7 +256,7 @@ async function dispatchOne() {
       policy: staticPolicy,
       ownedPositions: owned,
       productionCandidates,
-      ...(globalCycleId&&globalCandidateId?{globalWinnerAdmission:{globalCycleId,poolAddress:plan.poolAddress,candidateId:globalCandidateId,verified:globalWinnerVerified}}:{}),
+      ...(globalWinnerAdmission?{globalWinnerAdmission:{...globalWinnerAdmission,verified:true}}:{}),
       ...(phase7Control?{phase7Control}:{}),
       ...(boundPhase7Control?{boundPhase7Control}:{}),
       actionsToday,

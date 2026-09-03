@@ -8,7 +8,7 @@ export interface ClaimGuardResult {
   capitalLamports: bigint;
 }
 export interface ProductionAdmissionCandidate {poolAddress:string;state:string;tier:string;lastSeenAt:string;tokenYMint?:string|undefined;pairedTokenMint?:string|undefined;}
-export interface VerifiedGlobalWinnerAdmission {globalCycleId:string;poolAddress:string;candidateId:string;verified:boolean;}
+export interface VerifiedGlobalWinnerAdmission {globalCycleId:string;poolAddress:string;candidateId:string;selectionTier:string;selectionState:string;selectionDynamicEligible:boolean;verified:boolean;}
 const WSOL_MINT='So11111111111111111111111111111111111111112';
 export interface Phase7ExecutionControl {decisionId?:string;cycleKey?:string;authorityMode:string;healthStatus:string;driftStatus:string;safetyMode:string;newEconomicActionAllowed:boolean;observedAt:string;poolDrift?:Record<string,string>;activeIncidentIds?:string[];releaseIntegrityValid?:boolean;portfolioValid?:boolean;revokedApprovalIds?:string[];}
 /** Canonical projection used by both claim-time and execution-time P7 checks. */
@@ -51,8 +51,9 @@ function isRiskIncreasingAction(action: string) {
 }
 function verifiedGlobalWinnerAdmission(input:{plan:AutonomousPlan;admission:VerifiedGlobalWinnerAdmission|undefined}){
  const provenance=record(record(input.plan.planPayload).provenance),selection=record(provenance.globalSelection),intent=record(input.plan.planPayload.intent),admission=input.admission;
- return Boolean(admission?.verified&&equals(selection.globalCycleId,admission.globalCycleId)&&equals(selection.selectedCandidateId,admission.candidateId)&&equals(intent.candidateId,admission.candidateId)&&equals(input.plan.poolAddress,admission.poolAddress));
+ return Boolean(admission?.verified&&admission.selectionTier==='A'&&admission.selectionDynamicEligible===true&&equals(selection.globalCycleId,admission.globalCycleId)&&equals(selection.selectedCandidateId,admission.candidateId)&&equals(intent.candidateId,admission.candidateId)&&equals(input.plan.poolAddress,admission.poolAddress));
 }
+function currentHardDiscoveryDisqualification(candidate:ProductionAdmissionCandidate|undefined){return Boolean(candidate&&(['REJECTED','QUARANTINED','OBSERVING'].includes(candidate.state)||['REJECTED','QUARANTINED'].includes(candidate.tier)));}
 function policyPoolForPlan(input:{plan:AutonomousPlan;policy:MainnetCanaryDeploymentPolicy;productionCandidates:ProductionAdmissionCandidate[];globalWinnerAdmission?:VerifiedGlobalWinnerAdmission;now:string;controlledCanary:boolean},reasons:string[]){
  // A static policy pool is a bounded canary/healthcheck identity, not a
  // general new-entry admission.  Ordinary risk-increasing plans, including
@@ -63,9 +64,12 @@ function policyPoolForPlan(input:{plan:AutonomousPlan;policy:MainnetCanaryDeploy
  const admission=input.policy.productionAdmission;
  if(!admission?.enabled){reasons.push('P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return undefined;}
  const candidate=input.productionCandidates.find(x=>x.poolAddress===input.plan.poolAddress),age=candidate?Date.parse(input.now)-Date.parse(candidate.lastSeenAt):NaN,
-   activeEconomicLease=candidate?.state==='ACTIVE_CANDIDATE',
-   globallyAdmittedTransition=Boolean(candidate&&['QUALIFIED','PREFILTERED'].includes(candidate.state)&&verifiedGlobalWinnerAdmission({plan:input.plan,admission:input.globalWinnerAdmission}));
- if(!candidate||(!activeEconomicLease&&!globallyAdmittedTransition)||!admission.eligibleTiers.includes(candidate.tier as 'A'|'B'|'C')||!Number.isFinite(age)||age<0||age>admission.maxCandidateAgeMs||input.productionCandidates.indexOf(candidate)>=admission.maxCandidates){reasons.push('P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return undefined;}
+   activeEconomicLease=candidate?.state==='ACTIVE_CANDIDATE'&&admission.eligibleTiers.includes(candidate.tier as 'A'|'B'|'C')&&input.productionCandidates.indexOf(candidate)>=0&&input.productionCandidates.indexOf(candidate)<admission.maxCandidates,
+   selectionBoundWinner=verifiedGlobalWinnerAdmission({plan:input.plan,admission:input.globalWinnerAdmission});
+ // A current Tier-B/PREFILTERED rank is mutable ranking/lease drift. It
+ // cannot revoke the exact, fresh Tier-A winner snapshot. Terminal and stale
+ // discovery facts remain current hard disqualifiers at the signing boundary.
+ if(!candidate||(!activeEconomicLease&&!selectionBoundWinner)||currentHardDiscoveryDisqualification(candidate)||!Number.isFinite(age)||age<0||age>admission.maxCandidateAgeMs){reasons.push('P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return undefined;}
  if(candidate.tokenYMint!==WSOL_MINT){reasons.push('P6_PRODUCTION_REQUIRES_WSOL_TOKEN_Y');return undefined;}
  return{address:candidate.poolAddress,maxCapitalLamports:admission.maxCapitalLamports,maxOpenPositions:admission.maxOpenPositions};
 }

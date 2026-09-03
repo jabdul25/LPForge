@@ -57,7 +57,7 @@ test('wallet token balances join the NAV through the same pool price feed',()=>{
 test('owned positions remain mandatory management/drift targets without bypassing dynamic new-entry admission',()=>{
   const src=fs.readFileSync(production,'utf8');
   assert.match(src,/productionManagementPoolAddresses\(input\.env,\[\.\.\.openPools\]\)/,'owned positions remain in the management/drift universe');
-  assert.match(src,/getProductionNewEntryEligiblePools\(input\.store,input\.env,input\.cycleKey\)/,'new-entry evaluation remains dynamically admitted');
+  assert.match(src,/getProductionNewEntryAdmissionSnapshots\(input\.store,input\.env,input\.cycleKey\)/,'new-entry evaluation remains dynamically admitted through a frozen Tier-A selection snapshot');
   assert.match(src,/eligiblePoolAddresses:newEntryPoolAddresses/,'owned pools cannot be injected into global new-entry ranking merely by lifecycle state');
 });
 

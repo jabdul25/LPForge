@@ -836,9 +836,9 @@ export interface Phase1Store {
   insertProductionGlobalCandidate(value:{globalCycleId:string;poolAddress:string;operationalCycleId:string;observedAt:string;operationalState:'ENTRY_READY'|'NO_TRADE'|'WARMING'|'REJECTED';phase4State:string;recommendationId?:string;thesisId?:string;candidateId?:string;strategy?:string;orientation?:string;lowerBinId?:number;upperBinId?:number;activeBinId?:number;capitalValue?:number;horizonMinutes?:number;predictedGrossFees?:number;predictedInventoryPnl?:number;predictedNetEv?:number;riskAdjustedExpectedNetEv?:number;uncertainty?:number;confidence?:number;oorRisk?:number;eventPathEvidenceAt?:string;feeEvidenceAt?:string;volumeEvidenceAt?:string;tvl?:number;feeTvl1h?:number;feeTvl24h?:number;reasonCodes:string[];evidence:Record<string,unknown>;payload:Record<string,unknown>}):Promise<void>;
   loadProductionGlobalCandidateFacts(globalCycleId:string,poolAddresses:string[]):Promise<Array<Record<string,unknown>>>;
   /** Verifies an exact, fresh canonical global-winner binding for Phase-6 claim admission. */
-  verifyProductionGlobalWinnerAdmission(value:{globalCycleId:string;poolAddress:string;candidateId:string;now:string}):Promise<boolean>;
+  verifyProductionGlobalWinnerAdmission(value:{globalCycleId:string;poolAddress:string;candidateId:string;now:string}):Promise<{globalCycleId:string;poolAddress:string;candidateId:string;selectionTier:string;selectionState:string;selectionDynamicEligible:boolean}|undefined>;
   loadProductionPoolSettlementHistory(poolAddresses:string[],decisionCutoff:string):Promise<Array<Record<string,unknown>>>;
-  insertProductionGlobalSelection(value:{globalCycleId:string;policyVersion:string;reentryContextPolicyVersion:string;decisionCutoff:string;startedAt:string;completedAt:string;eligiblePoolCount:number;evaluatedPoolCount:number;candidatePoolCount:number;coverageState:string;outcome:string;winnerPoolAddress?:string;winnerCandidateId?:string;runnerUpPoolAddress?:string;rankingMetric:string;crossPoolMetricsComparable:boolean;reasonCodes:string[];sourceCommit?:string;buildId?:string;payload:Record<string,unknown>;candidates:Array<{poolAddress:string;evaluationOrder:number;candidateRank?:number;candidateState:string;recommendationId?:string;thesisId?:string;candidateId?:string;strategy?:string;orientation?:string;lowerBinId?:number;upperBinId?:number;activeBinId?:number;riskAdjustedExpectedNetEv?:number;predictedFees?:number;predictedInventoryPnl?:number;capitalValue?:number;horizonMinutes?:number;decisionAt?:string;expiresAt?:string;phase3State?:string;phase4State?:string;reasonCodes:string[];historyContext:Record<string,unknown>;payload:Record<string,unknown>}>}):Promise<void>;
+  insertProductionGlobalSelection(value:{globalCycleId:string;policyVersion:string;reentryContextPolicyVersion:string;decisionCutoff:string;startedAt:string;completedAt:string;eligiblePoolCount:number;evaluatedPoolCount:number;candidatePoolCount:number;coverageState:string;outcome:string;winnerPoolAddress?:string;winnerCandidateId?:string;runnerUpPoolAddress?:string;rankingMetric:string;crossPoolMetricsComparable:boolean;reasonCodes:string[];sourceCommit?:string;buildId?:string;payload:Record<string,unknown>;candidates:Array<{poolAddress:string;evaluationOrder:number;candidateRank?:number;candidateState:string;selectionTier?:string;selectionState?:string;selectionDynamicEligible?:boolean;recommendationId?:string;thesisId?:string;candidateId?:string;strategy?:string;orientation?:string;lowerBinId?:number;upperBinId?:number;activeBinId?:number;riskAdjustedExpectedNetEv?:number;predictedFees?:number;predictedInventoryPnl?:number;capitalValue?:number;horizonMinutes?:number;decisionAt?:string;expiresAt?:string;phase3State?:string;phase4State?:string;reasonCodes:string[];historyContext:Record<string,unknown>;payload:Record<string,unknown>}>}):Promise<void>;
   /** Shadow-only Phase-3 forward-validation capture. It has no authority path. */
   /** RESET-3C append-only full-universe evidence. It is never read by authority paths. */
   insertReset3cValidationUniverse(value:{recommendationId:string;decisionId:string;decisionAt:string;samplingContractVersion:string;storageContractVersion:string;capitalLamports:string;expectedCandidateCount:number;capturedCandidateCount:number;universeComplete:boolean;universeManifestHash:string;detailedCandidateCount:number;outcomeEligibleCandidateCount:number;detailedCandidateIds:string[];selectionManifest:Record<string,unknown>;detailedSelectionManifestHash:string;census:Record<string,unknown>;sharedEvidenceHash:string;temporarySharedEvidence:Record<string,unknown>;contentHash:string;}):Promise<'INSERTED'|'IDEMPOTENT'>;
@@ -2459,7 +2459,7 @@ export async function createPostgresStore(
       return r.rows as Array<Record<string,unknown>>;
     },
     async verifyProductionGlobalWinnerAdmission(v) {
-      const r=await db.query(`SELECT 1
+      const r=await db.query(`SELECT candidate.selection_tier,candidate.selection_state,candidate.selection_dynamic_eligible
         FROM execution.production_global_selection_cycles cycle
         JOIN execution.production_global_pool_candidates candidate
           ON candidate.global_cycle_id=cycle.global_cycle_id
@@ -2472,9 +2472,12 @@ export async function createPostgresStore(
           AND candidate.candidate_id=$3
           AND candidate.candidate_state='INCLUDED'
           AND candidate.phase3_state='ENTRY_READY'
+          AND candidate.selection_tier='A'
+          AND candidate.selection_dynamic_eligible=true
           AND (candidate.expires_at IS NULL OR candidate.expires_at>$4::timestamptz)
         LIMIT 1`,[v.globalCycleId,v.poolAddress,v.candidateId,v.now]);
-      return r.rows.length===1;
+      const row=r.rows[0];
+      return row?{globalCycleId:v.globalCycleId,poolAddress:v.poolAddress,candidateId:v.candidateId,selectionTier:String(row.selection_tier),selectionState:String(row.selection_state),selectionDynamicEligible:Boolean(row.selection_dynamic_eligible)}:undefined;
     },
     async loadProductionPoolSettlementHistory(poolAddresses,decisionCutoff) {
       if(!poolAddresses.length)return [];
@@ -2497,7 +2500,7 @@ export async function createPostgresStore(
       await db.query('BEGIN');
       try{
         await db.query(`INSERT INTO execution.production_global_selection_cycles(global_cycle_id,policy_version,reentry_context_policy_version,decision_cutoff,started_at,completed_at,eligible_pool_count,evaluated_pool_count,candidate_pool_count,coverage_state,outcome,winner_pool_address,winner_candidate_id,runner_up_pool_address,ranking_metric,cross_pool_metrics_comparable,reason_codes,source_commit,build_id,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,$18,$19,$20::jsonb) ON CONFLICT(global_cycle_id) DO NOTHING`,[v.globalCycleId,v.policyVersion,v.reentryContextPolicyVersion,v.decisionCutoff,v.startedAt,v.completedAt,v.eligiblePoolCount,v.evaluatedPoolCount,v.candidatePoolCount,v.coverageState,v.outcome,v.winnerPoolAddress??null,v.winnerCandidateId??null,v.runnerUpPoolAddress??null,v.rankingMetric,v.crossPoolMetricsComparable,json(v.reasonCodes),v.sourceCommit??null,v.buildId??null,json(v.payload)]);
-        for(const c of v.candidates)await db.query(`INSERT INTO execution.production_global_pool_candidates(global_cycle_id,pool_address,evaluation_order,candidate_rank,candidate_state,recommendation_id,thesis_id,candidate_id,strategy,orientation,lower_bin_id,upper_bin_id,active_bin_id,risk_adjusted_expected_net_ev,predicted_fees,predicted_inventory_pnl,capital_value,horizon_minutes,decision_at,expires_at,phase3_state,phase4_state,reason_codes,history_context,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23::jsonb,$24::jsonb,$25::jsonb) ON CONFLICT(global_cycle_id,pool_address) DO NOTHING`,[v.globalCycleId,c.poolAddress,c.evaluationOrder,c.candidateRank??null,c.candidateState,c.recommendationId??null,c.thesisId??null,c.candidateId??null,c.strategy??null,c.orientation??null,c.lowerBinId??null,c.upperBinId??null,c.activeBinId??null,c.riskAdjustedExpectedNetEv??null,c.predictedFees??null,c.predictedInventoryPnl??null,c.capitalValue??null,c.horizonMinutes??null,c.decisionAt??null,c.expiresAt??null,c.phase3State??null,c.phase4State??null,json(c.reasonCodes),json(c.historyContext),json(c.payload)]);
+        for(const c of v.candidates)await db.query(`INSERT INTO execution.production_global_pool_candidates(global_cycle_id,pool_address,evaluation_order,candidate_rank,candidate_state,selection_tier,selection_state,selection_dynamic_eligible,recommendation_id,thesis_id,candidate_id,strategy,orientation,lower_bin_id,upper_bin_id,active_bin_id,risk_adjusted_expected_net_ev,predicted_fees,predicted_inventory_pnl,capital_value,horizon_minutes,decision_at,expires_at,phase3_state,phase4_state,reason_codes,history_context,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26::jsonb,$27::jsonb,$28::jsonb) ON CONFLICT(global_cycle_id,pool_address) DO NOTHING`,[v.globalCycleId,c.poolAddress,c.evaluationOrder,c.candidateRank??null,c.candidateState,c.selectionTier??null,c.selectionState??null,c.selectionDynamicEligible??false,c.recommendationId??null,c.thesisId??null,c.candidateId??null,c.strategy??null,c.orientation??null,c.lowerBinId??null,c.upperBinId??null,c.activeBinId??null,c.riskAdjustedExpectedNetEv??null,c.predictedFees??null,c.predictedInventoryPnl??null,c.capitalValue??null,c.horizonMinutes??null,c.decisionAt??null,c.expiresAt??null,c.phase3State??null,c.phase4State??null,json(c.reasonCodes),json(c.historyContext),json(c.payload)]);
         await db.query('COMMIT');
       }catch(error){await db.query('ROLLBACK');throw error;}
     },
@@ -4595,7 +4598,7 @@ export function createMemoryStore(): Phase1Store {
     async loadShadowRecommendationPayload() { return undefined; },
     async insertProductionGlobalCandidate() {},
     async loadProductionGlobalCandidateFacts() { return []; },
-    async verifyProductionGlobalWinnerAdmission() { return false; },
+    async verifyProductionGlobalWinnerAdmission() { return undefined; },
     async loadProductionPoolSettlementHistory() { return []; },
     async insertProductionGlobalSelection() {},
     async insertReset3cValidationUniverse() { return 'INSERTED' as const; },

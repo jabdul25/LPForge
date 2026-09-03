@@ -32,7 +32,7 @@ test('drift reads lagged decoder telemetry from the prior evidence snapshot, fal
 
 test('drift retains management/health visibility while the Production selector evaluates its bounded dynamic fair set',()=>{
   const src=fs.readFileSync(production,'utf8');
-  assert.match(src,/const newEntryPoolAddresses=await getProductionNewEntryEligiblePools\(input\.store,input\.env,input\.cycleKey\),managementPoolAddresses=productionManagementPoolAddresses\(input\.env,\[\.\.\.openPools\]\),driftPoolAddresses=\[\.\.\.new Set\(\[input\.cfg\.smokePoolAddress,\.\.\.managementPoolAddresses,\.\.\.newEntryPoolAddresses\]\)\];/,'dynamic new-entry eligibility is isolated from owned/static management visibility');
+  assert.match(src,/const newEntryAdmissionSnapshots=await getProductionNewEntryAdmissionSnapshots\(input\.store,input\.env,input\.cycleKey\),newEntryPoolAddresses=newEntryAdmissionSnapshots\.map\(snapshot=>snapshot\.poolAddress\),managementPoolAddresses=productionManagementPoolAddresses\(input\.env,\[\.\.\.openPools\]\),driftPoolAddresses=\[\.\.\.new Set\(\[input\.cfg\.smokePoolAddress,\.\.\.managementPoolAddresses,\.\.\.newEntryPoolAddresses\]\)\];/,'dynamic new-entry eligibility is isolated from owned/static management visibility and frozen before selection');
   assert.ok(src.includes('runProductionGlobalSelectionCycle'),'the immutable universe is passed to the canonical global selector');
   assert.ok(src.includes('fairProductionPoolOrder'),'the selector has deterministic fair rotation rather than a static first pool');
   assert.ok(src.includes('significant:poolAddress===input.cfg.smokePoolAddress||capitalPools.has(poolAddress)||openPools.has(poolAddress)'),'smoke pool, deployed capital and open positions are the significance criteria');
