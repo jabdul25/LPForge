@@ -8,6 +8,7 @@ export interface ClaimGuardResult {
   capitalLamports: bigint;
 }
 export interface ProductionAdmissionCandidate {poolAddress:string;state:string;tier:string;lastSeenAt:string;tokenYMint?:string|undefined;pairedTokenMint?:string|undefined;}
+export interface VerifiedGlobalWinnerAdmission {globalCycleId:string;poolAddress:string;candidateId:string;verified:boolean;}
 const WSOL_MINT='So11111111111111111111111111111111111111112';
 export interface Phase7ExecutionControl {decisionId?:string;cycleKey?:string;authorityMode:string;healthStatus:string;driftStatus:string;safetyMode:string;newEconomicActionAllowed:boolean;observedAt:string;poolDrift?:Record<string,string>;activeIncidentIds?:string[];releaseIntegrityValid?:boolean;portfolioValid?:boolean;revokedApprovalIds?:string[];}
 /** Canonical projection used by both claim-time and execution-time P7 checks. */
@@ -48,7 +49,11 @@ function capital(plan: AutonomousPlan) {
 function isRiskIncreasingAction(action: string) {
   return ["OPEN", "ADD", "RESHAPE", "REBALANCE"].includes(action);
 }
-function policyPoolForPlan(input:{plan:AutonomousPlan;policy:MainnetCanaryDeploymentPolicy;productionCandidates:ProductionAdmissionCandidate[];now:string;controlledCanary:boolean},reasons:string[]){
+function verifiedGlobalWinnerAdmission(input:{plan:AutonomousPlan;admission:VerifiedGlobalWinnerAdmission|undefined}){
+ const provenance=record(record(input.plan.planPayload).provenance),selection=record(provenance.globalSelection),intent=record(input.plan.planPayload.intent),admission=input.admission;
+ return Boolean(admission?.verified&&equals(selection.globalCycleId,admission.globalCycleId)&&equals(selection.selectedCandidateId,admission.candidateId)&&equals(intent.candidateId,admission.candidateId)&&equals(input.plan.poolAddress,admission.poolAddress));
+}
+function policyPoolForPlan(input:{plan:AutonomousPlan;policy:MainnetCanaryDeploymentPolicy;productionCandidates:ProductionAdmissionCandidate[];globalWinnerAdmission?:VerifiedGlobalWinnerAdmission;now:string;controlledCanary:boolean},reasons:string[]){
  // A static policy pool is a bounded canary/healthcheck identity, not a
  // general new-entry admission.  Ordinary risk-increasing plans, including
  // plans targeting a listed pool, must prove the same fresh dynamic admission
@@ -57,8 +62,10 @@ function policyPoolForPlan(input:{plan:AutonomousPlan;policy:MainnetCanaryDeploy
  const staticPool=input.policy.pools.find(x=>x.address===input.plan.poolAddress);if(input.controlledCanary&&staticPool)return staticPool;
  const admission=input.policy.productionAdmission;
  if(!admission?.enabled){reasons.push('P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return undefined;}
- const candidate=input.productionCandidates.find(x=>x.poolAddress===input.plan.poolAddress),age=candidate?Date.parse(input.now)-Date.parse(candidate.lastSeenAt):NaN;
- if(!candidate||candidate.state!=='ACTIVE_CANDIDATE'||!admission.eligibleTiers.includes(candidate.tier as 'A'|'B'|'C')||!Number.isFinite(age)||age<0||age>admission.maxCandidateAgeMs||input.productionCandidates.indexOf(candidate)>=admission.maxCandidates){reasons.push('P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return undefined;}
+ const candidate=input.productionCandidates.find(x=>x.poolAddress===input.plan.poolAddress),age=candidate?Date.parse(input.now)-Date.parse(candidate.lastSeenAt):NaN,
+   activeEconomicLease=candidate?.state==='ACTIVE_CANDIDATE',
+   globallyAdmittedTransition=Boolean(candidate&&['QUALIFIED','PREFILTERED'].includes(candidate.state)&&verifiedGlobalWinnerAdmission({plan:input.plan,admission:input.globalWinnerAdmission}));
+ if(!candidate||(!activeEconomicLease&&!globallyAdmittedTransition)||!admission.eligibleTiers.includes(candidate.tier as 'A'|'B'|'C')||!Number.isFinite(age)||age<0||age>admission.maxCandidateAgeMs||input.productionCandidates.indexOf(candidate)>=admission.maxCandidates){reasons.push('P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return undefined;}
  if(candidate.tokenYMint!==WSOL_MINT){reasons.push('P6_PRODUCTION_REQUIRES_WSOL_TOKEN_Y');return undefined;}
  return{address:candidate.poolAddress,maxCapitalLamports:admission.maxCapitalLamports,maxOpenPositions:admission.maxOpenPositions};
 }
@@ -104,6 +111,8 @@ export function validateClaimedPlan(input: {
   ownedPositions: Record<string, unknown>[];
   positionTruth?: { owner: string; pool: string };
   productionCandidates?: ProductionAdmissionCandidate[];
+  /** Exact database-verified global-winner binding; this does not admit a static pool. */
+  globalWinnerAdmission?:VerifiedGlobalWinnerAdmission;
   phase7Control?:Phase7ExecutionControl;
   /** The immutable P7 control that the authenticated canary plan binds. */
   boundPhase7Control?:Phase7ExecutionControl;
@@ -122,7 +131,7 @@ export function validateClaimedPlan(input: {
     provenance = record(record(p.planPayload).provenance),
     riskIncreasing = isRiskIncreasingAction(p.action),
     policyPool = riskIncreasing
-      ? policyPoolForPlan({plan:p,policy:input.policy,productionCandidates:input.productionCandidates??[],now:input.now??new Date().toISOString(),controlledCanary:Boolean(input.controlledCanary)},reasons)
+      ? policyPoolForPlan({plan:p,policy:input.policy,productionCandidates:input.productionCandidates??[],...(input.globalWinnerAdmission?{globalWinnerAdmission:input.globalWinnerAdmission}:{}),now:input.now??new Date().toISOString(),controlledCanary:Boolean(input.controlledCanary)},reasons)
       : undefined;
   if (
     provenance.producer !== "LPFORGE_PRODUCTION" ||
