@@ -41,6 +41,101 @@ export function executionPlanCountsAsPendingForPortfolio(state: string): boolean
 }
 
 /**
+ * Continuity tracking is deliberately bounded.  When its slots contend, the
+ * selection must favour the pool most likely to complete the already-required
+ * live-confirmation episode, rather than the pool that happened to enter the
+ * tracker first.  This is scheduling only: it grants neither entry authority
+ * nor an exception to the confirmation contract.
+ */
+export interface ContinuityMaturityPriorityInput {
+  poolAddress: string;
+  observedAt: string;
+  liveObservationTimes: readonly string[];
+  trackingStartedAt?: string;
+  tierARank?: number;
+  candidateUtility?: number;
+  candidateReadiness?: number;
+  confirmationWindowMs?: number;
+  minimumObservations?: number;
+  maximumGapMs?: number;
+}
+
+export interface ContinuityMaturityPriority {
+  poolAddress: string;
+  confirmationRemainingMs: number;
+  validObservationCount: number;
+  validObservationSpanMs: number;
+  anchorPresent: boolean;
+  tierARank: number;
+  candidateUtility: number;
+  candidateReadiness: number;
+  trackingStartedAtMs: number;
+}
+
+export function continuityMaturityPriority(input: ContinuityMaturityPriorityInput): ContinuityMaturityPriority {
+  const now = Date.parse(input.observedAt);
+  const confirmationWindowMs = Math.max(1, Math.floor(input.confirmationWindowMs ?? 10 * 60_000));
+  const minimumObservations = Math.max(1, Math.floor(input.minimumObservations ?? 4));
+  const maximumGapMs = Math.max(1, Math.floor(input.maximumGapMs ?? 450_000));
+  const observations = input.liveObservationTimes
+    .map((value) => Date.parse(value))
+    .filter((value) => Number.isFinite(value) && value <= now && value >= now - confirmationWindowMs - maximumGapMs)
+    .sort((a, b) => a - b);
+  const latest = observations.at(-1);
+  const currentEpisode = latest === undefined || now - latest > maximumGapMs
+    ? []
+    : observations.reduce<number[]>((episode, value) => {
+        if (!episode.length || value - episode.at(-1)! <= maximumGapMs) episode.push(value);
+        else {
+          episode.length = 0;
+          episode.push(value);
+        }
+        return episode;
+      }, []);
+  const first = currentEpisode[0];
+  const last = currentEpisode.at(-1);
+  const validObservationCount = currentEpisode.length;
+  const validObservationSpanMs = first === undefined || last === undefined ? 0 : Math.max(0, last - first);
+  const anchorPresent = first !== undefined
+    && last !== undefined
+    && validObservationCount >= minimumObservations
+    && now - first >= confirmationWindowMs
+    && now - last <= maximumGapMs;
+  return {
+    poolAddress: input.poolAddress,
+    // A non-current episode is deliberately least preferred: retaining it
+    // cannot repair the already-broken confirmation window.
+    confirmationRemainingMs: first === undefined || last === undefined || now - last > maximumGapMs
+      ? Number.POSITIVE_INFINITY
+      : Math.max(0, confirmationWindowMs - (now - first)),
+    validObservationCount,
+    validObservationSpanMs,
+    anchorPresent,
+    tierARank: Number.isFinite(input.tierARank) ? Math.max(0, Math.floor(input.tierARank!)) : Number.MAX_SAFE_INTEGER,
+    candidateUtility: Number.isFinite(input.candidateUtility) ? input.candidateUtility! : Number.NEGATIVE_INFINITY,
+    candidateReadiness: Number.isFinite(input.candidateReadiness) ? input.candidateReadiness! : Number.NEGATIVE_INFINITY,
+    trackingStartedAtMs: input.trackingStartedAt && Number.isFinite(Date.parse(input.trackingStartedAt))
+      ? Date.parse(input.trackingStartedAt)
+      : Number.MAX_SAFE_INTEGER,
+  };
+}
+
+/** Lower values win.  This comparator is total and stable across restarts. */
+export function compareContinuityMaturityPriority(a: ContinuityMaturityPriority, b: ContinuityMaturityPriority): number {
+  const numericAsc = (left: number, right: number) => left === right ? 0 : left < right ? -1 : 1;
+  const numericDesc = (left: number, right: number) => left === right ? 0 : left > right ? -1 : 1;
+  return numericAsc(a.confirmationRemainingMs, b.confirmationRemainingMs)
+    || numericDesc(Number(a.anchorPresent), Number(b.anchorPresent))
+    || numericDesc(a.validObservationCount, b.validObservationCount)
+    || numericDesc(a.validObservationSpanMs, b.validObservationSpanMs)
+    || numericAsc(a.tierARank, b.tierARank)
+    || numericDesc(a.candidateUtility, b.candidateUtility)
+    || numericDesc(a.candidateReadiness, b.candidateReadiness)
+    || numericAsc(a.trackingStartedAtMs, b.trackingStartedAtMs)
+    || a.poolAddress.localeCompare(b.poolAddress);
+}
+
+/**
  * A non-MATCH plan reconciliation remains audit evidence forever.  It is only
  * operationally superseded when a later lifecycle-level chain reconciliation
  * proves the same lifecycle terminal and no newer unresolved effect exists.
@@ -757,7 +852,7 @@ export interface Phase1Store {
     poolAddress: string; state: string; tier: string; priorityScore: number; rank?: number | undefined; lastSeenAt: string; tokenXMint?:string|undefined;tokenYMint?:string|undefined;pairedTokenMint?:string|undefined; payload: Record<string, unknown>;
   }>>;
   reconcileLiveEvidenceAdmission(value:{observedAt:string;serviceableCapacity:number;productionMonitoredPoolAddresses?:string[]}):Promise<{serviceableCapacity:number;productionMonitoredCount:number;activeCount:number;qualifiedWaitingCount:number;promotedPoolAddresses:string[];demotedPoolAddresses:string[];replacements:Array<{incumbentPoolAddress:string;challengerPoolAddress:string;priorityDelta:number}>}>;
-  reconcileEvidenceContinuityTracking(value:{observedAt:string;capacity:number}):Promise<{capacity:number;trackedPoolAddresses:string[];expiredPoolAddresses:string[];evictedPoolAddresses:string[]}>;
+  reconcileEvidenceContinuityTracking(value:{observedAt:string;capacity:number;liveConfirmationWindowMs?:number;liveConfirmationMinimumObservations?:number;liveConfirmationMaximumGapMs?:number}):Promise<{capacity:number;trackedPoolAddresses:string[];expiredPoolAddresses:string[];evictedPoolAddresses:string[]}>;
   recordLiveEvidenceCollectionOutcome(value:{poolAddress:string;observedAt:string;success:boolean;eventPathEstimate?:boolean;phase3CurrentLiveReady?:boolean;poolReadStartedAt?:string;poolReadCompletedAt?:string;poolReadElapsedMs?:number;serviceGapMs?:number}):Promise<void>;
   recordEvidenceContinuityCollectionOutcome(value:{poolAddress:string;observedAt:string;success:boolean;poolReadStartedAt?:string;poolReadCompletedAt?:string;poolReadElapsedMs?:number;serviceGapMs?:number}):Promise<void>;
   loadActiveCandidateEvidenceCollectorTiming?():Promise<{p95PoolCollectionMs?:number}|undefined>;
@@ -2308,12 +2403,34 @@ export async function createPostgresStore(
           WHERE payload->>'evidenceContinuityTrackingState'='TRACKING'
             AND (COALESCE(NULLIF(payload->>'evidenceContinuityTrackingExpiresAt','')::timestamptz,'epoch'::timestamptz)<=$1::timestamptz OR current_state NOT IN ('QUALIFIED','ACTIVE_CANDIDATE') OR source_auto<>true)
           RETURNING pool_address`,[v.observedAt,v.observedAt]);
-        const eligible=await tx.query(`SELECT pool_address FROM market.pool_discovery_registry
+        const eligible=await tx.query(`SELECT registry.pool_address,registry.last_rank,
+            registry.payload->>'evidenceContinuityTrackingStartedAt' AS tracking_started_at,
+            latest.risk_adjusted_expected_net_ev AS candidate_utility,
+            latest.confidence AS candidate_readiness
+          FROM market.pool_discovery_registry registry
+          LEFT JOIN LATERAL (
+            SELECT risk_adjusted_expected_net_ev,confidence
+            FROM execution.production_global_candidates
+            WHERE pool_address=registry.pool_address AND observed_at<=$1::timestamptz
+            ORDER BY observed_at DESC LIMIT 1
+          ) latest ON true
           WHERE current_state='QUALIFIED' AND source_auto=true
-            AND payload->>'evidenceContinuityTrackingState'='TRACKING'
-            AND COALESCE(NULLIF(payload->>'evidenceContinuityTrackingExpiresAt','')::timestamptz,'epoch'::timestamptz)>$1::timestamptz
-          ORDER BY COALESCE(NULLIF(payload->>'evidenceContinuityTrackingStartedAt','')::timestamptz,'epoch'::timestamptz) ASC,pool_address ASC`,[v.observedAt]);
-        const retained=eligible.rows.slice(0,capacity).map(row=>String(row.pool_address)),evicted=eligible.rows.slice(capacity).map(row=>String(row.pool_address));
+            AND registry.payload->>'evidenceContinuityTrackingState'='TRACKING'
+            AND COALESCE(NULLIF(registry.payload->>'evidenceContinuityTrackingExpiresAt','')::timestamptz,'epoch'::timestamptz)>$1::timestamptz`,[v.observedAt]);
+        const eligiblePoolAddresses=eligible.rows.map(row=>String(row.pool_address));
+        const confirmationWindowMs=Math.max(1,Math.floor(v.liveConfirmationWindowMs??10*60_000)),confirmationMaximumGapMs=Math.max(1,Math.floor(v.liveConfirmationMaximumGapMs??450_000));
+        const observations=eligiblePoolAddresses.length?await tx.query(`SELECT pool_address,observed_at FROM market.candidate_market_observations WHERE pool_address=ANY($1::text[]) AND source_type='LIVE_OBSERVED' AND observed_at>=$2::timestamptz AND observed_at<=$3::timestamptz ORDER BY pool_address,observed_at`,[eligiblePoolAddresses,new Date(Date.parse(v.observedAt)-confirmationWindowMs-confirmationMaximumGapMs).toISOString(),v.observedAt]):{rows:[] as Array<{pool_address:string;observed_at:Date|string}>};
+        const observationTimes=new Map<string,string[]>();
+        for(const row of observations.rows){const poolAddress=String(row.pool_address),times=observationTimes.get(poolAddress)??[];times.push(new Date(String(row.observed_at)).toISOString());observationTimes.set(poolAddress,times);}
+        const prioritized=eligible.rows.map(row=>continuityMaturityPriority({
+          poolAddress:String(row.pool_address),observedAt:v.observedAt,liveObservationTimes:observationTimes.get(String(row.pool_address))??[],
+          ...(row.tracking_started_at?{trackingStartedAt:String(row.tracking_started_at)}:{}),
+          ...(row.last_rank===null?{}:{tierARank:Number(row.last_rank)}),
+          ...(row.candidate_utility===null?{}:{candidateUtility:Number(row.candidate_utility)}),
+          ...(row.candidate_readiness===null?{}:{candidateReadiness:Number(row.candidate_readiness)}),
+          confirmationWindowMs,...(v.liveConfirmationMinimumObservations===undefined?{}:{minimumObservations:v.liveConfirmationMinimumObservations}),maximumGapMs:confirmationMaximumGapMs,
+        })).sort(compareContinuityMaturityPriority);
+        const retained=prioritized.slice(0,capacity).map(row=>row.poolAddress),evicted=prioritized.slice(capacity).map(row=>row.poolAddress);
         if(evicted.length)await tx.query(`UPDATE market.pool_discovery_registry
           SET payload=payload||jsonb_build_object('evidenceContinuityTrackingState','EVICTED','evidenceContinuityTrackingEvictedAt',$2::text,'evidenceContinuityTrackingEvictionReason','EVIDENCE_CONTINUITY_CAPACITY_EVICTED')
           WHERE pool_address=ANY($1::text[]) AND payload->>'evidenceContinuityTrackingState'='TRACKING'`,[evicted,v.observedAt]);

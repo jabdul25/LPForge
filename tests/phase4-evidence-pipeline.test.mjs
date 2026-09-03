@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {assessHistoryMaturity,deriveEventPathEconomicEstimate,collectActiveCandidateEvidence,selectActiveCandidateCollectionSlice,requiredActiveCandidateCollectionCapacity,calculateServiceableActiveCandidateCapacity,calculateCompletionAwareCollectionSliceSize,completionAwareCollectorDelayMs,assessCollectorRevisitBudget} from '../.build/packages/active-candidate-evidence/src/index.js';
 import {estimateOpportunityEconomics} from '../.build/packages/opportunity/src/index.js';
 import {evaluateEntry,ENTRY_RESEARCH_POLICY_V1} from '../.build/packages/entry-intelligence/src/index.js';
-import {ACTIVE_EVIDENCE_LEASE_TIMEOUT_MS,EVIDENCE_CONTINUITY_TRACKING_CAP,EVIDENCE_CONTINUITY_TRACKING_TTL_MS,LIVE_EVIDENCE_MIN_ACTIVE_DWELL_MS,POST_EVIDENCE_EVALUATION_WINDOW_MS,dynamicLiveEvidenceAdmissionCapacity,evidenceContinuityTrackingExpiresAt,freshDiscoveryEconomicPriority,freshLiveEvidenceEconomicQuality,isEvidenceMaturityNoTrade,isLiveEvidenceAdmissionTerminal,isLiveEvidenceAdmissionTerminalForCurrentLease,isLiveEvidenceLeaseActive,isPhase3ReadyConsumptionPending,isPostEvidenceEvaluationEligible,liveEvidenceLeaseExpiresAt,liveEvidenceLeaseReleaseReason,selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
+import {ACTIVE_EVIDENCE_LEASE_TIMEOUT_MS,EVIDENCE_CONTINUITY_TRACKING_CAP,EVIDENCE_CONTINUITY_TRACKING_TTL_MS,LIVE_EVIDENCE_MIN_ACTIVE_DWELL_MS,POST_EVIDENCE_EVALUATION_WINDOW_MS,compareContinuityMaturityPriority,continuityMaturityPriority,dynamicLiveEvidenceAdmissionCapacity,evidenceContinuityTrackingExpiresAt,freshDiscoveryEconomicPriority,freshLiveEvidenceEconomicQuality,isEvidenceMaturityNoTrade,isLiveEvidenceAdmissionTerminal,isLiveEvidenceAdmissionTerminalForCurrentLease,isLiveEvidenceLeaseActive,isPhase3ReadyConsumptionPending,isPostEvidenceEvaluationEligible,liveEvidenceLeaseExpiresAt,liveEvidenceLeaseReleaseReason,selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
 import {decisionTimeEconomicEvidenceAgeSeconds,hasPhase3FreshHistoricalEvidence,summarizePhase3RecentLiveObservations} from '../.build/packages/operational-runtime/src/index.js';
 
 const at='2026-08-13T16:00:00.000Z',atMs=Date.parse(at);
@@ -41,6 +41,34 @@ test('two continuity lanes use the unchanged 450-second hard gap rather than con
  assert.equal(budget.capacityViolation,false);
  assert.equal(budget.projectedRevisitMs,360_000);
  assert.equal(calculateServiceableActiveCandidateCapacity({p3BudgetRps:3,estimatedP3CallsPerPool:12,p95PoolCollectionMs:90_000,maxConcurrentPoolReads:1,targetCoverageMs:180_000,serviceabilitySafetyMargin:.70,hardCap:30}),2);
+});
+test('maturity-aware continuity priority retains a BUTTHOLE-like near-confirmed tracker over an immature newcomer',()=>{
+ const now='2026-08-13T16:00:00.000Z',nowMs=Date.parse(now);
+ const near=continuityMaturityPriority({poolAddress:'BUTTHOLE',observedAt:now,liveObservationTimes:[285,180,90,0].map(seconds=>new Date(nowMs-seconds*1000).toISOString()),tierARank:1,candidateUtility:.001,trackingStartedAt:'2026-08-13T15:55:00.000Z'});
+ const newcomer=continuityMaturityPriority({poolAddress:'NEW',observedAt:now,liveObservationTimes:[90,0].map(seconds=>new Date(nowMs-seconds*1000).toISOString()),tierARank:20,candidateUtility:0,trackingStartedAt:'2026-08-13T15:59:00.000Z'});
+ assert.equal(near.validObservationCount,4);assert.equal(near.validObservationSpanMs,285_000);assert.equal(near.confirmationRemainingMs,315_000);
+ assert.ok(compareContinuityMaturityPriority(near,newcomer)<0);
+});
+test('anchor, observation span, Tier-A rank, utility, and deterministic ties order continuity trackers canonically',()=>{
+ const now='2026-08-13T16:00:00.000Z',nowMs=Date.parse(now),times=seconds=>seconds.map(x=>new Date(nowMs-x*1000).toISOString());
+ const anchored=continuityMaturityPriority({poolAddress:'ANCHOR',observedAt:now,liveObservationTimes:times([620,300,120,0]),tierARank:9,candidateUtility:0});
+ const unanchored=continuityMaturityPriority({poolAddress:'NO_ANCHOR',observedAt:now,liveObservationTimes:times([300,120,0]),tierARank:1,candidateUtility:9});
+ assert.equal(anchored.anchorPresent,true);assert.ok(compareContinuityMaturityPriority(anchored,unanchored)<0);
+ const ranked=continuityMaturityPriority({poolAddress:'RANKED',observedAt:now,liveObservationTimes:times([285,180,90,0]),tierARank:1,candidateUtility:0});
+ const lowerRank=continuityMaturityPriority({poolAddress:'LOWER',observedAt:now,liveObservationTimes:times([285,180,90,0]),tierARank:2,candidateUtility:9});
+ assert.ok(compareContinuityMaturityPriority(ranked,lowerRank)<0);
+ const higherUtility=continuityMaturityPriority({poolAddress:'UTILITY',observedAt:now,liveObservationTimes:times([285,180,90,0]),tierARank:1,candidateUtility:2});
+ assert.ok(compareContinuityMaturityPriority(higherUtility,ranked)<0);
+ const alpha=continuityMaturityPriority({poolAddress:'ALPHA',observedAt:now,liveObservationTimes:times([285,180,90,0]),tierARank:1,candidateUtility:2,trackingStartedAt:'2026-08-13T15:55:00.000Z'});
+ const beta=continuityMaturityPriority({poolAddress:'BETA',observedAt:now,liveObservationTimes:times([285,180,90,0]),tierARank:1,candidateUtility:2,trackingStartedAt:'2026-08-13T15:55:00.000Z'});
+ assert.ok(compareContinuityMaturityPriority(alpha,beta)<0);
+});
+test('cap two remains safe while cap three has no 450-second scheduling headroom',()=>{
+ const capTwo=assessCollectorRevisitBudget({activePoolCount:4,collectionSliceSize:4,maxConcurrentPoolReads:1,p95PoolCollectionMs:90_000,revisitBudgetMs:450_000});
+ const capThree=assessCollectorRevisitBudget({activePoolCount:5,collectionSliceSize:5,maxConcurrentPoolReads:1,p95PoolCollectionMs:90_000,revisitBudgetMs:450_000});
+ assert.deepEqual(capTwo,{projectedRevisitMs:360_000,capacityViolation:false});
+ assert.deepEqual(capThree,{projectedRevisitMs:450_000,capacityViolation:false});
+ assert.equal(EVIDENCE_CONTINUITY_TRACKING_CAP,2,'the production continuity cap remains two');
 });
 test('completion accounting never adds a nominal sleep after an overrun',()=>{
  assert.equal(completionAwareCollectorDelayMs({passStartedAtMs:0,passCompletedAtMs:108_000,nominalIntervalMs:60_000}),0);
