@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import {assessHistoryMaturity,deriveEventPathEconomicEstimate,collectActiveCandidateEvidence,selectActiveCandidateCollectionSlice,requiredActiveCandidateCollectionCapacity,calculateServiceableActiveCandidateCapacity,calculateCompletionAwareCollectionSliceSize,completionAwareCollectorDelayMs,assessCollectorRevisitBudget} from '../.build/packages/active-candidate-evidence/src/index.js';
 import {estimateOpportunityEconomics} from '../.build/packages/opportunity/src/index.js';
 import {evaluateEntry,ENTRY_RESEARCH_POLICY_V1} from '../.build/packages/entry-intelligence/src/index.js';
@@ -367,4 +368,12 @@ test('fresh continuity anchor excludes pre-admission raw observations from matur
  assert.equal(legacy.liveConfirmationState,'CONFIRMED');
  assert.equal(anchored.liveConfirmationState,'WARMING');
  assert.ok(anchored.reasonCodes.includes('ENTRY_LIVE_CONFIRMATION_PENDING'));
+});
+
+test('resumed qualified continuity persistence atomically initializes but never replaces an episode anchor',()=>{
+ const source=fs.readFileSync(new URL('../packages/db/src/index.ts',import.meta.url),'utf8');
+ const method=source.slice(source.indexOf('async recordEvidenceContinuityCollectionOutcome'),source.indexOf('async recordPostEvidenceEvaluationOutcome'));
+ assert.match(method,/evidenceContinuityEpisodeAnchorAt',COALESCE\(NULLIF\(payload->>'evidenceContinuityEpisodeAnchorAt',''\),\$3::text\)/);
+ assert.match(method,/evidenceContinuityTrackingStartedAt',COALESCE\(NULLIF\(payload->>'evidenceContinuityTrackingStartedAt',''\),\$3::text\)/);
+ assert.match(method,/\[v\.poolAddress,json\(payload\),v\.observedAt\]/);
 });
