@@ -205,6 +205,7 @@ function loadProductionCapitalEnvelope(poolAddress: string) {
     },
     productionPoolCapital: lamportsToSol(maxPoolLamports),
     ...(construction ? { maxRangeWidthBins: construction.maxInitialPositionWidthBins } : {}),
+    ...(deployment.range ? { minRangeWidthBins: deployment.range.minimumIncludedBins } : {}),
   };
 }
 async function loadLiveOpenPlanCapacity(input: {
