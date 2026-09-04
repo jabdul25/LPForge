@@ -64,6 +64,7 @@ import {
 } from "../../phase6-swap-quote/src/index.js";
 import { phase7ExecutionControlFromRow, validateFreshOpenPhase7Safety } from "../../phase6-claim-guard/src/index.js";
 import { createGovernedConnection, createMeteoraReadAdapter, type MeteoraReadAdapter } from "../../meteora/src/index.js";
+import { createMeteoraDataApi } from "../../data-api/src/index.js";
 import type { ControlledCanaryDeploymentPolicy } from "../../deployment-policy/src/index.js";
 import { assessLifecycleSettlement } from "../../db/src/index.js";
 import type {
@@ -98,6 +99,12 @@ export interface LiveWorkerConfig {
   maxPresignReferenceDivergenceBps: number;
   confirmPollMs: number;
   confirmAttempts: number;
+  /** Canonical live-policy value. Zero means dust retention is disabled. */
+  residualDustThresholdUsd?: number;
+  meteoraDataApiUrl?: string;
+  dataApiMaxRps?: number;
+  httpTimeoutMs?: number;
+  policyHash?: string;
   /** Present only while the explicitly approved controlled canary is armed. */
   controlledCanary?: ControlledCanaryDeploymentPolicy;
 }
@@ -122,6 +129,17 @@ export interface LiveRecoveryResult {
   reasonCodes: string[];
 }
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
+
+export function assessResidualDustDisposition(input:{rawAmount:bigint;decimals:number;unitPriceUsd:number|undefined;valuationAt:string|undefined;now:string;thresholdUsd:number;maxValuationAgeMs?:number}){
+  const maxAgeMs=input.maxValuationAgeMs??60_000;
+  if(input.rawAmount<=0n||!Number.isInteger(input.decimals)||input.decimals<0||!Number.isFinite(input.thresholdUsd)||input.thresholdUsd<0)return{eligible:false as const,reasonCodes:['SETTLEMENT_DUST_POLICY_INVALID']};
+  const valuationAtMs=input.valuationAt?Date.parse(input.valuationAt):NaN;
+  if(!Number.isFinite(input.unitPriceUsd)||input.unitPriceUsd===undefined||input.unitPriceUsd<=0)return{eligible:false as const,reasonCodes:['SETTLEMENT_DUST_PRICE_UNAVAILABLE']};
+  if(!Number.isFinite(valuationAtMs)||Date.parse(input.now)-valuationAtMs>maxAgeMs)return{eligible:false as const,reasonCodes:['SETTLEMENT_DUST_PRICE_STALE']};
+  const usdValue=Number(input.rawAmount)/10**input.decimals*input.unitPriceUsd;
+  if(!Number.isFinite(usdValue)||usdValue<0)return{eligible:false as const,reasonCodes:['SETTLEMENT_DUST_VALUE_INVALID']};
+  return usdValue<=input.thresholdUsd?{eligible:true as const,usdValue,reasonCodes:[]}:{eligible:false as const,usdValue,reasonCodes:['SETTLEMENT_DUST_THRESHOLD_EXCEEDED']};
+}
 
 async function readMintDecimals(connection:Connection,mint:string):Promise<number|undefined>{
   const account=await connection.getAccountInfo(new PublicKey(mint),'confirmed'),data=account?.data;
@@ -3754,7 +3772,7 @@ async function executeCloseSettlement(input: {
 }
 
 /** A recovered close reaches the same durable settlement boundary as a normal close. */
-async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:AutonomousPlan;positionAddress:string;connection:Connection;config:Pick<LiveWorkerConfig,"rpcUrl">}):Promise<{ready:boolean;reasonCodes:string[]}>{
+async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:AutonomousPlan;positionAddress:string;connection:Connection;config:Pick<LiveWorkerConfig,"rpcUrl"|"residualDustThresholdUsd"|"meteoraDataApiUrl"|"dataApiMaxRps"|"httpTimeoutMs"|"policyHash">}):Promise<{ready:boolean;reasonCodes:string[]}>{
   const positionCheck=await input.connection.getAccountInfoAndContext(new PublicKey(input.positionAddress),"confirmed");
   if(positionCheck.value!==null)return{ready:false,reasonCodes:["SETTLEMENT_POSITION_STILL_EXISTS"]};
   const dispatch=closeSettlementDispatch(input.plan),closeSignature=typeof dispatch.signature==="string"?dispatch.signature:typeof dispatch.pendingSignature==="string"?dispatch.pendingSignature:undefined,closeTransactionId=typeof dispatch.transactionId==="string"?dispatch.transactionId:undefined;
@@ -3791,6 +3809,42 @@ async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:Au
   // own transaction ledger, inventory, cashflows, and reservations are still
   // assessed below and remain hard blockers, but the transitional marker must
   // not prevent the operation that clears it.
+  // Older close plans recorded the wallet delta after REMOVE *and* CLAIM as
+  // one CLOSE_WITHDRAWAL lot, while the claim receipt also created its own
+  // FEE_CLAIM lot.  The receipt-bound claim is real; the overlap is not.  A
+  // correction is permitted only when the already-confirmed aggregate unwind
+  // is the exact terminal receipt for the aggregate lot.
+  const aggregateCloseLot=settlementInput.inventoryLots.find(lot=>lot.planId===input.plan.planId&&lot.sourceEvent==='CLOSE_WITHDRAWAL'&&lot.status==='SETTLED');
+  const openClaimLots=settlementInput.inventoryLots.filter(lot=>lot.planId===input.plan.planId&&lot.sourceEvent==='FEE_CLAIM'&&lot.status==='OPEN'&&lot.remainingRawAmount===lot.rawAmount&&lot.tokenMint===aggregateCloseLot?.tokenMint);
+  const aggregateTerminal=(aggregateCloseLot?.payload.terminalSettlement??{}) as Record<string,unknown>,aggregateSignature=typeof aggregateTerminal.transactionSignature==='string'?aggregateTerminal.transactionSignature:undefined;
+  if(aggregateCloseLot&&aggregateSignature)for(const claimLot of openClaimLots){
+    const claimReceipt=(claimLot.payload.signature??'') as string;
+    if(!claimReceipt||!claimLot.sourceCashflowId)continue;
+    await input.store.correctAggregateCloseClaimAttribution({eventId:`${input.plan.planId}:aggregate-claim-attribution:${claimLot.lotId}`,closeLotId:aggregateCloseLot.lotId,claimLotId:claimLot.lotId,planId:input.plan.planId,claimRawAmount:claimLot.rawAmount,transactionSignature:aggregateSignature,observedAt:at,payload:{source:'RECEIPT_BOUND_REMOVE_PLUS_CLAIM_OVERLAP_CORRECTION_V1',claimReceipt,aggregateUnwindSignature:aggregateSignature}});
+  }
+  settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
+  if(!settlementInput)return{ready:false,reasonCodes:["SETTLEMENT_LIFECYCLE_MISSING"]};
+  // Dust is a retained, valued inventory disposition, never an inferred zero
+  // balance.  Only a fresh Meteora pool USD price and an exact current wallet
+  // balance match can authorize it.  This deliberately fails closed for an
+  // unknown/stale price, a missing claim receipt, or mixed owner inventory.
+  const threshold=input.config.residualDustThresholdUsd??0;
+  if(threshold>0){
+    const unresolved=settlementInput.inventoryLots.filter(lot=>(lot.status==='OPEN'||lot.status==='PARTIALLY_SETTLED')&&lot.remainingRawAmount>0n);
+    if(unresolved.length){
+      let priced:Awaited<ReturnType<ReturnType<typeof createMeteoraDataApi>['getPool']>>|undefined;
+      try{priced=await createMeteoraDataApi({...(input.config.meteoraDataApiUrl?{baseUrl:input.config.meteoraDataApiUrl}:{}),...(input.config.dataApiMaxRps===undefined?{}:{maxRps:input.config.dataApiMaxRps}),...(input.config.httpTimeoutMs===undefined?{}:{timeoutMs:input.config.httpTimeoutMs})}).getPool(input.plan.poolAddress);}catch{/* unavailable valuations remain a terminal blocker */}
+      for(const lot of unresolved){
+        const sameMint=unresolved.filter(other=>other.tokenMint===lot.tokenMint),attributed=sameMint.reduce((total,other)=>total+other.remainingRawAmount,0n),wallet=await readWalletTokenBalance({connection:input.connection,ownerAddress:input.plan.ownerAddress,mint:lot.tokenMint}),token=[priced?.token_x,priced?.token_y].find(token=>token?.address===lot.tokenMint),price=token?.price,valuationAt=new Date().toISOString();
+        if(wallet!==attributed||lot.sourceEvent==='FEE_CLAIM'&&(!lot.sourceCashflowId||typeof lot.payload.signature!=='string'))continue;
+        const dust=assessResidualDustDisposition({rawAmount:lot.remainingRawAmount,decimals:lot.decimals,unitPriceUsd:price,valuationAt,now:at,thresholdUsd:threshold});
+        if(!dust.eligible)continue;
+        await input.store.retainPositionInventoryLotDust({eventId:`${input.plan.planId}:dust-retained:${lot.lotId}`,lotId:lot.lotId,planId:input.plan.planId,observedAt:at,payload:{state:'DUST_RETAINED',rawAmount:lot.remainingRawAmount.toString(),decimals:lot.decimals,usdValue:dust.usdValue,unitPriceUsd:price,valuationAt,valuationSource:'METEORA_DATA_API_POOL_TOKEN_PRICE',thresholdUsd:threshold,policyHash:input.config.policyHash??null,positionAddress:input.positionAddress,inventoryProvenance:{sourceEvent:lot.sourceEvent,sourceCashflowId:lot.sourceCashflowId??null}}});
+      }
+      settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
+      if(!settlementInput)return{ready:false,reasonCodes:["SETTLEMENT_LIFECYCLE_MISSING"]};
+    }
+  }
   const assessment=assessLifecycleSettlement({...settlementInput,reconciliationClean:true,positionAbsent:true,positionCheckedAt,positionCheckedSlot});
   if(!assessment.ready){
     await input.store.markOwnedPositionLifecycle({positionAddress:input.positionAddress,lifecycleState:"RECONCILIATION_REQUIRED",reconciliationStatus:"SETTLEMENT_BLOCKED",lastPlanId:input.plan.planId,at,payload:{stage:"SOL_SETTLEMENT_BLOCKED",reasonCodes:assessment.reasonCodes,lifecycleId:settlementInput.lifecycle.lifecycleId,settlementEvidence}});
@@ -3852,7 +3906,7 @@ async function executeAccountCloseOnlyRecovery(input:{
   built.metadata.transactionId=closeStep.transactionId;
   const closed=await executeMeteoraMutation({...input,built,action:'CLOSE',deferCompletion:true,afterSubmit:async({signature})=>input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECONCILING',at:new Date().toISOString(),payload:{stage:'ACCOUNT_CLOSE_ONLY_SUBMITTED',accountCloseOnly:true,pendingStage:'ACCOUNT_CLOSE_ONLY_SUBMITTED',pendingSignature:signature,signature,transactionId:closeStep.transactionId}}),afterConfirmed:async({signature})=>{const rent=await persistConfirmedPositionRentRecovery({store:input.store,connection,plan:input.plan,positionAddress:input.positionAddress,signature,transactionId:closeStep.transactionId});if(!rent.ok)throw new Error(rent.reasonCodes.join(','));}});
   if(closed.status!=='RECONCILED')return closed;
-  const settlement=await finalizeClosedPositionSettlement({store:input.store,plan:input.plan,positionAddress:input.positionAddress,connection,config:{rpcUrl:input.config.rpcUrl}});
+  const settlement=await finalizeClosedPositionSettlement({store:input.store,plan:input.plan,positionAddress:input.positionAddress,connection,config:input.config});
   if(!settlement.ready)return{status:'UNKNOWN',planId:input.plan.planId,reasonCodes:settlement.reasonCodes,transactionSubmitted:true};
   await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'COMPLETED',at:new Date().toISOString(),payload:{action:'CLOSE',recovery:'ACCOUNT_CLOSE_ONLY_SETTLED',accountCloseOnly:true}});
   return closed;
@@ -4049,6 +4103,11 @@ export async function recoverUnfinishedAutonomousPlans(input: {
   now: string;
   rpcUrl?: string;
   programId?: string;
+  residualDustThresholdUsd?: number;
+  meteoraDataApiUrl?: string;
+  dataApiMaxRps?: number;
+  httpTimeoutMs?: number;
+  policyHash?: string;
   /** Test seam; production creates its governed recovery connection below. */
   connection?: Connection;
   /** Test seam; production uses the RPC connection below. */
@@ -4647,7 +4706,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
           results.push({ planId: plan.planId, action: "HOLD_FOR_OPERATOR", reasonCodes: ["P6_CLOSE_SETTLEMENT_RPC_UNAVAILABLE"] });
           continue;
         }
-        const settlement=await finalizeClosedPositionSettlement({store:input.store,plan,positionAddress:recoveryPositionAddress,connection,config:{rpcUrl:input.rpcUrl}});
+        const settlement=await finalizeClosedPositionSettlement({store:input.store,plan,positionAddress:recoveryPositionAddress,connection,config:{rpcUrl:input.rpcUrl,...(input.residualDustThresholdUsd===undefined?{}:{residualDustThresholdUsd:input.residualDustThresholdUsd}),...(input.meteoraDataApiUrl===undefined?{}:{meteoraDataApiUrl:input.meteoraDataApiUrl}),...(input.dataApiMaxRps===undefined?{}:{dataApiMaxRps:input.dataApiMaxRps}),...(input.httpTimeoutMs===undefined?{}:{httpTimeoutMs:input.httpTimeoutMs}),...(input.policyHash===undefined?{}:{policyHash:input.policyHash})}});
         if(!settlement.ready){
           results.push({ planId: plan.planId, action: "HOLD_FOR_OPERATOR", reasonCodes: settlement.reasonCodes });
           continue;
@@ -5056,7 +5115,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     for(const candidate of await input.store.loadTerminalCloseRentRecoveryCandidates(16)){
       const plan=await input.store.loadAutonomousPlan(candidate.planId);
       if(!plan||!plan.positionAddress||plan.positionAddress!==candidate.positionAddress)continue;
-      const settlement=await finalizeClosedPositionSettlement({store:input.store,plan,positionAddress:candidate.positionAddress,connection,config:{rpcUrl:input.rpcUrl}});
+      const settlement=await finalizeClosedPositionSettlement({store:input.store,plan,positionAddress:candidate.positionAddress,connection,config:{rpcUrl:input.rpcUrl,...(input.residualDustThresholdUsd===undefined?{}:{residualDustThresholdUsd:input.residualDustThresholdUsd}),...(input.meteoraDataApiUrl===undefined?{}:{meteoraDataApiUrl:input.meteoraDataApiUrl}),...(input.dataApiMaxRps===undefined?{}:{dataApiMaxRps:input.dataApiMaxRps}),...(input.httpTimeoutMs===undefined?{}:{httpTimeoutMs:input.httpTimeoutMs}),...(input.policyHash===undefined?{}:{policyHash:input.policyHash})}});
       results.push({planId:plan.planId,action:settlement.ready?"MARK_RECONCILED":"HOLD_FOR_OPERATOR",reasonCodes:settlement.ready?["P6_CLOSE_POSITION_RENT_RECOVERY_RECONCILED"]:settlement.reasonCodes});
     }
   }

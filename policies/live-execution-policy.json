@@ -33,6 +33,9 @@
     "requirePreinitializedBinArrays": true,
     "liquiditySlippageBps": 100
   },
+  "settlement": {
+    "residualDustThresholdUsd": 0.10
+  },
   "pools": [
     {
       "address": "2VHM9pTZEU6pqeZoiNi8ZCeyerqhRYgS5Um7U8AEKrd9",

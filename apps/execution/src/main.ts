@@ -16,6 +16,8 @@ import {
   reconcileWalletWidePositions,
 } from "../../../packages/phase6-live-worker/src/index.js";
 import { PublicKey } from "@solana/web3.js";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { EXPECTED_DLMM_PROGRAM_ID } from "../../../packages/meteora/src/index.js";
 import { loadDeploymentPolicyFile } from "../../../packages/deployment-policy/src/index.js";
 import { resolveLiveExecutionPolicyPath } from "../../../packages/config/src/index.js";
@@ -202,6 +204,11 @@ function workerConfig() {
     maxPresignReferenceDivergenceBps: Number(process.env.LPFORGE_P6_MAX_PRESIGN_REFERENCE_DIVERGENCE_BPS ?? 250),
     confirmPollMs: Number(process.env.LPFORGE_P6_CONFIRM_POLL_MS ?? 1000),
     confirmAttempts: Number(process.env.LPFORGE_P6_CONFIRM_ATTEMPTS ?? 30),
+    residualDustThresholdUsd: policy.settlement.residualDustThresholdUsd,
+    meteoraDataApiUrl: process.env.METEORA_DATA_API_URL ?? '',
+    dataApiMaxRps: Number(process.env.LPFORGE_DATA_API_MAX_RPS ?? 25),
+    httpTimeoutMs: Number(process.env.LPFORGE_HTTP_TIMEOUT_MS ?? 10_000),
+    policyHash: createHash('sha256').update(readFileSync(resolveLiveExecutionPolicyPath(), 'utf8')).digest('hex'),
     ...(yes(process.env.LPFORGE_MAINNET_CANARY)&&!boundedUnattendedProduction()
       ? { controlledCanary: policy.controlledCanary }
       : {}),
@@ -349,6 +356,11 @@ async function recoverOnce() {
       now: new Date().toISOString(),
       rpcUrl: config.rpcUrl,
       programId: config.programId,
+      residualDustThresholdUsd: config.residualDustThresholdUsd,
+      meteoraDataApiUrl: config.meteoraDataApiUrl,
+      dataApiMaxRps: config.dataApiMaxRps,
+      httpTimeoutMs: config.httpTimeoutMs,
+      policyHash: config.policyHash,
     });
     // CLOSE/EMERGENCY_CLOSE stages that were durably confirmed before a
     // process interruption are protective workflows. Resume only the next

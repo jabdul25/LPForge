@@ -512,11 +512,14 @@ export type PositionInventoryLotStatus =
   | "OPEN"
   | "PARTIALLY_SETTLED"
   | "SETTLED"
-  | "TRANSFERRED";
+  | "TRANSFERRED"
+  | "DUST_RETAINED";
 export type PositionInventoryLotEventType =
   | "CREATED"
   | "SETTLED"
-  | "TRANSFERRED";
+  | "TRANSFERRED"
+  | "DUST_RETAINED"
+  | "ATTRIBUTION_CORRECTED";
 export interface PositionInventoryLot {
   lotId:string;
   positionAddress:string;
@@ -641,6 +644,11 @@ export function assessLifecycleSettlement(input:LifecycleSettlementInput):Lifecy
   if(!input.reservationClean)reasons.push("SETTLEMENT_RESERVATION_PENDING");
   reasons.push(...assertLifecycleTransactionsTerminal(input.transactions));
   for(const lot of input.inventoryLots){
+    if(lot.status==="DUST_RETAINED"){
+      const dust=lot.payload.dustDisposition;
+      if(!dust||typeof dust!=="object"||String((dust as Record<string,unknown>).state??"")!=="DUST_RETAINED"||String((dust as Record<string,unknown>).rawAmount??"")!==lot.remainingRawAmount.toString()||!Number.isFinite(Number((dust as Record<string,unknown>).usdValue))||Number((dust as Record<string,unknown>).usdValue)<0||!Number.isFinite(Number((dust as Record<string,unknown>).thresholdUsd))||Number((dust as Record<string,unknown>).thresholdUsd)<0||Number((dust as Record<string,unknown>).usdValue)>Number((dust as Record<string,unknown>).thresholdUsd)||typeof (dust as Record<string,unknown>).valuationSource!=="string"||typeof (dust as Record<string,unknown>).valuationAt!=="string")reasons.push(`SETTLEMENT_DUST_DISPOSITION_INVALID:${lot.lotId}`);
+      continue;
+    }
     if(lot.remainingRawAmount!==0n||!(lot.status==="SETTLED"||lot.status==="TRANSFERRED")){reasons.push(`SETTLEMENT_INVENTORY_REMAINS:${lot.lotId}`);continue;}
     const terminal=lot.payload.terminalSettlement;
     if(lot.status==="SETTLED"&&(!terminal||typeof terminal!=="object"||typeof (terminal as Record<string,unknown>).transactionSignature!=="string"))reasons.push(`SETTLEMENT_INVENTORY_DISPOSITION_MISSING:${lot.lotId}`);
@@ -1333,6 +1341,8 @@ export interface Phase1Store {
   insertLiveLearningCalibration(value:{snapshotId:string;observedAt:string;sampleCount:number;independentEpisodes:number;brierProfit?:number;netPnlMaeLamports?:number;meanBiasLamports?:number;payload:Record<string,unknown>}):Promise<void>;
   createPositionInventoryLot(value:Omit<PositionInventoryLot,"remainingRawAmount"|"status">&{createdEventId:string;transactionSignature?:string}):Promise<void>;
   settlePositionInventoryLot(value:{eventId:string;lotId:string;planId?:string;eventType:"SETTLED"|"TRANSFERRED";settledRawAmount:bigint;observedAt:string;transactionSignature?:string;payload:Record<string,unknown>}):Promise<{remainingRawAmount:bigint;status:PositionInventoryLotStatus}>;
+  retainPositionInventoryLotDust(value:{eventId:string;lotId:string;planId?:string;observedAt:string;payload:Record<string,unknown>}):Promise<void>;
+  correctAggregateCloseClaimAttribution(value:{eventId:string;closeLotId:string;claimLotId:string;planId:string;claimRawAmount:bigint;transactionSignature:string;observedAt:string;payload:Record<string,unknown>}):Promise<void>;
   loadPositionInventoryLots(positionAddress:string,tokenMint?:string):Promise<PositionInventoryLot[]>;
   loadOwnerPositionInventoryLots(ownerAddress:string):Promise<PositionInventoryLot[]>;
   insertPlanCashflow(value:PlanCashflow):Promise<void>;
@@ -3736,6 +3746,40 @@ return 'APPLIED';
         return next;
       }catch(error){try{await tx.query("ROLLBACK");}catch{}throw error;}
     },
+    async retainPositionInventoryLotDust(v){
+      const tx=db;
+      try{
+        await tx.query("BEGIN");
+        const existing=await tx.query("SELECT 1 FROM execution.position_inventory_lot_events WHERE event_id=$1 FOR UPDATE",[v.eventId]);
+        if(existing.rows[0]){await tx.query("COMMIT");return;}
+        const lot=await tx.query("SELECT remaining_raw_amount,status FROM execution.position_inventory_lots WHERE lot_id=$1 FOR UPDATE",[v.lotId]);
+        if(!lot.rows[0])throw new Error("LPFORGE_INVENTORY_LOT_NOT_FOUND");
+        const raw=BigInt(String(lot.rows[0].remaining_raw_amount));
+        if(raw<=0n||!['OPEN','PARTIALLY_SETTLED'].includes(String(lot.rows[0].status)))throw new Error("LPFORGE_INVENTORY_DUST_DISPOSITION_INVALID_STATE");
+        await tx.query("UPDATE execution.position_inventory_lots SET status='DUST_RETAINED',updated_at=$2,payload=payload||jsonb_build_object('dustDisposition',$3::jsonb) WHERE lot_id=$1",[v.lotId,v.observedAt,json(v.payload)]);
+        await tx.query("INSERT INTO execution.position_inventory_lot_events(event_id,lot_id,plan_id,event_type,raw_amount,remaining_raw_amount,observed_at,payload) VALUES($1,$2,$3,'DUST_RETAINED',$4,$4,$5,$6::jsonb)",[v.eventId,v.lotId,v.planId??null,raw.toString(),v.observedAt,json(v.payload)]);
+        await tx.query("COMMIT");
+      }catch(error){try{await tx.query("ROLLBACK");}catch{}throw error;}
+    },
+    async correctAggregateCloseClaimAttribution(v){
+      const tx=db;
+      try{
+        await tx.query("BEGIN");
+        const prior=await tx.query("SELECT 1 FROM execution.position_inventory_lot_events WHERE event_id=$1 FOR UPDATE",[v.eventId]);
+        if(prior.rows[0]){await tx.query("COMMIT");return;}
+        const rows=await tx.query("SELECT lot_id,raw_amount,remaining_raw_amount,status,payload FROM execution.position_inventory_lots WHERE lot_id=ANY($1::text[]) FOR UPDATE",[[v.closeLotId,v.claimLotId]]);
+        const close=rows.rows.find(row=>String(row.lot_id)===v.closeLotId),claim=rows.rows.find(row=>String(row.lot_id)===v.claimLotId);
+        if(!close||!claim)throw new Error('LPFORGE_INVENTORY_ATTRIBUTION_LOT_MISSING');
+        const closeRaw=BigInt(String(close.raw_amount)),claimRaw=BigInt(String(claim.raw_amount));
+        if(claimRaw!==v.claimRawAmount||closeRaw<=claimRaw||String(close.status)!=='SETTLED'||String(claim.status)!=='OPEN')throw new Error('LPFORGE_INVENTORY_ATTRIBUTION_CORRECTION_INVALID');
+        const corrected=closeRaw-claimRaw;
+        const closePayload={...(close.payload as Record<string,unknown>),attributionCorrection:{...v.payload,originalRawAmount:closeRaw.toString(),correctedRawAmount:corrected.toString(),overlapRawAmount:claimRaw.toString(),transactionSignature:v.transactionSignature}};
+        await tx.query("UPDATE execution.position_inventory_lots SET raw_amount=$2,updated_at=$3,payload=$4::jsonb WHERE lot_id=$1",[v.closeLotId,corrected.toString(),v.observedAt,json(closePayload)]);
+        await tx.query("UPDATE execution.position_inventory_lots SET remaining_raw_amount=0,status='SETTLED',updated_at=$2,payload=payload||jsonb_build_object('terminalSettlement',$3::jsonb) WHERE lot_id=$1",[v.claimLotId,v.observedAt,json({eventType:'SETTLED',transactionSignature:v.transactionSignature,disposition:'AGGREGATE_CLOSE_UNWIND_RECEIPT_ALLOCATION',...v.payload})]);
+        await tx.query("INSERT INTO execution.position_inventory_lot_events(event_id,lot_id,plan_id,event_type,raw_amount,remaining_raw_amount,observed_at,transaction_signature,payload) VALUES($1,$2,$3,'ATTRIBUTION_CORRECTED',$4,0,$5,$6,$7::jsonb),($1||':claim-settled',$8,$3,'SETTLED',$4,0,$5,$6,$7::jsonb)",[v.eventId,v.closeLotId,v.planId,claimRaw.toString(),v.observedAt,v.transactionSignature,json(v.payload),v.claimLotId]);
+        await tx.query("COMMIT");
+      }catch(error){try{await tx.query("ROLLBACK");}catch{}throw error;}
+    },
     async loadPositionInventoryLots(positionAddress,tokenMint){
       const r=await db.query("SELECT lot_id,position_address,plan_id,owner_address,pool_address,token_mint,token_side,source_event,source_cashflow_id,raw_amount,remaining_raw_amount,decimals,acquired_at,status,payload FROM execution.position_inventory_lots WHERE position_address=$1 AND ($2::text IS NULL OR token_mint=$2) ORDER BY acquired_at ASC,lot_id ASC",[positionAddress,tokenMint??null]);
       return r.rows.map(row=>({lotId:String(row.lot_id),positionAddress:String(row.position_address),planId:String(row.plan_id),ownerAddress:String(row.owner_address),poolAddress:String(row.pool_address),tokenMint:String(row.token_mint),tokenSide:String(row.token_side) as PositionInventoryLotSide,sourceEvent:String(row.source_event) as PositionInventoryLotSource,...(row.source_cashflow_id?{sourceCashflowId:String(row.source_cashflow_id)}:{}),rawAmount:BigInt(String(row.raw_amount)),remainingRawAmount:BigInt(String(row.remaining_raw_amount)),decimals:Number(row.decimals),acquiredAt:toIsoTimestamp(row.acquired_at),status:String(row.status) as PositionInventoryLotStatus,payload:(row.payload??{}) as Record<string,unknown>}));
@@ -4834,6 +4878,8 @@ export function createMemoryStore(): Phase1Store {
     async insertLiveLearningCalibration() {},
     async createPositionInventoryLot() {},
     async settlePositionInventoryLot() { return {remainingRawAmount:0n,status:"SETTLED" as PositionInventoryLotStatus}; },
+    async retainPositionInventoryLotDust() {},
+    async correctAggregateCloseClaimAttribution() {},
     async loadPositionInventoryLots() { return []; },
     async loadOwnerPositionInventoryLots() { return []; },
     async insertPlanCashflow() {},
