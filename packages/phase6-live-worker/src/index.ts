@@ -1364,7 +1364,7 @@ async function ensureRecoveredOpenResidualInventory(input:{
   if(
     !recoveryRow||
     String(recoveryRow.state)!=="OPEN_RECOVERED"||
-    (recoveryRow.payload??{} as Record<string,unknown>).partialEntry!==true||
+    ((recoveryRow.payload ?? {}) as Record<string,unknown>).partialEntry!==true||
     String(recoveryRow.owner_address)!==input.plan.ownerAddress||
     String(recoveryRow.pool_address)!==input.plan.poolAddress||
     String(recoveryRow.token_mint)!==input.tokenMint

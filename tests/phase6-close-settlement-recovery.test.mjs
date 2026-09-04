@@ -95,7 +95,7 @@ test('terminal OPEN_RECOVERED attribution remains off the recurring queue and is
   const db = await import('node:fs/promises').then(fs => fs.readFile('packages/db/src/index.ts', 'utf8'));
   assert.match(source,/loadPartialEntryRecovery\(entryPlanId\)/);
   assert.match(source,/recoveryRow\.state\)!=="OPEN_RECOVERED"/);
-  assert.match(source,/recoveryRow\.payload\?\?\{\} as Record<string,unknown>\)\.partialEntry!==true/);
+  assert.match(source,/\(recoveryRow\.payload \?\? \{\}\) as Record<string,unknown>\)\.partialEntry!==true/);
   assert.match(db,/async loadPartialEntryRecovery\(planId\)/);
   assert.match(db,/WHERE plan_id=\$1/);
 });
