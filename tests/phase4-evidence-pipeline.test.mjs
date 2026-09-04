@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {assessHistoryMaturity,deriveEventPathEconomicEstimate,collectActiveCandidateEvidence,selectActiveCandidateCollectionSlice,requiredActiveCandidateCollectionCapacity,calculateServiceableActiveCandidateCapacity,calculateCompletionAwareCollectionSliceSize,completionAwareCollectorDelayMs,assessCollectorRevisitBudget} from '../.build/packages/active-candidate-evidence/src/index.js';
 import {estimateOpportunityEconomics} from '../.build/packages/opportunity/src/index.js';
 import {evaluateEntry,ENTRY_RESEARCH_POLICY_V1} from '../.build/packages/entry-intelligence/src/index.js';
-import {ACTIVE_EVIDENCE_LEASE_TIMEOUT_MS,EVIDENCE_CONTINUITY_TRACKING_CAP,EVIDENCE_CONTINUITY_TRACKING_TTL_MS,LIVE_EVIDENCE_MIN_ACTIVE_DWELL_MS,POST_EVIDENCE_EVALUATION_WINDOW_MS,compareContinuityMaturityPriority,continuityMaturityPriority,dynamicLiveEvidenceAdmissionCapacity,evidenceContinuityTrackingExpiresAt,freshDiscoveryEconomicPriority,freshLiveEvidenceEconomicQuality,isEvidenceMaturityNoTrade,isLiveEvidenceAdmissionTerminal,isLiveEvidenceAdmissionTerminalForCurrentLease,isLiveEvidenceLeaseActive,isPhase3ReadyConsumptionPending,isPostEvidenceEvaluationEligible,liveEvidenceLeaseExpiresAt,liveEvidenceLeaseReleaseReason,selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
+import {ACTIVE_EVIDENCE_LEASE_TIMEOUT_MS,EVIDENCE_CONTINUITY_TRACKING_CAP,EVIDENCE_CONTINUITY_TRACKING_TTL_MS,EVIDENCE_CONTINUITY_SERVICE_HEADROOM_MS,evidenceContinuityDeadlines,LIVE_EVIDENCE_MIN_ACTIVE_DWELL_MS,POST_EVIDENCE_EVALUATION_WINDOW_MS,compareContinuityMaturityPriority,continuityMaturityPriority,dynamicLiveEvidenceAdmissionCapacity,evidenceContinuityTrackingExpiresAt,freshDiscoveryEconomicPriority,freshLiveEvidenceEconomicQuality,isEvidenceMaturityNoTrade,isLiveEvidenceAdmissionTerminal,isLiveEvidenceAdmissionTerminalForCurrentLease,isLiveEvidenceLeaseActive,isPhase3ReadyConsumptionPending,isPostEvidenceEvaluationEligible,liveEvidenceLeaseExpiresAt,liveEvidenceLeaseReleaseReason,selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
 import {decisionTimeEconomicEvidenceAgeSeconds,hasPhase3FreshHistoricalEvidence,summarizePhase3RecentLiveObservations} from '../.build/packages/operational-runtime/src/index.js';
 
 const at='2026-08-13T16:00:00.000Z',atMs=Date.parse(at);
@@ -335,4 +335,19 @@ test('post-evidence handoff is bounded by existing economic freshness and does n
  assert.equal(isPostEvidenceEvaluationEligible(payload,'2026-08-13T16:04:59.999Z'),true);
  assert.equal(isPostEvidenceEvaluationEligible(payload,expires),false);
  assert.equal(isPostEvidenceEvaluationEligible({postEvidenceEvaluationState:'COMPLETED',postEvidenceEvaluationExpiresAt:expires},eligibleAt),false);
+});
+
+test('retained continuity uses a successful-observation deadline with 150-second service headroom',()=>{
+ const last='2026-09-04T21:58:57.543Z',deadlines=evidenceContinuityDeadlines(last,450_000);
+ assert.equal(EVIDENCE_CONTINUITY_SERVICE_HEADROOM_MS,150_000);
+ assert.equal(new Date(deadlines.logicalDeadlineAtMs).toISOString(),'2026-09-04T22:06:27.543Z');
+ assert.equal(new Date(deadlines.internalServiceDeadlineAtMs).toISOString(),'2026-09-04T22:03:57.543Z');
+ assert.ok(deadlines.internalServiceDeadlineAtMs<deadlines.logicalDeadlineAtMs);
+});
+
+test('earliest internal continuity deadline preempts later-maturing ordinary tracker priority',()=>{
+ const now='2026-09-04T22:00:00.000Z';
+ const urgent=continuityMaturityPriority({poolAddress:'54SBY',observedAt:now,liveObservationTimes:['2026-09-04T21:58:57.543Z'],tierARank:99,candidateUtility:-1});
+ const ordinary=continuityMaturityPriority({poolAddress:'OTHER',observedAt:now,liveObservationTimes:['2026-09-04T21:59:57.543Z'],tierARank:1,candidateUtility:10});
+ assert.ok(compareContinuityMaturityPriority(urgent,ordinary)<0);
 });
