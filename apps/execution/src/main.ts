@@ -336,6 +336,7 @@ async function recoverOnce() {
   try {
     const config = workerConfig(),
       currentBlockHeight = await createGovernedConnection({rpcUrl:config.rpcUrl,priority:'P1_RECOVERY_CRITICAL'}).getBlockHeight("confirmed");
+    const preflightNoEffectRecovered=await store.recoverNoEffectPreflightSubmissionAttempts(new Date().toISOString());
     await store.reconcileExecutionCapitalReservations(new Date().toISOString());
     const partial = await recoverPartialEntryFunding({
       store,
@@ -405,7 +406,7 @@ async function recoverOnce() {
       ownerAddress: (process.env.LPFORGE_OPERATOR_OWNER_ADDRESS ?? "").trim(),
       now: new Date().toISOString(),
     });
-    return { partial, plans: unresolvedPlans, resumed, walletSweep, compaction:{candidates:compactionCandidates,compactedPositionAddresses} };
+    return { partial, plans: unresolvedPlans, resumed, walletSweep, preflightNoEffectRecovered, compaction:{candidates:compactionCandidates,compactedPositionAddresses} };
   } finally {
     await store.close();
   }

@@ -118,6 +118,16 @@ test('a transient recovery RPC failure at execution startup does not terminate t
   assert.doesNotMatch(startup,/P6_EXECUTION_START_FAILURE'\]\}\);throw error/);
 });
 
+test('an unsigned deterministic preflight rejection is terminal no-chain-effect evidence, not an active UNKNOWN', async () => {
+  const db = await import('node:fs/promises').then(fs => fs.readFile('packages/db/src/index.ts', 'utf8'));
+  const runtime = await import('node:fs/promises').then(fs => fs.readFile('apps/execution/src/main.ts', 'utf8'));
+  assert.match(db,/recoverNoEffectPreflightSubmissionAttempts/);
+  assert.match(db,/state='EXPIRED'/);
+  assert.match(db,/state='UNKNOWN' AND signature IS NULL/);
+  assert.match(db,/submission_error' LIKE 'Simulation failed\.%%?'/);
+  assert.match(runtime,/preflightNoEffectRecovered=await store\.recoverNoEffectPreflightSubmissionAttempts/);
+});
+
 test('expired entry deadlines never strand an existing protective close, but still bind OPEN', () => {
   const input = {planExpiresAt: '2026-08-29T00:00:00.000Z', now: '2026-08-29T01:00:00.000Z', protectivePermitTtlMs: 5_000};
   assert.equal(

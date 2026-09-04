@@ -1419,6 +1419,8 @@ export interface Phase1Store {
     at: string,
     reason: string,
   ): Promise<void>;
+  /** A skip-preflight=false RPC simulation rejection has no chain effect. */
+  recoverNoEffectPreflightSubmissionAttempts(at: string): Promise<number>;
   /** Durable blockhash evidence for signature-first recovery. */
   loadSubmissionAttemptBySignature(
     signature: string,
@@ -3878,6 +3880,17 @@ return 'APPLIED';
         [signature, at, reason],
       );
     },
+    async recoverNoEffectPreflightSubmissionAttempts(at) {
+      const result=await db.query(
+        `UPDATE execution.submission_attempts
+         SET state='EXPIRED',payload=payload||jsonb_build_object('terminal_recovery_reason','P6_PREFLIGHT_REJECTED_NO_CHAIN_EFFECT','terminal_recovered_at',$1::timestamptz)
+         WHERE state='UNKNOWN' AND signature IS NULL
+           AND payload->>'submission_error' LIKE 'Simulation failed.%'
+         RETURNING attempt_id`,
+        [at],
+      );
+      return result.rows.length;
+    },
     async loadSubmissionAttemptBySignature(signature) {
       const r = await db.query(
         `SELECT last_valid_block_height FROM execution.submission_attempts WHERE signature=$1 ORDER BY prepared_at DESC LIMIT 1`,
@@ -4846,6 +4859,7 @@ export function createMemoryStore(): Phase1Store {
     async markSubmissionSent() {},
     async markSubmissionUnknown() {},
     async markSubmissionExpired() {},
+    async recoverNoEffectPreflightSubmissionAttempts() { return 0; },
     async loadSubmissionAttemptBySignature() { return undefined; },
     async loadConfirmedSubmissionByTransactionId() { return undefined; },
     async insertExecutionConfirmation() {},
