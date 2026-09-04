@@ -110,6 +110,14 @@ test('a normal reconciled funded OPEN cannot be misclassified as a recovered par
   assert.match(source,/partialEntry!==true/);
 });
 
+test('a transient recovery RPC failure at execution startup does not terminate the autonomous runner', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile('apps/execution/src/main.ts', 'utf8'));
+  const startup = source.slice(source.indexOf('const startupAt=new Date().toISOString();'), source.indexOf('for (;;) {', source.indexOf('const startupAt=new Date().toISOString();')));
+  assert.match(startup,/P6_EXECUTION_DAEMON_START_FAILURE/);
+  assert.match(startup,/will retry\. No blind resend is permitted/);
+  assert.doesNotMatch(startup,/P6_EXECUTION_START_FAILURE'\]\}\);throw error/);
+});
+
 test('expired entry deadlines never strand an existing protective close, but still bind OPEN', () => {
   const input = {planExpiresAt: '2026-08-29T00:00:00.000Z', now: '2026-08-29T01:00:00.000Z', protectivePermitTtlMs: 5_000};
   assert.equal(
