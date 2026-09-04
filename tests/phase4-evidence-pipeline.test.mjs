@@ -358,3 +358,13 @@ test('admission recognizes only ACTIVE_CANDIDATE and QUALIFIED among collector s
  assert.deepEqual(new Set(selectLiveEvidenceAdmissionCandidates(eligible,2).map(candidate=>candidate.state)),new Set(['ACTIVE_CANDIDATE','QUALIFIED']));
  assert.deepEqual(states.filter(candidate=>!candidate.admissionEligible).map(candidate=>candidate.state),['PREFILTERED','OBSERVING','WAITING']);
 });
+
+test('fresh continuity anchor excludes pre-admission raw observations from maturity',async()=>{
+ const live=[-11,-10,-9,-8,-1,0].map(minutes=>({observedAt:new Date(atMs+minutes*60_000).toISOString(),sourceType:'LIVE_OBSERVED',sourceProvider:'test',price:1,resolutionMs:60_000}));
+ const baseline={poolAddress:'FRESH',assessedAt:at,history:history(61),liveMarket:live,liveConfirmationMinutes:10,liveConfirmationMinObservations:4,liveConfirmationMaxGapMs:450_000};
+ const legacy=await assessHistoryMaturity(baseline);
+ const anchored=await assessHistoryMaturity({...baseline,liveConfirmationEpisodeAnchorAt:new Date(atMs-60_000).toISOString()});
+ assert.equal(legacy.liveConfirmationState,'CONFIRMED');
+ assert.equal(anchored.liveConfirmationState,'WARMING');
+ assert.ok(anchored.reasonCodes.includes('ENTRY_LIVE_CONFIRMATION_PENDING'));
+});
