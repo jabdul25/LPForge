@@ -2345,7 +2345,7 @@ export async function createPostgresStore(
       );
     },
     async listDiscoveryCandidates(tiers=['A']) {
-      const r=await db.query(`SELECT pool_address,current_state,current_tier,last_priority_score,last_rank,last_seen_at,token_x_mint,token_y_mint,paired_token_mint,COALESCE(NULLIF(payload->>'deepScreenedAt','')::timestamptz,last_seen_at) AS admission_seen_at,payload FROM market.pool_discovery_registry WHERE current_tier=ANY($1::text[]) ORDER BY last_rank NULLS LAST,last_priority_score DESC,pool_address`,[tiers]);
+      const r=await db.query(`SELECT pool_address,current_state,current_tier,last_priority_score,last_rank,last_seen_at,token_x_mint,token_y_mint,paired_token_mint,last_seen_at AS admission_seen_at,payload FROM market.pool_discovery_registry WHERE current_tier=ANY($1::text[]) ORDER BY last_rank NULLS LAST,last_priority_score DESC,pool_address`,[tiers]);
       return r.rows.map(row=>({poolAddress:String(row.pool_address),state:String(row.current_state),tier:String(row.current_tier),priorityScore:Number(row.last_priority_score),...(row.last_rank!==null?{rank:Number(row.last_rank)}:{}),lastSeenAt:new Date(String(row.admission_seen_at)).toISOString(),...(row.token_x_mint?{tokenXMint:String(row.token_x_mint)}:{}),...(row.token_y_mint?{tokenYMint:String(row.token_y_mint)}:{}),...(row.paired_token_mint?{pairedTokenMint:String(row.paired_token_mint)}:{}),payload:(row.payload??{}) as Record<string,unknown>}));
     },
     async reconcileLiveEvidenceAdmission(v) {
