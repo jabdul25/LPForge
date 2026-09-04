@@ -1,6 +1,6 @@
 # LPForge DOGE-1 exit / terminalization forensic
 
-Forensic cutoff: 2026-09-04T13:01:20Z
+Forensic cutoff: 2026-09-04T11:04:16Z (UTC)
 
 Position: `7z3YCFnYGN27nuQQXL58U5Li9qc3PmRSKZyvLNmbEtA4`  
 Entry plan: `plan-fa11a94c1955baf48a451b66b7c2c11a`  
