@@ -194,6 +194,17 @@ test('live-evidence replacement honors hysteresis, dwell, and critical-consumpti
  assert.deepEqual(protectedSelected.map(x=>x.poolAddress),['critical']);
 });
 
+test('active WARMING continuity trackers retain both slots through economic rotation while a third pool waits',()=>{
+ const base={priorityScore:10,firstSeenAt:'2026-08-13T14:00:00.000Z',matureForPhase3:false,phase3Terminal:false,state:'ACTIVE_CANDIDATE',evidenceLeaseActive:true,activeDwellMs:LIVE_EVIDENCE_MIN_ACTIVE_DWELL_MS+1,protectedCriticalConsumption:true};
+ const selected=selectLiveEvidenceAdmissionCandidates([
+  {...base,poolAddress:'warming-a',evidencePriority:10},
+  {...base,poolAddress:'warming-b',evidencePriority:11},
+  {...base,poolAddress:'waiting-c',state:'QUALIFIED',evidenceLeaseActive:false,protectedCriticalConsumption:false,evidencePriority:99},
+ ],2);
+ assert.deepEqual(new Set(selected.map(x=>x.poolAddress)),new Set(['warming-a','warming-b']));
+ assert.equal(selected.includes(selected.find(x=>x.poolAddress==='waiting-c')),false,'the waiting pool cannot displace a protected WARMING episode');
+});
+
 test('discovery economic priority has explicit bounded freshness',()=>{
  assert.equal(freshDiscoveryEconomicPriority({priority:75,observedAt:'2026-08-13T15:55:00.000Z'},at),75);
  assert.equal(freshDiscoveryEconomicPriority({priority:75,observedAt:'2026-08-13T15:49:59.999Z'},at),undefined);
