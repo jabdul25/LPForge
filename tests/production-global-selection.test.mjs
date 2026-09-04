@@ -10,10 +10,18 @@ test('one best Candidate-Primary result per pool is globally ranked by comparabl
   const r=selectProductionGlobalWinner({decisionCutoff:cutoff,candidates:[candidate('A',.0001),candidate('B',.0003),candidate('C',.0002)]});
   assert.equal(r.outcome,'GLOBAL_WINNER');assert.equal(r.crossPoolMetricsComparable,true);assert.equal(r.winner?.poolAddress,'B');assert.deepEqual(r.ranked.map(x=>x.poolAddress),['B','C','A']);
 });
-test('P4 remains downstream authorization and does not erase a comparable P3 winner',()=>{
-  const p3Winner=candidate('A',.0003,{phase4State:'WAIT'}),other=candidate('B',.0002,{phase4State:'ENTRY_READY'});
-  const r=selectProductionGlobalWinner({decisionCutoff:cutoff,candidates:[p3Winner,other]});
-  assert.equal(p3Winner.state,'INCLUDED');assert.equal(r.winner?.poolAddress,'A');
+test('P4 WAIT or REJECT cannot be emitted as a global winner even when rank one',()=>{
+  const wait=candidate('A',.0003,{phase4State:'WAIT'}),reject=candidate('B',.0002,{phase4State:'REJECT'});
+  const r=selectProductionGlobalWinner({decisionCutoff:cutoff,candidates:[wait,reject]});
+  assert.equal(wait.state,'NO_VALID_CANDIDATE');assert.equal(reject.state,'NO_VALID_CANDIDATE');assert.equal(r.outcome,'GLOBAL_NO_TRADE');
+  assert.ok(wait.reasonCodes.includes('GLOBAL_P4_NOT_ENTRY_READY'));
+});
+test('zero operational allocation or false final entry readiness cannot be emitted as a global winner',()=>{
+  const zero=candidate('A',.0003,{operationalCapitalAllocated:0,operationalEntryReady:false});
+  const r=selectProductionGlobalWinner({decisionCutoff:cutoff,candidates:[zero]});
+  assert.equal(zero.state,'NO_VALID_CANDIDATE');assert.equal(r.outcome,'GLOBAL_NO_TRADE');
+  assert.ok(zero.reasonCodes.includes('GLOBAL_OPERATIONAL_CAPITAL_ALLOCATION_ZERO'));
+  assert.ok(zero.reasonCodes.includes('GLOBAL_OPERATIONAL_ENTRY_NOT_READY'));
 });
 test('missing, stale, or incompatible pool facts fail closed rather than falling back to a single probe',()=>{
   const stale=candidate('A',.1,{decisionAt:'2026-08-31T19:50:00.000Z'});assert.equal(stale.state,'EXCLUDED_STALE');
