@@ -351,3 +351,10 @@ test('earliest internal continuity deadline preempts later-maturing ordinary tra
  const ordinary=continuityMaturityPriority({poolAddress:'OTHER',observedAt:now,liveObservationTimes:['2026-09-04T21:59:57.543Z'],tierARank:1,candidateUtility:10});
  assert.ok(compareContinuityMaturityPriority(urgent,ordinary)<0);
 });
+
+test('admission recognizes only ACTIVE_CANDIDATE and QUALIFIED among collector state controls',()=>{
+ const states=['ACTIVE_CANDIDATE','QUALIFIED','PREFILTERED','OBSERVING','WAITING'].map((state,index)=>({poolAddress:state,state,priorityScore:10-index,firstSeenAt:at,matureForPhase3:state==='QUALIFIED',phase3Terminal:false,admissionEligible:state==='ACTIVE_CANDIDATE'||state==='QUALIFIED'}));
+ const eligible=states.filter(candidate=>candidate.admissionEligible);
+ assert.deepEqual(new Set(selectLiveEvidenceAdmissionCandidates(eligible,2).map(candidate=>candidate.state)),new Set(['ACTIVE_CANDIDATE','QUALIFIED']));
+ assert.deepEqual(states.filter(candidate=>!candidate.admissionEligible).map(candidate=>candidate.state),['PREFILTERED','OBSERVING','WAITING']);
+});
