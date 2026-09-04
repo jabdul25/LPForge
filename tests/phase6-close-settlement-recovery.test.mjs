@@ -95,8 +95,19 @@ test('terminal OPEN_RECOVERED attribution remains off the recurring queue and is
   const db = await import('node:fs/promises').then(fs => fs.readFile('packages/db/src/index.ts', 'utf8'));
   assert.match(source,/loadPartialEntryRecovery\(entryPlanId\)/);
   assert.match(source,/recoveryRow\.state\)!=="OPEN_RECOVERED"/);
+  assert.match(source,/recoveryRow\.payload\?\?\{\} as Record<string,unknown>\)\.partialEntry!==true/);
   assert.match(db,/async loadPartialEntryRecovery\(planId\)/);
   assert.match(db,/WHERE plan_id=\$1/);
+});
+
+test('a normal reconciled funded OPEN cannot be misclassified as a recovered partial entry at close time', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile('packages/phase6-live-worker/src/index.ts', 'utf8'));
+  const normalOpen = source.slice(
+    source.indexOf('await persistOpenResidualInventory'),
+    source.indexOf('await input.store.completeAutonomousPlan', source.indexOf('await persistOpenResidualInventory')),
+  );
+  assert.doesNotMatch(normalOpen,/upsertPartialEntryRecovery/);
+  assert.match(source,/partialEntry!==true/);
 });
 
 test('expired entry deadlines never strand an existing protective close, but still bind OPEN', () => {

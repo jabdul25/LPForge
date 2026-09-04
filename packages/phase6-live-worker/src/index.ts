@@ -1122,29 +1122,11 @@ export async function executeAutonomousOpen(input: {
         const actualOpenFee=await confirmedTransactionFeeLamports(connection,submitted.signature);
         await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:tx-cost:${input.plan.transactionId}`,positionAddress:prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'TX_COST',observedAt:new Date().toISOString(),lamports:actualOpenFee??fee.totalFeeLamports,payload:{signature:submitted.signature,transactionId:input.plan.transactionId,source:actualOpenFee===undefined?'EXECUTION_FEE_ESTIMATE':'CHAIN_RECEIPT_META',...(actualOpenFee===undefined?{estimatedLamports:fee.totalFeeLamports.toString()}:{})}});
         await persistOpenResidualInventory({store:input.store,connection,plan:input.plan,positionAddress:prepared.positionSigner.publicKeyAddress,funding:entryFundingMeasurement,signature:submitted.signature});
-        if (input.plan.swapTransactionId)
-          await input.store.upsertPartialEntryRecovery({
-            planId: input.plan.planId,
-            poolAddress: input.plan.poolAddress,
-            ownerAddress: input.plan.ownerAddress,
-            tokenMint: entryFundingMeasurement?.tokenMint ?? String(funding.tokenMint ?? ""),
-            fundingTransactionId: input.plan.swapTransactionId,
-            fundingSignature: entryFundingMeasurement?.fundingSignature ?? "confirmed",
-            fundedAt: new Date().toISOString(),
-            pairedTokenAmount: entryFundingMeasurement?.pairedTokenReceivedRaw.toString() ?? String(funding.totalPairedTokenRaw ?? "0"),
-            intendedCapitalLamports: fields.capital,
-            intendedRange: {
-              lowerBinId: fields.lower,
-              upperBinId: fields.upper,
-              strategy: intent.strategy,
-            },
-            state: "OPEN_RECOVERED",
-            walletTruth: { refreshRequired: false },
-            payload: {
-              positionAddress: prepared.positionSigner.publicKeyAddress,
-            },
-            updatedAt: new Date().toISOString(),
-          });
+        // A fully reconciled OPEN with a funding swap is not a partial-entry
+        // recovery. Normal residuals are recorded by persistOpenResidualInventory
+        // above. Only an interrupted/partially reconciled OPEN may create an
+        // OPEN_RECOVERED record, because close settlement treats that record as
+        // proof that a separately attributable wallet residual must be unwound.
         await input.store.completeAutonomousPlan({
           planId: input.plan.planId,
           state: "RECONCILED",
@@ -1382,6 +1364,7 @@ async function ensureRecoveredOpenResidualInventory(input:{
   if(
     !recoveryRow||
     String(recoveryRow.state)!=="OPEN_RECOVERED"||
+    (recoveryRow.payload??{} as Record<string,unknown>).partialEntry!==true||
     String(recoveryRow.owner_address)!==input.plan.ownerAddress||
     String(recoveryRow.pool_address)!==input.plan.poolAddress||
     String(recoveryRow.token_mint)!==input.tokenMint
