@@ -2503,10 +2503,26 @@ export async function createPostgresStore(
       try {
         await db.query('BEGIN');
         await db.query("SELECT pg_advisory_xact_lock(hashtext('LPFORGE_RAW_REPLAY_TRACKING'))");
-        const rows=await db.query(`SELECT pool_address,current_state,last_priority_score,first_seen_at,payload
-          FROM market.pool_discovery_registry
-          WHERE source_auto=true AND current_tier='A' AND current_state IN ('QUALIFIED','ACTIVE_CANDIDATE')
-            AND payload->>'rawReplayTrackingState' IN ('WAITING_REPLAY_SERVICE','REPLAY_TRACKING')
+        // Reconcile both durable queue members and the pre-deployment backlog.  The
+        // latter is identified from its authoritative latest Phase-3 result, rather
+        // than by an operator repair or a pool-specific exception.
+        const rows=await db.query(`SELECT registry.pool_address,registry.current_state,registry.last_priority_score,registry.first_seen_at,registry.payload
+          FROM market.pool_discovery_registry registry
+          LEFT JOIN LATERAL (
+            SELECT phase3_status,payload,observed_at
+            FROM operations.forward_cycles
+            WHERE pool_address=registry.pool_address
+            ORDER BY observed_at DESC
+            LIMIT 1
+          ) latest_phase3 ON true
+          WHERE registry.source_auto=true AND registry.current_tier='A' AND registry.current_state IN ('QUALIFIED','ACTIVE_CANDIDATE')
+            AND (
+              registry.payload->>'rawReplayTrackingState' IN ('WAITING_REPLAY_SERVICE','REPLAY_TRACKING')
+              OR (
+                latest_phase3.phase3_status='NO_TRADE'
+                AND COALESCE(latest_phase3.payload->'reasonCodes','[]'::jsonb) ? 'FEE_CALIBRATION_RAW_REPLAY_NOT_ACTIONABLE'
+              )
+            )
           FOR UPDATE`);
         const ranked=rows.rows.map(row=>{const payload=(row.payload??{}) as Record<string,unknown>;return{poolAddress:String(row.pool_address),state:String(row.current_state),priority:Number(row.last_priority_score??0),waitingAt:String(payload.rawReplayWaitingAt??row.first_seen_at)};}).sort((a,b)=>b.priority-a.priority||Date.parse(a.waitingAt)-Date.parse(b.waitingAt)||a.poolAddress.localeCompare(b.poolAddress));
         const tracked=ranked.slice(0,capacity).map(row=>row.poolAddress),waiting=ranked.slice(capacity).map(row=>row.poolAddress);
