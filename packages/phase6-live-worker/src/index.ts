@@ -4194,15 +4194,14 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     // child signature rather than whichever earlier mutation last updated the
     // plan journal.
     const pendingSignature = closeSettlementPending(plan)?.signature;
-    let recoverySignature = pendingSignature ?? journal.signature;
+    const recoverySignature = pendingSignature ?? journal.signature;
     let transactionSubmission:
       | { signature: string; lastValidBlockHeight?: number }
       | undefined;
     if (!recoverySignature && journal.transactionId &&
       typeof (input.store as unknown as { loadSubmissionAttemptByTransactionId?: unknown }).loadSubmissionAttemptByTransactionId === "function")
       transactionSubmission = await input.store.loadSubmissionAttemptByTransactionId(journal.transactionId);
-    if (!recoverySignature && transactionSubmission)
-      recoverySignature = transactionSubmission.signature;
+    const effectiveRecoverySignature = recoverySignature ?? transactionSubmission?.signature;
     // A journal records the signature boundary; the durable submission row is
     // the authoritative fallback for its blockhash lifetime.  This lets a
     // crash between send and journal metadata persistence recover the exact
@@ -4210,10 +4209,12 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     let recoveryLastValidBlockHeight = journal.lastValidBlockHeight ?? transactionSubmission?.lastValidBlockHeight;
     if (
       recoveryLastValidBlockHeight === undefined &&
-      recoverySignature &&
+      effectiveRecoverySignature &&
       typeof (input.store as unknown as { loadSubmissionAttemptBySignature?: unknown }).loadSubmissionAttemptBySignature === "function"
     ) {
-      const attempt = await input.store.loadSubmissionAttemptBySignature(recoverySignature);
+      const attempt = recoverySignature
+        ? await input.store.loadSubmissionAttemptBySignature(recoverySignature)
+        : await input.store.loadSubmissionAttemptBySignature(effectiveRecoverySignature);
       if (attempt?.lastValidBlockHeight !== undefined)
         recoveryLastValidBlockHeight = attempt.lastValidBlockHeight;
     }
@@ -4225,16 +4226,16 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       | "FAILED"
       | "UNKNOWN" = "UNKNOWN";
     let signatureStatusReadUnknown = false;
-    if (recoverySignature && (connection || input.signatureStatusProvider)) {
+    if (effectiveRecoverySignature && (connection || input.signatureStatusProvider)) {
       let status:
         | { err: unknown; confirmationStatus?: string | null }
         | null
         | undefined;
       try {
         status = input.signatureStatusProvider
-          ? await input.signatureStatusProvider(recoverySignature)
+          ? await input.signatureStatusProvider(effectiveRecoverySignature)
           : (
-              await connection!.getSignatureStatus(recoverySignature, {
+              await connection!.getSignatureStatus(recoverySignature ?? effectiveRecoverySignature, {
                 searchTransactionHistory: true,
               })
             ).value;
@@ -4922,7 +4923,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         hasFundingChild:plan.steps.some(step=>step.kind==="JUPITER_SWAP"),
         fundingChildProvenNotLanded:
           confirmationStatus === "EXPIRED" &&
-          Boolean(recoverySignature) &&
+          Boolean(effectiveRecoverySignature) &&
           journal.transactionId === plan.steps[0]?.transactionId &&
           plan.steps[0]?.kind === "JUPITER_SWAP" &&
           plan.steps.slice(1).every(step => step.state === "PLANNED"),
@@ -4931,6 +4932,16 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         chunkDispositions:chunkDispositions.map(child=>child.disposition),
       });
       if(noEffect.terminal){
+        await input.store.insertExecutionReconciliation({
+          reconciliationId:`${plan.planId}:open-no-effect`,
+          planId:plan.planId,
+          observedAt:input.now,
+          status:"MATCH",
+          expected:{action:"OPEN",owner:plan.ownerAddress,pool:plan.poolAddress,signature:effectiveRecoverySignature??null},
+          actual:{confirmationStatus,economicEffect:"ABSENT",positionTruth,signature:effectiveRecoverySignature??null,fundingChildProvenNotLanded:true},
+          discrepancies:[],
+          payload:{recovery:"OPEN_EXPIRED_NO_CHAIN_EFFECT",chainEffect:"NONE",planCashflowCount:planCashflows.length,chunkDispositionCount:chunkDispositions.length},
+        });
         await input.store.transitionAutonomousPlan({
           planId:plan.planId,
           state:"EXPIRED",
@@ -4942,6 +4953,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
             confirmationStatus,
             economicEffect,
             positionTruth,
+            signature:effectiveRecoverySignature??null,
             noEffectProof:{planCashflowCount:planCashflows.length,chunkDispositionCount:chunkDispositions.length},
           },
         });
