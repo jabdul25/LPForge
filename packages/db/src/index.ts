@@ -4537,8 +4537,7 @@ return 'APPLIED';
       const [decision, unknown, recon, journal, canary, portfolio] =
         await Promise.all([
           db.query(
-            `SELECT observed_at FROM operations.forward_cycles WHERE pool_address=$1 ORDER BY observed_at DESC LIMIT 1`,
-            [poolAddress],
+            `SELECT observed_at FROM operations.forward_cycles ORDER BY observed_at DESC LIMIT 1`,
           ),
           db.query(
             `SELECT count(*)::int AS n FROM execution.submission_attempts WHERE state='UNKNOWN'`,
