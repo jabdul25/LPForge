@@ -95,8 +95,37 @@ test('terminal OPEN_RECOVERED attribution remains off the recurring queue and is
   const db = await import('node:fs/promises').then(fs => fs.readFile('packages/db/src/index.ts', 'utf8'));
   assert.match(source,/loadPartialEntryRecovery\(entryPlanId\)/);
   assert.match(source,/recoveryRow\.state\)!=="OPEN_RECOVERED"/);
+  assert.match(source,/\(recoveryRow\.payload \?\? \{\}\) as Record<string,unknown>\)\.partialEntry!==true/);
   assert.match(db,/async loadPartialEntryRecovery\(planId\)/);
   assert.match(db,/WHERE plan_id=\$1/);
+});
+
+test('a normal reconciled funded OPEN cannot be misclassified as a recovered partial entry at close time', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile('packages/phase6-live-worker/src/index.ts', 'utf8'));
+  const normalOpen = source.slice(
+    source.indexOf('await persistOpenResidualInventory'),
+    source.indexOf('await input.store.completeAutonomousPlan', source.indexOf('await persistOpenResidualInventory')),
+  );
+  assert.doesNotMatch(normalOpen,/upsertPartialEntryRecovery/);
+  assert.match(source,/partialEntry!==true/);
+});
+
+test('a transient recovery RPC failure at execution startup does not terminate the autonomous runner', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile('apps/execution/src/main.ts', 'utf8'));
+  const startup = source.slice(source.indexOf('const startupAt=new Date().toISOString();'), source.indexOf('for (;;) {', source.indexOf('const startupAt=new Date().toISOString();')));
+  assert.match(startup,/P6_EXECUTION_DAEMON_START_FAILURE/);
+  assert.match(startup,/will retry\. No blind resend is permitted/);
+  assert.doesNotMatch(startup,/P6_EXECUTION_START_FAILURE'\]\}\);throw error/);
+});
+
+test('an unsigned deterministic preflight rejection is terminal no-chain-effect evidence, not an active UNKNOWN', async () => {
+  const db = await import('node:fs/promises').then(fs => fs.readFile('packages/db/src/index.ts', 'utf8'));
+  const runtime = await import('node:fs/promises').then(fs => fs.readFile('apps/execution/src/main.ts', 'utf8'));
+  assert.match(db,/recoverNoEffectPreflightSubmissionAttempts/);
+  assert.match(db,/state='EXPIRED'/);
+  assert.match(db,/state='UNKNOWN' AND signature IS NULL/);
+  assert.match(db,/submission_error' LIKE 'Simulation failed\.%%?'/);
+  assert.match(runtime,/preflightNoEffectRecovered=await store\.recoverNoEffectPreflightSubmissionAttempts/);
 });
 
 test('expired entry deadlines never strand an existing protective close, but still bind OPEN', () => {

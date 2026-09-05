@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { createMeteoraDataApi } from '../../../packages/data-api/src/index.js';
 import { createPostgresStore } from '../../../packages/db/src/index.js';
-import { loadPhase1Config } from '../../../packages/config/src/index.js';
+import { loadPhase1Config, resolveLiveExecutionPolicyPath } from '../../../packages/config/src/index.js';
 import { createMeteoraReadAdapter, createSolanaRpcClient } from '../../../packages/meteora/src/index.js';
 import { DEFAULT_DISCOVERY_RUNTIME_POLICY, deriveDiscoveryLifecycleState, runDeepDiscoveryCycle, selectDeepScreenSlice } from '../../../packages/discovery-runtime/src/index.js';
 import { collectActiveCandidateEvidence, completionAwareCollectorDelayMs } from '../../../packages/active-candidate-evidence/src/index.js';
@@ -59,7 +59,7 @@ function collectorNumber(name:string,fallback:number,min:number,max:number){cons
 async function collect(observedPoolCollectionMs?:number){
  const cfg=loadPhase1Config();if(cfg.dataMode!=='LIVE_READ_ONLY')throw new Error('LPFORGE_DISCOVERY_COLLECTOR_REQUIRES_LIVE_READ_ONLY');
  const store=await createPostgresStore(env('DATABASE_URL'));try{
-  const deployment=loadDeploymentPolicyFile(process.env.LPFORGE_EXECUTION_POLICY_PATH??'policies/live-execution-policy.json'),maxExecutableRangeWidthBins=deployment.positionConstruction?.maxInitialPositionWidthBins??100,evidenceWidth=derivePhase3EvidenceWidthRequirement(maxExecutableRangeWidthBins);
+  const deployment=loadDeploymentPolicyFile(resolveLiveExecutionPolicyPath()),maxExecutableRangeWidthBins=deployment.positionConstruction?.maxInitialPositionWidthBins??100,evidenceWidth=derivePhase3EvidenceWidthRequirement(maxExecutableRangeWidthBins);
   const rpcInterval=Math.max(cfg.rpcMinIntervalMs,collectorNumber('LPFORGE_ACTIVE_COLLECTOR_RPC_MIN_INTERVAL_MS',400,100,10_000));
   const api=createMeteoraDataApi({baseUrl:cfg.meteoraDataApiUrl,maxRps:Math.max(1,Math.min(cfg.dataApiMaxRps,collectorNumber('LPFORGE_ACTIVE_COLLECTOR_DATA_API_MAX_RPS',2,1,10))),timeoutMs:cfg.httpTimeoutMs});
   const adapter=createMeteoraReadAdapter({rpcUrl:cfg.solanaRpcHttpUrl,cluster:cfg.cluster,programId:cfg.programId,expectedSdkVersion:cfg.expectedSdkVersion,rpcTimeoutMs:cfg.rpcTimeoutMs,rpcMinIntervalMs:rpcInterval,rpcMaxRetries:cfg.rpcMaxRetries,retryBaseDelayMs:cfg.rpcRetryBaseDelayMs,retryMaxDelayMs:cfg.rpcRetryMaxDelayMs,priority:'P3_DISCOVERY'});

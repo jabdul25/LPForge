@@ -54,11 +54,17 @@ The Git checkout is deliberately different from a running release:
 ```text
 GitHub source checkout
         -> install, test, build, and validate migrations
-        -> create immutable LPForge-release-<source-sha>
+        -> install immutable LPForge/releases/<source-sha>
         -> PM2 runs services from that release directory
 ```
 
 Release directories, `.build/`, `dist/`, dependency directories, logs, databases, position state, and secrets are intentionally excluded from Git. A release manifest, checksums, and source revision must be generated and verified for the exact release artifact; do not copy an old release directory as a generic deployment.
+
+Production runtime configuration is mounted at `/root/systems/LPForge`: `.env`
+for non-secret settings, `.env.execution` for protected execution settings,
+and `policy/live-execution-policy.json` for the canonical execution policy.
+Immutable `LPForge/releases/<sha>` directories never own runtime environment
+files. See [the centralized runtime configuration runbook](docs/runbooks/RUNBOOK_CENTRALIZED_RUNTIME_CONFIGURATION.md).
 
 ## Development and validation
 

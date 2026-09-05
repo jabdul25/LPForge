@@ -3,13 +3,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 service="${1:?LPFORGE_SERVICE_REQUIRED}"
-# Runtime configuration is operational state, never release payload.  Keep
-# the release cwd for immutable artifact verification while load paths remain
-# stable across every nested immutable release.
-LPFORGE_HOME="${LPFORGE_HOME:-/root/systems/LPForge}"
-runtime_env="$LPFORGE_HOME/.env"
-[[ -r "$runtime_env" ]] || { echo 'LPFORGE_RUNTIME_ENV_REQUIRED' >&2; exit 1; }
-env_args=(--env-file="$runtime_env")
+# This establishes the stable operational root and central configuration
+# paths.  Immutable releases carry code only, never runtime configuration.
+source scripts/runtime-config-paths.sh
+env_args=(--env-file="$LPFORGE_RUNTIME_ENV_SOURCE")
 case "$service" in
   production) target='.build/apps/production/src/main.js' ;;
   discovery) target='.build/apps/discovery/src/main.js' ;;
@@ -17,7 +14,7 @@ case "$service" in
     target='.build/apps/discovery-learning/src/main.js'
     ;;
   execution)
-    execution_env="$LPFORGE_HOME/.env.execution"
+    execution_env="$LPFORGE_RUNTIME_EXECUTION_ENV_SOURCE"
     [[ -r "$execution_env" ]] || { echo 'LPFORGE_EXECUTION_ENV_REQUIRED' >&2; exit 1; }
     env_args+=(--env-file="$execution_env")
     target='.build/apps/execution/src/main.js'

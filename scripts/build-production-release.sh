@@ -2,6 +2,9 @@
 set -euo pipefail
 
 # Builds from Git's tracked tree, never from a recursive working-directory zip.
+# `install-production-release.sh` places validated artifacts below
+# $LPFORGE_HOME/releases/<source-sha>; sibling release directories are not a
+# supported deployment target.
 # Every provenance file below is generated inside the staging tree for this exact
 # commit.  Legacy root-level release metadata must never be carried forward.
 root="$(git rev-parse --show-toplevel)"
@@ -19,7 +22,7 @@ git diff --cached --quiet -- . \
   ':(exclude)SOURCE_REVISION.txt' \
   ':(exclude)SHA256SUMS.txt' || { echo 'release requires committed staged source changes' >&2; exit 1; }
 sha="$(git rev-parse HEAD)"
-policy="${LPFORGE_EXECUTION_POLICY_PATH:-policies/live-execution-policy.json}"
+policy='policies/live-execution-policy.json'
 test -f "$policy" || { echo "missing policy: $policy" >&2; exit 1; }
 pnpm test:ci
 stage="$(mktemp -d)"

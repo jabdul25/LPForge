@@ -16,8 +16,11 @@ import {
   reconcileWalletWidePositions,
 } from "../../../packages/phase6-live-worker/src/index.js";
 import { PublicKey } from "@solana/web3.js";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { EXPECTED_DLMM_PROGRAM_ID } from "../../../packages/meteora/src/index.js";
 import { loadDeploymentPolicyFile } from "../../../packages/deployment-policy/src/index.js";
+import { resolveLiveExecutionPolicyPath } from "../../../packages/config/src/index.js";
 import { validateClaimedPlan, type Phase7ExecutionControl } from "../../../packages/phase6-claim-guard/src/index.js";
 import { createGovernedConnection, createMeteoraReadAdapter } from "../../../packages/meteora/src/index.js";
 import { assertPreinitializedMeteoraBinArrays } from "../../../packages/meteora-execution/src/index.js";
@@ -168,8 +171,7 @@ function workerConfig() {
     ),
     maxFeeFraction = Number(process.env.LPFORGE_P6_MAX_FEE_FRACTION ?? "0.02"),
     policy = loadDeploymentPolicyFile(
-      process.env.LPFORGE_EXECUTION_POLICY_PATH?.trim() ||
-        "policies/live-execution-policy.json",
+      resolveLiveExecutionPolicyPath(),
     ),
     construction = policy.positionConstruction,
     configuredLiquiditySlippageBps = construction?.liquiditySlippageBps,
@@ -202,6 +204,11 @@ function workerConfig() {
     maxPresignReferenceDivergenceBps: Number(process.env.LPFORGE_P6_MAX_PRESIGN_REFERENCE_DIVERGENCE_BPS ?? 250),
     confirmPollMs: Number(process.env.LPFORGE_P6_CONFIRM_POLL_MS ?? 1000),
     confirmAttempts: Number(process.env.LPFORGE_P6_CONFIRM_ATTEMPTS ?? 30),
+    residualDustThresholdUsd: policy.settlement.residualDustThresholdUsd,
+    meteoraDataApiUrl: process.env.METEORA_DATA_API_URL ?? '',
+    dataApiMaxRps: Number(process.env.LPFORGE_DATA_API_MAX_RPS ?? 25),
+    httpTimeoutMs: Number(process.env.LPFORGE_HTTP_TIMEOUT_MS ?? 10_000),
+    policyHash: createHash('sha256').update(readFileSync(resolveLiveExecutionPolicyPath(), 'utf8')).digest('hex'),
     ...(yes(process.env.LPFORGE_MAINNET_CANARY)&&!boundedUnattendedProduction()
       ? { controlledCanary: policy.controlledCanary }
       : {}),
@@ -222,20 +229,19 @@ async function dispatchOne() {
       };
     const baseConfig = workerConfig(),
       staticPolicy = loadDeploymentPolicyFile(
-        process.env.LPFORGE_EXECUTION_POLICY_PATH?.trim() ||
-          "policies/live-execution-policy.json",
+        resolveLiveExecutionPolicyPath(),
       ),
       [owned,productionCandidates] = await Promise.all([
         store.loadOwnedPositions(plan.ownerAddress),
-        store.listDiscoveryCandidates([...(staticPolicy.productionAdmission?.eligibleTiers??['A'])]),
+        store.listDiscoveryCandidates(['A','B','C','COOLDOWN','REJECTED','QUARANTINED']),
       ]),
       config = {
         ...baseConfig,
         liquiditySlippageBps:
           staticPolicy.positionConstruction?.liquiditySlippageBps ?? 0,
       };
-    const now=new Date().toISOString(), dayStart=new Date(Date.UTC(new Date(now).getUTCFullYear(),new Date(now).getUTCMonth(),new Date(now).getUTCDate())).toISOString(),runtimeId=(process.env.LPFORGE_P7_RUNTIME_ID??'lpforge-production').trim(),provenance=object(object(plan.planPayload).provenance),binding=object(provenance.phase7Control),boundControlDecisionId=String(binding.decisionId??'');
-    const [controlRow,actionsToday,portfolioFacts,boundControlRow]=await Promise.all([store.loadLatestPhase7ControlDecision(runtimeId),store.countExecutionActionsSince(plan.ownerAddress,dayStart),store.loadPhase7PortfolioFacts(plan.ownerAddress),boundControlDecisionId?store.loadPhase7ControlDecision(runtimeId,boundControlDecisionId):Promise.resolve(undefined)]);
+    const now=new Date().toISOString(), dayStart=new Date(Date.UTC(new Date(now).getUTCFullYear(),new Date(now).getUTCMonth(),new Date(now).getUTCDate())).toISOString(),runtimeId=(process.env.LPFORGE_P7_RUNTIME_ID??'lpforge-production').trim(),provenance=object(object(plan.planPayload).provenance),binding=object(provenance.phase7Control),globalSelection=object(provenance.globalSelection),boundControlDecisionId=String(binding.decisionId??''),globalCycleId=String(globalSelection.globalCycleId??''),globalCandidateId=String(globalSelection.selectedCandidateId??'');
+    const [controlRow,actionsToday,portfolioFacts,boundControlRow,globalWinnerAdmission]=await Promise.all([store.loadLatestPhase7ControlDecision(runtimeId),store.countExecutionActionsSince(plan.ownerAddress,dayStart),store.loadPhase7PortfolioFacts(plan.ownerAddress),boundControlDecisionId?store.loadPhase7ControlDecision(runtimeId,boundControlDecisionId):Promise.resolve(undefined),globalCycleId&&globalCandidateId?store.verifyProductionGlobalWinnerAdmission({globalCycleId,poolAddress:plan.poolAddress,candidateId:globalCandidateId,now}):Promise.resolve(undefined)]);
     const phase7Control=phase7ExecutionControlFromRow(controlRow),boundPhase7Control=phase7ExecutionControlFromRow(boundControlRow);
     const provenanceSecret=(process.env.LPFORGE_PLAN_PROVENANCE_SECRET??'').trim();
     let positionTruth;
@@ -256,6 +262,7 @@ async function dispatchOne() {
       policy: staticPolicy,
       ownedPositions: owned,
       productionCandidates,
+      ...(globalWinnerAdmission?{globalWinnerAdmission:{...globalWinnerAdmission,verified:true}}:{}),
       ...(phase7Control?{phase7Control}:{}),
       ...(boundPhase7Control?{boundPhase7Control}:{}),
       actionsToday,
@@ -336,6 +343,7 @@ async function recoverOnce() {
   try {
     const config = workerConfig(),
       currentBlockHeight = await createGovernedConnection({rpcUrl:config.rpcUrl,priority:'P1_RECOVERY_CRITICAL'}).getBlockHeight("confirmed");
+    const preflightNoEffectRecovered=await store.recoverNoEffectPreflightSubmissionAttempts(new Date().toISOString());
     await store.reconcileExecutionCapitalReservations(new Date().toISOString());
     const partial = await recoverPartialEntryFunding({
       store,
@@ -348,6 +356,11 @@ async function recoverOnce() {
       now: new Date().toISOString(),
       rpcUrl: config.rpcUrl,
       programId: config.programId,
+      residualDustThresholdUsd: config.residualDustThresholdUsd,
+      meteoraDataApiUrl: config.meteoraDataApiUrl,
+      dataApiMaxRps: config.dataApiMaxRps,
+      httpTimeoutMs: config.httpTimeoutMs,
+      policyHash: config.policyHash,
     });
     // CLOSE/EMERGENCY_CLOSE stages that were durably confirmed before a
     // process interruption are protective workflows. Resume only the next
@@ -405,7 +418,7 @@ async function recoverOnce() {
       ownerAddress: (process.env.LPFORGE_OPERATOR_OWNER_ADDRESS ?? "").trim(),
       now: new Date().toISOString(),
     });
-    return { partial, plans: unresolvedPlans, resumed, walletSweep, compaction:{candidates:compactionCandidates,compactedPositionAddresses} };
+    return { partial, plans: unresolvedPlans, resumed, walletSweep, preflightNoEffectRecovered, compaction:{candidates:compactionCandidates,compactedPositionAddresses} };
   } finally {
     await store.close();
   }
@@ -456,7 +469,7 @@ async function start() {
     ),
   );
   const startupAt=new Date().toISOString();
-  try{console.log(json({...assertLaunchable(),status:"RECOVERY_BEFORE_AUTONOMOUS_DISPATCH",recovery:await recoverOnce()}));if(executionTelegramAlerter.config.notifyStartup)await safeExecutionTelegramAlert({severity:'INFO',code:'P6_EXECUTION_DAEMON_START',title:'LPForge execution daemon started',message:'The execution worker is online and awaiting autonomous plans. Signing remains subject to its independent claim guard and live policy.',runtimeId:'lpforge-execution',observedAt:startupAt});}catch(error){await safeExecutionTelegramAlert({severity:'CRITICAL',code:'P6_EXECUTION_DAEMON_START_FAILURE',title:'LPForge execution daemon failed to start',message:'The execution worker could not complete its launch checks. No transaction was sent.',runtimeId:'lpforge-execution',observedAt:startupAt,reasonCodes:['P6_EXECUTION_START_FAILURE']});throw error;}
+  try{console.log(json({...assertLaunchable(),status:"RECOVERY_BEFORE_AUTONOMOUS_DISPATCH",recovery:await recoverOnce()}));if(executionTelegramAlerter.config.notifyStartup)await safeExecutionTelegramAlert({severity:'INFO',code:'P6_EXECUTION_DAEMON_START',title:'LPForge execution daemon started',message:'The execution worker is online and awaiting autonomous plans. Signing remains subject to its independent claim guard and live policy.',runtimeId:'lpforge-execution',observedAt:startupAt});}catch(error){console.error(error);await safeExecutionTelegramAlert({severity:'CRITICAL',code:'P6_EXECUTION_DAEMON_START_FAILURE',title:'LPForge execution recovery is temporarily unavailable',message:'The execution worker caught a startup recovery exception and will retry. No blind resend is permitted.',runtimeId:'lpforge-execution',observedAt:startupAt,reasonCodes:['P6_EXECUTION_START_FAILURE']});}
   for (;;) {
     const observedAt=new Date().toISOString();
     try{const recovery = await recoverOnce();if (recovery.partial.length || recovery.plans.length || (!('skipped' in recovery.walletSweep) && recovery.walletSweep.adopted>0)){const result={service:'lpforge-execution',status:'RECOVERY_PENDING',recovery,observedAt};console.log(json(result));await safeExecutionTelegramAlert({severity:'WARNING',code:'P6_EXECUTION_RECOVERY_PENDING',title:'Execution recovery is active',message:'LPForge is reconciling unfinished execution state before accepting a new plan.',runtimeId:'lpforge-execution',observedAt,reasonCodes:[...recovery.partial.flatMap(x=>x.reasonCodes),...recovery.plans.flatMap(x=>x.reasonCodes),...recovery.walletSweep.reasonCodes].slice(0,12)});}else{const result=await dispatchOne();console.log(json({...result,observedAt}));await alertExecutionResult(result,observedAt);}}catch(error){console.error(error);await safeExecutionTelegramAlert({severity:'CRITICAL',code:'P6_EXECUTION_CYCLE_EXCEPTION',title:'Execution cycle exception',message:'The execution worker caught an exception and will retry. No blind resend is permitted.',runtimeId:'lpforge-execution',observedAt,reasonCodes:['P6_EXECUTION_CYCLE_EXCEPTION']});}

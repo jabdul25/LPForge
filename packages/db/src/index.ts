@@ -41,6 +41,118 @@ export function executionPlanCountsAsPendingForPortfolio(state: string): boolean
 }
 
 /**
+ * Continuity tracking is deliberately bounded.  When its slots contend, the
+ * selection must favour the pool most likely to complete the already-required
+ * live-confirmation episode, rather than the pool that happened to enter the
+ * tracker first.  This is scheduling only: it grants neither entry authority
+ * nor an exception to the confirmation contract.
+ */
+export interface ContinuityMaturityPriorityInput {
+  poolAddress: string;
+  observedAt: string;
+  liveObservationTimes: readonly string[];
+  trackingStartedAt?: string;
+  tierARank?: number;
+  candidateUtility?: number;
+  candidateReadiness?: number;
+  confirmationWindowMs?: number;
+  minimumObservations?: number;
+  maximumGapMs?: number;
+}
+
+export interface ContinuityMaturityPriority {
+  poolAddress: string;
+  logicalDeadlineAtMs: number;
+  internalServiceDeadlineAtMs: number;
+  confirmationRemainingMs: number;
+  validObservationCount: number;
+  validObservationSpanMs: number;
+  anchorPresent: boolean;
+  tierARank: number;
+  candidateUtility: number;
+  candidateReadiness: number;
+  trackingStartedAtMs: number;
+}
+
+/** A 60s collector wake plus observed ~90s p95 pool-read duration. */
+export const EVIDENCE_CONTINUITY_SERVICE_HEADROOM_MS = 150_000;
+
+export function evidenceContinuityDeadlines(lastObservationAt: string, maximumGapMs = 450_000): { logicalDeadlineAtMs: number; internalServiceDeadlineAtMs: number } | undefined {
+  const last = Date.parse(lastObservationAt);
+  if (!Number.isFinite(last)) return undefined;
+  const gap = Math.max(1, Math.floor(maximumGapMs));
+  return { logicalDeadlineAtMs: last + gap, internalServiceDeadlineAtMs: last + Math.max(1, gap - EVIDENCE_CONTINUITY_SERVICE_HEADROOM_MS) };
+}
+
+export function continuityMaturityPriority(input: ContinuityMaturityPriorityInput): ContinuityMaturityPriority {
+  const now = Date.parse(input.observedAt);
+  const confirmationWindowMs = Math.max(1, Math.floor(input.confirmationWindowMs ?? 10 * 60_000));
+  const minimumObservations = Math.max(1, Math.floor(input.minimumObservations ?? 4));
+  const maximumGapMs = Math.max(1, Math.floor(input.maximumGapMs ?? 450_000));
+  const observations = input.liveObservationTimes
+    .map((value) => Date.parse(value))
+    .filter((value) => Number.isFinite(value) && value <= now && value >= now - confirmationWindowMs - maximumGapMs)
+    .sort((a, b) => a - b);
+  const latest = observations.at(-1);
+  const deadlines = latest === undefined ? undefined : evidenceContinuityDeadlines(new Date(latest).toISOString(), maximumGapMs);
+  const currentEpisode = latest === undefined || now - latest > maximumGapMs
+    ? []
+    : observations.reduce<number[]>((episode, value) => {
+        if (!episode.length || value - episode.at(-1)! <= maximumGapMs) episode.push(value);
+        else {
+          episode.length = 0;
+          episode.push(value);
+        }
+        return episode;
+      }, []);
+  const first = currentEpisode[0];
+  const last = currentEpisode.at(-1);
+  const validObservationCount = currentEpisode.length;
+  const validObservationSpanMs = first === undefined || last === undefined ? 0 : Math.max(0, last - first);
+  const anchorPresent = first !== undefined
+    && last !== undefined
+    && validObservationCount >= minimumObservations
+    && now - first >= confirmationWindowMs
+    && now - last <= maximumGapMs;
+  return {
+    poolAddress: input.poolAddress,
+    logicalDeadlineAtMs: deadlines?.logicalDeadlineAtMs ?? Number.MAX_SAFE_INTEGER,
+    internalServiceDeadlineAtMs: deadlines?.internalServiceDeadlineAtMs ?? Number.MAX_SAFE_INTEGER,
+    // A non-current episode is deliberately least preferred: retaining it
+    // cannot repair the already-broken confirmation window.
+    confirmationRemainingMs: first === undefined || last === undefined || now - last > maximumGapMs
+      ? Number.POSITIVE_INFINITY
+      : Math.max(0, confirmationWindowMs - (now - first)),
+    validObservationCount,
+    validObservationSpanMs,
+    anchorPresent,
+    tierARank: Number.isFinite(input.tierARank) ? Math.max(0, Math.floor(input.tierARank!)) : Number.MAX_SAFE_INTEGER,
+    candidateUtility: Number.isFinite(input.candidateUtility) ? input.candidateUtility! : Number.NEGATIVE_INFINITY,
+    candidateReadiness: Number.isFinite(input.candidateReadiness) ? input.candidateReadiness! : Number.NEGATIVE_INFINITY,
+    trackingStartedAtMs: input.trackingStartedAt && Number.isFinite(Date.parse(input.trackingStartedAt))
+      ? Date.parse(input.trackingStartedAt)
+      : Number.MAX_SAFE_INTEGER,
+  };
+}
+
+/** Lower values win.  This comparator is total and stable across restarts. */
+export function compareContinuityMaturityPriority(a: ContinuityMaturityPriority, b: ContinuityMaturityPriority): number {
+  const numericAsc = (left: number, right: number) => left === right ? 0 : left < right ? -1 : 1;
+  const numericDesc = (left: number, right: number) => left === right ? 0 : left > right ? -1 : 1;
+  return numericAsc(a.internalServiceDeadlineAtMs, b.internalServiceDeadlineAtMs)
+    || numericAsc(a.logicalDeadlineAtMs, b.logicalDeadlineAtMs)
+    || numericAsc(a.confirmationRemainingMs, b.confirmationRemainingMs)
+    || numericDesc(Number(a.anchorPresent), Number(b.anchorPresent))
+    || numericDesc(a.validObservationCount, b.validObservationCount)
+    || numericDesc(a.validObservationSpanMs, b.validObservationSpanMs)
+    || numericAsc(a.tierARank, b.tierARank)
+    || numericDesc(a.candidateUtility, b.candidateUtility)
+    || numericDesc(a.candidateReadiness, b.candidateReadiness)
+    || numericAsc(a.trackingStartedAtMs, b.trackingStartedAtMs)
+    || a.poolAddress.localeCompare(b.poolAddress);
+}
+
+/**
  * A non-MATCH plan reconciliation remains audit evidence forever.  It is only
  * operationally superseded when a later lifecycle-level chain reconciliation
  * proves the same lifecycle terminal and no newer unresolved effect exists.
@@ -188,8 +300,13 @@ export const ACTIVE_EVIDENCE_LEASE_RETRY_COOLDOWN_MS=15*60_000;
  * bounded cooldown, but cannot become an unbounded background collector.
  */
 export const EVIDENCE_CONTINUITY_TRACKING_TTL_MS=60*60_000;
-/** One bounded lane preserves the two-slot economic lease contract. */
-export const EVIDENCE_CONTINUITY_TRACKING_CAP=1;
+/** Two bounded lanes preserve the two-slot economic lease contract while
+ * avoiding immediate FIFO eviction of near-mature dynamic pools. */
+export const EVIDENCE_CONTINUITY_TRACKING_CAP=2;
+/** Raw replay is a separate, bounded evidence queue.  One lane is the
+ * serviceable remainder of the one-RPC-lane collector when two protected
+ * confirmation trackers are present (3 × 90s < the existing 300s target). */
+export const RAW_REPLAY_TRACKING_CAP=1;
 const EVIDENCE_CONTINUITY_NO_TRADE_REASONS=new Set([
   'CANDIDATE_REPLAY_COVERAGE_INSUFFICIENT',
   'CANDIDATE_REPLAY_CONTINUITY_INSUFFICIENT',
@@ -416,11 +533,14 @@ export type PositionInventoryLotStatus =
   | "OPEN"
   | "PARTIALLY_SETTLED"
   | "SETTLED"
-  | "TRANSFERRED";
+  | "TRANSFERRED"
+  | "DUST_RETAINED";
 export type PositionInventoryLotEventType =
   | "CREATED"
   | "SETTLED"
-  | "TRANSFERRED";
+  | "TRANSFERRED"
+  | "DUST_RETAINED"
+  | "ATTRIBUTION_CORRECTED";
 export interface PositionInventoryLot {
   lotId:string;
   positionAddress:string;
@@ -545,6 +665,11 @@ export function assessLifecycleSettlement(input:LifecycleSettlementInput):Lifecy
   if(!input.reservationClean)reasons.push("SETTLEMENT_RESERVATION_PENDING");
   reasons.push(...assertLifecycleTransactionsTerminal(input.transactions));
   for(const lot of input.inventoryLots){
+    if(lot.status==="DUST_RETAINED"){
+      const dust=lot.payload.dustDisposition;
+      if(!dust||typeof dust!=="object"||String((dust as Record<string,unknown>).state??"")!=="DUST_RETAINED"||String((dust as Record<string,unknown>).rawAmount??"")!==lot.remainingRawAmount.toString()||!Number.isFinite(Number((dust as Record<string,unknown>).usdValue))||Number((dust as Record<string,unknown>).usdValue)<0||!Number.isFinite(Number((dust as Record<string,unknown>).thresholdUsd))||Number((dust as Record<string,unknown>).thresholdUsd)<0||Number((dust as Record<string,unknown>).usdValue)>Number((dust as Record<string,unknown>).thresholdUsd)||typeof (dust as Record<string,unknown>).valuationSource!=="string"||typeof (dust as Record<string,unknown>).valuationAt!=="string")reasons.push(`SETTLEMENT_DUST_DISPOSITION_INVALID:${lot.lotId}`);
+      continue;
+    }
     if(lot.remainingRawAmount!==0n||!(lot.status==="SETTLED"||lot.status==="TRANSFERRED")){reasons.push(`SETTLEMENT_INVENTORY_REMAINS:${lot.lotId}`);continue;}
     const terminal=lot.payload.terminalSettlement;
     if(lot.status==="SETTLED"&&(!terminal||typeof terminal!=="object"||typeof (terminal as Record<string,unknown>).transactionSignature!=="string"))reasons.push(`SETTLEMENT_INVENTORY_DISPOSITION_MISSING:${lot.lotId}`);
@@ -756,9 +881,11 @@ export interface Phase1Store {
     poolAddress: string; state: string; tier: string; priorityScore: number; rank?: number | undefined; lastSeenAt: string; tokenXMint?:string|undefined;tokenYMint?:string|undefined;pairedTokenMint?:string|undefined; payload: Record<string, unknown>;
   }>>;
   reconcileLiveEvidenceAdmission(value:{observedAt:string;serviceableCapacity:number;productionMonitoredPoolAddresses?:string[]}):Promise<{serviceableCapacity:number;productionMonitoredCount:number;activeCount:number;qualifiedWaitingCount:number;promotedPoolAddresses:string[];demotedPoolAddresses:string[];replacements:Array<{incumbentPoolAddress:string;challengerPoolAddress:string;priorityDelta:number}>}>;
-  reconcileEvidenceContinuityTracking(value:{observedAt:string;capacity:number}):Promise<{capacity:number;trackedPoolAddresses:string[];expiredPoolAddresses:string[];evictedPoolAddresses:string[]}>;
+  reconcileEvidenceContinuityTracking(value:{observedAt:string;capacity:number;liveConfirmationWindowMs?:number;liveConfirmationMinimumObservations?:number;liveConfirmationMaximumGapMs?:number}):Promise<{capacity:number;trackedPoolAddresses:string[];expiredPoolAddresses:string[];evictedPoolAddresses:string[]}>;
+  reconcileRawReplayTracking(value:{observedAt:string;capacity:number}):Promise<{capacity:number;trackedPoolAddresses:string[];waitingPoolAddresses:string[]}>;
   recordLiveEvidenceCollectionOutcome(value:{poolAddress:string;observedAt:string;success:boolean;eventPathEstimate?:boolean;phase3CurrentLiveReady?:boolean;poolReadStartedAt?:string;poolReadCompletedAt?:string;poolReadElapsedMs?:number;serviceGapMs?:number}):Promise<void>;
   recordEvidenceContinuityCollectionOutcome(value:{poolAddress:string;observedAt:string;success:boolean;poolReadStartedAt?:string;poolReadCompletedAt?:string;poolReadElapsedMs?:number;serviceGapMs?:number}):Promise<void>;
+  recordRawReplayCollectionOutcome(value:{poolAddress:string;observedAt:string;success:boolean;poolReadStartedAt?:string;poolReadCompletedAt?:string;poolReadElapsedMs?:number;serviceGapMs?:number}):Promise<void>;
   loadActiveCandidateEvidenceCollectorTiming?():Promise<{p95PoolCollectionMs?:number}|undefined>;
   recordActiveCandidateEvidenceCollectorPass?(value:{observedAt:string;completedAt:string;elapsedMs:number;collectionSliceSize:number;effectivePoolCollectionMs:number;measuredP95PoolCollectionMs:number;projectedRevisitMs:number;capacityViolation:boolean;maxServiceGapMs:number;activePoolCount:number;successfulPoolCount:number;continuityPoolCount?:number;economicProjectedRevisitMs?:number;continuityProjectedRevisitMs?:number;economicTargetViolation?:boolean}):Promise<void>;
   recordPostEvidenceEvaluationOutcome(value:{poolAddress:string;observedAt:string;phase3Status:string;reasonCodes?:readonly string[]}):Promise<void>;
@@ -834,8 +961,10 @@ export interface Phase1Store {
   /** Canonical Production global-selection evidence. This is the only pool-selection lane. */
   insertProductionGlobalCandidate(value:{globalCycleId:string;poolAddress:string;operationalCycleId:string;observedAt:string;operationalState:'ENTRY_READY'|'NO_TRADE'|'WARMING'|'REJECTED';phase4State:string;recommendationId?:string;thesisId?:string;candidateId?:string;strategy?:string;orientation?:string;lowerBinId?:number;upperBinId?:number;activeBinId?:number;capitalValue?:number;horizonMinutes?:number;predictedGrossFees?:number;predictedInventoryPnl?:number;predictedNetEv?:number;riskAdjustedExpectedNetEv?:number;uncertainty?:number;confidence?:number;oorRisk?:number;eventPathEvidenceAt?:string;feeEvidenceAt?:string;volumeEvidenceAt?:string;tvl?:number;feeTvl1h?:number;feeTvl24h?:number;reasonCodes:string[];evidence:Record<string,unknown>;payload:Record<string,unknown>}):Promise<void>;
   loadProductionGlobalCandidateFacts(globalCycleId:string,poolAddresses:string[]):Promise<Array<Record<string,unknown>>>;
+  /** Verifies an exact, fresh canonical global-winner binding for Phase-6 claim admission. */
+  verifyProductionGlobalWinnerAdmission(value:{globalCycleId:string;poolAddress:string;candidateId:string;now:string}):Promise<{globalCycleId:string;poolAddress:string;candidateId:string;selectionTier:string;selectionState:string;selectionDynamicEligible:boolean}|undefined>;
   loadProductionPoolSettlementHistory(poolAddresses:string[],decisionCutoff:string):Promise<Array<Record<string,unknown>>>;
-  insertProductionGlobalSelection(value:{globalCycleId:string;policyVersion:string;reentryContextPolicyVersion:string;decisionCutoff:string;startedAt:string;completedAt:string;eligiblePoolCount:number;evaluatedPoolCount:number;candidatePoolCount:number;coverageState:string;outcome:string;winnerPoolAddress?:string;winnerCandidateId?:string;runnerUpPoolAddress?:string;rankingMetric:string;crossPoolMetricsComparable:boolean;reasonCodes:string[];sourceCommit?:string;buildId?:string;payload:Record<string,unknown>;candidates:Array<{poolAddress:string;evaluationOrder:number;candidateRank?:number;candidateState:string;recommendationId?:string;thesisId?:string;candidateId?:string;strategy?:string;orientation?:string;lowerBinId?:number;upperBinId?:number;activeBinId?:number;riskAdjustedExpectedNetEv?:number;predictedFees?:number;predictedInventoryPnl?:number;capitalValue?:number;horizonMinutes?:number;decisionAt?:string;expiresAt?:string;phase3State?:string;phase4State?:string;reasonCodes:string[];historyContext:Record<string,unknown>;payload:Record<string,unknown>}>}):Promise<void>;
+  insertProductionGlobalSelection(value:{globalCycleId:string;policyVersion:string;reentryContextPolicyVersion:string;decisionCutoff:string;startedAt:string;completedAt:string;eligiblePoolCount:number;evaluatedPoolCount:number;candidatePoolCount:number;coverageState:string;outcome:string;winnerPoolAddress?:string;winnerCandidateId?:string;runnerUpPoolAddress?:string;rankingMetric:string;crossPoolMetricsComparable:boolean;reasonCodes:string[];sourceCommit?:string;buildId?:string;payload:Record<string,unknown>;candidates:Array<{poolAddress:string;evaluationOrder:number;candidateRank?:number;candidateState:string;selectionTier?:string;selectionState?:string;selectionDynamicEligible?:boolean;recommendationId?:string;thesisId?:string;candidateId?:string;strategy?:string;orientation?:string;lowerBinId?:number;upperBinId?:number;activeBinId?:number;riskAdjustedExpectedNetEv?:number;predictedFees?:number;predictedInventoryPnl?:number;capitalValue?:number;horizonMinutes?:number;decisionAt?:string;expiresAt?:string;phase3State?:string;phase4State?:string;reasonCodes:string[];historyContext:Record<string,unknown>;payload:Record<string,unknown>}>}):Promise<void>;
   /** Shadow-only Phase-3 forward-validation capture. It has no authority path. */
   /** RESET-3C append-only full-universe evidence. It is never read by authority paths. */
   insertReset3cValidationUniverse(value:{recommendationId:string;decisionId:string;decisionAt:string;samplingContractVersion:string;storageContractVersion:string;capitalLamports:string;expectedCandidateCount:number;capturedCandidateCount:number;universeComplete:boolean;universeManifestHash:string;detailedCandidateCount:number;outcomeEligibleCandidateCount:number;detailedCandidateIds:string[];selectionManifest:Record<string,unknown>;detailedSelectionManifestHash:string;census:Record<string,unknown>;sharedEvidenceHash:string;temporarySharedEvidence:Record<string,unknown>;contentHash:string;}):Promise<'INSERTED'|'IDEMPOTENT'>;
@@ -1235,6 +1364,8 @@ export interface Phase1Store {
   insertLiveLearningCalibration(value:{snapshotId:string;observedAt:string;sampleCount:number;independentEpisodes:number;brierProfit?:number;netPnlMaeLamports?:number;meanBiasLamports?:number;payload:Record<string,unknown>}):Promise<void>;
   createPositionInventoryLot(value:Omit<PositionInventoryLot,"remainingRawAmount"|"status">&{createdEventId:string;transactionSignature?:string}):Promise<void>;
   settlePositionInventoryLot(value:{eventId:string;lotId:string;planId?:string;eventType:"SETTLED"|"TRANSFERRED";settledRawAmount:bigint;observedAt:string;transactionSignature?:string;payload:Record<string,unknown>}):Promise<{remainingRawAmount:bigint;status:PositionInventoryLotStatus}>;
+  retainPositionInventoryLotDust(value:{eventId:string;lotId:string;planId?:string;observedAt:string;payload:Record<string,unknown>}):Promise<void>;
+  correctAggregateCloseClaimAttribution(value:{eventId:string;closeLotId:string;claimLotId:string;planId:string;claimRawAmount:bigint;transactionSignature:string;observedAt:string;payload:Record<string,unknown>}):Promise<void>;
   loadPositionInventoryLots(positionAddress:string,tokenMint?:string):Promise<PositionInventoryLot[]>;
   loadOwnerPositionInventoryLots(ownerAddress:string):Promise<PositionInventoryLot[]>;
   insertPlanCashflow(value:PlanCashflow):Promise<void>;
@@ -1321,6 +1452,8 @@ export interface Phase1Store {
     at: string,
     reason: string,
   ): Promise<void>;
+  /** A skip-preflight=false RPC simulation rejection has no chain effect. */
+  recoverNoEffectPreflightSubmissionAttempts(at: string): Promise<number>;
   /** Durable blockhash evidence for signature-first recovery. */
   loadSubmissionAttemptBySignature(
     signature: string,
@@ -2252,7 +2385,7 @@ export async function createPostgresStore(
       );
     },
     async listDiscoveryCandidates(tiers=['A']) {
-      const r=await db.query(`SELECT pool_address,current_state,current_tier,last_priority_score,last_rank,last_seen_at,token_x_mint,token_y_mint,paired_token_mint,COALESCE(NULLIF(payload->>'deepScreenedAt','')::timestamptz,last_seen_at) AS admission_seen_at,payload FROM market.pool_discovery_registry WHERE current_tier=ANY($1::text[]) ORDER BY last_rank NULLS LAST,last_priority_score DESC,pool_address`,[tiers]);
+      const r=await db.query(`SELECT pool_address,current_state,current_tier,last_priority_score,last_rank,last_seen_at,token_x_mint,token_y_mint,paired_token_mint,last_seen_at AS admission_seen_at,payload FROM market.pool_discovery_registry WHERE current_tier=ANY($1::text[]) ORDER BY last_rank NULLS LAST,last_priority_score DESC,pool_address`,[tiers]);
       return r.rows.map(row=>({poolAddress:String(row.pool_address),state:String(row.current_state),tier:String(row.current_tier),priorityScore:Number(row.last_priority_score),...(row.last_rank!==null?{rank:Number(row.last_rank)}:{}),lastSeenAt:new Date(String(row.admission_seen_at)).toISOString(),...(row.token_x_mint?{tokenXMint:String(row.token_x_mint)}:{}),...(row.token_y_mint?{tokenYMint:String(row.token_y_mint)}:{}),...(row.paired_token_mint?{pairedTokenMint:String(row.paired_token_mint)}:{}),payload:(row.payload??{}) as Record<string,unknown>}));
     },
     async reconcileLiveEvidenceAdmission(v) {
@@ -2272,7 +2405,8 @@ export async function createPostgresStore(
         const rows=await tx.query(`SELECT registry.pool_address,registry.current_state,registry.last_priority_score,registry.last_rank,registry.first_seen_at,registry.payload,maturity.state AS maturity_state,maturity.payload->>'historicalMaturity' AS historical_maturity,maturity.payload->>'liveConfirmation' AS live_confirmation,cycle.phase3_status,economic.as_of AS event_path_as_of,economic.fee_rate_per_capital_hour,economic.uncertainty AS event_path_uncertainty,prediction.observed_at AS forecast_as_of,(prediction.prediction#>>'{deep,toxicity,adverseInventoryPressure}') AS adverse_inventory_pressure,(prediction.prediction#>>'{strategy,strategies,0,uncertainty}') AS forecast_uncertainty,deep.current_opportunity_score,deep.pool_quality_score,deep.toxicity_probability,deep.observed_at AS deep_observed_at FROM market.pool_discovery_registry registry LEFT JOIN market.active_candidate_history_maturity maturity ON maturity.pool_address=registry.pool_address LEFT JOIN LATERAL (SELECT phase3_status FROM operations.forward_cycles WHERE pool_address=registry.pool_address ORDER BY observed_at DESC LIMIT 1) cycle ON true LEFT JOIN LATERAL (SELECT as_of,fee_rate_per_capital_hour,uncertainty FROM research.economic_estimates WHERE pool_address=registry.pool_address AND fidelity='EVENT_PATH_ESTIMATE' AND as_of<=$2::timestamptz ORDER BY as_of DESC LIMIT 1) economic ON true LEFT JOIN LATERAL (SELECT observed_at,prediction FROM research.discovery_predictions WHERE pool_address=registry.pool_address AND observed_at<=$2::timestamptz ORDER BY observed_at DESC LIMIT 1) prediction ON true LEFT JOIN LATERAL (SELECT observed_at,current_opportunity_score,pool_quality_score,toxicity_probability FROM research.pool_deep_screen_observations WHERE pool_address=registry.pool_address AND observed_at<=$2::timestamptz ORDER BY observed_at DESC LIMIT 1) deep ON true WHERE registry.current_tier='A' AND registry.current_state IN ('ACTIVE_CANDIDATE','QUALIFIED') AND NOT(registry.pool_address=ANY($1::text[])) FOR UPDATE OF registry`,[monitored,v.observedAt]);
         const targets=rows.rows.map(row=>{
           const payload=(row.payload??{}) as Record<string,unknown>,metrics=(payload.discoveryMetrics??{}) as Record<string,unknown>,leaseStartedAt=typeof payload.liveEvidenceLeaseStartedAt==='string'?payload.liveEvidenceLeaseStartedAt:typeof payload.liveEvidenceAdmissionAt==='string'?payload.liveEvidenceAdmissionAt:undefined,leaseExpiresAt=typeof payload.liveEvidenceLeaseExpiresAt==='string'?payload.liveEvidenceLeaseExpiresAt:undefined,leaseFailureCount=Number(payload.liveEvidenceLeaseFailures??0),nextEligibleAt=typeof payload.liveEvidenceLeaseNextEligibleAt==='string'?payload.liveEvidenceLeaseNextEligibleAt:undefined,eventPathEstimateFresh=Boolean(row.event_path_as_of)&&Date.parse(v.observedAt)-Date.parse(String(row.event_path_as_of))<=LIVE_EVIDENCE_ECONOMIC_RANKING_FRESHNESS_SECONDS*1000,phase3Status=String(row.phase3_status??''),leaseActive=isLiveEvidenceLeaseActive({startedAt:leaseStartedAt,expiresAt:leaseExpiresAt,failureCount:leaseFailureCount},v.observedAt),pending=isPhase3ReadyConsumptionPending(payload,v.observedAt),releaseReason=liveEvidenceLeaseReleaseReason({state:String(row.current_state),startedAt:leaseStartedAt,expiresAt:leaseExpiresAt,failureCount:leaseFailureCount,eventPathEstimateFresh,phase3Status},v.observedAt),economicQuality=freshLiveEvidenceEconomicQuality(row.event_path_as_of?{eventPathAsOf:new Date(String(row.event_path_as_of)).toISOString(),forecastAsOf:new Date(String(row.forecast_as_of??row.event_path_as_of)).toISOString(),feeRatePerCapitalHour:Number(row.fee_rate_per_capital_hour),...(Number.isFinite(Number(row.adverse_inventory_pressure))?{adverseInventoryPressure:Number(row.adverse_inventory_pressure)}:{}),forecastUncertainty:Number(row.forecast_uncertainty??row.event_path_uncertainty)}:undefined,v.observedAt),metricObservedAt=typeof metrics.sourceObservedAt==='string'?metrics.sourceObservedAt:typeof metrics.ingestedAt==='string'?metrics.ingestedAt:undefined,discoveryPriority=freshDiscoveryEconomicPriority({priority:Number(payload.discoveryEconomicPriority),observedAt:metricObservedAt},v.observedAt),deepOpportunity=Number(row.current_opportunity_score),deepQuality=Number(row.pool_quality_score),toxicity=Number(row.toxicity_probability),waitSince=typeof payload.liveEvidenceWaitingAt==='string'?payload.liveEvidenceWaitingAt:new Date(String(row.first_seen_at)).toISOString(),waitingMinutes=Math.max(0,(Date.parse(v.observedAt)-Date.parse(waitSince))/60_000),feeRatios=[Number(metrics.feeActiveTvlRatio30mPct),Number(metrics.feeActiveTvlRatio1hPct),Number(metrics.feeActiveTvlRatio24hPct)],feePersistence=feeRatios.every(Number.isFinite)?Math.max(0,Math.min(1,Math.min(...feeRatios)/Math.max(...feeRatios,1e-12))):0,evidencePriority=Math.round((.48*(discoveryPriority??0)+.20*(Number.isFinite(deepOpportunity)?deepOpportunity:0)+.10*(Number.isFinite(deepQuality)?deepQuality:0)+.10*(Number.isFinite(toxicity)?(1-Math.max(0,Math.min(1,toxicity)))*100:0)+.07*feePersistence*100+.05*Math.min(100,waitingMinutes/30*100))*100)/100,cooling=nextEligibleAt!==undefined&&Date.parse(nextEligibleAt)>Date.parse(v.observedAt),matureForPhase3=String(row.maturity_state??'')==='MATURE'&&String(row.historical_maturity??'')==='MATURE'&&String(row.live_confirmation??'')==='CONFIRMED',activeDwellMs=leaseStartedAt?Math.max(0,Date.parse(v.observedAt)-Date.parse(leaseStartedAt)):0;
-          const target:LiveEvidenceAdmissionCandidate={poolAddress:String(row.pool_address),state:String(row.current_state),priorityScore:Number(row.last_priority_score??0),firstSeenAt:new Date(String(row.first_seen_at)).toISOString(),matureForPhase3,phase3Terminal:isLiveEvidenceAdmissionTerminalForCurrentLease({state:String(row.current_state),phase3Status})||releaseReason!==undefined,evidenceLeaseActive:String(row.current_state)==='ACTIVE_CANDIDATE'&&leaseActive&&!releaseReason,phase3ConsumptionPending:String(row.current_state)==='ACTIVE_CANDIDATE'&&leaseActive&&!releaseReason&&pending,...(pending?{phase3ReadyAt:String(payload.liveEvidencePhase3ReadyAt)}:{}),admissionEligible:!cooling&&!releaseReason&&(String(row.current_state)==='ACTIVE_CANDIDATE'||discoveryPriority!==undefined),evidencePriority,activeDwellMs,waitingMinutes,protectedCriticalConsumption:pending,...(row.last_rank===null?{}:{rank:Number(row.last_rank)}),...(discoveryPriority===undefined?{}:{economicPriority:discoveryPriority}),...(metricObservedAt===undefined?{}:{economicPriorityObservedAt:metricObservedAt}),...(economicQuality?{economicQuality}:{}),...(releaseReason===undefined?{}:{releaseReason})};
+          const continuityActive=payload.evidenceContinuityTrackingState==='TRACKING';
+          const target:LiveEvidenceAdmissionCandidate={poolAddress:String(row.pool_address),state:String(row.current_state),priorityScore:Number(row.last_priority_score??0),firstSeenAt:new Date(String(row.first_seen_at)).toISOString(),matureForPhase3,phase3Terminal:isLiveEvidenceAdmissionTerminalForCurrentLease({state:String(row.current_state),phase3Status})||releaseReason!==undefined,evidenceLeaseActive:String(row.current_state)==='ACTIVE_CANDIDATE'&&leaseActive&&!releaseReason,phase3ConsumptionPending:String(row.current_state)==='ACTIVE_CANDIDATE'&&leaseActive&&!releaseReason&&pending,...(pending?{phase3ReadyAt:String(payload.liveEvidencePhase3ReadyAt)}:{}),admissionEligible:!cooling&&!releaseReason&&(String(row.current_state)==='ACTIVE_CANDIDATE'||discoveryPriority!==undefined),evidencePriority,activeDwellMs,waitingMinutes,protectedCriticalConsumption:pending||continuityActive,...(row.last_rank===null?{}:{rank:Number(row.last_rank)}),...(discoveryPriority===undefined?{}:{economicPriority:discoveryPriority}),...(metricObservedAt===undefined?{}:{economicPriorityObservedAt:metricObservedAt}),...(economicQuality?{economicQuality}:{}),...(releaseReason===undefined?{}:{releaseReason})};
           return target;
         }),available=dynamicLiveEvidenceAdmissionCapacity({serviceableCapacity:capacity,staticPolicyPoolCount:monitored.length}),admitted=selectLiveEvidenceAdmissionCandidates(targets,available),admittedSet=new Set(admitted.map(x=>x.poolAddress)),promoted=admitted.filter(x=>x.state==='QUALIFIED'),demoted=targets.filter(x=>x.state==='ACTIVE_CANDIDATE'&&!admittedSet.has(x.poolAddress));
         const replacementPairs=demoted.sort((a,b)=>liveEvidenceAdmissionPriority(a)-liveEvidenceAdmissionPriority(b)||a.poolAddress.localeCompare(b.poolAddress)).flatMap((incumbent,index)=>{
@@ -2289,6 +2423,7 @@ export async function createPostgresStore(
         // start/expiry unset lets a later reconciliation treat a newly
         // promoted pool as an expired lease before it gets its first read.
         const promotedLeaseExpiresAt=liveEvidenceLeaseExpiresAt(v.observedAt)??v.observedAt;
+        if(promoted.length)await tx.query(`UPDATE market.pool_discovery_registry SET payload=payload-ARRAY['evidenceContinuityEpisodeAnchorAt','evidenceContinuityLastObservationAt','evidenceContinuityDeadlineAt','evidenceContinuityServiceDeadlineAt','evidenceContinuityTrackingStartedAt','evidenceContinuityTrackingExpiresAt']::text[] WHERE pool_address=ANY($1::text[])`,[promoted.map(x=>x.poolAddress)]);
         if(promoted.length)await tx.query(`UPDATE market.pool_discovery_registry SET current_state='ACTIVE_CANDIDATE',reason_codes=(reason_codes - 'LIVE_EVIDENCE_WAITING_FOR_CAPACITY') || '["LIVE_EVIDENCE_ADMITTED"]'::jsonb,payload=payload||jsonb_build_object('liveEvidenceAdmission','ADMITTED','liveEvidenceAdmissionAt',$2::text,'liveEvidenceLeaseStartedAt',$2::text,'liveEvidenceLeaseExpiresAt',$3::text,'liveEvidenceLeaseFailures',0,'liveEvidencePhase3ConsumptionState','NONE','liveEvidencePhase3ReadyAt',NULL,'liveEvidencePhase3ReadyEventPathAt',NULL,'postEvidenceEvaluationState','NONE','evidenceContinuityTrackingState','CONSUMED_BY_ACTIVE_ECONOMIC_LEASE','evidenceContinuityTrackingConsumedAt',$2::text) WHERE pool_address=ANY($1::text[])`,[promoted.map(x=>x.poolAddress),v.observedAt,promotedLeaseExpiresAt]);
         const waitingCandidates=targets.filter(candidate=>!admittedSet.has(candidate.poolAddress));
         // jsonb_build_object is polymorphic: explicitly type the priority so PostgreSQL
@@ -2305,17 +2440,53 @@ export async function createPostgresStore(
       try {
         await tx.query('BEGIN');
         await tx.query("SELECT pg_advisory_xact_lock(hashtext('LPFORGE_LIVE_EVIDENCE_ADMISSION'))");
+        // Confirmation is durable in the maturity record.  A continuity slot
+        // protects only an incomplete episode, so it must be released without
+        // waiting for later P3/P4 economic handling.
+        await tx.query(`UPDATE market.pool_discovery_registry registry
+          SET payload=(registry.payload-ARRAY['evidenceContinuityEpisodeAnchorAt','evidenceContinuityLastObservationAt','evidenceContinuityDeadlineAt','evidenceContinuityServiceDeadlineAt','evidenceContinuityTrackingStartedAt','evidenceContinuityTrackingExpiresAt']::text[])||jsonb_build_object('evidenceContinuityTrackingState','COMPLETED','evidenceContinuityReleasedAt',$1::text,'evidenceContinuityReleaseReason','LIVE_CONFIRMATION_CONFIRMED')
+          FROM market.active_candidate_history_maturity maturity
+          WHERE registry.pool_address=maturity.pool_address
+            AND registry.payload->>'evidenceContinuityTrackingState'='TRACKING'
+            AND maturity.payload->>'liveConfirmation'='CONFIRMED'`,[v.observedAt]);
+        // Waiting is queue state, never an active protected episode.  Keep raw
+        // observation history intact while removing stale active-episode facts.
+        await tx.query(`UPDATE market.pool_discovery_registry
+          SET payload=(payload-ARRAY['evidenceContinuityEpisodeAnchorAt','evidenceContinuityLastObservationAt','evidenceContinuityDeadlineAt','evidenceContinuityServiceDeadlineAt','evidenceContinuityTrackingStartedAt','evidenceContinuityTrackingExpiresAt']::text[])||jsonb_build_object('evidenceContinuityTrackingState','WAITING_FOR_CONTINUITY_SLOT')
+          WHERE payload->>'evidenceContinuityTrackingState' IN ('WAITING_FOR_CONTINUITY_SLOT','CONSUMED_BY_ACTIVE_ECONOMIC_LEASE')`);
         const expired=await tx.query(`UPDATE market.pool_discovery_registry
           SET payload=payload||jsonb_build_object('evidenceContinuityTrackingState','EXPIRED','evidenceContinuityTrackingEvictedAt',$2::text,'evidenceContinuityTrackingEvictionReason','EVIDENCE_CONTINUITY_TTL_OR_ELIGIBILITY_EXPIRED')
           WHERE payload->>'evidenceContinuityTrackingState'='TRACKING'
             AND (COALESCE(NULLIF(payload->>'evidenceContinuityTrackingExpiresAt','')::timestamptz,'epoch'::timestamptz)<=$1::timestamptz OR current_state NOT IN ('QUALIFIED','ACTIVE_CANDIDATE') OR source_auto<>true)
           RETURNING pool_address`,[v.observedAt,v.observedAt]);
-        const eligible=await tx.query(`SELECT pool_address FROM market.pool_discovery_registry
-          WHERE current_state='QUALIFIED' AND source_auto=true
-            AND payload->>'evidenceContinuityTrackingState'='TRACKING'
-            AND COALESCE(NULLIF(payload->>'evidenceContinuityTrackingExpiresAt','')::timestamptz,'epoch'::timestamptz)>$1::timestamptz
-          ORDER BY COALESCE(NULLIF(payload->>'evidenceContinuityTrackingStartedAt','')::timestamptz,'epoch'::timestamptz) ASC,pool_address ASC`,[v.observedAt]);
-        const retained=eligible.rows.slice(0,capacity).map(row=>String(row.pool_address)),evicted=eligible.rows.slice(capacity).map(row=>String(row.pool_address));
+        const eligible=await tx.query(`SELECT registry.pool_address,registry.last_rank,
+            registry.payload->>'evidenceContinuityTrackingStartedAt' AS tracking_started_at,
+            latest.risk_adjusted_expected_net_ev AS candidate_utility,
+            latest.confidence AS candidate_readiness
+          FROM market.pool_discovery_registry registry
+          LEFT JOIN LATERAL (
+            SELECT risk_adjusted_expected_net_ev,confidence
+            FROM execution.production_global_candidates
+            WHERE pool_address=registry.pool_address AND observed_at<=$1::timestamptz
+            ORDER BY observed_at DESC LIMIT 1
+          ) latest ON true
+          WHERE current_state IN ('QUALIFIED','ACTIVE_CANDIDATE') AND source_auto=true
+            AND registry.payload->>'evidenceContinuityTrackingState'='TRACKING'
+            AND COALESCE(NULLIF(registry.payload->>'evidenceContinuityTrackingExpiresAt','')::timestamptz,'epoch'::timestamptz)>$1::timestamptz`,[v.observedAt]);
+        const eligiblePoolAddresses=eligible.rows.map(row=>String(row.pool_address));
+        const confirmationWindowMs=Math.max(1,Math.floor(v.liveConfirmationWindowMs??10*60_000)),confirmationMaximumGapMs=Math.max(1,Math.floor(v.liveConfirmationMaximumGapMs??450_000));
+        const observations=eligiblePoolAddresses.length?await tx.query(`SELECT pool_address,observed_at FROM market.candidate_market_observations WHERE pool_address=ANY($1::text[]) AND source_type='LIVE_OBSERVED' AND observed_at>=$2::timestamptz AND observed_at<=$3::timestamptz ORDER BY pool_address,observed_at`,[eligiblePoolAddresses,new Date(Date.parse(v.observedAt)-confirmationWindowMs-confirmationMaximumGapMs).toISOString(),v.observedAt]):{rows:[] as Array<{pool_address:string;observed_at:Date|string}>};
+        const observationTimes=new Map<string,string[]>();
+        for(const row of observations.rows){const poolAddress=String(row.pool_address),times=observationTimes.get(poolAddress)??[];times.push(new Date(String(row.observed_at)).toISOString());observationTimes.set(poolAddress,times);}
+        const prioritized=eligible.rows.map(row=>continuityMaturityPriority({
+          poolAddress:String(row.pool_address),observedAt:v.observedAt,liveObservationTimes:observationTimes.get(String(row.pool_address))??[],
+          ...(row.tracking_started_at?{trackingStartedAt:String(row.tracking_started_at)}:{}),
+          ...(row.last_rank===null?{}:{tierARank:Number(row.last_rank)}),
+          ...(row.candidate_utility===null?{}:{candidateUtility:Number(row.candidate_utility)}),
+          ...(row.candidate_readiness===null?{}:{candidateReadiness:Number(row.candidate_readiness)}),
+          confirmationWindowMs,...(v.liveConfirmationMinimumObservations===undefined?{}:{minimumObservations:v.liveConfirmationMinimumObservations}),maximumGapMs:confirmationMaximumGapMs,
+        })).sort(compareContinuityMaturityPriority);
+        const retained=prioritized.slice(0,capacity).map(row=>row.poolAddress),evicted=prioritized.slice(capacity).map(row=>row.poolAddress);
         if(evicted.length)await tx.query(`UPDATE market.pool_discovery_registry
           SET payload=payload||jsonb_build_object('evidenceContinuityTrackingState','EVICTED','evidenceContinuityTrackingEvictedAt',$2::text,'evidenceContinuityTrackingEvictionReason','EVIDENCE_CONTINUITY_CAPACITY_EVICTED')
           WHERE pool_address=ANY($1::text[]) AND payload->>'evidenceContinuityTrackingState'='TRACKING'`,[evicted,v.observedAt]);
@@ -2326,6 +2497,45 @@ export async function createPostgresStore(
     async loadActiveCandidateEvidenceCollectorTiming() {
       const r=await db.query(`SELECT payload->'collectorPass' AS pass FROM market.active_candidate_evidence_capacity_observations WHERE payload ? 'collectorPass' ORDER BY observed_at DESC LIMIT 1`),pass=r.rows[0]?.pass as Record<string,unknown>|undefined,p95=Number(pass?.measuredP95PoolCollectionMs);
       return Number.isFinite(p95)&&p95>0?{p95PoolCollectionMs:p95}:undefined;
+    },
+    async reconcileRawReplayTracking(v) {
+      const capacity=Math.max(0,Math.floor(v.capacity));
+      try {
+        await db.query('BEGIN');
+        await db.query("SELECT pg_advisory_xact_lock(hashtext('LPFORGE_RAW_REPLAY_TRACKING'))");
+        // Reconcile both durable queue members and the pre-deployment backlog.  The
+        // latter is identified from its authoritative latest Phase-3 result, rather
+        // than by an operator repair or a pool-specific exception.
+        const rows=await db.query(`SELECT registry.pool_address,registry.current_state,registry.last_priority_score,registry.first_seen_at,registry.payload
+          FROM market.pool_discovery_registry registry
+          LEFT JOIN LATERAL (
+            SELECT phase3_status,payload,observed_at
+            FROM operations.forward_cycles
+            WHERE pool_address=registry.pool_address
+            ORDER BY observed_at DESC
+            LIMIT 1
+          ) latest_phase3 ON true
+          WHERE registry.source_auto=true AND registry.current_tier='A' AND registry.current_state IN ('QUALIFIED','ACTIVE_CANDIDATE')
+            AND (
+              registry.payload->>'rawReplayTrackingState' IN ('WAITING_REPLAY_SERVICE','REPLAY_TRACKING')
+              OR (
+                latest_phase3.phase3_status='NO_TRADE'
+                AND COALESCE(latest_phase3.payload->'reasonCodes','[]'::jsonb) ? 'FEE_CALIBRATION_RAW_REPLAY_NOT_ACTIONABLE'
+              )
+            )
+          FOR UPDATE OF registry`);
+        const ranked=rows.rows.map(row=>{const payload=(row.payload??{}) as Record<string,unknown>;return{poolAddress:String(row.pool_address),state:String(row.current_state),priority:Number(row.last_priority_score??0),waitingAt:String(payload.rawReplayWaitingAt??row.first_seen_at),trackingStartedAt:String(payload.rawReplayTrackingStartedAt??'')};}).sort((a,b)=>b.priority-a.priority||Date.parse(a.waitingAt)-Date.parse(b.waitingAt)||a.poolAddress.localeCompare(b.poolAddress));
+        // A protected replay episode is not a fair-slice lease.  Retain a
+        // valid admitted tracker through ordinary rank churn; otherwise every
+        // newly higher-ranked waiter resets the 60-minute occupancy clock.
+        const alreadyTracking=ranked.filter(row=>row.trackingStartedAt&&Number.isFinite(Date.parse(row.trackingStartedAt))).sort((a,b)=>Date.parse(a.trackingStartedAt)-Date.parse(b.trackingStartedAt)||a.poolAddress.localeCompare(b.poolAddress));
+        const retained=alreadyTracking.slice(0,capacity),remaining=Math.max(0,capacity-retained.length),admitted=ranked.filter(row=>!retained.some(active=>active.poolAddress===row.poolAddress)).slice(0,remaining);
+        const tracked=[...retained,...admitted].map(row=>row.poolAddress),waiting=ranked.filter(row=>!tracked.includes(row.poolAddress)).map(row=>row.poolAddress);
+        if(tracked.length)await db.query(`UPDATE market.pool_discovery_registry SET payload=payload||jsonb_build_object('rawReplayTrackingState','REPLAY_TRACKING','rawReplayTrackingStartedAt',COALESCE(NULLIF(payload->>'rawReplayTrackingStartedAt',''),$2::text),'rawReplayServiceDeadlineAt',COALESCE(NULLIF(payload->>'rawReplayServiceDeadlineAt',''),to_char(($2::timestamptz + interval '300 seconds'),'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'))) WHERE pool_address=ANY($1::text[])`,[tracked,v.observedAt]);
+        if(waiting.length)await db.query(`UPDATE market.pool_discovery_registry SET payload=(payload-ARRAY['rawReplayEpisodeAnchorAt','rawReplayLastObservationAt','rawReplayDeadlineAt','rawReplayServiceDeadlineAt','rawReplayTrackingStartedAt']::text[])||jsonb_build_object('rawReplayTrackingState','WAITING_REPLAY_SERVICE','rawReplayWaitingAt',COALESCE(payload->>'rawReplayWaitingAt',$2::text)) WHERE pool_address=ANY($1::text[])`,[waiting,v.observedAt]);
+        await db.query('COMMIT');
+        return{capacity,trackedPoolAddresses:tracked,waitingPoolAddresses:waiting};
+      } catch(error) {try{await db.query('ROLLBACK');}catch{} throw error;}
     },
     async recordActiveCandidateEvidenceCollectorPass(v) {
       await db.query(`UPDATE market.active_candidate_evidence_capacity_observations SET payload=payload||jsonb_build_object('collectorPass',jsonb_build_object('startedAt',$2::text,'completedAt',$3::text,'elapsedMs',$4::numeric,'collectionSliceSize',$5::int,'effectivePoolCollectionMs',$6::numeric,'measuredP95PoolCollectionMs',$7::numeric,'projectedRevisitMs',$8::numeric,'capacityViolation',$9::boolean,'maxServiceGapMs',$10::numeric,'activePoolCount',$11::int,'successfulPoolCount',$12::int,'continuityPoolCount',$13::int,'economicProjectedRevisitMs',$14::numeric,'continuityProjectedRevisitMs',$15::numeric,'economicTargetViolation',$16::boolean)) WHERE observed_at=$1::timestamptz`,[v.observedAt,v.observedAt,v.completedAt,v.elapsedMs,v.collectionSliceSize,v.effectivePoolCollectionMs,v.measuredP95PoolCollectionMs,v.projectedRevisitMs,v.capacityViolation,v.maxServiceGapMs,v.activePoolCount,v.successfulPoolCount,Math.max(0,Math.floor(v.continuityPoolCount??0)),Math.max(0,Number(v.economicProjectedRevisitMs??v.projectedRevisitMs)),Math.max(0,Number(v.continuityProjectedRevisitMs??v.projectedRevisitMs)),Boolean(v.economicTargetViolation)]);
@@ -2341,21 +2551,31 @@ export async function createPostgresStore(
         if(v.success&&v.eventPathEstimate&&v.phase3CurrentLiveReady){const startedAt=typeof payload.liveEvidenceLeaseStartedAt==='string'&&Number.isFinite(Date.parse(payload.liveEvidenceLeaseStartedAt))?payload.liveEvidenceLeaseStartedAt:v.observedAt,expiresAt=typeof payload.liveEvidenceLeaseExpiresAt==='string'&&Number.isFinite(Date.parse(payload.liveEvidenceLeaseExpiresAt))?payload.liveEvidenceLeaseExpiresAt:liveEvidenceLeaseExpiresAt(startedAt);await tx.query(`UPDATE market.pool_discovery_registry SET reason_codes=(reason_codes-'LIVE_EVIDENCE_LEASE_PHASE3_READY')||'["LIVE_EVIDENCE_PHASE3_CONSUMPTION_PENDING"]'::jsonb,payload=payload||jsonb_build_object('liveEvidenceAdmission','ADMITTED','liveEvidenceLeaseStartedAt',$2::text,'liveEvidenceLeaseExpiresAt',$3::text,'liveEvidenceLeaseFailures',0,'liveEvidenceLastSuccessfulAt',$4::text,'liveEvidencePhase3ConsumptionState','PENDING','liveEvidencePhase3ReadyAt',COALESCE(NULLIF(payload->>'liveEvidencePhase3ReadyAt',''),$4::text),'liveEvidencePhase3ReadyEventPathAt',$4::text,'postEvidenceEvaluationState','PENDING_ACTIVE') WHERE pool_address=$1`,[v.poolAddress,startedAt,expiresAt??v.observedAt,v.observedAt]);}
         else if(v.success){const startedAt=typeof payload.liveEvidenceLeaseStartedAt==='string'&&Number.isFinite(Date.parse(payload.liveEvidenceLeaseStartedAt))?payload.liveEvidenceLeaseStartedAt:v.observedAt,expiresAt=typeof payload.liveEvidenceLeaseExpiresAt==='string'&&Number.isFinite(Date.parse(payload.liveEvidenceLeaseExpiresAt))?payload.liveEvidenceLeaseExpiresAt:liveEvidenceLeaseExpiresAt(startedAt);await tx.query(`UPDATE market.pool_discovery_registry SET payload=payload||jsonb_build_object('liveEvidenceAdmission','ADMITTED','liveEvidenceLeaseStartedAt',$2::text,'liveEvidenceLeaseExpiresAt',$3::text,'liveEvidenceLeaseFailures',0,'liveEvidenceLastSuccessfulAt',$4::text) WHERE pool_address=$1`,[v.poolAddress,startedAt,expiresAt??v.observedAt,v.observedAt]);}
         else {const failures=priorFailures+1;if(failures>=ACTIVE_EVIDENCE_LEASE_MAX_FAILURES)await tx.query(`UPDATE market.pool_discovery_registry SET current_state='QUALIFIED',reason_codes=(reason_codes-'LIVE_EVIDENCE_ADMITTED')||'["LIVE_EVIDENCE_LEASE_COLLECTION_FAILURE_LIMIT"]'::jsonb,payload=payload||jsonb_build_object('liveEvidenceAdmission','WAITING','liveEvidenceLeaseReleaseReason','LIVE_EVIDENCE_LEASE_COLLECTION_FAILURE_LIMIT','liveEvidenceLeaseReleasedAt',$2::text,'liveEvidenceLeaseNextEligibleAt',$3::text,'liveEvidenceLeaseFailures',$4::int) WHERE pool_address=$1`,[v.poolAddress,v.observedAt,nextEligibleAt,failures]);else await tx.query(`UPDATE market.pool_discovery_registry SET payload=payload||jsonb_build_object('liveEvidenceLeaseFailures',$2::int,'liveEvidenceLastFailureAt',$3::text) WHERE pool_address=$1`,[v.poolAddress,failures,v.observedAt]);}
-        if(v.success)await tx.query(`UPDATE market.pool_discovery_registry SET payload=payload||jsonb_build_object('liveEvidenceLastReadStartedAt',$2::text,'liveEvidenceLastReadCompletedAt',$3::text,'liveEvidenceLastReadElapsedMs',$4::numeric,'liveEvidenceLastServiceGapMs',$5::numeric) WHERE pool_address=$1`,[v.poolAddress,v.poolReadStartedAt??v.observedAt,v.poolReadCompletedAt??v.observedAt,Number(v.poolReadElapsedMs??0),Number(v.serviceGapMs??0)]);
+        if(v.success){const continuityStarted=await tx.query(`UPDATE market.pool_discovery_registry SET payload=payload||jsonb_build_object('liveEvidenceLastReadStartedAt',$2::text,'liveEvidenceLastReadCompletedAt',$3::text,'liveEvidenceLastReadElapsedMs',$4::numeric,'liveEvidenceLastServiceGapMs',$5::numeric,'evidenceContinuityTrackingState','TRACKING','evidenceContinuityTrackingStartedAt',CASE WHEN payload->>'evidenceContinuityTrackingState'='TRACKING' THEN COALESCE(payload->>'evidenceContinuityTrackingStartedAt',$2::text) ELSE $2::text END,'evidenceContinuityEpisodeAnchorAt',CASE WHEN payload->>'evidenceContinuityTrackingState'='TRACKING' THEN COALESCE(payload->>'evidenceContinuityEpisodeAnchorAt',$2::text) ELSE $2::text END,'evidenceContinuityLastObservationAt',$2::text,'evidenceContinuityDeadlineAt',to_char(($2::timestamptz + interval '450 seconds'),'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),'evidenceContinuityTrackingExpiresAt',CASE WHEN payload->>'evidenceContinuityTrackingState'='TRACKING' THEN COALESCE(payload->>'evidenceContinuityTrackingExpiresAt',to_char(($2::timestamptz + interval '60 minutes'),'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')) ELSE to_char(($2::timestamptz + interval '60 minutes'),'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') END) WHERE pool_address=$1 AND current_state='ACTIVE_CANDIDATE' AND (payload->>'evidenceContinuityTrackingState'='TRACKING' OR (SELECT COUNT(*) FROM market.pool_discovery_registry tracker WHERE tracker.payload->>'evidenceContinuityTrackingState'='TRACKING' AND tracker.current_state IN ('QUALIFIED','ACTIVE_CANDIDATE') AND tracker.source_auto=true AND COALESCE(NULLIF(tracker.payload->>'evidenceContinuityTrackingExpiresAt','')::timestamptz,'epoch'::timestamptz)>$2::timestamptz)<2) RETURNING pool_address`,[v.poolAddress,v.observedAt,v.poolReadCompletedAt??v.observedAt,Number(v.poolReadElapsedMs??0),Number(v.serviceGapMs??0)]);if(continuityStarted.rows.length)await tx.query(`UPDATE market.pool_discovery_registry SET payload=payload||jsonb_build_object('evidenceContinuityServiceDeadlineAt',to_char(($2::timestamptz + interval '300 seconds'),'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')) WHERE pool_address=$1`,[v.poolAddress,v.observedAt]);if(continuityStarted.rows.length===0)await tx.query(`UPDATE market.pool_discovery_registry SET payload=payload||jsonb_build_object('evidenceContinuityTrackingState','WAITING_FOR_CONTINUITY_SLOT','evidenceContinuityWaitingAt',COALESCE(payload->>'evidenceContinuityWaitingAt',$2::text)) WHERE pool_address=$1 AND current_state='ACTIVE_CANDIDATE'`,[v.poolAddress,v.observedAt]);}
+        if(v.success)await tx.query(`UPDATE market.pool_discovery_registry SET payload=(payload-ARRAY['evidenceContinuityEpisodeAnchorAt','evidenceContinuityLastObservationAt','evidenceContinuityDeadlineAt','evidenceContinuityServiceDeadlineAt','evidenceContinuityTrackingStartedAt','evidenceContinuityTrackingExpiresAt']::text[])||jsonb_build_object('evidenceContinuityTrackingState','WAITING_FOR_CONTINUITY_SLOT','evidenceContinuityWaitingAt',COALESCE(payload->>'evidenceContinuityWaitingAt',$2::text)) WHERE pool_address=$1 AND payload->>'evidenceContinuityTrackingState'='WAITING_FOR_CONTINUITY_SLOT'`,[v.poolAddress,v.observedAt]);
         await tx.query('COMMIT');
       } catch(error) {try{await tx.query('ROLLBACK');}catch{} throw error;}
     },
     async recordEvidenceContinuityCollectionOutcome(v) {
-      const payload=v.success?{evidenceContinuityTrackingState:'TRACKING',evidenceContinuityLastSuccessfulAt:v.observedAt,evidenceContinuityLastReadStartedAt:v.poolReadStartedAt??v.observedAt,evidenceContinuityLastReadCompletedAt:v.poolReadCompletedAt??v.observedAt,evidenceContinuityLastReadElapsedMs:Math.max(0,Number(v.poolReadElapsedMs??0)),...(v.serviceGapMs===undefined?{}:{evidenceContinuityLastServiceGapMs:Math.max(0,Number(v.serviceGapMs))})}:{evidenceContinuityTrackingState:'TRACKING',evidenceContinuityLastFailureAt:v.observedAt};
-      await db.query(`UPDATE market.pool_discovery_registry SET payload=payload||$2::jsonb WHERE pool_address=$1 AND current_state='QUALIFIED' AND source_auto=true AND payload->>'evidenceContinuityTrackingState'='TRACKING'`,[v.poolAddress,json(payload)]);
+      const payload=v.success?{evidenceContinuityTrackingState:'TRACKING',evidenceContinuityLastSuccessfulAt:v.observedAt,evidenceContinuityLastObservationAt:v.observedAt,evidenceContinuityDeadlineAt:new Date(Date.parse(v.observedAt)+450_000).toISOString(),evidenceContinuityServiceDeadlineAt:new Date(Date.parse(v.observedAt)+300_000).toISOString(),evidenceContinuityLastReadStartedAt:v.poolReadStartedAt??v.observedAt,evidenceContinuityLastReadCompletedAt:v.poolReadCompletedAt??v.observedAt,evidenceContinuityLastReadElapsedMs:Math.max(0,Number(v.poolReadElapsedMs??0)),...(v.serviceGapMs===undefined?{}:{evidenceContinuityLastServiceGapMs:Math.max(0,Number(v.serviceGapMs))})}:{evidenceContinuityTrackingState:'TRACKING',evidenceContinuityLastFailureAt:v.observedAt};
+      await db.query(`UPDATE market.pool_discovery_registry SET payload=payload||$2::jsonb||jsonb_build_object('evidenceContinuityEpisodeAnchorAt',COALESCE(NULLIF(payload->>'evidenceContinuityEpisodeAnchorAt',''),$3::text),'evidenceContinuityTrackingStartedAt',COALESCE(NULLIF(payload->>'evidenceContinuityTrackingStartedAt',''),$3::text)) WHERE pool_address=$1 AND current_state='QUALIFIED' AND source_auto=true AND payload->>'evidenceContinuityTrackingState'='TRACKING'`,[v.poolAddress,json(payload),v.observedAt]);
+    },
+    async recordRawReplayCollectionOutcome(v) {
+      const payload=v.success?{rawReplayTrackingState:'REPLAY_TRACKING',rawReplayLastObservationAt:v.observedAt,rawReplayDeadlineAt:new Date(Date.parse(v.observedAt)+450_000).toISOString(),rawReplayServiceDeadlineAt:new Date(Date.parse(v.observedAt)+300_000).toISOString(),rawReplayLastReadStartedAt:v.poolReadStartedAt??v.observedAt,rawReplayLastReadCompletedAt:v.poolReadCompletedAt??v.observedAt,rawReplayLastReadElapsedMs:Math.max(0,Number(v.poolReadElapsedMs??0)),...(v.serviceGapMs===undefined?{}:{rawReplayLastServiceGapMs:Math.max(0,Number(v.serviceGapMs))})}:{rawReplayTrackingState:'REPLAY_TRACKING',rawReplayLastFailureAt:v.observedAt};
+      await db.query(`UPDATE market.pool_discovery_registry SET payload=payload||$2::jsonb||jsonb_build_object('rawReplayEpisodeAnchorAt',COALESCE(NULLIF(payload->>'rawReplayEpisodeAnchorAt',''),$3::text),'rawReplayTrackingStartedAt',COALESCE(NULLIF(payload->>'rawReplayTrackingStartedAt',''),$3::text)) WHERE pool_address=$1 AND source_auto=true AND payload->>'rawReplayTrackingState'='REPLAY_TRACKING'`,[v.poolAddress,json(payload),v.observedAt]);
     },
     async recordPostEvidenceEvaluationOutcome(v) {
       if(v.phase3Status!=='ENTRY_READY'&&v.phase3Status!=='NO_TRADE')return;
+      const rawReplayPending=isEvidenceMaturityNoTrade(v.phase3Status,v.reasonCodes)&&Boolean(v.reasonCodes?.some(code=>code==='FEE_CALIBRATION_RAW_REPLAY_NOT_ACTIONABLE'||code==='NO_TRADE_EVIDENCE_NON_ACTIONABLE'));
+      if(rawReplayPending){
+        await db.query(`UPDATE market.pool_discovery_registry SET reason_codes=(reason_codes-'LIVE_EVIDENCE_LEASE_TERMINAL_PHASE3')||'["RAW_REPLAY_EVIDENCE_PENDING"]'::jsonb,payload=payload||jsonb_build_object('rawReplayTrackingState',CASE WHEN payload->>'rawReplayTrackingState'='REPLAY_TRACKING' THEN 'REPLAY_TRACKING' ELSE 'WAITING_REPLAY_SERVICE' END,'rawReplayWaitingAt',COALESCE(NULLIF(payload->>'rawReplayWaitingAt',''),$2::text),'postEvidenceEvaluationState','RAW_REPLAY_EVIDENCE_PENDING','postEvidenceEvaluationCompletedAt',$2::text) WHERE pool_address=$1 AND source_auto=true`,[v.poolAddress,v.observedAt]);
+        return;
+      }
       const nextEligibleAt=new Date(Date.parse(v.observedAt)+ACTIVE_EVIDENCE_LEASE_RETRY_COOLDOWN_MS).toISOString(),clearReason='POST_EVIDENCE_PHASE3_'+v.phase3Status;
       // A ready ACTIVE lease is released only after a durable real economics
       // result. WARMING intentionally reaches neither update.
-      const continuity=isEvidenceMaturityNoTrade(v.phase3Status,v.reasonCodes),continuityPayload=continuity?{evidenceContinuityTrackingState:'TRACKING',evidenceContinuityTrackingStartedAt:v.observedAt,evidenceContinuityTrackingExpiresAt:evidenceContinuityTrackingExpiresAt(v.observedAt),evidenceContinuityTrackingReason:'P3_EVIDENCE_MATURITY_NO_TRADE',evidenceContinuityEconomicLeaseReleasedAt:v.observedAt,evidenceContinuityExecutionAuthority:false}:{evidenceContinuityTrackingState:'NOT_REQUIRED',evidenceContinuityTrackingEvictedAt:v.observedAt,evidenceContinuityTrackingEvictionReason:'P3_NON_EVIDENCE_TERMINAL'};
-      await db.query(`UPDATE market.pool_discovery_registry SET current_state='QUALIFIED',reason_codes=(reason_codes-'LIVE_EVIDENCE_ADMITTED')||'[\"LIVE_EVIDENCE_LEASE_TERMINAL_PHASE3\"]'::jsonb,payload=payload||jsonb_build_object('liveEvidenceAdmission','WAITING','liveEvidenceLeaseReleaseReason','LIVE_EVIDENCE_LEASE_TERMINAL_PHASE3','liveEvidenceLeaseReleasedAt',$2::text,'liveEvidenceLeaseNextEligibleAt',$3::text,'liveEvidencePhase3ConsumptionState','COMPLETED','liveEvidencePhase3ConsumedAt',$2::text,'postEvidenceEvaluationState','COMPLETED','postEvidenceEvaluationCompletedAt',$2::text,'postEvidenceEvaluationClearReason',$4::text)||$5::jsonb WHERE pool_address=$1 AND current_state='ACTIVE_CANDIDATE' AND source_auto=true AND payload->>'liveEvidencePhase3ConsumptionState'='PENDING'`,[v.poolAddress,v.observedAt,nextEligibleAt,clearReason,json(continuityPayload)]);
+      const continuityPayload={evidenceContinuityTrackingState:'COMPLETED',evidenceContinuityReleasedAt:v.observedAt,evidenceContinuityReleaseReason:'LIVE_CONFIRMATION_DOWNSTREAM_TERMINAL',evidenceContinuityExecutionAuthority:false,rawReplayTrackingState:'REPLAY_TERMINAL',rawReplayReleasedAt:v.observedAt,rawReplayReleaseReason:'PHASE3_TERMINAL'};
+      await db.query(`UPDATE market.pool_discovery_registry SET current_state='QUALIFIED',reason_codes=(reason_codes-'LIVE_EVIDENCE_ADMITTED')||'[\"LIVE_EVIDENCE_LEASE_TERMINAL_PHASE3\"]'::jsonb,payload=(payload-ARRAY['evidenceContinuityEpisodeAnchorAt','evidenceContinuityLastObservationAt','evidenceContinuityDeadlineAt','evidenceContinuityServiceDeadlineAt','evidenceContinuityTrackingStartedAt','evidenceContinuityTrackingExpiresAt']::text[])||jsonb_build_object('liveEvidenceAdmission','WAITING','liveEvidenceLeaseReleaseReason','LIVE_EVIDENCE_LEASE_TERMINAL_PHASE3','liveEvidenceLeaseReleasedAt',$2::text,'liveEvidenceLeaseNextEligibleAt',$3::text,'liveEvidencePhase3ConsumptionState','COMPLETED','liveEvidencePhase3ConsumedAt',$2::text,'postEvidenceEvaluationState','COMPLETED','postEvidenceEvaluationCompletedAt',$2::text,'postEvidenceEvaluationClearReason',$4::text)||$5::jsonb WHERE pool_address=$1 AND current_state='ACTIVE_CANDIDATE' AND source_auto=true AND payload->>'liveEvidencePhase3ConsumptionState'='PENDING'`,[v.poolAddress,v.observedAt,nextEligibleAt,clearReason,json(continuityPayload)]);
       // Preserve completion records for the bounded legacy QUALIFIED handoff.
       await db.query(`UPDATE market.pool_discovery_registry SET payload=payload||jsonb_build_object('postEvidenceEvaluationState','COMPLETED','postEvidenceEvaluationCompletedAt',$2::text,'postEvidenceEvaluationClearReason',$3::text) WHERE pool_address=$1 AND payload->>'postEvidenceEvaluationState'='ELIGIBLE' AND COALESCE(NULLIF(payload->>'postEvidenceEvaluationEligibleAt','')::timestamptz,'epoch'::timestamptz)<=$2::timestamptz`,[v.poolAddress,v.observedAt,clearReason]);
     },
@@ -2460,6 +2680,27 @@ export async function createPostgresStore(
       const r=await db.query(`SELECT * FROM execution.production_global_candidates WHERE global_cycle_id=$1 AND pool_address=ANY($2::text[]) ORDER BY pool_address`,[globalCycleId,poolAddresses]);
       return r.rows as Array<Record<string,unknown>>;
     },
+    async verifyProductionGlobalWinnerAdmission(v) {
+      const r=await db.query(`SELECT candidate.selection_tier,candidate.selection_state,candidate.selection_dynamic_eligible
+        FROM execution.production_global_selection_cycles cycle
+        JOIN execution.production_global_pool_candidates candidate
+          ON candidate.global_cycle_id=cycle.global_cycle_id
+        WHERE cycle.global_cycle_id=$1
+          AND cycle.outcome='GLOBAL_WINNER'
+          AND cycle.coverage_state='COMPLETE'
+          AND cycle.winner_pool_address=$2
+          AND cycle.winner_candidate_id=$3
+          AND candidate.pool_address=$2
+          AND candidate.candidate_id=$3
+          AND candidate.candidate_state='INCLUDED'
+          AND candidate.phase3_state='ENTRY_READY'
+          AND candidate.selection_tier='A'
+          AND candidate.selection_dynamic_eligible=true
+          AND (candidate.expires_at IS NULL OR candidate.expires_at>$4::timestamptz)
+        LIMIT 1`,[v.globalCycleId,v.poolAddress,v.candidateId,v.now]);
+      const row=r.rows[0];
+      return row?{globalCycleId:v.globalCycleId,poolAddress:v.poolAddress,candidateId:v.candidateId,selectionTier:String(row.selection_tier),selectionState:String(row.selection_state),selectionDynamicEligible:Boolean(row.selection_dynamic_eligible)}:undefined;
+    },
     async loadProductionPoolSettlementHistory(poolAddresses,decisionCutoff) {
       if(!poolAddresses.length)return [];
       const r=await db.query(`WITH latest AS (
@@ -2481,7 +2722,7 @@ export async function createPostgresStore(
       await db.query('BEGIN');
       try{
         await db.query(`INSERT INTO execution.production_global_selection_cycles(global_cycle_id,policy_version,reentry_context_policy_version,decision_cutoff,started_at,completed_at,eligible_pool_count,evaluated_pool_count,candidate_pool_count,coverage_state,outcome,winner_pool_address,winner_candidate_id,runner_up_pool_address,ranking_metric,cross_pool_metrics_comparable,reason_codes,source_commit,build_id,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,$18,$19,$20::jsonb) ON CONFLICT(global_cycle_id) DO NOTHING`,[v.globalCycleId,v.policyVersion,v.reentryContextPolicyVersion,v.decisionCutoff,v.startedAt,v.completedAt,v.eligiblePoolCount,v.evaluatedPoolCount,v.candidatePoolCount,v.coverageState,v.outcome,v.winnerPoolAddress??null,v.winnerCandidateId??null,v.runnerUpPoolAddress??null,v.rankingMetric,v.crossPoolMetricsComparable,json(v.reasonCodes),v.sourceCommit??null,v.buildId??null,json(v.payload)]);
-        for(const c of v.candidates)await db.query(`INSERT INTO execution.production_global_pool_candidates(global_cycle_id,pool_address,evaluation_order,candidate_rank,candidate_state,recommendation_id,thesis_id,candidate_id,strategy,orientation,lower_bin_id,upper_bin_id,active_bin_id,risk_adjusted_expected_net_ev,predicted_fees,predicted_inventory_pnl,capital_value,horizon_minutes,decision_at,expires_at,phase3_state,phase4_state,reason_codes,history_context,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23::jsonb,$24::jsonb,$25::jsonb) ON CONFLICT(global_cycle_id,pool_address) DO NOTHING`,[v.globalCycleId,c.poolAddress,c.evaluationOrder,c.candidateRank??null,c.candidateState,c.recommendationId??null,c.thesisId??null,c.candidateId??null,c.strategy??null,c.orientation??null,c.lowerBinId??null,c.upperBinId??null,c.activeBinId??null,c.riskAdjustedExpectedNetEv??null,c.predictedFees??null,c.predictedInventoryPnl??null,c.capitalValue??null,c.horizonMinutes??null,c.decisionAt??null,c.expiresAt??null,c.phase3State??null,c.phase4State??null,json(c.reasonCodes),json(c.historyContext),json(c.payload)]);
+        for(const c of v.candidates)await db.query(`INSERT INTO execution.production_global_pool_candidates(global_cycle_id,pool_address,evaluation_order,candidate_rank,candidate_state,selection_tier,selection_state,selection_dynamic_eligible,recommendation_id,thesis_id,candidate_id,strategy,orientation,lower_bin_id,upper_bin_id,active_bin_id,risk_adjusted_expected_net_ev,predicted_fees,predicted_inventory_pnl,capital_value,horizon_minutes,decision_at,expires_at,phase3_state,phase4_state,reason_codes,history_context,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26::jsonb,$27::jsonb,$28::jsonb) ON CONFLICT(global_cycle_id,pool_address) DO NOTHING`,[v.globalCycleId,c.poolAddress,c.evaluationOrder,c.candidateRank??null,c.candidateState,c.selectionTier??null,c.selectionState??null,c.selectionDynamicEligible??false,c.recommendationId??null,c.thesisId??null,c.candidateId??null,c.strategy??null,c.orientation??null,c.lowerBinId??null,c.upperBinId??null,c.activeBinId??null,c.riskAdjustedExpectedNetEv??null,c.predictedFees??null,c.predictedInventoryPnl??null,c.capitalValue??null,c.horizonMinutes??null,c.decisionAt??null,c.expiresAt??null,c.phase3State??null,c.phase4State??null,json(c.reasonCodes),json(c.historyContext),json(c.payload)]);
         await db.query('COMMIT');
       }catch(error){await db.query('ROLLBACK');throw error;}
     },
@@ -3598,6 +3839,40 @@ return 'APPLIED';
         return next;
       }catch(error){try{await tx.query("ROLLBACK");}catch{}throw error;}
     },
+    async retainPositionInventoryLotDust(v){
+      const tx=db;
+      try{
+        await tx.query("BEGIN");
+        const existing=await tx.query("SELECT 1 FROM execution.position_inventory_lot_events WHERE event_id=$1 FOR UPDATE",[v.eventId]);
+        if(existing.rows[0]){await tx.query("COMMIT");return;}
+        const lot=await tx.query("SELECT remaining_raw_amount,status FROM execution.position_inventory_lots WHERE lot_id=$1 FOR UPDATE",[v.lotId]);
+        if(!lot.rows[0])throw new Error("LPFORGE_INVENTORY_LOT_NOT_FOUND");
+        const raw=BigInt(String(lot.rows[0].remaining_raw_amount));
+        if(raw<=0n||!['OPEN','PARTIALLY_SETTLED'].includes(String(lot.rows[0].status)))throw new Error("LPFORGE_INVENTORY_DUST_DISPOSITION_INVALID_STATE");
+        await tx.query("UPDATE execution.position_inventory_lots SET status='DUST_RETAINED',updated_at=$2,payload=payload||jsonb_build_object('dustDisposition',$3::jsonb) WHERE lot_id=$1",[v.lotId,v.observedAt,json(v.payload)]);
+        await tx.query("INSERT INTO execution.position_inventory_lot_events(event_id,lot_id,plan_id,event_type,raw_amount,remaining_raw_amount,observed_at,payload) VALUES($1,$2,$3,'DUST_RETAINED',$4,$4,$5,$6::jsonb)",[v.eventId,v.lotId,v.planId??null,raw.toString(),v.observedAt,json(v.payload)]);
+        await tx.query("COMMIT");
+      }catch(error){try{await tx.query("ROLLBACK");}catch{}throw error;}
+    },
+    async correctAggregateCloseClaimAttribution(v){
+      const tx=db;
+      try{
+        await tx.query("BEGIN");
+        const prior=await tx.query("SELECT 1 FROM execution.position_inventory_lot_events WHERE event_id=$1 FOR UPDATE",[v.eventId]);
+        if(prior.rows[0]){await tx.query("COMMIT");return;}
+        const rows=await tx.query("SELECT lot_id,raw_amount,remaining_raw_amount,status,payload FROM execution.position_inventory_lots WHERE lot_id=ANY($1::text[]) FOR UPDATE",[[v.closeLotId,v.claimLotId]]);
+        const close=rows.rows.find(row=>String(row.lot_id)===v.closeLotId),claim=rows.rows.find(row=>String(row.lot_id)===v.claimLotId);
+        if(!close||!claim)throw new Error('LPFORGE_INVENTORY_ATTRIBUTION_LOT_MISSING');
+        const closeRaw=BigInt(String(close.raw_amount)),claimRaw=BigInt(String(claim.raw_amount));
+        if(claimRaw!==v.claimRawAmount||closeRaw<=claimRaw||String(close.status)!=='SETTLED'||String(claim.status)!=='OPEN')throw new Error('LPFORGE_INVENTORY_ATTRIBUTION_CORRECTION_INVALID');
+        const corrected=closeRaw-claimRaw;
+        const closePayload={...(close.payload as Record<string,unknown>),attributionCorrection:{...v.payload,originalRawAmount:closeRaw.toString(),correctedRawAmount:corrected.toString(),overlapRawAmount:claimRaw.toString(),transactionSignature:v.transactionSignature}};
+        await tx.query("UPDATE execution.position_inventory_lots SET raw_amount=$2,updated_at=$3,payload=$4::jsonb WHERE lot_id=$1",[v.closeLotId,corrected.toString(),v.observedAt,json(closePayload)]);
+        await tx.query("UPDATE execution.position_inventory_lots SET remaining_raw_amount=0,status='SETTLED',updated_at=$2,payload=payload||jsonb_build_object('terminalSettlement',$3::jsonb) WHERE lot_id=$1",[v.claimLotId,v.observedAt,json({eventType:'SETTLED',transactionSignature:v.transactionSignature,disposition:'AGGREGATE_CLOSE_UNWIND_RECEIPT_ALLOCATION',...v.payload})]);
+        await tx.query("INSERT INTO execution.position_inventory_lot_events(event_id,lot_id,plan_id,event_type,raw_amount,remaining_raw_amount,observed_at,transaction_signature,payload) VALUES($1,$2,$3,'ATTRIBUTION_CORRECTED',$4,0,$5,$6,$7::jsonb),($1||':claim-settled',$8,$3,'SETTLED',$4,0,$5,$6,$7::jsonb)",[v.eventId,v.closeLotId,v.planId,claimRaw.toString(),v.observedAt,v.transactionSignature,json(v.payload),v.claimLotId]);
+        await tx.query("COMMIT");
+      }catch(error){try{await tx.query("ROLLBACK");}catch{}throw error;}
+    },
     async loadPositionInventoryLots(positionAddress,tokenMint){
       const r=await db.query("SELECT lot_id,position_address,plan_id,owner_address,pool_address,token_mint,token_side,source_event,source_cashflow_id,raw_amount,remaining_raw_amount,decimals,acquired_at,status,payload FROM execution.position_inventory_lots WHERE position_address=$1 AND ($2::text IS NULL OR token_mint=$2) ORDER BY acquired_at ASC,lot_id ASC",[positionAddress,tokenMint??null]);
       return r.rows.map(row=>({lotId:String(row.lot_id),positionAddress:String(row.position_address),planId:String(row.plan_id),ownerAddress:String(row.owner_address),poolAddress:String(row.pool_address),tokenMint:String(row.token_mint),tokenSide:String(row.token_side) as PositionInventoryLotSide,sourceEvent:String(row.source_event) as PositionInventoryLotSource,...(row.source_cashflow_id?{sourceCashflowId:String(row.source_cashflow_id)}:{}),rawAmount:BigInt(String(row.raw_amount)),remainingRawAmount:BigInt(String(row.remaining_raw_amount)),decimals:Number(row.decimals),acquiredAt:toIsoTimestamp(row.acquired_at),status:String(row.status) as PositionInventoryLotStatus,payload:(row.payload??{}) as Record<string,unknown>}));
@@ -3741,6 +4016,17 @@ return 'APPLIED';
         `UPDATE execution.submission_attempts SET state='EXPIRED',payload=payload||jsonb_build_object('terminal_recovery_reason',$3::text,'terminal_recovered_at',$2::timestamptz) WHERE signature=$1 AND state IN ('PREPARED','SENT','UNKNOWN')`,
         [signature, at, reason],
       );
+    },
+    async recoverNoEffectPreflightSubmissionAttempts(at) {
+      const result=await db.query(
+        `UPDATE execution.submission_attempts
+         SET state='EXPIRED',payload=payload||jsonb_build_object('terminal_recovery_reason','P6_PREFLIGHT_REJECTED_NO_CHAIN_EFFECT','terminal_recovered_at',$1::timestamptz)
+         WHERE state='UNKNOWN' AND signature IS NULL
+           AND payload->>'submission_error' LIKE 'Simulation failed.%'
+         RETURNING attempt_id`,
+        [at],
+      );
+      return result.rows.length;
     },
     async loadSubmissionAttemptBySignature(signature) {
       const r = await db.query(
@@ -4328,8 +4614,7 @@ return 'APPLIED';
       const [decision, unknown, recon, journal, canary, portfolio] =
         await Promise.all([
           db.query(
-            `SELECT observed_at FROM operations.forward_cycles WHERE pool_address=$1 ORDER BY observed_at DESC LIMIT 1`,
-            [poolAddress],
+            `SELECT observed_at FROM operations.forward_cycles ORDER BY observed_at DESC LIMIT 1`,
           ),
           db.query(
             `SELECT count(*)::int AS n FROM execution.submission_attempts WHERE state='UNKNOWN'`,
@@ -4565,9 +4850,11 @@ export function createMemoryStore(): Phase1Store {
     async insertDiscoveryRanking() {},
     async listDiscoveryCandidates() { return []; },
     async reconcileLiveEvidenceAdmission(v) { return {serviceableCapacity:v.serviceableCapacity,productionMonitoredCount:0,activeCount:0,qualifiedWaitingCount:0,promotedPoolAddresses:[],demotedPoolAddresses:[],replacements:[]}; },
+    async reconcileRawReplayTracking(v) { return {capacity:v.capacity,trackedPoolAddresses:[],waitingPoolAddresses:[]}; },
     async reconcileEvidenceContinuityTracking(v) { return {capacity:v.capacity,trackedPoolAddresses:[],expiredPoolAddresses:[],evictedPoolAddresses:[]}; },
     async recordLiveEvidenceCollectionOutcome() {},
     async recordEvidenceContinuityCollectionOutcome() {},
+    async recordRawReplayCollectionOutcome() {},
     async recordPostEvidenceEvaluationOutcome() {},
     async markDiscoveryPoolsStale() { return 0; },
     async insertFeeVolumeObservations() {},
@@ -4601,6 +4888,7 @@ export function createMemoryStore(): Phase1Store {
     async loadShadowRecommendationPayload() { return undefined; },
     async insertProductionGlobalCandidate() {},
     async loadProductionGlobalCandidateFacts() { return []; },
+    async verifyProductionGlobalWinnerAdmission() { return undefined; },
     async loadProductionPoolSettlementHistory() { return []; },
     async insertProductionGlobalSelection() {},
     async insertReset3cValidationUniverse() { return 'INSERTED' as const; },
@@ -4706,6 +4994,8 @@ export function createMemoryStore(): Phase1Store {
     async insertLiveLearningCalibration() {},
     async createPositionInventoryLot() {},
     async settlePositionInventoryLot() { return {remainingRawAmount:0n,status:"SETTLED" as PositionInventoryLotStatus}; },
+    async retainPositionInventoryLotDust() {},
+    async correctAggregateCloseClaimAttribution() {},
     async loadPositionInventoryLots() { return []; },
     async loadOwnerPositionInventoryLots() { return []; },
     async insertPlanCashflow() {},
@@ -4731,6 +5021,7 @@ export function createMemoryStore(): Phase1Store {
     async markSubmissionSent() {},
     async markSubmissionUnknown() {},
     async markSubmissionExpired() {},
+    async recoverNoEffectPreflightSubmissionAttempts() { return 0; },
     async loadSubmissionAttemptBySignature() { return undefined; },
     async loadSubmissionAttemptByTransactionId() { return undefined; },
     async loadConfirmedSubmissionByTransactionId() { return undefined; },

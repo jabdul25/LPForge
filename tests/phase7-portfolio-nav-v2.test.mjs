@@ -57,13 +57,13 @@ test('wallet token balances join the NAV through the same pool price feed',()=>{
 test('owned positions remain mandatory management/drift targets without bypassing dynamic new-entry admission',()=>{
   const src=fs.readFileSync(production,'utf8');
   assert.match(src,/productionManagementPoolAddresses\(input\.env,\[\.\.\.openPools\]\)/,'owned positions remain in the management/drift universe');
-  assert.match(src,/getProductionNewEntryEligiblePools\(input\.store,input\.env,input\.cycleKey\)/,'new-entry evaluation remains dynamically admitted');
+  assert.match(src,/getProductionNewEntryAdmissionSnapshots\(input\.store,input\.env,input\.cycleKey\)/,'new-entry evaluation remains dynamically admitted through a frozen Tier-A selection snapshot');
   assert.match(src,/eligiblePoolAddresses:newEntryPoolAddresses/,'owned pools cannot be injected into global new-entry ranking merely by lifecycle state');
 });
 
 test('rent locked in open position accounts is exact recoverable book-value equity and policy precedes valuation',()=>{
   const src=fs.readFileSync(production,'utf8');
-  const policyAt=src.indexOf("const policy=loadDeploymentPolicyFile(input.env.LPFORGE_EXECUTION_POLICY_PATH?.trim()||'policies/live-execution-policy.json'),capital=policy.productionCapital;");
+  const policyAt=src.indexOf('const policy=loadDeploymentPolicyFile(resolveLiveExecutionPolicyPath(input.env)),capital=policy.productionCapital;');
   const accountAt=src.indexOf('connection.getAccountInfo(new PublicKey(positionAddress)');
   const rentAt=src.indexOf('const rentReserveLamports=valuations.reduce((sum,value)=>sum+value.recoverableRentLamports,0n);');
   const currentAt=src.indexOf('current=BigInt(wallet)+positionValueLamports+walletTokenValueLamports+rentReserveLamports');

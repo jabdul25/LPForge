@@ -94,3 +94,26 @@ test('the executor forwards the configured provenance secret into the claim guar
   assert.ok(src.includes('loadPhase7ControlDecision(runtimeId,boundControlDecisionId)'),'the executor resolves the immutable control by its persisted identity rather than assuming latest wins');
   assert.ok(src.includes('boundPhase7Control'),'the bound record is delivered separately from the latest hard-revocation control');
 });
+
+
+
+test('Production OPEN refuses persistence before creating an unauthenticated executable plan',()=>{
+ const src=fs.readFileSync(operator,'utf8');
+ assert.match(src,/plan\.intent\.action==="OPEN"&&!provenanceSecret/);
+ assert.match(src,/PLAN_PROVENANCE_HMAC_UNAVAILABLE/);
+});
+
+test('a four-step Jupiter and Meteora OPEN plan with valid provenance passes P6 claim',()=>{
+ const policy={schemaVersion:1,policyId:'p',status:'ENABLED',approvalTtlMs:15_000,minDevnetConfirmedRuns:1,maxActionsPerDay:2,maxOpenPositions:1,pools:[{address:'DYNAMIC',maxCapitalLamports:30_000_000n,maxOpenPositions:1}],productionAdmission:{enabled:true,eligibleTiers:['A'],maxCandidates:1,maxCandidateAgeMs:900_000,maxCapitalLamports:30_000_000n,maxOpenPositions:1}};
+ const current={decisionId:'control-1',cycleKey:'cycle-1',authorityMode:'PRODUCTION',healthStatus:'HEALTHY',driftStatus:'WATCH',safetyMode:'NORMAL',newEconomicActionAllowed:true,observedAt:'2026-09-03T20:34:45.000Z'};
+ const steps=['JUPITER_SWAP','METEORA_POSITION_EXTEND','METEORA_OPEN_CHUNK','METEORA_OPEN_CHUNK'].map((kind,index)=>({transactionId:'tx-'+(index+1),sequence:index+1,kind,requiredSignerAddresses:['OWNER'],metadata:{chunk:index>1?index-1:undefined}}));
+ const intent={capitalLamports:'30000000',candidateId:'defensive-99-32-66-bid_ask-skewed_y-1000',lowerBinId:-1142,upperBinId:-1044,activeBinId:-1073,binStep:1,strategy:'BID_ASK'};
+ const immutablePlan={intentPayload:{},planIntent:intent,steps};
+ const provenance={producer:'LPFORGE_PRODUCTION',schemaVersion:1,intentId:'incident-intent',poolAddress:'DYNAMIC',observedAt:'2026-09-03T20:34:54.000Z',phase7Control:{decisionId:current.decisionId,cycleKey:current.cycleKey,observedAt:current.observedAt},globalSelection:{globalCycleId:'production-global:incident',selectedCandidateId:intent.candidateId}};
+ provenance.hmac=computePlanProvenanceHmac({...provenance,action:'OPEN',ownerAddress:'OWNER',positionAddress:null,expiresAt:'2026-09-03T20:39:54.000Z',immutablePlan},secret);
+ const plan={planId:'fixture-d52',intentId:'incident-intent',idempotencyKey:'fixture-d52',action:'OPEN',poolAddress:'DYNAMIC',ownerAddress:'OWNER',thesisId:'t',observedAt:provenance.observedAt,expiresAt:'2026-09-03T20:39:54.000Z',intentPayload:{},planPayload:{provenance,intent},steps};
+ const candidate={poolAddress:'DYNAMIC',state:'PREFILTERED',tier:'B',lastSeenAt:'2026-09-03T20:34:50.000Z',tokenYMint:'So11111111111111111111111111111111111111112',pairedTokenMint:'TOKEN'};
+ const globalWinnerAdmission={globalCycleId:'production-global:incident',poolAddress:'DYNAMIC',candidateId:intent.candidateId,selectionTier:'A',selectionState:'ACTIVE_CANDIDATE',selectionDynamicEligible:true,verified:true};
+ const result=validateClaimedPlan({plan,policy,ownedPositions:[],productionCandidates:[candidate],globalWinnerAdmission,phase7Control:current,boundPhase7Control:current,provenanceSecret:secret,now:'2026-09-03T20:35:00.000Z'});
+ assert.equal(result.approved,true,JSON.stringify(result.reasonCodes));
+});

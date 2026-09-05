@@ -8,6 +8,7 @@ export interface ClaimGuardResult {
   capitalLamports: bigint;
 }
 export interface ProductionAdmissionCandidate {poolAddress:string;state:string;tier:string;lastSeenAt:string;tokenYMint?:string|undefined;pairedTokenMint?:string|undefined;}
+export interface VerifiedGlobalWinnerAdmission {globalCycleId:string;poolAddress:string;candidateId:string;selectionTier:string;selectionState:string;selectionDynamicEligible:boolean;verified:boolean;}
 const WSOL_MINT='So11111111111111111111111111111111111111112';
 export interface Phase7ExecutionControl {decisionId?:string;cycleKey?:string;authorityMode:string;healthStatus:string;driftStatus:string;safetyMode:string;newEconomicActionAllowed:boolean;observedAt:string;poolDrift?:Record<string,string>;activeIncidentIds?:string[];releaseIntegrityValid?:boolean;portfolioValid?:boolean;revokedApprovalIds?:string[];}
 /** Canonical projection used by both claim-time and execution-time P7 checks. */
@@ -22,6 +23,32 @@ export function validateFreshPhase7ExecutionControl(control:Phase7ExecutionContr
  if(control.authorityMode!=='PRODUCTION')reasons.push('P6_CLAIM_P7_AUTHORITY_NOT_PRODUCTION');if(control.healthStatus!=='HEALTHY')reasons.push('P6_CLAIM_P7_HEALTH_NOT_HEALTHY');if(control.driftStatus==='BLOCK')reasons.push('P6_CLAIM_P7_DRIFT_BLOCK');if(control.safetyMode!=='NORMAL')reasons.push('P6_CLAIM_P7_SAFETY_NOT_NORMAL');if(!control.newEconomicActionAllowed)reasons.push('P6_CLAIM_P7_NEW_ACTION_BLOCKED');
  if(!Number.isFinite(age)||age<0||age>maxAgeMs)reasons.push('P6_CLAIM_P7_CONTROL_STALE');
  return reasons.sort();
+}
+/**
+ * A production OPEN is HMAC-bound to the P7 decision that governed plan
+ * preparation. P7 deliberately emits a new control record every cycle, so
+ * equality with the latest decision id would turn harmless healthy refreshes
+ * into a race. The bound record must have been valid when the plan was made;
+ * the current record must independently be fresh and entry-authorizing.
+ */
+function validateBoundProductionAuthority(input:{plan:AutonomousPlan;bound:Phase7ExecutionControl|undefined;current:Phase7ExecutionControl|undefined;now:string}):string[]{
+ const provenance=record(record(input.plan.planPayload).provenance),binding=record(provenance.phase7Control),boundDecisionId=String(binding.decisionId??''),boundObservedAt=String(binding.observedAt??'');
+ if(!boundDecisionId||!boundObservedAt)return ['P6_CLAIM_P7_CONTROL_BINDING_MISSING'];
+ if(!input.current)return ['P6_CLAIM_P7_CONTROL_MISSING'];
+ // The exact-current case remains valid without an additional database lookup;
+ // after a refresh, execution must supply the persisted plan-bound control.
+ const bound=input.bound??(input.current?.decisionId===boundDecisionId?input.current:undefined);
+ if(!bound)return ['P6_CLAIM_P7_BOUND_CONTROL_MISSING'];
+ const reasons:string[]=[];
+ if(!input.current?.decisionId)reasons.push('P6_CLAIM_P7_CONTROL_ID_MISSING');
+ if(bound.decisionId!==boundDecisionId)reasons.push('P6_CLAIM_P7_CONTROL_BINDING_MISMATCH');
+ if(!validTimestamp(boundObservedAt)||!validTimestamp(input.plan.observedAt)||Date.parse(boundObservedAt)>Date.parse(input.plan.observedAt)||bound.observedAt!==boundObservedAt)reasons.push('P6_CLAIM_P7_CONTROL_BINDING_INVALID');
+ // Validate the historical authority at the time it authorized this exact
+ // plan, rather than against wall-clock claim time.
+ reasons.push(...validateFreshPhase7ExecutionControl(bound,input.plan.observedAt));
+ // Current control remains a fresh, fail-closed hard-safety gate.
+ reasons.push(...validateFreshPhase7ExecutionControl(input.current,input.now));
+ return [...new Set(reasons)].sort();
 }
 function record(value: unknown) {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -48,7 +75,12 @@ function capital(plan: AutonomousPlan) {
 function isRiskIncreasingAction(action: string) {
   return ["OPEN", "ADD", "RESHAPE", "REBALANCE"].includes(action);
 }
-function policyPoolForPlan(input:{plan:AutonomousPlan;policy:MainnetCanaryDeploymentPolicy;productionCandidates:ProductionAdmissionCandidate[];now:string;controlledCanary:boolean},reasons:string[]){
+function verifiedGlobalWinnerAdmission(input:{plan:AutonomousPlan;admission:VerifiedGlobalWinnerAdmission|undefined}){
+ const provenance=record(record(input.plan.planPayload).provenance),selection=record(provenance.globalSelection),intent=record(input.plan.planPayload.intent),admission=input.admission;
+ return Boolean(admission?.verified&&admission.selectionTier==='A'&&admission.selectionDynamicEligible===true&&equals(selection.globalCycleId,admission.globalCycleId)&&equals(selection.selectedCandidateId,admission.candidateId)&&equals(intent.candidateId,admission.candidateId)&&equals(input.plan.poolAddress,admission.poolAddress));
+}
+function currentHardDiscoveryDisqualification(candidate:ProductionAdmissionCandidate|undefined){return Boolean(candidate&&(['REJECTED','QUARANTINED','OBSERVING'].includes(candidate.state)||['REJECTED','QUARANTINED'].includes(candidate.tier)));}
+function policyPoolForPlan(input:{plan:AutonomousPlan;policy:MainnetCanaryDeploymentPolicy;productionCandidates:ProductionAdmissionCandidate[];globalWinnerAdmission?:VerifiedGlobalWinnerAdmission;now:string;controlledCanary:boolean},reasons:string[]){
  // A static policy pool is a bounded canary/healthcheck identity, not a
  // general new-entry admission.  Ordinary risk-increasing plans, including
  // plans targeting a listed pool, must prove the same fresh dynamic admission
@@ -57,8 +89,13 @@ function policyPoolForPlan(input:{plan:AutonomousPlan;policy:MainnetCanaryDeploy
  const staticPool=input.policy.pools.find(x=>x.address===input.plan.poolAddress);if(input.controlledCanary&&staticPool)return staticPool;
  const admission=input.policy.productionAdmission;
  if(!admission?.enabled){reasons.push('P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return undefined;}
- const candidate=input.productionCandidates.find(x=>x.poolAddress===input.plan.poolAddress),age=candidate?Date.parse(input.now)-Date.parse(candidate.lastSeenAt):NaN;
- if(!candidate||candidate.state!=='ACTIVE_CANDIDATE'||!admission.eligibleTiers.includes(candidate.tier as 'A'|'B'|'C')||!Number.isFinite(age)||age<0||age>admission.maxCandidateAgeMs||input.productionCandidates.indexOf(candidate)>=admission.maxCandidates){reasons.push('P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return undefined;}
+ const candidate=input.productionCandidates.find(x=>x.poolAddress===input.plan.poolAddress),age=candidate?Date.parse(input.now)-Date.parse(candidate.lastSeenAt):NaN,
+   activeEconomicLease=candidate?.state==='ACTIVE_CANDIDATE'&&admission.eligibleTiers.includes(candidate.tier as 'A'|'B'|'C')&&input.productionCandidates.indexOf(candidate)>=0&&input.productionCandidates.indexOf(candidate)<admission.maxCandidates,
+   selectionBoundWinner=verifiedGlobalWinnerAdmission({plan:input.plan,admission:input.globalWinnerAdmission});
+ // A current Tier-B/PREFILTERED rank is mutable ranking/lease drift. It
+ // cannot revoke the exact, fresh Tier-A winner snapshot. Terminal and stale
+ // discovery facts remain current hard disqualifiers at the signing boundary.
+ if(!candidate||(!activeEconomicLease&&!selectionBoundWinner)||currentHardDiscoveryDisqualification(candidate)||!Number.isFinite(age)||age<0||age>admission.maxCandidateAgeMs){reasons.push('P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return undefined;}
  if(candidate.tokenYMint!==WSOL_MINT){reasons.push('P6_PRODUCTION_REQUIRES_WSOL_TOKEN_Y');return undefined;}
  return{address:candidate.poolAddress,maxCapitalLamports:admission.maxCapitalLamports,maxOpenPositions:admission.maxOpenPositions};
 }
@@ -104,6 +141,8 @@ export function validateClaimedPlan(input: {
   ownedPositions: Record<string, unknown>[];
   positionTruth?: { owner: string; pool: string };
   productionCandidates?: ProductionAdmissionCandidate[];
+  /** Exact database-verified global-winner binding; this does not admit a static pool. */
+  globalWinnerAdmission?:VerifiedGlobalWinnerAdmission;
   phase7Control?:Phase7ExecutionControl;
   /** The immutable P7 control that the authenticated canary plan binds. */
   boundPhase7Control?:Phase7ExecutionControl;
@@ -122,7 +161,7 @@ export function validateClaimedPlan(input: {
     provenance = record(record(p.planPayload).provenance),
     riskIncreasing = isRiskIncreasingAction(p.action),
     policyPool = riskIncreasing
-      ? policyPoolForPlan({plan:p,policy:input.policy,productionCandidates:input.productionCandidates??[],now:input.now??new Date().toISOString(),controlledCanary:Boolean(input.controlledCanary)},reasons)
+      ? policyPoolForPlan({plan:p,policy:input.policy,productionCandidates:input.productionCandidates??[],...(input.globalWinnerAdmission?{globalWinnerAdmission:input.globalWinnerAdmission}:{}),now:input.now??new Date().toISOString(),controlledCanary:Boolean(input.controlledCanary)},reasons)
       : undefined;
   if (
     provenance.producer !== "LPFORGE_PRODUCTION" ||
@@ -221,11 +260,7 @@ export function validateClaimedPlan(input: {
       reasons.push(...validateBoundCanaryAuthorization({plan:p,provenance,bound:input.boundPhase7Control,current:control,now:input.now??new Date().toISOString()}));
       if(!boundDecisionId||!boundObservedAt||!Number.isFinite(Date.parse(boundObservedAt))||Date.parse(boundObservedAt)>Date.parse(p.observedAt))reasons.push('P6_CLAIM_P7_CONTROL_BINDING_INVALID');
     }else{
-      reasons.push(...validateFreshPhase7ExecutionControl(control,input.now??new Date().toISOString()));
-      if(!boundDecisionId||!boundObservedAt)reasons.push('P6_CLAIM_P7_CONTROL_BINDING_MISSING');
-      else if(!control?.decisionId)reasons.push('P6_CLAIM_P7_CONTROL_ID_MISSING');
-      else if(control.decisionId!==boundDecisionId)reasons.push('P6_CLAIM_P7_CONTROL_BINDING_MISMATCH');
-      else if(!Number.isFinite(Date.parse(boundObservedAt))||Date.parse(boundObservedAt)>Date.parse(p.observedAt))reasons.push('P6_CLAIM_P7_CONTROL_BINDING_INVALID');
+      reasons.push(...validateBoundProductionAuthority({plan:p,bound:input.boundPhase7Control,current:control,now:input.now??new Date().toISOString()}));
       if(control?.poolDrift?.[p.poolAddress]==='BLOCK')reasons.push('P6_CLAIM_P7_POOL_DRIFT_BLOCK');
     }
   }

@@ -34,6 +34,10 @@ export interface HorizonContext {
   priceRangePct:number;
   netBins:number;
   absoluteBins:number;
+  /** Largest distance of an observed bin from the first bin in this horizon.
+   * Unlike absoluteBins this is an excursion envelope, so reversals do not
+   * turn repeated travel through the same range into additional range width. */
+  maxAnchorDisplacementBins:number;
   binVelocityPerMinute:number;
   directionalEfficiency:number;
   volumeTotal:number;
@@ -57,7 +61,7 @@ function contextFor(horizon:MarketHorizon,decisionAt:string,rows:MarketObservati
   const decision=Date.parse(decisionAt),mins=MARKET_HORIZON_MINUTES[horizon],start=decision-mins*60000;
   const s=rows.filter((r)=>{const t=Date.parse(r.observedAt);return t>=start&&t<=decision;}).sort((a,b)=>Date.parse(a.observedAt)-Date.parse(b.observedAt));
   const endAt=decisionAt;
-  if(!s.length)return{horizon,samples:0,endAt,returnPct:0,maxDrawdownPct:0,realizedVolatility:0,priceRangePct:0,netBins:0,absoluteBins:0,binVelocityPerMinute:0,directionalEfficiency:0,volumeTotal:0,feeTotal:0,twoWayRatioMean:null,localLiquidityChangePct:null,completeness:0};
+  if(!s.length)return{horizon,samples:0,endAt,returnPct:0,maxDrawdownPct:0,realizedVolatility:0,priceRangePct:0,netBins:0,absoluteBins:0,maxAnchorDisplacementBins:0,binVelocityPerMinute:0,directionalEfficiency:0,volumeTotal:0,feeTotal:0,twoWayRatioMean:null,localLiquidityChangePct:null,completeness:0};
   const prices=s.map((x)=>x.price).filter((x)=>Number.isFinite(x)&&x>0); const first=prices[0]??0,last=prices.at(-1)??first;
   let peak=first,maxDd=0; for(const p of prices){peak=Math.max(peak,p);if(peak>0)maxDd=Math.min(maxDd,(p-peak)/peak*100);}
   const logReturns:number[]=[];for(let i=1;i<prices.length;i++){const a=prices[i-1]!,b=prices[i]!;if(a>0&&b>0)logReturns.push(Math.log(b/a));}
@@ -65,6 +69,8 @@ function contextFor(horizon:MarketHorizon,decisionAt:string,rows:MarketObservati
   const binRows=s.filter((row):row is MarketObservation & {activeBinId:number}=>Number.isFinite(row.activeBinId));
   let absBins=0;for(let i=1;i<binRows.length;i++)absBins+=Math.abs(binRows[i]!.activeBinId-binRows[i-1]!.activeBinId);
   const netBins=binRows.length>=2?binRows.at(-1)!.activeBinId-binRows[0]!.activeBinId:0;
+  const anchorBin=binRows[0]?.activeBinId;
+  const maxAnchorDisplacementBins=anchorBin===undefined?0:Math.max(...binRows.map((row)=>Math.abs(row.activeBinId-anchorBin)));
   const duration=Math.max((Date.parse(s.at(-1)!.observedAt)-Date.parse(s[0]!.observedAt))/60000,1/60);
   const tw=s.map((x)=>x.twoWayRatio).filter(finite); const liq=s.map((x)=>x.localLiquidity).filter(finite);
   // Completeness is market-time coverage, not ingestion-count.  This retains
@@ -72,7 +78,7 @@ function contextFor(horizon:MarketHorizon,decisionAt:string,rows:MarketObservati
   // five-minute interval without manufacturing five minute observations.
   const intervals=s.map(row=>{const bucketStart=Math.max(Date.parse(row.observedAt),start);const resolution=Math.max(1_000,Math.min(15*60_000,Number(row.resolutionMs??60_000)));return[bucketStart,Math.min(decision,bucketStart+resolution)] as const;}).filter(([a,b])=>b>a).sort((a,b)=>a[0]-b[0]);
   let covered=0,coveredEnd=-Infinity;for(const [a,b] of intervals){const from=Math.max(a,coveredEnd);if(b>from){covered+=b-from;coveredEnd=Math.max(coveredEnd,b);}}
-  return{horizon,samples:s.length,startAt:s[0]!.observedAt,endAt,returnPct:first>0?(last-first)/first*100:0,maxDrawdownPct:maxDd,realizedVolatility:Math.sqrt(Math.max(0,variance))*100,priceRangePct:prices.length&&Math.min(...prices)>0?(Math.max(...prices)-Math.min(...prices))/Math.min(...prices)*100:0,netBins,absoluteBins:absBins,binVelocityPerMinute:absBins/duration,directionalEfficiency:absBins?Math.abs(netBins)/absBins:0,volumeTotal:s.reduce((a,b)=>a+(finite(b.volume)?b.volume:0),0),feeTotal:s.reduce((a,b)=>a+(finite(b.feeValue)?b.feeValue:0),0),twoWayRatioMean:tw.length?mean(tw):null,localLiquidityChangePct:liq.length>=2&&liq[0]!>0?(liq.at(-1)!-liq[0]!)/liq[0]!*100:null,completeness:clamp(covered/(mins*60_000))};
+  return{horizon,samples:s.length,startAt:s[0]!.observedAt,endAt,returnPct:first>0?(last-first)/first*100:0,maxDrawdownPct:maxDd,realizedVolatility:Math.sqrt(Math.max(0,variance))*100,priceRangePct:prices.length&&Math.min(...prices)>0?(Math.max(...prices)-Math.min(...prices))/Math.min(...prices)*100:0,netBins,absoluteBins:absBins,maxAnchorDisplacementBins,binVelocityPerMinute:absBins/duration,directionalEfficiency:absBins?Math.abs(netBins)/absBins:0,volumeTotal:s.reduce((a,b)=>a+(finite(b.volume)?b.volume:0),0),feeTotal:s.reduce((a,b)=>a+(finite(b.feeValue)?b.feeValue:0),0),twoWayRatioMean:tw.length?mean(tw):null,localLiquidityChangePct:liq.length>=2&&liq[0]!>0?(liq.at(-1)!-liq[0]!)/liq[0]!*100:null,completeness:clamp(covered/(mins*60_000))};
 }
 export async function buildMarketContext(pool:string,decisionAt:string,observations:MarketObservation[]):Promise<MarketContextSnapshot>{
   assertNoLookahead(decisionAt,observations);

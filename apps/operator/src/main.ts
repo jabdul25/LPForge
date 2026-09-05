@@ -1,4 +1,4 @@
-import { loadPhase1Config } from "../../../packages/config/src/index.js";
+import { loadPhase1Config, resolveLiveExecutionPolicyPath } from "../../../packages/config/src/index.js";
 import { createMeteoraDataApi, type DataApiPool } from "../../../packages/data-api/src/index.js";
 import {
   createPostgresStore,
@@ -181,7 +181,7 @@ async function persistFeeCompensationMetrics(input:{store:Phase1Store;position:O
 }
 function loadProductionCapitalEnvelope(poolAddress: string) {
   const deployment = loadDeploymentPolicyFile(
-    process.env.LPFORGE_EXECUTION_POLICY_PATH ?? "policies/live-execution-policy.json",
+    resolveLiveExecutionPolicyPath(),
   );
   if (deployment.status !== "ENABLED" || !deployment.productionCapital)
     throw new Error("LPFORGE_PRODUCTION_CAPITAL_POLICY_REQUIRED");
@@ -222,8 +222,7 @@ async function loadLiveOpenPlanCapacity(input: {
       reasonCodes: ["P7_PLAN_OWNER_ADDRESS_MISSING"],
     };
   const deployment = loadDeploymentPolicyFile(
-    process.env.LPFORGE_EXECUTION_POLICY_PATH ??
-      "policies/live-execution-policy.json",
+      resolveLiveExecutionPolicyPath(),
   );
   const capital = deployment.productionCapital;
   if (!capital)
@@ -279,7 +278,7 @@ async function persistTransactionPlan(
   store: Phase1Store,
   plan: TransactionPlan,
 ) {
-  const deployment=loadDeploymentPolicyFile(process.env.LPFORGE_EXECUTION_POLICY_PATH??"policies/live-execution-policy.json");
+  const deployment=loadDeploymentPolicyFile(resolveLiveExecutionPolicyPath());
   const boundedUnattended=process.env.LPFORGE_BOUNDED_UNATTENDED_PRODUCTION==='true';
   // The controlled-canary probe remains read-only; its plan-only marker still
   // enforces the exact capital and no-replacement envelope before signing.
@@ -290,6 +289,7 @@ async function persistTransactionPlan(
       throw new Error('LPFORGE_P6_CONTROLLED_CANARY_REPLACEMENT_OPEN_BLOCKED');
   }
   const provenanceSecret=(process.env.LPFORGE_PLAN_PROVENANCE_SECRET??'').trim();
+  if(plan.intent.action==="OPEN"&&!provenanceSecret)throw new Error("PLAN_PROVENANCE_HMAC_UNAVAILABLE");
   const globalSelectionCycleId=(process.env.LPFORGE_GLOBAL_SELECTION_CYCLE_ID??'').trim(),globalSelectedCandidateId=(process.env.LPFORGE_GLOBAL_SELECTED_CANDIDATE_ID??'').trim();
   const globalSelection=globalSelectionCycleId||globalSelectedCandidateId?{globalCycleId:globalSelectionCycleId,selectedCandidateId:globalSelectedCandidateId}:undefined;
   if(globalSelection&&plan.intent.action==='OPEN'&&(!globalSelection.globalCycleId||!globalSelection.selectedCandidateId||globalSelection.selectedCandidateId!==plan.intent.candidateId))throw new Error('LPFORGE_GLOBAL_SELECTION_PROVENANCE_MISMATCH');
@@ -624,6 +624,13 @@ async function observeAndPlanOwnedPositions(input: {
       managementContext: {
         decision,
         policy,
+        routineFeeClaimEvaluation: {
+          claimableValueLamports: claimExpectedValueLamports?.toString() ?? null,
+          claimableValueUsd: claimExpectedValueUsd ?? null,
+          minimumClaimValueUsd: policy.minimumClaimValueUsd,
+          decision: decision.action === "CLAIM" ? "CLAIM" : "WAIT",
+          reasonCodes: decision.reasonCodes,
+        },
         oor,
         oorPolicy,
         exitDecision,
@@ -961,7 +968,7 @@ async function liveOnce() {
     await store.insertCompatibility(compat);
     if (compat.state !== "VERIFIED")
       throw new Error("LPFORGE_PROTOCOL_COMPATIBILITY_HOLD");
-    const deploymentPolicy=loadDeploymentPolicyFile(process.env.LPFORGE_EXECUTION_POLICY_PATH ?? "policies/live-execution-policy.json");
+    const deploymentPolicy=loadDeploymentPolicyFile(resolveLiveExecutionPolicyPath());
     const evidenceWidth=derivePhase3EvidenceWidthRequirement(deploymentPolicy.positionConstruction?.maxInitialPositionWidthBins ?? 100);
     const [pool, bins] = await Promise.all([
       adapter.getPool(cfg.smokePoolAddress),

@@ -5,7 +5,7 @@ export const GLOBAL_SELECTION_MAX_EVIDENCE_AGE_SECONDS=300;
 export type CandidateState='INCLUDED'|'WARMING'|'NO_TRADE'|'REJECTED'|'EXCLUDED_STALE'|'EXCLUDED_REENTRY_EVIDENCE'|'NO_VALID_CANDIDATE'|'INCOMPARABLE';
 export interface SettledPoolOutcome {lifecycleId:string;poolAddress:string;settledAt:string;realizedNetLamports:bigint;realizedReturnFraction?:number;closeReason?:string;oorDirection?:string;inventoryClassification?:string;grossFeesLamports?:bigint;inventoryPnlLamports?:bigint;}
 export interface PoolHistoryContext {poolAddress:string;asOf:string;sourceLifecycleIds:string[];lastSettlementAt?:string;timeSinceLastSettlementSeconds?:number;lastRealizedNetLamports?:bigint;lastRealizedReturnFraction?:number;lastCloseReason?:string;lastOorDirection?:string;lastInventoryClassification?:string;entriesToday:number;recentWins:number;recentLosses:number;recentCumulativeNetLamports:bigint;recentTokenRiskCloseCount:number;recentBelowMinCloseCount:number;recentFeeCaptureLamports:bigint;recentInventoryPnlLamports:bigint;historyWindow:'UTC_DAY';}
-export interface PoolCandidate {poolAddress:string;operationalState?:'ENTRY_READY'|'NO_TRADE'|'WARMING'|'REJECTED';operationalReasonCodes?:string[];recommendationId?:string;thesisId?:string;candidateId?:string;strategy?:string;orientation?:string;lowerBinId?:number;upperBinId?:number;activeBinId?:number;decisionAt?:string;expiresAt?:string;phase3State:string;phase4State?:string;capitalValue?:number;horizonMinutes?:number;riskAdjustedExpectedNetEv?:number;predictedFees?:number;predictedInventoryPnl?:number;uncertainty?:number;confidence?:number;oorRisk?:number;rankingPolicyId?:string;history:PoolHistoryContext;state:CandidateState;reasonCodes:string[];}
+export interface PoolCandidate {poolAddress:string;operationalState?:'ENTRY_READY'|'NO_TRADE'|'WARMING'|'REJECTED';operationalReasonCodes?:string[];recommendationId?:string;thesisId?:string;candidateId?:string;strategy?:string;orientation?:string;lowerBinId?:number;upperBinId?:number;activeBinId?:number;decisionAt?:string;expiresAt?:string;phase3State:string;phase4State?:string;/** Exact P4/operational entry result for this selection snapshot. */operationalEntryReady?:boolean;/** Capital actually allocated to this candidate, not its nominal ranking capital. */operationalCapitalAllocated?:number;capitalValue?:number;horizonMinutes?:number;riskAdjustedExpectedNetEv?:number;predictedFees?:number;predictedInventoryPnl?:number;uncertainty?:number;confidence?:number;oorRisk?:number;rankingPolicyId?:string;history:PoolHistoryContext;state:CandidateState;reasonCodes:string[];}
 export interface GlobalSelection {policyVersion:string;decisionCutoff:string;crossPoolMetricsComparable:boolean;outcome:'GLOBAL_WINNER'|'GLOBAL_NO_TRADE';reasonCodes:string[];ranked:PoolCandidate[];winner?:PoolCandidate;}
 const at=(s?:string)=>Date.parse(s??'');
 const dayStart=(iso:string)=>{const d=new Date(iso);return new Date(Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate())).getTime();};
@@ -22,11 +22,17 @@ export function classifyProductionPoolCandidate(input:{candidate:Omit<PoolCandid
   if(c.operationalState==='WARMING')return{...c,state:'WARMING',reasonCodes:[...new Set([...operationalReasons,'GLOBAL_POOL_WARMING'])].sort()};
   if(c.operationalState==='NO_TRADE')return{...c,state:'NO_TRADE',reasonCodes:[...new Set([...operationalReasons,'GLOBAL_POOL_NO_TRADE'])].sort()};
   if(c.operationalState==='REJECTED')return{...c,state:'REJECTED',reasonCodes:[...new Set([...operationalReasons,'GLOBAL_POOL_REJECTED'])].sort()};
-  // Candidate-Primary/P3 establishes the per-pool economic winner.  P4 is
-  // deliberately retained as the existing downstream authorization gate after
-  // the global selector chooses a pool; a P4 WAIT must not erase an otherwise
-  // comparable per-pool candidate from the production decision record.
   if(c.phase3State!=='ENTRY_READY'||!c.candidateId)reasons.push('GLOBAL_NO_VALID_POOL_CANDIDATE');
+  // GLOBAL_WINNER is an execution authority, not merely a ranking label. The
+  // selection snapshot must therefore contain the final P4 decision and the
+  // actual operational allocation that the producer would use for a plan.
+  // Older fixtures can omit the explicit derived fields, in which case their
+  // equivalent canonical P4/capital fields retain the same meaning.
+  const entryReady=c.operationalEntryReady??c.phase4State==='ENTRY_READY';
+  const allocated=c.operationalCapitalAllocated??c.capitalValue;
+  if(c.phase4State!=='ENTRY_READY')reasons.push('GLOBAL_P4_NOT_ENTRY_READY');
+  if(!entryReady)reasons.push('GLOBAL_OPERATIONAL_ENTRY_NOT_READY');
+  if(!Number.isFinite(allocated)||allocated!<=0)reasons.push('GLOBAL_OPERATIONAL_CAPITAL_ALLOCATION_ZERO');
   if(!Number.isFinite(decision)||decision<started||decision>cutoff||cutoff-decision>GLOBAL_SELECTION_MAX_EVIDENCE_AGE_SECONDS*1000||Number.isFinite(expires)&&expires<=cutoff)reasons.push('GLOBAL_CANDIDATE_EVIDENCE_STALE');
   if(c.history.lastSettlementAt&&decision<=at(c.history.lastSettlementAt))reasons.push('GLOBAL_SAME_POOL_POST_SETTLEMENT_EVIDENCE_REQUIRED');
   if(!Number.isFinite(c.capitalValue)||!Number.isFinite(c.horizonMinutes)||!Number.isFinite(c.riskAdjustedExpectedNetEv))reasons.push('GLOBAL_ENTRY_READY_METRICS_INCOMPLETE');

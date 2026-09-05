@@ -11,17 +11,12 @@ fail(){ echo "RELEASE_INTEGRITY_FAIL: $*" >&2; exit 1; }
 [[ -f SOURCE_REVISION.txt ]] || fail "SOURCE_REVISION.txt missing"
 [[ -f pnpm-lock.yaml ]] || fail "pnpm-lock.yaml missing"
 
-# A packaged artifact never contains an operator environment file. Runtime
-# verification intentionally permits the separately mounted .env, while still
-# rejecting an environment file included in immutable checksums.
-runtime_verify="${LPFORGE_RUNTIME_RELEASE_VERIFY:-false}"
-if [[ "$runtime_verify" != "true" ]]; then
-  [[ ! -e .env ]] || fail ".env must not be shipped in release"
-  if find . -type f \( -name '.env' -o -name '.env.*' \) ! -name '*.example' -print -quit | grep -q .; then
-    fail "non-example environment file must not be shipped in release"
-  fi
-elif grep -Eq '  \./\.env$' SHA256SUMS.txt; then
-  fail "operator environment file appears in immutable checksum manifest"
+# A release is an immutable executable artifact, never a configuration mount.
+# Runtime verification is deliberately just as strict as build verification.
+[[ ! -e .env ]] || fail ".env must not be present in release"
+[[ ! -e .env.execution ]] || fail ".env.execution must not be present in release"
+if find . -type f \( -name '.env' -o -name '.env.*' \) ! -name '*.example' -print -quit | grep -q .; then
+  fail "non-example environment file must not be present in release"
 fi
 
 COUNT=$(grep -cE '^[0-9a-f]{64}  ' SHA256SUMS.txt || true)
@@ -81,7 +76,13 @@ manifest_lock="${manifest[7]}"
 [[ "$manifest_build" =~ ^[0-9a-f]{64}$ ]] || fail "manifest build identity invalid"
 [[ "$manifest_lock" =~ ^[0-9a-f]{64}$ ]] || fail "manifest lockfile hash invalid"
 
-policy='policies/live-execution-policy.json'
+if [[ "${LPFORGE_RUNTIME_CONFIG_ENFORCED:-false}" == "true" ]]; then
+  config_root="${LPFORGE_HOME:-/root/systems/LPForge}"
+  [[ "$config_root" == /* ]] || fail "LPFORGE_HOME must be absolute"
+  policy="$config_root/policy/live-execution-policy.json"
+else
+  policy="${LPFORGE_EXECUTION_POLICY_PATH:-policies/live-execution-policy.json}"
+fi
 [[ -f "$policy" ]] || fail "canonical execution policy missing"
 actual_policy=$(sha256sum "$policy" | awk '{print $1}')
 [[ "$actual_policy" == "$manifest_policy" ]] || fail "policy hash mismatch"
