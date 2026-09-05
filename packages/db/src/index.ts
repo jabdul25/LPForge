@@ -2524,8 +2524,13 @@ export async function createPostgresStore(
               )
             )
           FOR UPDATE OF registry`);
-        const ranked=rows.rows.map(row=>{const payload=(row.payload??{}) as Record<string,unknown>;return{poolAddress:String(row.pool_address),state:String(row.current_state),priority:Number(row.last_priority_score??0),waitingAt:String(payload.rawReplayWaitingAt??row.first_seen_at)};}).sort((a,b)=>b.priority-a.priority||Date.parse(a.waitingAt)-Date.parse(b.waitingAt)||a.poolAddress.localeCompare(b.poolAddress));
-        const tracked=ranked.slice(0,capacity).map(row=>row.poolAddress),waiting=ranked.slice(capacity).map(row=>row.poolAddress);
+        const ranked=rows.rows.map(row=>{const payload=(row.payload??{}) as Record<string,unknown>;return{poolAddress:String(row.pool_address),state:String(row.current_state),priority:Number(row.last_priority_score??0),waitingAt:String(payload.rawReplayWaitingAt??row.first_seen_at),trackingStartedAt:String(payload.rawReplayTrackingStartedAt??'')};}).sort((a,b)=>b.priority-a.priority||Date.parse(a.waitingAt)-Date.parse(b.waitingAt)||a.poolAddress.localeCompare(b.poolAddress));
+        // A protected replay episode is not a fair-slice lease.  Retain a
+        // valid admitted tracker through ordinary rank churn; otherwise every
+        // newly higher-ranked waiter resets the 60-minute occupancy clock.
+        const alreadyTracking=ranked.filter(row=>row.trackingStartedAt&&Number.isFinite(Date.parse(row.trackingStartedAt))).sort((a,b)=>Date.parse(a.trackingStartedAt)-Date.parse(b.trackingStartedAt)||a.poolAddress.localeCompare(b.poolAddress));
+        const retained=alreadyTracking.slice(0,capacity),remaining=Math.max(0,capacity-retained.length),admitted=ranked.filter(row=>!retained.some(active=>active.poolAddress===row.poolAddress)).slice(0,remaining);
+        const tracked=[...retained,...admitted].map(row=>row.poolAddress),waiting=ranked.filter(row=>!tracked.includes(row.poolAddress)).map(row=>row.poolAddress);
         if(tracked.length)await db.query(`UPDATE market.pool_discovery_registry SET payload=payload||jsonb_build_object('rawReplayTrackingState','REPLAY_TRACKING','rawReplayTrackingStartedAt',COALESCE(NULLIF(payload->>'rawReplayTrackingStartedAt',''),$2::text),'rawReplayServiceDeadlineAt',COALESCE(NULLIF(payload->>'rawReplayServiceDeadlineAt',''),to_char(($2::timestamptz + interval '300 seconds'),'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'))) WHERE pool_address=ANY($1::text[])`,[tracked,v.observedAt]);
         if(waiting.length)await db.query(`UPDATE market.pool_discovery_registry SET payload=(payload-ARRAY['rawReplayEpisodeAnchorAt','rawReplayLastObservationAt','rawReplayDeadlineAt','rawReplayServiceDeadlineAt','rawReplayTrackingStartedAt']::text[])||jsonb_build_object('rawReplayTrackingState','WAITING_REPLAY_SERVICE','rawReplayWaitingAt',COALESCE(payload->>'rawReplayWaitingAt',$2::text)) WHERE pool_address=ANY($1::text[])`,[waiting,v.observedAt]);
         await db.query('COMMIT');
