@@ -73,6 +73,7 @@ import type {
   LifecycleSettlementInput,
   OpenChunkDispositionRecord,
   Phase1Store,
+  PositionInventoryLot,
   WalletPositionClassification,
 } from "../../db/src/index.js";
 import {
@@ -264,6 +265,30 @@ async function recordPositionTokenXLot(input:{store:Phase1Store;connection:Conne
   if(!Number.isInteger(decimals)||decimals<0||decimals>255)throw new Error("LPFORGE_P6_INVENTORY_TOKEN_DECIMALS_INVALID");
   const suffix=input.sourceEvent==="FEE_CLAIM"?"claim-x":input.sourceEvent==="REDUCE_WITHDRAWAL"?"reduce-x":"close-x";
   await input.store.createPositionInventoryLot({lotId:`${input.plan.planId}:${suffix}:lot`,createdEventId:`${input.plan.planId}:${suffix}:lot-created`,positionAddress:input.positionAddress,planId:input.plan.planId,ownerAddress:input.plan.ownerAddress,poolAddress:input.plan.poolAddress,tokenMint:input.tokenMint,tokenSide:"X",sourceEvent:input.sourceEvent,sourceCashflowId:input.sourceCashflowId,rawAmount:input.rawAmount,decimals,acquiredAt:input.observedAt,payload:{source:"WALLET_DELTA",signature:input.signature}});
+}
+
+/**
+ * A wallet snapshot alone cannot distinguish manual inventory from fees that
+ * were already claimed for this position.  Lots are the receipt-bound
+ * provenance record.  We may unwind only the just-withdrawn close delta plus
+ * OPEN/PARTIALLY_SETTLED fee-claim lots for this exact position and mint.
+ */
+export function derivePositionAttributedTerminalUnwind(input:{
+  positionAddress:string;
+  tokenMint:string;
+  closePlanId:string;
+  newlyWithdrawnRaw:bigint;
+  walletRawAfterClose:bigint;
+  lots:ReadonlyArray<Pick<PositionInventoryLot,"lotId"|"positionAddress"|"planId"|"tokenMint"|"sourceEvent"|"remainingRawAmount"|"status"|"acquiredAt">>;
+}):{ok:true;amountRaw:bigint;feeLotAllocations:Array<{lotId:string;rawAmount:bigint}>}|{ok:false;reasonCodes:string[]}{
+  if(input.newlyWithdrawnRaw<0n||input.walletRawAfterClose<0n)return{ok:false,reasonCodes:['P6_CLOSE_POSITION_ATTRIBUTED_INVENTORY_INVALID']};
+  const feeLots=input.lots
+    .filter(lot=>lot.positionAddress===input.positionAddress&&lot.tokenMint===input.tokenMint&&lot.sourceEvent==='FEE_CLAIM'&&lot.planId!==input.closePlanId&&['OPEN','PARTIALLY_SETTLED'].includes(lot.status)&&lot.remainingRawAmount>0n)
+    .sort((a,b)=>a.acquiredAt.localeCompare(b.acquiredAt)||a.lotId.localeCompare(b.lotId));
+  const feeLotAllocations=feeLots.map(lot=>({lotId:lot.lotId,rawAmount:lot.remainingRawAmount}));
+  const feeRaw=feeLotAllocations.reduce((total,lot)=>total+lot.rawAmount,0n),amountRaw=input.newlyWithdrawnRaw+feeRaw;
+  if(input.walletRawAfterClose<amountRaw)return{ok:false,reasonCodes:['P6_CLOSE_POSITION_ATTRIBUTED_FEE_LOTS_WALLET_SHORTFALL']};
+  return{ok:true,amountRaw,feeLotAllocations};
 }
 /** Read the chain immediately before signing.  The plan's market inputs are
  * immutable; a missing/mismatched value is a fail-closed condition, not a
@@ -3213,6 +3238,8 @@ export async function reconcileConfirmedCloseUnwind(input: {
   observedAt?: string;
   /** A recovered OPEN residual has its own lot and durable receipt ids. */
   lotId?: string;
+  /** Deterministic receipt-backed lot consumption for a combined close unwind. */
+  lotAllocations?: Array<{lotId:string;rawAmount:bigint}>;
   settlementIdSuffix?: string;
 }): Promise<{ ok: true; swapProceedsLamports: bigint; inputCorroborated: boolean } | { ok: false; reasonCodes: string[] }> {
   const receipt = await loadConfirmedExecutionReceipt(input.connection, input.signature);
@@ -3247,7 +3274,10 @@ export async function reconcileConfirmedCloseUnwind(input: {
           lotEventId:`${input.plan.planId}:${input.settlementIdSuffix}:lot-settled`,
         }
       : closeUnwindSettlementIds(input.plan.planId),
-    lotId=input.lotId??`${input.plan.planId}:close-x:lot`;
+    lotId=input.lotId??`${input.plan.planId}:close-x:lot`,
+    lotAllocations=input.lotAllocations??[{lotId,rawAmount:input.inputAmountRaw}];
+  if(lotAllocations.length===0||lotAllocations.some(allocation=>allocation.rawAmount<=0n)||lotAllocations.reduce((total,allocation)=>total+allocation.rawAmount,0n)!==input.inputAmountRaw)
+    return{ok:false,reasonCodes:['P6_CLOSE_POSITION_ATTRIBUTED_LOT_ALLOCATION_INVALID']};
   await input.store.insertPositionCashflow({
     cashflowId: ids.cashflowId,
     positionAddress: input.positionAddress,
@@ -3273,12 +3303,12 @@ export async function reconcileConfirmedCloseUnwind(input: {
       outputEffects: closeSettlementOutputPayload(settlement.outputEffects),
     },
   });
-  await input.store.settlePositionInventoryLot({
-    eventId: ids.lotEventId,
-    lotId,
+  for(const [index,allocation] of lotAllocations.entries())await input.store.settlePositionInventoryLot({
+    eventId: `${ids.lotEventId}:${index}`,
+    lotId: allocation.lotId,
     planId: input.plan.planId,
     eventType: "SETTLED",
-    settledRawAmount: input.inputAmountRaw,
+    settledRawAmount: allocation.rawAmount,
     observedAt,
     transactionSignature: input.signature,
     payload: {
@@ -3287,6 +3317,7 @@ export async function reconcileConfirmedCloseUnwind(input: {
       settlementSignature: input.signature,
       proceedsCashflowId: ids.cashflowId,
       source: "CONFIRMED_TRANSACTION_ASSET_EFFECTS",
+      allocationIndex:index,
     },
   });
   return {
@@ -3518,21 +3549,28 @@ async function executeCloseSettlement(input: {
     stage = "CLOSE_CLAIMS_SETTLED";
   }
 
-  let attributableTokenX = closeSettlementAmount(dispatch.attributableTokenX),attributableTokenY=closeSettlementAmount(dispatch.attributableTokenY);
+  let attributableTokenX = closeSettlementAmount(dispatch.attributableTokenX),attributableTokenY=closeSettlementAmount(dispatch.attributableTokenY),attributableFeeLotAllocations:Array<{lotId:string;rawAmount:bigint}>=Array.isArray(dispatch.attributableFeeLotAllocations)?dispatch.attributableFeeLotAllocations.flatMap((value):Array<{lotId:string;rawAmount:bigint}>=>{if(!value||typeof value!=="object")return[];const row=value as Record<string,unknown>;if(typeof row.lotId!=="string"||typeof row.rawAmount!=="string")return[];try{const rawAmount=BigInt(row.rawAmount);return rawAmount>0n?[{lotId:row.lotId,rawAmount}]:[];}catch{return[];}}):[];
   if (stage === "CLOSE_CLAIMS_SETTLED") {
     const [tokenXAfter,tokenYAfter]=await Promise.all([readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenXMint}),readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenYMint})]);
-    attributableTokenX =
+    const newlyWithdrawnTokenX =
       tokenXAfter > tokenXBefore ? tokenXAfter - tokenXBefore : 0n;
     attributableTokenY=tokenYAfter>tokenYBefore?tokenYAfter-tokenYBefore:0n;
     // Token X is non-SOL inventory, not PnL.  Record an attributable lot
     // before the unwind so terminal settlement can require an exact
     // disposition transaction instead of inferring ownership from wallet
     // balance. Jupiter's later WSOL output is the only realized SOL receipt.
-    if(attributableTokenX>0n){
+    if(newlyWithdrawnTokenX>0n){
       const cashflowId=`${input.plan.planId}:close-token-x`,at=new Date().toISOString();
-      await input.store.insertPositionCashflow({cashflowId,positionAddress:input.positionAddress,planId:input.plan.planId,flowType:"CLOSE_WITHDRAWAL",observedAt:at,tokenMint:poolFact.tokenXMint,tokenAmountRaw:attributableTokenX.toString(),payload:{source:"REMOVE_PLUS_CLAIM_DELTA",nonSolInventory:true}});
-      await recordPositionTokenXLot({store:input.store,connection,plan:input.plan,positionAddress:input.positionAddress,tokenMint:poolFact.tokenXMint,sourceEvent:"CLOSE_WITHDRAWAL",sourceCashflowId:cashflowId,rawAmount:attributableTokenX,observedAt:at,signature:"CLOSE_REMOVE_CONFIRMED"});
+      await input.store.insertPositionCashflow({cashflowId,positionAddress:input.positionAddress,planId:input.plan.planId,flowType:"CLOSE_WITHDRAWAL",observedAt:at,tokenMint:poolFact.tokenXMint,tokenAmountRaw:newlyWithdrawnTokenX.toString(),payload:{source:"REMOVE_PLUS_CLAIM_DELTA",nonSolInventory:true}});
+      await recordPositionTokenXLot({store:input.store,connection,plan:input.plan,positionAddress:input.positionAddress,tokenMint:poolFact.tokenXMint,sourceEvent:"CLOSE_WITHDRAWAL",sourceCashflowId:cashflowId,rawAmount:newlyWithdrawnTokenX,observedAt:at,signature:"CLOSE_REMOVE_CONFIRMED"});
     }
+    const attributed=derivePositionAttributedTerminalUnwind({positionAddress:input.positionAddress,tokenMint:poolFact.tokenXMint,closePlanId:input.plan.planId,newlyWithdrawnRaw:newlyWithdrawnTokenX,walletRawAfterClose:tokenXAfter,lots:await input.store.loadPositionInventoryLots(input.positionAddress,poolFact.tokenXMint)});
+    if(!attributed.ok){
+      await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:"RECONCILIATION_REQUIRED",at:new Date().toISOString(),reasonCodes:attributed.reasonCodes,payload:{stage:"CLOSE_POSITION_ATTRIBUTED_FEE_INVENTORY",tokenXBefore:tokenXBefore.toString(),tokenXAfter:tokenXAfter.toString(),newlyWithdrawnTokenX:newlyWithdrawnTokenX.toString()}});
+      return{status:"UNKNOWN",planId:input.plan.planId,reasonCodes:attributed.reasonCodes,transactionSubmitted:true};
+    }
+    attributableTokenX=attributed.amountRaw;
+    attributableFeeLotAllocations=[...(newlyWithdrawnTokenX>0n?[{lotId:`${input.plan.planId}:close-x:lot`,rawAmount:newlyWithdrawnTokenX}]:[]),...attributed.feeLotAllocations];
     if(attributableTokenY>0n)
       await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:close-token-y`,positionAddress:input.positionAddress,planId:input.plan.planId,flowType:"CLOSE_WITHDRAWAL",observedAt:new Date().toISOString(),tokenMint:poolFact.tokenYMint,tokenAmountRaw:attributableTokenY.toString(),payload:{source:"REMOVE_PLUS_CLAIM_DELTA",tokenYBefore:tokenYBefore.toString(),tokenYAfter:tokenYAfter.toString()}});
     await persist("CLOSE_INVENTORY_MEASURED", {
@@ -3541,6 +3579,8 @@ async function executeCloseSettlement(input: {
       tokenXAfter: tokenXAfter.toString(),
       tokenYAfter:tokenYAfter.toString(),
       attributableTokenX: attributableTokenX.toString(),
+      newlyWithdrawnTokenX:newlyWithdrawnTokenX.toString(),
+      attributableFeeLotAllocations:attributableFeeLotAllocations.map(allocation=>({lotId:allocation.lotId,rawAmount:allocation.rawAmount.toString()})),
       attributableTokenY:attributableTokenY.toString(),
     });
     stage = "CLOSE_INVENTORY_MEASURED";
@@ -3597,6 +3637,7 @@ async function executeCloseSettlement(input: {
         transactionId: unwindStep.transactionId,
         inputMint: poolFact.tokenXMint,
         inputAmountRaw: attributableTokenX,
+        ...(attributableFeeLotAllocations.length?{lotAllocations:attributableFeeLotAllocations}:{}),
       });
       if (!settlement.ok)
         return incomplete(settlement.reasonCodes, "CLOSE_UNWIND_SETTLEMENT_UNKNOWN");
