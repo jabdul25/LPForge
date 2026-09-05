@@ -1452,6 +1452,11 @@ export interface Phase1Store {
   loadSubmissionAttemptBySignature(
     signature: string,
   ): Promise<{ lastValidBlockHeight?: number } | undefined>;
+  /** Durable submission evidence for a journal whose signature write was
+   * interrupted after the send ledger had already been persisted. */
+  loadSubmissionAttemptByTransactionId(
+    transactionId: string,
+  ): Promise<{ signature: string; lastValidBlockHeight?: number } | undefined>;
   /**
    * Recovery may resume a multi-child protective close only from the exact
    * child that is durably recorded as confirmed.  This is intentionally a
@@ -3979,6 +3984,24 @@ return 'APPLIED';
         ? undefined
         : { lastValidBlockHeight: Number(value) };
     },
+    async loadSubmissionAttemptByTransactionId(transactionId) {
+      const r = await db.query(
+        `SELECT signature,last_valid_block_height
+         FROM execution.submission_attempts
+         WHERE transaction_id=$1 AND signature IS NOT NULL
+         ORDER BY submitted_at DESC NULLS LAST,prepared_at DESC
+         LIMIT 1`,
+        [transactionId],
+      );
+      const row = r.rows[0];
+      if (!row?.signature) return undefined;
+      return {
+        signature: String(row.signature),
+        ...(row.last_valid_block_height === undefined || row.last_valid_block_height === null
+          ? {}
+          : { lastValidBlockHeight: Number(row.last_valid_block_height) }),
+      };
+    },
     async loadConfirmedSubmissionByTransactionId(transactionId) {
       const r = await db.query(
         `SELECT a.signature,c.status,c.slot
@@ -4608,7 +4631,11 @@ return 'APPLIED';
             `SELECT idempotency_key FROM execution.execution_journal WHERE state='RECONCILED' ORDER BY updated_at DESC LIMIT 500`,
           ),
           db.query(
-            `SELECT count(*)::int AS n FROM execution.execution_journal WHERE state IN ('SIGNED','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED')`,
+            `SELECT count(*)::int AS n
+             FROM execution.transaction_plans p
+             LEFT JOIN execution.execution_journal j ON j.plan_id=p.plan_id
+             WHERE p.state IN ('RECOVERING','RECONCILIATION_REQUIRED')
+                OR j.state IN ('SIGNED','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED')`,
           ),
           db.query(
             `SELECT count(*)::int AS n FROM execution.submission_attempts WHERE state='UNKNOWN'`,
@@ -4940,6 +4967,7 @@ export function createMemoryStore(): Phase1Store {
     async markSubmissionExpired() {},
     async recoverNoEffectPreflightSubmissionAttempts() { return 0; },
     async loadSubmissionAttemptBySignature() { return undefined; },
+    async loadSubmissionAttemptByTransactionId() { return undefined; },
     async loadConfirmedSubmissionByTransactionId() { return undefined; },
     async insertExecutionConfirmation() {},
     async insertExecutionReconciliation() {},

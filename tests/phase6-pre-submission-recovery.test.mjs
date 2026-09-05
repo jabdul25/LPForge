@@ -10,6 +10,7 @@ test("expired no-effect OPEN is terminal only with complete absence evidence",()
   assert.equal(assessExpiredNoEffectOpenRecovery({...clean,partialEntryRecoveryPresent:true}).terminal,false);
   assert.equal(assessExpiredNoEffectOpenRecovery({...clean,planCashflowCount:1}).terminal,false);
   assert.equal(assessExpiredNoEffectOpenRecovery({...clean,chunkDispositions:["UNKNOWN_SUBMISSION"]}).terminal,false);
+  assert.equal(assessExpiredNoEffectOpenRecovery({...clean,economicEffect:"UNKNOWN",positionAbsenceProven:false,hasFundingChild:true,fundingChildProvenNotLanded:true}).terminal,true);
 });
 
 test('orphan sweep targets the installed Meteora SDK wallet-position API',async()=>{

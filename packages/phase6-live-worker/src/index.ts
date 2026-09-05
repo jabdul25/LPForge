@@ -313,16 +313,20 @@ export function assessExpiredNoEffectOpenRecovery(input:{
   positionAbsenceProven:boolean;
   signatureStatusReadUnknown:boolean;
   hasFundingChild:boolean;
+  /** The only submitted child is the first, serial funding child and its
+   * exact signature has independently proven absent. No position address is
+   * created until later steps, which remain unsubmitted. */
+  fundingChildProvenNotLanded?:boolean;
   partialEntryRecoveryPresent:boolean;
   planCashflowCount:number;
   chunkDispositions:string[];
 }):{terminal:boolean;reasonCodes:string[]}{
   const reasons:string[]=[];
   if(input.confirmationStatus!=="EXPIRED")reasons.push("P6_NO_EFFECT_SIGNATURE_NOT_EXPIRED");
-  if(input.economicEffect!=="ABSENT")reasons.push("P6_NO_EFFECT_ECONOMIC_EFFECT_NOT_ABSENT");
-  if(!input.positionAbsenceProven)reasons.push("P6_NO_EFFECT_POSITION_ABSENCE_UNPROVEN");
+  if(input.economicEffect!=="ABSENT"&&!input.fundingChildProvenNotLanded)reasons.push("P6_NO_EFFECT_ECONOMIC_EFFECT_NOT_ABSENT");
+  if(!input.positionAbsenceProven&&!input.fundingChildProvenNotLanded)reasons.push("P6_NO_EFFECT_POSITION_ABSENCE_UNPROVEN");
   if(input.signatureStatusReadUnknown)reasons.push("P6_NO_EFFECT_SIGNATURE_STATUS_UNKNOWN");
-  if(input.hasFundingChild)reasons.push("P6_NO_EFFECT_FUNDING_CHILD_REQUIRES_PARTIAL_RECOVERY");
+  if(input.hasFundingChild&&!input.fundingChildProvenNotLanded)reasons.push("P6_NO_EFFECT_FUNDING_CHILD_REQUIRES_PARTIAL_RECOVERY");
   if(input.partialEntryRecoveryPresent)reasons.push("P6_NO_EFFECT_PARTIAL_ENTRY_RECOVERY_PRESENT");
   if(input.planCashflowCount!==0)reasons.push("P6_NO_EFFECT_PLAN_CASHFLOW_PRESENT");
   if(input.chunkDispositions.some(disposition=>!["PROVEN_NOT_LANDED","FAILED_PRE_SIGN"].includes(disposition)))reasons.push("P6_NO_EFFECT_CHILD_DISPOSITION_NOT_PROVEN");
@@ -4190,12 +4194,20 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     // child signature rather than whichever earlier mutation last updated the
     // plan journal.
     const pendingSignature = closeSettlementPending(plan)?.signature;
-    const recoverySignature = pendingSignature ?? journal.signature;
+    let recoverySignature = pendingSignature ?? journal.signature;
+    let transactionSubmission:
+      | { signature: string; lastValidBlockHeight?: number }
+      | undefined;
+    if (!recoverySignature && journal.transactionId &&
+      typeof (input.store as unknown as { loadSubmissionAttemptByTransactionId?: unknown }).loadSubmissionAttemptByTransactionId === "function")
+      transactionSubmission = await input.store.loadSubmissionAttemptByTransactionId(journal.transactionId);
+    if (!recoverySignature && transactionSubmission)
+      recoverySignature = transactionSubmission.signature;
     // A journal records the signature boundary; the durable submission row is
     // the authoritative fallback for its blockhash lifetime.  This lets a
     // crash between send and journal metadata persistence recover the exact
     // child without ever retransmitting it.
-    let recoveryLastValidBlockHeight = journal.lastValidBlockHeight;
+    let recoveryLastValidBlockHeight = journal.lastValidBlockHeight ?? transactionSubmission?.lastValidBlockHeight;
     if (
       recoveryLastValidBlockHeight === undefined &&
       recoverySignature &&
@@ -4908,6 +4920,12 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         positionAbsenceProven:positionTruth.absenceProven===true,
         signatureStatusReadUnknown,
         hasFundingChild:plan.steps.some(step=>step.kind==="JUPITER_SWAP"),
+        fundingChildProvenNotLanded:
+          confirmationStatus === "EXPIRED" &&
+          Boolean(recoverySignature) &&
+          journal.transactionId === plan.steps[0]?.transactionId &&
+          plan.steps[0]?.kind === "JUPITER_SWAP" &&
+          plan.steps.slice(1).every(step => step.state === "PLANNED"),
         partialEntryRecoveryPresent:partialEntryRecovery!==undefined,
         planCashflowCount:planCashflows.length,
         chunkDispositions:chunkDispositions.map(child=>child.disposition),
