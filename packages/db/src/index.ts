@@ -2523,7 +2523,7 @@ export async function createPostgresStore(
                 AND COALESCE(latest_phase3.payload->'reasonCodes','[]'::jsonb) ? 'FEE_CALIBRATION_RAW_REPLAY_NOT_ACTIONABLE'
               )
             )
-          FOR UPDATE`);
+          FOR UPDATE OF registry`);
         const ranked=rows.rows.map(row=>{const payload=(row.payload??{}) as Record<string,unknown>;return{poolAddress:String(row.pool_address),state:String(row.current_state),priority:Number(row.last_priority_score??0),waitingAt:String(payload.rawReplayWaitingAt??row.first_seen_at)};}).sort((a,b)=>b.priority-a.priority||Date.parse(a.waitingAt)-Date.parse(b.waitingAt)||a.poolAddress.localeCompare(b.poolAddress));
         const tracked=ranked.slice(0,capacity).map(row=>row.poolAddress),waiting=ranked.slice(capacity).map(row=>row.poolAddress);
         if(tracked.length)await db.query(`UPDATE market.pool_discovery_registry SET payload=payload||jsonb_build_object('rawReplayTrackingState','REPLAY_TRACKING','rawReplayTrackingStartedAt',COALESCE(NULLIF(payload->>'rawReplayTrackingStartedAt',''),$2::text),'rawReplayServiceDeadlineAt',COALESCE(NULLIF(payload->>'rawReplayServiceDeadlineAt',''),to_char(($2::timestamptz + interval '300 seconds'),'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'))) WHERE pool_address=ANY($1::text[])`,[tracked,v.observedAt]);
