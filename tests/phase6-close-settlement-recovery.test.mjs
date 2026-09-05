@@ -52,7 +52,7 @@ test('close workflow preserves every durable settlement stage and resumes from i
 test('pending close-child recovery queries its durable child signature, not an older parent journal signature', async () => {
   const source = await import('node:fs/promises').then(fs => fs.readFile('packages/phase6-live-worker/src/index.ts', 'utf8'));
   assert.match(source,/const pendingSignature = closeSettlementPending\(plan\)\?\.signature;/);
-  assert.match(source,/const recoverySignature = pendingSignature \?\? journal\.signature;/);
+  assert.match(source,/let recoverySignature = pendingSignature \?\? journal\.signature;/);
   assert.match(source,/getSignatureStatus\(recoverySignature/);
 });
 

@@ -97,7 +97,7 @@ test('NULLBIN-006/007 reproduces 5A15-shaped corrected 15m and 1h movement', asy
   assert.ok(h.binVelocityPerMinute < 1);
 });
 
-test('NULLBIN-008/009 adaptive widths return from corrected motion', async () => {
+test('NULLBIN-008/009 corrected motion resolves one canonical width across families', async () => {
   const rows = [
     project(dbRow(0, 3_200)),
     project(dbRow(15, null)),
@@ -108,7 +108,7 @@ test('NULLBIN-008/009 adaptive widths return from corrected motion', async () =>
   const context = await buildMarketContext('pool', stamp(60), rows);
   const universe = rangeUniverse(context);
   const widths = universe.candidates.map(candidate => candidate.widthBins);
-  assert.ok(new Set(widths).size > 1);
+  assert.equal(new Set(widths).size, 1);
   assert.ok(widths.some(width => width < 99));
 });
 

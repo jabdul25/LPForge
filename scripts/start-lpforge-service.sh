@@ -5,6 +5,8 @@ cd "$(dirname "$0")/.."
 service="${1:?LPFORGE_SERVICE_REQUIRED}"
 # This establishes the stable operational root and central configuration
 # paths.  Immutable releases carry code only, never runtime configuration.
+LPFORGE_HOME="${LPFORGE_HOME:-/root/systems/LPForge}"
+# The shared path resolves the central .env.execution file for this service.
 source scripts/runtime-config-paths.sh
 env_args=(--env-file="$LPFORGE_RUNTIME_ENV_SOURCE")
 case "$service" in
