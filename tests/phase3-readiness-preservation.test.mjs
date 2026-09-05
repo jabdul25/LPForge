@@ -33,7 +33,7 @@ test('static policy reads write canonical LIVE_OBSERVED evidence without using d
  const db=fs.readFileSync(new URL('../packages/db/src/index.ts',import.meta.url),'utf8');
  assert.match(operator,/productionPolicyPool:true/);assert.match(operator,/sourceProvider:'OPERATOR_METEORA_API\+RPC'/);
  assert.match(active,/summarizePhase3RecentLiveObservations/);assert.match(active,/hasPhase3FreshHistoricalEvidence/);
- assert.match(db,/liveEvidencePhase3ConsumptionState','PENDING/);assert.match(db,/current_state='ACTIVE_CANDIDATE' AND payload->>'liveEvidencePhase3ConsumptionState'='PENDING'/);
+ assert.match(db,/liveEvidencePhase3ConsumptionState','PENDING/);assert.match(db,/current_state='ACTIVE_CANDIDATE' AND source_auto=true AND payload->>'liveEvidencePhase3ConsumptionState'='PENDING'/);
  assert.equal(dynamicLiveEvidenceAdmissionCapacity({serviceableCapacity:2,staticPolicyPoolCount:5}),2);
 });
 test('WARMING cannot complete a ready lease through the durable outcome path',()=>{
@@ -41,4 +41,10 @@ test('WARMING cannot complete a ready lease through the durable outcome path',()
  const body=db.slice(db.indexOf('async recordPostEvidenceEvaluationOutcome'),db.indexOf('async markDiscoveryPoolsStale'));
  assert.ok(body.includes("phase3Status!=='ENTRY_READY'&&v.phase3Status!=='NO_TRADE')return"));
  assert.ok(body.indexOf("phase3Status!=='ENTRY_READY'&&v.phase3Status!=='NO_TRADE')return")<body.indexOf('LIVE_EVIDENCE_LEASE_TERMINAL_PHASE3'));
+});
+test('a continuity tracker resumes when its temporary economic lease is demoted before its replay TTL',()=>{
+ const db=fs.readFileSync(new URL('../packages/db/src/index.ts',import.meta.url),'utf8');
+ assert.match(db,/evidenceContinuityTrackingState','CONSUMED_BY_ACTIVE_ECONOMIC_LEASE'/);
+ assert.match(db,/evidenceContinuityTrackingState','TRACKING','evidenceContinuityTrackingResumedAt'/);
+ assert.match(db,/current_state='QUALIFIED' AND source_auto=true/);
 });

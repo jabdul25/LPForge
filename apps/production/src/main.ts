@@ -39,7 +39,7 @@ function requireVerifiedRuntimeArtifactIdentity():VerifiedRuntimeArtifactIdentit
   console.log(json({event:'lpforge_runtime_artifact_identity_verified',artifactDerived:true,...verifiedRuntimeArtifactIdentity}));
   return verifiedRuntimeArtifactIdentity;
 }
-function artifactBoundEnvironment(identity:VerifiedRuntimeArtifactIdentity):NodeJS.ProcessEnv{return {...process.env,LPFORGE_SOURCE_COMMIT:identity.sourceCommit,LPFORGE_BUILD_ID:identity.buildIdentity,LPFORGE_P7_POLICY_HASH:identity.policyHash,LPFORGE_EXECUTION_POLICY_PATH:'policies/live-execution-policy.json',LPFORGE_APPROVED_RELEASE_IDENTITY_PATH:'RELEASE_MANIFEST.json'};}
+function artifactBoundEnvironment(identity:VerifiedRuntimeArtifactIdentity):NodeJS.ProcessEnv{const home=process.env.LPFORGE_HOME?.trim()||'/root/systems/LPForge',policy=process.env.LPFORGE_EXECUTION_POLICY_PATH?.trim()||`${home}/policy/live-execution-policy.json`;return {...process.env,LPFORGE_SOURCE_COMMIT:identity.sourceCommit,LPFORGE_BUILD_ID:identity.buildIdentity,LPFORGE_P7_POLICY_HASH:identity.policyHash,LPFORGE_EXECUTION_POLICY_PATH:policy,LPFORGE_APPROVED_RELEASE_IDENTITY_PATH:'RELEASE_MANIFEST.json'};}
 const baseline={sampleCount:100,regimeBrier:.2,survivalBrier:.18,netValueMae:.001,noTradeRate:.7,entryReadyRate:.1,executionCostRate:.0005,reconciliationMismatchRate:0,featureMissingRate:.01,decoderSkipRate:.001};
 const driftPolicy={minSamples:50,maxForecastRelativeDegradation:.25,maxNetValueMaeRelativeDegradation:.5,maxDecisionRateShift:.2,maxExecutionCostRelativeDegradation:.5,maxReconciliationMismatchRate:.01,maxFeatureMissingRate:.05,maxDecoderSkipRate:.02};
 const telegramAlerter=new Phase7TelegramAlerter(loadPhase7TelegramConfig());

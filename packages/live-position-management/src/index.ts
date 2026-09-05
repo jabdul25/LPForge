@@ -91,12 +91,16 @@ export interface LivePositionManagementPolicy {
   estimatedClaimCostLamports: bigint;
   /** Claim requires this much net SOL benefit after the execution estimate. */
   minimumClaimNetBenefitLamports: bigint;
+  /** Canonical routine-claim threshold from live-execution-policy.json. */
+  minimumClaimValueUsd?: number;
   missingPositionAction: "HOLD" | "EMERGENCY_CLOSE";
   replacementRange: "PRESERVE_WIDTH_CENTER_ACTIVE";
   planTtlMs: number;
 }
-export function assessClaimEconomics(input:{expectedClaimValueLamports?:bigint|undefined;estimatedClaimCostLamports:bigint;minimumClaimNetBenefitLamports:bigint}):{approved:boolean;netBenefitLamports?:bigint;reasonCodes:string[]}{
-  if(input.expectedClaimValueLamports===undefined)return{approved:false,reasonCodes:['POSITION_CLAIM_VALUE_UNAVAILABLE']};
+export function assessClaimEconomics(input:{expectedClaimValueLamports?:bigint|undefined;expectedClaimValueUsd?:number|undefined;minimumClaimValueUsd?:number|undefined;estimatedClaimCostLamports:bigint;minimumClaimNetBenefitLamports:bigint}):{approved:boolean;netBenefitLamports?:bigint;reasonCodes:string[]}{
+  if(input.expectedClaimValueLamports===undefined||input.expectedClaimValueUsd===undefined||!Number.isFinite(input.expectedClaimValueUsd)||input.expectedClaimValueUsd<0)return{approved:false,reasonCodes:['FEE_CLAIM_VALUE_UNAVAILABLE']};
+  if(input.minimumClaimValueUsd===undefined||!Number.isFinite(input.minimumClaimValueUsd)||input.minimumClaimValueUsd<=0)throw new Error('LPFORGE_FEE_CLAIM_POLICY_VALUE_REQUIRED');
+  if(input.expectedClaimValueUsd<input.minimumClaimValueUsd)return{approved:false,reasonCodes:['FEE_CLAIM_BELOW_MINIMUM_VALUE']};
   const netBenefitLamports=input.expectedClaimValueLamports-input.estimatedClaimCostLamports;
   return netBenefitLamports>=input.minimumClaimNetBenefitLamports?{approved:true,netBenefitLamports,reasonCodes:['POSITION_CLAIM_NET_BENEFIT_APPROVED']}:{approved:false,netBenefitLamports,reasonCodes:['POSITION_CLAIM_NET_BENEFIT_TOO_LOW']};
 }
@@ -301,6 +305,7 @@ export function decideLivePositionManagement(input: {
   activeBinId: number;
   exitDecision?: LiveExitGovernorDecision;
   claimExpectedValueLamports?: bigint | undefined;
+  claimExpectedValueUsd?: number | undefined;
   currentForwardEv?: number | undefined;
   /** OOR authority is supplied by the persistent oor-lifecycle-v1 layer. */
   oor?: OorLifecycleAssessment;
@@ -344,7 +349,7 @@ export function decideLivePositionManagement(input: {
     return{action:"HOLD",reasonCodes:input.oor.reasonCodes};
   }
   if (policy.claimAccruedFees && (positive(position.feeX) || positive(position.feeY))) {
-    const claim=assessClaimEconomics({expectedClaimValueLamports:input.claimExpectedValueLamports,estimatedClaimCostLamports:policy.estimatedClaimCostLamports,minimumClaimNetBenefitLamports:policy.minimumClaimNetBenefitLamports});
+    const claim=assessClaimEconomics({expectedClaimValueLamports:input.claimExpectedValueLamports,expectedClaimValueUsd:input.claimExpectedValueUsd,minimumClaimValueUsd:policy.minimumClaimValueUsd,estimatedClaimCostLamports:policy.estimatedClaimCostLamports,minimumClaimNetBenefitLamports:policy.minimumClaimNetBenefitLamports});
     return claim.approved?{action:"CLAIM",reasonCodes:["POSITION_ACCRUED_FEES",...claim.reasonCodes]}:{action:"HOLD",reasonCodes:claim.reasonCodes};
   }
   return { action: "HOLD", reasonCodes: ["POSITION_IN_RANGE_NO_ACTION"] };

@@ -33,6 +33,12 @@
     "requirePreinitializedBinArrays": true,
     "liquiditySlippageBps": 100
   },
+  "range": {
+    "minimumIncludedBins": 35
+  },
+  "feeClaim": {
+    "minimumClaimValueUsd": 0.10
+  },
   "pools": [
     {
       "address": "2VHM9pTZEU6pqeZoiNi8ZCeyerqhRYgS5Um7U8AEKrd9",

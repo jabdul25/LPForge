@@ -7,6 +7,7 @@ export interface Phase7ControlConfig {
   scalingMode:Phase7ScalingMode;
   automaticPolicyPromotion:false;
   authorityTtlMs:number;
+  boundedUnattendedProduction:boolean;
 }
 
 /**
@@ -43,17 +44,20 @@ export function loadPhase7ControlConfig(env:NodeJS.ProcessEnv=process.env):Phase
   const automaticPolicyPromotion=bool(env,'LPFORGE_P7_AUTOMATIC_POLICY_PROMOTION',false);
   if(automaticPolicyPromotion)throw new Error('LPFORGE_P7_AUTOMATIC_POLICY_PROMOTION_FORBIDDEN');
   const productionAuthorityRequested=bool(env,'LPFORGE_P7_PRODUCTION_AUTHORITY',false);
+  const boundedUnattendedProduction=bool(env,'LPFORGE_BOUNDED_UNATTENDED_PRODUCTION',false);
   const authorityTtlMs=int(env,'LPFORGE_P7_AUTHORITY_TTL_MS',60_000,1_000,300_000);
   if(mode==='OBSERVE_ONLY'&&(productionAuthorityRequested||scalingMode!=='DISABLED'))throw new Error('LPFORGE_P7_OBSERVE_ONLY_DEFAULT_DENY');
   if(mode==='LIMITED_LIVE'&&productionAuthorityRequested)throw new Error('LPFORGE_P7_LIMITED_LIVE_PRODUCTION_AUTHORITY_FORBIDDEN');
   if(mode==='LIMITED_LIVE'&&scalingMode==='POLICY_BOUNDED')throw new Error('LPFORGE_P7_LIMITED_LIVE_POLICY_SCALING_FORBIDDEN');
   if(mode==='PRODUCTION'&&!productionAuthorityRequested)throw new Error('LPFORGE_P7_PRODUCTION_AUTHORITY_FLAG_REQUIRED');
-  return{mode,productionAuthorityRequested,scalingMode,automaticPolicyPromotion:false,authorityTtlMs};
+  if(boundedUnattendedProduction&&(mode!=='PRODUCTION'||!productionAuthorityRequested||scalingMode!=='DISABLED'))throw new Error('LPFORGE_P7_BOUNDED_UNATTENDED_PRODUCTION_CONFIG');
+  return{mode,productionAuthorityRequested,scalingMode,automaticPolicyPromotion:false,authorityTtlMs,boundedUnattendedProduction};
 }
 
 export function resolvePhase7Authority(input:{config:Phase7ControlConfig;now:string;approval?:Phase7ManualApproval;reasonCodes?:string[]}):Phase7Authority{
   const {config,now}=input;
-  if(config.mode!=='OBSERVE_ONLY'){
+  const boundedUnattended=config.boundedUnattendedProduction;
+  if(config.mode!=='OBSERVE_ONLY'&&!boundedUnattended){
     if(!input.approval)throw new Error('LPFORGE_P7_EXPLICIT_APPROVAL_REQUIRED');
     assertManualApproval(input.approval,now);
     const expected=config.mode==='LIMITED_LIVE'?'PROMOTE_LIMITED_LIVE':'PROMOTE_PRODUCTION';
@@ -63,12 +67,12 @@ export function resolvePhase7Authority(input:{config:Phase7ControlConfig;now:str
   const approvalExpiry=input.approval?.expiresAt;
   const boundedExpiry=approvalExpiry&&Date.parse(approvalExpiry)<Date.parse(expiresAt)?approvalExpiry:expiresAt;
   const authority:Phase7Authority={
-    phase:'P7',cluster:'mainnet-beta',mode:config.mode,issuedAt:now,expiresAt:boundedExpiry,
-    approvalId:input.approval?.approvalId??null,
+    phase:'P7',cluster:'mainnet-beta',mode:config.mode,authorityKind:boundedUnattended?'BOUNDED_UNATTENDED_PRODUCTION':'TEMPORARY',issuedAt:now,expiresAt:boundedUnattended?null:boundedExpiry,
+    approvalId:boundedUnattended?null:input.approval?.approvalId??null,
     productionAuthorityIssued:config.mode==='PRODUCTION'&&config.productionAuthorityRequested,
     scalingMode:config.scalingMode,
     automaticPolicyPromotion:false,
-    reasonCodes:input.reasonCodes??[`P7_${config.mode}`]
+    reasonCodes:input.reasonCodes??[boundedUnattended?'P7_BOUNDED_UNATTENDED_PRODUCTION':`P7_${config.mode}`]
   };
   assertPhase7Authority(authority,now);
   return authority;

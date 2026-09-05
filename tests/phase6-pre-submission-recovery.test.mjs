@@ -10,6 +10,10 @@ test("expired no-effect OPEN is terminal only with complete absence evidence",()
   assert.equal(assessExpiredNoEffectOpenRecovery({...clean,partialEntryRecoveryPresent:true}).terminal,false);
   assert.equal(assessExpiredNoEffectOpenRecovery({...clean,planCashflowCount:1}).terminal,false);
   assert.equal(assessExpiredNoEffectOpenRecovery({...clean,chunkDispositions:["UNKNOWN_SUBMISSION"]}).terminal,false);
+  // Serial OPEN funding has no possible position effect when its exact first
+  // child is proven absent and every later position/liquidity step is still
+  // unsubmitted.  This is not permission to replay the stale funding swap.
+  assert.equal(assessExpiredNoEffectOpenRecovery({...clean,economicEffect:"UNKNOWN",positionAbsenceProven:false,hasFundingChild:true,fundingChildProvenNotLanded:true}).terminal,true);
 });
 
 test('orphan sweep targets the installed Meteora SDK wallet-position API',async()=>{

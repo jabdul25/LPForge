@@ -20,8 +20,15 @@ test('P7-01 observe authority refuses production authority or scaling',()=>{
 
 test('P7-01 limited live and production require explicit approval semantics',()=>{
   const expiresAt='2026-08-13T00:01:00.000Z';
-  assert.throws(()=>assertPhase7Authority({phase:'P7',cluster:'mainnet-beta',mode:'LIMITED_LIVE',issuedAt:now,expiresAt,approvalId:null,productionAuthorityIssued:false,scalingMode:'DISABLED',automaticPolicyPromotion:false,reasonCodes:[]},now),/LIMITED_LIVE_APPROVAL_REQUIRED/);
-  assert.throws(()=>assertPhase7Authority({phase:'P7',cluster:'mainnet-beta',mode:'PRODUCTION',issuedAt:now,expiresAt,approvalId:'approval',productionAuthorityIssued:false,scalingMode:'OPERATOR_STEP',automaticPolicyPromotion:false,reasonCodes:[]},now),/PRODUCTION_AUTHORITY_REQUIRED/);
+  assert.throws(()=>assertPhase7Authority({phase:'P7',cluster:'mainnet-beta',mode:'LIMITED_LIVE',authorityKind:'TEMPORARY',issuedAt:now,expiresAt,approvalId:null,productionAuthorityIssued:false,scalingMode:'DISABLED',automaticPolicyPromotion:false,reasonCodes:[]},now),/LIMITED_LIVE_APPROVAL_REQUIRED/);
+  assert.throws(()=>assertPhase7Authority({phase:'P7',cluster:'mainnet-beta',mode:'PRODUCTION',authorityKind:'TEMPORARY',issuedAt:now,expiresAt,approvalId:'approval',productionAuthorityIssued:false,scalingMode:'OPERATOR_STEP',automaticPolicyPromotion:false,reasonCodes:[]},now),/PRODUCTION_AUTHORITY_REQUIRED/);
+});
+
+test('P7-01 bounded unattended Production authority is non-expiring but remains strictly bounded',()=>{
+  const authority={phase:'P7',cluster:'mainnet-beta',mode:'PRODUCTION',authorityKind:'BOUNDED_UNATTENDED_PRODUCTION',issuedAt:now,expiresAt:null,approvalId:null,productionAuthorityIssued:true,scalingMode:'DISABLED',automaticPolicyPromotion:false,reasonCodes:['P7_BOUNDED_UNATTENDED_PRODUCTION']};
+  assert.doesNotThrow(()=>assertPhase7Authority(authority,now));
+  assert.throws(()=>assertPhase7Authority({...authority,expiresAt:'2026-08-13T00:01:00.000Z'},now),/UNATTENDED_AUTHORITY_MUST_NOT_EXPIRE/);
+  assert.throws(()=>assertPhase7Authority({...authority,scalingMode:'POLICY_BOUNDED'},now),/UNATTENDED_SCALING_FORBIDDEN/);
 });
 
 test('P7-01 manual approval is expiring, attributable and not from future',()=>{

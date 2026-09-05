@@ -106,6 +106,7 @@ function claimValueLamports(input:{feeX?:string|undefined;feeY?:string|undefined
   const x=value(input.feeX,input.pool.token_x),y=value(input.feeY,input.pool.token_y);
   return x===undefined||y===undefined?undefined:x+y;
 }
+function claimValueUsd(input:{feeValueLamports?:bigint|undefined;pool:DataApiPool}):number|undefined{const sol=[input.pool.token_x,input.pool.token_y].find(token=>token?.address===WSOL_MINT);if(input.feeValueLamports===undefined||!sol||typeof sol.price!=="number"||!Number.isFinite(sol.price)||sol.price<=0)return undefined;const value=Number(input.feeValueLamports)/1e9*sol.price;return Number.isFinite(value)&&value>=0?value:undefined;}
 function positiveRaw(value:string|undefined){try{return BigInt(value??"0")>0n;}catch{return false;}}
 /** Inventory classification is based on the chain PositionV2 token sides and
  * actual pool mint orientation; it never assumes X is SOL. */
@@ -205,6 +206,7 @@ function loadProductionCapitalEnvelope(poolAddress: string) {
     },
     productionPoolCapital: lamportsToSol(maxPoolLamports),
     ...(construction ? { maxRangeWidthBins: construction.maxInitialPositionWidthBins } : {}),
+    ...(deployment.range ? { minRangeWidthBins: deployment.range.minimumIncludedBins } : {}),
   };
 }
 async function loadLiveOpenPlanCapacity(input: {
@@ -461,10 +463,12 @@ async function observeAndPlanOwnedPositions(input: {
   swapQuoteProvider?: { quote(request:{inputMint:string;outputMint:string;inputAmount:bigint;requiredOutputAmount:bigint}):Promise<{status:string;quote?:{outAmount:bigint}}> };
 }) {
   if (!input.ownerAddress) return { observed: 0, planned: 0 };
-  const policy = loadLivePositionManagementPolicy(
+  const deployment=loadDeploymentPolicyFile(process.env.LPFORGE_EXECUTION_POLICY_PATH??"policies/live-execution-policy.json");
+  if(!deployment.feeClaim)throw new Error('LPFORGE_FEE_CLAIM_POLICY_MISSING');
+  const policy = {...loadLivePositionManagementPolicy(
       process.env.LPFORGE_LIVE_MANAGEMENT_POLICY_PATH ??
         "policies/live-position-management-policy.json",
-    ),
+    ),minimumClaimValueUsd:deployment.feeClaim.minimumClaimValueUsd},
     oorPolicy = loadOorLifecyclePolicy(
       process.env.LPFORGE_OOR_LIFECYCLE_POLICY_PATH ??
         "policies/oor-lifecycle-policy.json",
@@ -549,6 +553,7 @@ async function observeAndPlanOwnedPositions(input: {
       ...(position.enteredAt&&Number.isFinite(Date.parse(position.enteredAt))?{positionAgeMinutes:Math.max(0,(Date.parse(input.observedAt)-Date.parse(position.enteredAt))/60000)}:{}),
     });
     const claimExpectedValueLamports=fact&&apiPool?claimValueLamports({feeX:fact.feeX,feeY:fact.feeY,pool:apiPool}):undefined;
+    const claimExpectedValueUsd=apiPool?claimValueUsd({feeValueLamports:claimExpectedValueLamports,pool:apiPool}):undefined;
     const activePlans=await input.store.loadActiveAutonomousPlansForPosition(position.positionAddress);
     const activePlanForPosition=activePlans.length>0;
     const isOor=fact!==undefined&&(activeBinId<fact.lowerBinId||activeBinId>fact.upperBinId);
@@ -572,6 +577,7 @@ async function observeAndPlanOwnedPositions(input: {
       activeBinId,
       exitDecision,
       ...(claimExpectedValueLamports!==undefined?{claimExpectedValueLamports}:{}),
+      ...(claimExpectedValueUsd!==undefined?{claimExpectedValueUsd}:{}),
       ...(typeof currentForwardEv==='number'?{currentForwardEv}:{}),
       oor,
     });
@@ -909,7 +915,7 @@ async function persistResult(
   });
   const globalCycleId=process.env.LPFORGE_PRODUCTION_GLOBAL_SELECTION_CYCLE_ID?.trim();
   if(globalCycleId)await store.insertProductionGlobalCandidate(productionGlobalCandidateFromOperationalResult(globalCycleId,r));
-  await store.recordPostEvidenceEvaluationOutcome({poolAddress:r.poolAddress,observedAt:r.observedAt,phase3Status:r.phase3Status});
+  await store.recordPostEvidenceEvaluationOutcome({poolAddress:r.poolAddress,observedAt:r.observedAt,phase3Status:r.phase3Status,reasonCodes:r.reasonCodes});
 }
 async function liveOnce() {
   const cfg = loadPhase1Config();
