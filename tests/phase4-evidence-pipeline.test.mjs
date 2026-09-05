@@ -29,8 +29,8 @@ test('completion-aware collection services both ACTIVE leases within the existin
  const budget=assessCollectorRevisitBudget({activePoolCount:2,collectionSliceSize:slice,maxConcurrentPoolReads:1,p95PoolCollectionMs:90_000,revisitBudgetMs:180_000});
  assert.deepEqual(budget,{projectedRevisitMs:180_000,capacityViolation:false});
 });
-test('evidence-maturity NO_TRADE is eligible for one bounded continuity lane through its existing replay horizon',()=>{
- assert.equal(EVIDENCE_CONTINUITY_TRACKING_CAP,1);
+test('evidence-maturity NO_TRADE is eligible for the bounded two-slot continuity lane through its existing replay horizon',()=>{
+ assert.equal(EVIDENCE_CONTINUITY_TRACKING_CAP,2);
  assert.equal(EVIDENCE_CONTINUITY_TRACKING_TTL_MS,60*60_000);
  assert.equal(isEvidenceMaturityNoTrade('NO_TRADE',['RANGE_SURVIVAL_EVIDENCE_INSUFFICIENT']),true);
  assert.equal(isEvidenceMaturityNoTrade('NO_TRADE',['NON_POSITIVE_RISK_ADJUSTED_EV']),false);
