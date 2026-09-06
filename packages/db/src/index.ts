@@ -1400,6 +1400,7 @@ export interface Phase1Store {
       | "RESOLVED"
       | "RECONCILIATION_REQUIRED"
       | "OPEN_RECOVERED"
+      | "SUPERSEDED_BY_SUCCESSFUL_ENTRY"
       | "ABORTED_SOL_SETTLED";
     walletTruth: Record<string, unknown>;
     payload: Record<string, unknown>;
@@ -1412,6 +1413,15 @@ export interface Phase1Store {
   loadPartialEntryRecovery(
     planId: string,
   ): Promise<Record<string, unknown> | undefined>;
+  /** Retires only an already-present, actionable recovery row after its exact
+   * entry plan has a durable OPEN/MATCH owned-position proof. */
+  supersedePartialEntryRecoveryIfSuccessfulOpen(value: {
+    planId: string;
+    positionAddress: string;
+    ownerAddress: string;
+    poolAddress: string;
+    at: string;
+  }): Promise<boolean>;
   upsertOpenChunkDisposition(value:OpenChunkDispositionRecord):Promise<void>;
   loadOpenChunkDispositions(planId:string):Promise<OpenChunkDispositionRecord[]>;
   loadAutonomousPlan(planId: string): Promise<AutonomousPlan | undefined>;
@@ -3945,6 +3955,28 @@ return 'APPLIED';
       );
       return r.rows[0] as Record<string, unknown> | undefined;
     },
+    async supersedePartialEntryRecoveryIfSuccessfulOpen(v) {
+      const r = await db.query(
+        `UPDATE execution.partial_entry_recovery r
+         SET state='SUPERSEDED_BY_SUCCESSFUL_ENTRY',
+             wallet_truth=r.wallet_truth||jsonb_build_object('supersededBySuccessfulEntry',jsonb_build_object('positionAddress',$2,'lifecycleState','OPEN','reconciliationStatus','MATCH','at',$5)),
+             payload=r.payload||jsonb_build_object('supersession',jsonb_build_object('reasonCode','P6_PARTIAL_RECOVERY_SUPERSEDED_BY_SUCCESSFUL_ENTRY','positionAddress',$2,'lifecycleState','OPEN','reconciliationStatus','MATCH','at',$5)),
+             updated_at=$5
+         WHERE r.plan_id=$1
+           AND r.owner_address=$3
+           AND r.pool_address=$4
+           AND r.state IN ('ENTRY_FUNDED_NOT_OPEN','RESUME_OPEN','UNWIND_REQUIRED','UNWIND_SUBMITTED','RECONCILIATION_REQUIRED')
+           AND EXISTS(
+             SELECT 1 FROM execution.owned_positions o
+             WHERE o.entry_plan_id=r.plan_id AND o.position_address=$2
+               AND o.owner_address=$3 AND o.pool_address=$4
+               AND o.lifecycle_state='OPEN' AND o.reconciliation_status='MATCH'
+           )
+         RETURNING r.plan_id`,
+        [v.planId,v.positionAddress,v.ownerAddress,v.poolAddress,v.at],
+      );
+      return r.rows.length===1;
+    },
     async upsertOpenChunkDisposition(v) {
       await db.query(
         `INSERT INTO execution.open_chunk_dispositions(plan_id,transaction_id,sequence,kind,disposition,signature,last_valid_block_height,observed_at,payload)
@@ -5022,6 +5054,7 @@ export function createMemoryStore(): Phase1Store {
       return [];
     },
     async loadPartialEntryRecovery() { return undefined; },
+    async supersedePartialEntryRecoveryIfSuccessfulOpen() { return false; },
     async upsertOpenChunkDisposition() {},
     async loadOpenChunkDispositions() { return []; },
     async loadAutonomousPlan() {

@@ -12,10 +12,11 @@ test('a reconciled OPEN resolves a partial-entry row only when construction and 
   const genericUnwindHold = worker.indexOf('if (state !== "ENTRY_FUNDED_NOT_OPEN" && state !== "RESUME_OPEN")', loadPlan);
   assert.ok(loadPlan >= 0 && construction > loadPlan && reconciled > construction, 'recovery must check construction and an authoritative owned-position binding first');
   assert.ok(partialHold > reconciled && partialHold < unwindSubmitted && partialHold < genericUnwindHold, 'incomplete construction remains in protective recovery rather than becoming ordinary OPEN');
-  assert.match(worker, /P6_PARTIAL_OPEN_RECONCILED_AFTER_RECOVERY/);
-  assert.match(worker, /state: "OPEN_RECOVERED"/);
+  assert.match(worker, /P6_PARTIAL_RECOVERY_SUPERSEDED_BY_SUCCESSFUL_ENTRY/);
+  assert.match(worker, /state: "SUPERSEDED_BY_SUCCESSFUL_ENTRY"/);
   assert.match(worker, /A payload address alone is never sufficient/);
   assert.match(worker, /positionOpenReconciled/);
+  assert.match(worker, /supersedeProvisionalPartialEntryRecovery/);
 });
 
 test('autonomous plan mapping preserves the durable transaction-plan state', () => {
@@ -25,4 +26,6 @@ test('autonomous plan mapping preserves the durable transaction-plan state', () 
   assert.ok(planQueries.length >= 3, 'claim, direct load, and recovery scans must all map plan state');
   assert.match(store, /position_open_reconciled/);
   assert.match(store, /OWNED_OPEN_RECONCILED/);
+  assert.match(store, /SUPERSEDED_BY_SUCCESSFUL_ENTRY/);
+  assert.match(store, /supersedePartialEntryRecoveryIfSuccessfulOpen/);
 });

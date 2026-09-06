@@ -267,6 +267,16 @@ async function recordPositionTokenXLot(input:{store:Phase1Store;connection:Conne
   await input.store.createPositionInventoryLot({lotId:`${input.plan.planId}:${suffix}:lot`,createdEventId:`${input.plan.planId}:${suffix}:lot-created`,positionAddress:input.positionAddress,planId:input.plan.planId,ownerAddress:input.plan.ownerAddress,poolAddress:input.plan.poolAddress,tokenMint:input.tokenMint,tokenSide:"X",sourceEvent:input.sourceEvent,sourceCashflowId:input.sourceCashflowId,rawAmount:input.rawAmount,decimals,acquiredAt:input.observedAt,payload:{source:"WALLET_DELTA",signature:input.signature}});
 }
 
+async function supersedeProvisionalPartialEntryRecovery(input:{store:Phase1Store;plan:Pick<AutonomousPlan,"planId"|"ownerAddress"|"poolAddress">;positionAddress:string;at:string}):Promise<boolean>{
+  // This runs only after the normal OPEN reconciliation has persisted the
+  // exact owned-position identity. It never creates a recovery row and never
+  // changes a row without OPEN/MATCH proof in the same transaction boundary.
+  return input.store.supersedePartialEntryRecoveryIfSuccessfulOpen({
+    planId:input.plan.planId,positionAddress:input.positionAddress,
+    ownerAddress:input.plan.ownerAddress,poolAddress:input.plan.poolAddress,at:input.at,
+  });
+}
+
 /**
  * A wallet snapshot alone cannot distinguish manual inventory from fees that
  * were already claimed for this position.  Lots are the receipt-bound
@@ -805,6 +815,7 @@ async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:Auto
     if(positionAccount?.lamports)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:rent-lock`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'RENT_LOCK',observedAt:new Date().toISOString(),lamports:BigInt(positionAccount.lamports),payload:{signature:lastSignature,recoverable:true,source:'POSITION_ACCOUNT_INFO'}});
     for(const child of completedSteps){const actualFee=await confirmedTransactionFeeLamports(input.connection,child.signature);await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:tx-cost:${child.transactionId}`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'TX_COST',observedAt:new Date().toISOString(),lamports:actualFee??child.estimatedFeeLamports,payload:{signature:child.signature,transactionId:child.transactionId,source:actualFee===undefined?'EXECUTION_FEE_ESTIMATE':'CHAIN_RECEIPT_META',...(actualFee===undefined?{estimatedLamports:child.estimatedFeeLamports.toString()}:{})}});}
     await persistOpenResidualInventory({store:input.store,connection:input.connection,plan:input.plan,positionAddress:input.prepared.positionSigner.publicKeyAddress,funding:input.entryFundingMeasurement,signature:lastSignature});
+    await supersedeProvisionalPartialEntryRecovery({store:input.store,plan:input.plan,positionAddress:input.prepared.positionSigner.publicKeyAddress,at:new Date().toISOString()});
     await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'RECONCILED',at:new Date().toISOString(),payload:{signature:lastSignature,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,actualEconomicCapitalLamports:actualEconomicCapitalLamports.toString()}});
     return{status:'RECONCILED',planId:input.plan.planId,reasonCodes:[],transactionSubmitted:true,positionAddress:input.prepared.positionSigner.publicKeyAddress};
   }catch(error){const reason=error instanceof Error?error.message:'LPFORGE_P6_CHUNKABLE_OPEN_UNKNOWN';if(currentStep&&!currentStep.submitted&&!reason.startsWith('LPFORGE_P6_PRESUBMISSION_SAFETY_BLOCKED:'))await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:currentStep.transactionId,sequence:currentStep.sequence,kind:currentStep.kind,disposition:'FAILED_PRE_SIGN',...(currentStep.lastValidBlockHeight!==undefined?{lastValidBlockHeight:currentStep.lastValidBlockHeight}:{}),observedAt:new Date().toISOString(),payload:{chunked:true,error:reason}});if(currentStep?.submitted&&currentStep.signature&&reason==='LPFORGE_P6_CHUNK_CONFIRMATION_PENDING')await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:currentStep.transactionId,sequence:currentStep.sequence,kind:currentStep.kind,disposition:'UNKNOWN_SUBMISSION',signature:currentStep.signature,...(currentStep.lastValidBlockHeight!==undefined?{lastValidBlockHeight:currentStep.lastValidBlockHeight}:{}),observedAt:new Date().toISOString(),payload:{chunked:true,error:reason}});if(submittedAny){if(input.entryFundingMeasurement){await input.store.upsertPartialEntryRecovery({planId:input.plan.planId,poolAddress:input.plan.poolAddress,ownerAddress:input.plan.ownerAddress,tokenMint:input.entryFundingMeasurement.tokenMint,fundingTransactionId:input.plan.swapTransactionId??'P6_CHUNKABLE_OPEN',fundingSignature:input.entryFundingMeasurement.fundingSignature,fundedAt:new Date().toISOString(),pairedTokenAmount:input.entryFundingMeasurement.pairedTokenReceivedRaw.toString(),intendedCapitalLamports:input.fields.capital,intendedRange:{lowerBinId:input.fields.lower,upperBinId:input.fields.upper},state:'RECONCILIATION_REQUIRED',walletTruth:{refreshRequired:true,confirmedLiquiditySolAssetOutLamports:confirmedLiquiditySolAssetOut.toString(),entryFundingMeasurement:{tokenMint:input.entryFundingMeasurement.tokenMint,pairedTokenReceivedRaw:input.entryFundingMeasurement.pairedTokenReceivedRaw.toString(),pairedTokenRawBeforeFunding:input.entryFundingMeasurement.pairedTokenRawBeforeFunding.toString(),pairedTokenRawBeforeOpen:input.entryFundingMeasurement.pairedTokenRawBeforeOpen.toString(),fundingSignature:input.entryFundingMeasurement.fundingSignature}},payload:{partialEntry:true,reasonCodes:['P6_PARTIAL_OPEN_CHUNK_DISPOSITION_REQUIRED',reason],positionAddress:input.prepared.positionSigner.publicKeyAddress},updatedAt:new Date().toISOString()});}await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'RECONCILIATION_REQUIRED',{action:'OPEN',chunked:true,error:reason,positionAddress:input.prepared.positionSigner.publicKeyAddress,lastSignature,postSubmission:true},lastSignature||undefined);await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECONCILIATION_REQUIRED',at:new Date().toISOString(),reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',reason],payload:{stage:'CHUNKABLE_OPEN',error:reason,positionAddress:input.prepared.positionSigner.publicKeyAddress,lastSignature,partialEntry:true}});return{status:'UNKNOWN',planId:input.plan.planId,reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',reason],transactionSubmitted:true};}if(reason.startsWith('LPFORGE_P6_PRESUBMISSION_SAFETY_BLOCKED:'))await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'FAILED',{action:'OPEN',stage:'PRESUBMISSION_SAFETY',error:reason,chunked:true,positionAddress:input.prepared.positionSigner.publicKeyAddress});await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'BLOCKED',at:new Date().toISOString(),payload:{stage:'CHUNKABLE_OPEN',error:reason}});return{status:'BLOCKED',planId:input.plan.planId,reasonCodes:[reason],transactionSubmitted:false};}
@@ -1169,6 +1180,7 @@ export async function executeAutonomousOpen(input: {
         const actualOpenFee=await confirmedTransactionFeeLamports(connection,submitted.signature);
         await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:tx-cost:${input.plan.transactionId}`,positionAddress:prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'TX_COST',observedAt:new Date().toISOString(),lamports:actualOpenFee??fee.totalFeeLamports,payload:{signature:submitted.signature,transactionId:input.plan.transactionId,source:actualOpenFee===undefined?'EXECUTION_FEE_ESTIMATE':'CHAIN_RECEIPT_META',...(actualOpenFee===undefined?{estimatedLamports:fee.totalFeeLamports.toString()}:{})}});
         await persistOpenResidualInventory({store:input.store,connection,plan:input.plan,positionAddress:prepared.positionSigner.publicKeyAddress,funding:entryFundingMeasurement,signature:submitted.signature});
+        await supersedeProvisionalPartialEntryRecovery({store:input.store,plan:input.plan,positionAddress:prepared.positionSigner.publicKeyAddress,at:new Date().toISOString()});
         // A fully reconciled OPEN with a funding swap is not a partial-entry
         // recovery. Normal residuals are recorded by persistOpenResidualInventory
         // above. Only an interrupted/partially reconciled OPEN may create an
@@ -1848,7 +1860,7 @@ export async function recoverPartialEntryFunding(input: {
         pairedTokenAmount: String(row.paired_token_amount),
         intendedCapitalLamports: BigInt(String(row.intended_capital_lamports)),
         intendedRange: (row.intended_range ?? {}) as Record<string, unknown>,
-        state: "OPEN_RECOVERED",
+        state: "SUPERSEDED_BY_SUCCESSFUL_ENTRY",
         walletTruth: {
           ...(row.wallet_truth ?? {}),
           reconciledPlanId: plan.planId,
@@ -1856,10 +1868,10 @@ export async function recoverPartialEntryFunding(input: {
           positionIdentitySource: plan.positionIdentitySource ?? null,
           refreshedAt: new Date().toISOString(),
         },
-        payload: { reasonCodes: ["P6_PARTIAL_OPEN_RECONCILED_AFTER_RECOVERY"] },
+        payload: { reasonCodes: ["P6_PARTIAL_RECOVERY_SUPERSEDED_BY_SUCCESSFUL_ENTRY"] },
         updatedAt: new Date().toISOString(),
       });
-      results.push({ planId, action: "HOLD", reasonCodes: ["P6_PARTIAL_OPEN_RECONCILED_AFTER_RECOVERY"] });
+      results.push({ planId, action: "HOLD", reasonCodes: ["P6_PARTIAL_RECOVERY_SUPERSEDED_BY_SUCCESSFUL_ENTRY"] });
       continue;
     }
     if(plan?.action==='OPEN'&&construction&&!construction.fullyConstructed){
