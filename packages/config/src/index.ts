@@ -109,6 +109,25 @@ function intValue(env: NodeJS.ProcessEnv, name: string, fallback: number, min: n
 function urlValue(value: string, name: string): string {
   try { return new URL(value).toString().replace(/\/$/, ''); } catch { throw new Error(`LPFORGE_CONFIG_URL:${name}`); }
 }
+/**
+ * A live service must use its explicitly assigned RPC credential. This keeps
+ * discovery load, protected position management, and signing/submission from
+ * sharing a provider throttle domain. Development callers retain the ordinary
+ * SOLANA_RPC_HTTP_URL fixture contract by omitting LPFORGE_RPC_ROLE.
+ */
+function rpcUrlForRole(env: NodeJS.ProcessEnv): { value: string; source: string } {
+  const role = env.LPFORGE_RPC_ROLE?.trim();
+  if (!role) return { value: required(env, 'SOLANA_RPC_HTTP_URL'), source: 'SOLANA_RPC_HTTP_URL' };
+  const source = role === 'DISCOVERY'
+    ? 'LPFORGE_DISCOVERY_RPC_URL'
+    : role === 'PRODUCTION'
+      ? 'LPFORGE_PRODUCTION_RPC_URL'
+      : role === 'EXECUTION'
+        ? 'LPFORGE_P6_PRIVATE_WRITE_RPC_URL'
+        : undefined;
+  if (!source) throw new Error('LPFORGE_RPC_ROLE_INVALID');
+  return { value: required(env, source), source };
+}
 
 export function loadPhase1Config(env: NodeJS.ProcessEnv = process.env): Phase1Config {
   if ((env.LIVE_SIGNING ?? 'false').toLowerCase() !== 'false') throw new Error('LPFORGE_PHASE1_LIVE_SIGNING_PROHIBITED');
@@ -119,9 +138,10 @@ export function loadPhase1Config(env: NodeJS.ProcessEnv = process.env): Phase1Co
   if (!['LIVE_READ_ONLY','FIXTURE'].includes(dataMode)) throw new Error('LPFORGE_PHASE1_DATA_MODE');
   const logLevel = (env.LOG_LEVEL ?? 'info') as Phase1Config['logLevel'];
   if (!['debug','info','warn','error'].includes(logLevel)) throw new Error('LPFORGE_CONFIG_LOG_LEVEL');
+  const rpc = rpcUrlForRole(env);
   return {
     databaseUrl: required(env, 'DATABASE_URL'),
-    solanaRpcHttpUrl: urlValue(required(env, 'SOLANA_RPC_HTTP_URL'), 'SOLANA_RPC_HTTP_URL'),
+    solanaRpcHttpUrl: urlValue(rpc.value, rpc.source),
     ...(env.SOLANA_RPC_WS_URL?.trim() ? {solanaRpcWsUrl: urlValue(env.SOLANA_RPC_WS_URL, 'SOLANA_RPC_WS_URL')} : {}),
     meteoraDataApiUrl: urlValue(env.METEORA_DATA_API_URL ?? 'https://dlmm.datapi.meteora.ag', 'METEORA_DATA_API_URL'),
     cluster,

@@ -17,15 +17,21 @@ case "$service" in
     # runtime value. These three variables are defined solely by .env for the
     # Production control runtime.
     unset LPFORGE_P7_DRIFT_BASELINE_JSON LPFORGE_P7_INSTANCE_ID LPFORGE_P7_RUNTIME_ID
+    export LPFORGE_RPC_ROLE=PRODUCTION
     target='.build/apps/production/src/main.js'
     ;;
-  discovery) target='.build/apps/discovery/src/main.js' ;;
+  discovery)
+    export LPFORGE_RPC_ROLE=DISCOVERY
+    target='.build/apps/discovery/src/main.js'
+    ;;
   discovery-learning)
+    export LPFORGE_RPC_ROLE=DISCOVERY
     target='.build/apps/discovery-learning/src/main.js'
     ;;
   execution)
     execution_env="$LPFORGE_RUNTIME_EXECUTION_ENV_SOURCE"
     [[ -r "$execution_env" ]] || { echo 'LPFORGE_EXECUTION_ENV_REQUIRED' >&2; exit 1; }
+    export LPFORGE_RPC_ROLE=EXECUTION
     env_args+=(--env-file="$execution_env")
     target='.build/apps/execution/src/main.js'
     ;;
