@@ -4749,7 +4749,7 @@ return 'APPLIED';
             phase7ReconciliationDebtQuery,
           ),
           db.query(
-            `SELECT count(*)::int AS n FROM execution.partial_entry_recovery WHERE state NOT IN ('RESOLVED','OPEN_RECOVERED','ABORTED_SOL_SETTLED')`,
+            `SELECT count(*)::int AS n FROM execution.partial_entry_recovery WHERE state NOT IN ('RESOLVED','OPEN_RECOVERED','SUPERSEDED_BY_SUCCESSFUL_ENTRY','ABORTED_SOL_SETTLED')`,
           ),
         ]);
       return {
