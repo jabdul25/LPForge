@@ -175,3 +175,11 @@ test('expired account-close child rehydrates the normal close sequence when conf
   assert.match(source,/!unwindConfirmed/);
   assert.match(source,/stage:'CLOSE_CLAIMS_SETTLED'/);
 });
+
+test('confirmed residual unwind followed by an expired account-close identity creates only a fresh account-close successor', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile('packages/phase6-live-worker/src/index.ts', 'utf8'));
+  assert.match(source,/P6_CLOSE_ACCOUNT_RETRY_SUCCESSOR_CREATED/);
+  assert.match(source,/terminalDispatch\.error==='LPFORGE_DUPLICATE_SUBMISSION_ATTEMPT'/);
+  assert.match(source,/loadConfirmedSubmissionByTransactionId\(unwindStep\.transactionId\)/);
+  assert.match(source,/createAccountCloseOnlySuccessor/);
+});

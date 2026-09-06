@@ -4893,6 +4893,34 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:claimRecovery.reasonCodes});
       continue;
     }
+    // A receipt-bound OPEN_RESIDUAL unwind may itself succeed while the
+    // previously expired account-close transaction identity remains unusable.
+    // Once the exact unwind receipt and all lot consumption are durable, hand
+    // off to the bounded account-close-only successor. This is deliberately
+    // after receipt reconciliation: it can never repeat REMOVE, CLAIM, or
+    // JUPITER, and it gives the final account-close a fresh submission id.
+    const terminalDispatch=closeSettlementDispatch(plan);
+    if(
+      (plan.action==='CLOSE'||plan.action==='EMERGENCY_CLOSE')&&
+      positionTruth.exists===true&&
+      terminalDispatch.stage==='CLOSE_POSITION_PENDING'&&
+      terminalDispatch.error==='LPFORGE_DUPLICATE_SUBMISSION_ATTEMPT'&&
+      recoveryPositionAddress
+    ){
+      const unwindStep=plan.steps.find(step=>step.kind==='JUPITER_UNWIND'),
+        unwindConfirmed=unwindStep?await input.store.loadConfirmedSubmissionByTransactionId(unwindStep.transactionId):undefined;
+      if(unwindConfirmed){
+        const successor=await createAccountCloseOnlySuccessor({store:input.store,plan,positionAddress:recoveryPositionAddress,positionTruth,now:input.now});
+        if(successor.created){
+          results.push({planId:plan.planId,action:'RETURN_EXISTING_PLAN',reasonCodes:["P6_CLOSE_ACCOUNT_RETRY_SUCCESSOR_CREATED",...successor.reasonCodes]});
+          continue;
+        }
+        if(successor.planId)continue;
+        await input.store.transitionAutonomousPlan({planId:plan.planId,state:'RECONCILIATION_REQUIRED',at:input.now,reasonCodes:["P6_CLOSE_ACCOUNT_RETRY_SUCCESSOR_BLOCKED",...successor.reasonCodes],payload:{stage:'CLOSE_POSITION_PENDING',accountCloseRetryAfterConfirmedUnwind:true}});
+        results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:["P6_CLOSE_ACCOUNT_RETRY_SUCCESSOR_BLOCKED",...successor.reasonCodes]});
+        continue;
+      }
+    }
     const action = determineRecoveryAction({
       journal,
       currentBlockHeight: input.currentBlockHeight,
