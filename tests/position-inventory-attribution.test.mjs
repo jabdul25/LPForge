@@ -33,6 +33,12 @@ test('same-close terminal fee lot equal to the aggregate unwind is receipt-recon
   assert.deepEqual(assessAggregateCloseClaimAttributionCorrection({closeRawAmount:31_373_299_314n,claimRawAmount:31_373_299_315n,closeStatus:'SETTLED',claimStatus:'OPEN'}),{ok:false,reasonCode:'LPFORGE_INVENTORY_ATTRIBUTION_CORRECTION_INVALID'});
 });
 
+test('same-close exact-overlap repair preserves the original positive receipt amount',async()=>{
+  const source=await readFile('packages/db/src/index.ts','utf8');
+  assert.match(source,/UPDATE execution\.position_inventory_lots SET updated_at=\$2,payload=\$3::jsonb WHERE lot_id=\$1/);
+  assert.doesNotMatch(source,/UPDATE execution\.position_inventory_lots SET raw_amount=\$2,updated_at=\$3/);
+});
+
 test('inventory migration keeps a durable source lot and immutable event trail',async()=>{
   const sql=await readFile('packages/db/migrations/M0039_position_inventory_attribution.sql','utf8');
   assert.match(sql,/CREATE TABLE IF NOT EXISTS execution\.position_inventory_lots/);

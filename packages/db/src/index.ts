@@ -3876,7 +3876,12 @@ return 'APPLIED';
         if(claimRaw!==v.claimRawAmount||!correction.ok)throw new Error('LPFORGE_INVENTORY_ATTRIBUTION_CORRECTION_INVALID');
         const corrected=correction.correctedCloseRawAmount;
         const closePayload={...(close.payload as Record<string,unknown>),attributionCorrection:{...v.payload,originalRawAmount:closeRaw.toString(),correctedRawAmount:corrected.toString(),overlapRawAmount:claimRaw.toString(),transactionSignature:v.transactionSignature}};
-        await tx.query("UPDATE execution.position_inventory_lots SET raw_amount=$2,updated_at=$3,payload=$4::jsonb WHERE lot_id=$1",[v.closeLotId,corrected.toString(),v.observedAt,json(closePayload)]);
+        // `raw_amount` is the immutable amount measured from the confirmed
+        // wallet receipt and is constrained positive by the audit schema.
+        // For an exact overlap its corrected economic allocation is zero, but
+        // the original receipt must remain intact; carry that allocation only
+        // in the append-only correction metadata and settle the claim lot.
+        await tx.query("UPDATE execution.position_inventory_lots SET updated_at=$2,payload=$3::jsonb WHERE lot_id=$1",[v.closeLotId,v.observedAt,json(closePayload)]);
         await tx.query("UPDATE execution.position_inventory_lots SET remaining_raw_amount=0,status='SETTLED',updated_at=$2,payload=payload||jsonb_build_object('terminalSettlement',$3::jsonb) WHERE lot_id=$1",[v.claimLotId,v.observedAt,json({eventType:'SETTLED',transactionSignature:v.transactionSignature,disposition:'AGGREGATE_CLOSE_UNWIND_RECEIPT_ALLOCATION',...v.payload})]);
         await tx.query("INSERT INTO execution.position_inventory_lot_events(event_id,lot_id,plan_id,event_type,raw_amount,remaining_raw_amount,observed_at,transaction_signature,payload) VALUES($1,$2,$3,'ATTRIBUTION_CORRECTED',$4,0,$5,$6,$7::jsonb),($1||':claim-settled',$8,$3,'SETTLED',$4,0,$5,$6,$7::jsonb)",[v.eventId,v.closeLotId,v.planId,claimRaw.toString(),v.observedAt,v.transactionSignature,json(v.payload),v.claimLotId]);
         await tx.query("COMMIT");
