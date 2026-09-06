@@ -32,6 +32,8 @@ export interface Phase1Config {
  * but the service launcher always enables it.
  */
 export const DEFAULT_LPFORGE_HOME = '/root/systems/LPForge';
+/** Versioned input to CI and release construction; never a live authority. */
+export const RELEASE_POLICY_TEMPLATE_PATH = 'policies/live-execution-policy.json';
 export interface RuntimeConfigPaths {
   home: string;
   envFile: string;
@@ -41,6 +43,9 @@ export interface RuntimeConfigPaths {
 function absolutePath(value: string, name: string): string {
   if (!value.startsWith('/')) throw new Error(`LPFORGE_RUNTIME_CONFIG_ABSOLUTE_PATH_REQUIRED:${name}`);
   return value.replace(/\/+$/, '') || '/';
+}
+export function productionRuntimePolicyEnforced(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (env.LPFORGE_RUNTIME_CONFIG_ENFORCED ?? 'false').toLowerCase() === 'true';
 }
 export function resolveRuntimeConfigPaths(env: NodeJS.ProcessEnv = process.env): RuntimeConfigPaths {
   const home = absolutePath((env.LPFORGE_HOME ?? DEFAULT_LPFORGE_HOME).trim() || DEFAULT_LPFORGE_HOME, 'LPFORGE_HOME');
@@ -58,8 +63,17 @@ export function resolveRuntimeConfigPaths(env: NodeJS.ProcessEnv = process.env):
  */
 export function resolveLiveExecutionPolicyPath(env: NodeJS.ProcessEnv = process.env): string {
   const paths = resolveRuntimeConfigPaths(env);
-  if ((env.LPFORGE_RUNTIME_CONFIG_ENFORCED ?? 'false').toLowerCase() === 'true') return paths.executionPolicyFile;
-  return env.LPFORGE_EXECUTION_POLICY_PATH?.trim() || 'policies/live-execution-policy.json';
+  if (productionRuntimePolicyEnforced(env)) {
+    // A live process has one authority only.  Do not silently repair a bad
+    // override: a relative or immutable-release path must stop economic work.
+    const configured = env.LPFORGE_EXECUTION_POLICY_PATH?.trim();
+    if (configured && configured !== paths.executionPolicyFile) {
+      throw new Error('LPFORGE_RUNTIME_POLICY_PATH_INVALID');
+    }
+    if (paths.home.includes('/releases/')) throw new Error('LPFORGE_RUNTIME_POLICY_PATH_INVALID');
+    return paths.executionPolicyFile;
+  }
+  return env.LPFORGE_EXECUTION_POLICY_PATH?.trim() || RELEASE_POLICY_TEMPLATE_PATH;
 }
 export function runtimeConfigDiagnostics(env: NodeJS.ProcessEnv = process.env) {
   const paths = resolveRuntimeConfigPaths(env);
@@ -68,7 +82,7 @@ export function runtimeConfigDiagnostics(env: NodeJS.ProcessEnv = process.env) {
     envSource: env.LPFORGE_RUNTIME_ENV_SOURCE?.trim() || paths.envFile,
     executionEnvSource: env.LPFORGE_RUNTIME_EXECUTION_ENV_SOURCE?.trim() || paths.executionEnvFile,
     policySource: resolveLiveExecutionPolicyPath(env),
-    runtimeConfigEnforced: (env.LPFORGE_RUNTIME_CONFIG_ENFORCED ?? 'false').toLowerCase() === 'true',
+    runtimeConfigEnforced: productionRuntimePolicyEnforced(env),
     flags: {
       boundedUnattendedProduction: (env.LPFORGE_BOUNDED_UNATTENDED_PRODUCTION ?? 'false').toLowerCase() === 'true',
       p7PlanDispatchEnabled: (env.LPFORGE_P7_PLAN_DISPATCH_ENABLED ?? 'false').toLowerCase() === 'true',

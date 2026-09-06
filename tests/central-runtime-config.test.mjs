@@ -16,7 +16,17 @@ test('enforced releases use only the stable LPForge runtime root', () => {
     executionEnvFile: '/srv/lpforge/.env.execution',
     executionPolicyFile: '/srv/lpforge/policy/live-execution-policy.json',
   });
-  assert.equal(config.resolveLiveExecutionPolicyPath(env), '/srv/lpforge/policy/live-execution-policy.json');
+  assert.throws(() => config.resolveLiveExecutionPolicyPath(env), /RUNTIME_POLICY_PATH_INVALID/);
+  assert.equal(config.resolveLiveExecutionPolicyPath({...env, LPFORGE_EXECUTION_POLICY_PATH: '/srv/lpforge/policy/live-execution-policy.json'}), '/srv/lpforge/policy/live-execution-policy.json');
+});
+
+test('production rejects relative and release-local policy paths rather than falling back', () => {
+  const base={LPFORGE_HOME:'/root/systems/LPForge',LPFORGE_RUNTIME_CONFIG_ENFORCED:'true'};
+  for(const value of ['policies/live-execution-policy.json','./policies/live-execution-policy.json','../policies/live-execution-policy.json','/root/systems/LPForge/releases/abc/policies/live-execution-policy.json']){
+    assert.throws(()=>config.resolveLiveExecutionPolicyPath({...base,LPFORGE_EXECUTION_POLICY_PATH:value}),/RUNTIME_POLICY_PATH_INVALID/,value);
+  }
+  assert.equal(config.resolveLiveExecutionPolicyPath(base),'/root/systems/LPForge/policy/live-execution-policy.json');
+  assert.equal(config.RELEASE_POLICY_TEMPLATE_PATH,'policies/live-execution-policy.json');
 });
 
 test('development callers retain explicit policy fixtures without weakening production enforcement', () => {
@@ -38,6 +48,15 @@ test('release integrity rejects release-local runtime environments', () => {
   assert.match(text, /\.env must not be present in release/);
   assert.match(text, /\.env\.execution must not be present in release/);
   assert.match(text, /LPFORGE_RUNTIME_CONFIG_ENFORCED/);
+});
+
+test('deployment promotes only a validated template to the central authority and restarts do not promote', () => {
+  const installer=readFileSync('scripts/install-production-release.sh','utf8');
+  const launcher=readFileSync('scripts/start-lpforge-service.sh','utf8');
+  assert.match(installer,/LPFORGE_RUNTIME_POLICY_TEMPLATE_HASH_MISMATCH/);
+  assert.match(installer,/mv -f "\$policy_stage" "\$runtime_policy"/);
+  assert.doesNotMatch(launcher,/cp .*live-execution-policy/);
+  assert.doesNotMatch(launcher,/mv .*live-execution-policy/);
 });
 
 test('nested immutable release layout is required for activation and installation', () => {

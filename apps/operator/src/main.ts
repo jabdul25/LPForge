@@ -463,7 +463,7 @@ async function observeAndPlanOwnedPositions(input: {
   swapQuoteProvider?: { quote(request:{inputMint:string;outputMint:string;inputAmount:bigint;requiredOutputAmount:bigint}):Promise<{status:string;quote?:{outAmount:bigint}}> };
 }) {
   if (!input.ownerAddress) return { observed: 0, planned: 0 };
-  const deployment=loadDeploymentPolicyFile(process.env.LPFORGE_EXECUTION_POLICY_PATH??"policies/live-execution-policy.json");
+  const deployment=loadDeploymentPolicyFile(resolveLiveExecutionPolicyPath());
   if(!deployment.feeClaim)throw new Error('LPFORGE_FEE_CLAIM_POLICY_MISSING');
   const policy = {...loadLivePositionManagementPolicy(
       process.env.LPFORGE_LIVE_MANAGEMENT_POLICY_PATH ??

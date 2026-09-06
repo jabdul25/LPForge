@@ -1,6 +1,6 @@
 # Live execution policy
 
-`live-execution-policy.json` is the non-secret, versioned source of truth for live pool limits. It is `DISABLED` by default. No pool can receive an OPEN authorization until its status is changed to `ENABLED` and the normal runtime gates and operator approval are also satisfied.
+`live-execution-policy.json` is the non-secret, versioned **release policy template** for live pool limits. It is used by review, CI, release construction and provenance. Production never reads this relative file as a runtime fallback: deployment validates and atomically promotes it to `/root/systems/LPForge/policy/live-execution-policy.json`, the sole live runtime authority.
 
 Use regular SOL amounts for all pool capital settings. Prefer quoted decimals (for example, `"0.1"` or `"0.2"`) so the configured amount remains exact. Numeric JSON values such as `0.1` are also accepted for convenience.
 
@@ -25,7 +25,7 @@ Use regular SOL amounts for all pool capital settings. Prefer quoted decimals (f
 
 `maxOpenPositions` is the global concurrent-position limit. Each pool additionally has its own `maxOpenPositions` and `maxCapitalSol`. There are no source-code ceilings for either setting. LPForge converts SOL decimals to exact native units internally; values with more than nine decimal places are rejected. The policy parser rejects duplicate pool addresses, non-positive capital, invalid position counts, and an enabled policy with no pools.
 
-The only related environment entry is `LPFORGE_EXECUTION_POLICY_PATH`, which selects this policy file; it does not carry pool limits, capital limits, or allowlists.
+The only related environment entry is `LPFORGE_EXECUTION_POLICY_PATH`. In Production it must name `/root/systems/LPForge/policy/live-execution-policy.json`; relative and release-local paths fail closed. It does not carry pool limits, capital limits, or allowlists.
 
 ## Discovery boundary
 

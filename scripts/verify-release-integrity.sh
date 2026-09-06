@@ -73,6 +73,10 @@ manifest_pnpm="${manifest[6]}"
 manifest_lock="${manifest[7]}"
 [[ "$manifest_source" == "$REV" ]] || fail "manifest source identity mismatch"
 [[ "$manifest_policy" =~ ^[0-9a-f]{64}$ ]] || fail "manifest policy hash invalid"
+node - "$manifest_policy" RELEASE_MANIFEST.json <<'NODE' || fail "runtime policy authority manifest mismatch"
+const fs=require('fs');const [expected,file]=process.argv.slice(2);const m=JSON.parse(fs.readFileSync(file,'utf8'));
+for(const key of ['releasePolicyTemplateHash','runtimeExpectedPolicyHash'])if(m[key]!==undefined&&m[key]!==expected)process.exit(1);
+NODE
 [[ "$manifest_build" =~ ^[0-9a-f]{64}$ ]] || fail "manifest build identity invalid"
 [[ "$manifest_lock" =~ ^[0-9a-f]{64}$ ]] || fail "manifest lockfile hash invalid"
 
@@ -80,6 +84,8 @@ if [[ "${LPFORGE_RUNTIME_CONFIG_ENFORCED:-false}" == "true" ]]; then
   config_root="${LPFORGE_HOME:-/root/systems/LPForge}"
   [[ "$config_root" == /* ]] || fail "LPFORGE_HOME must be absolute"
   policy="$config_root/policy/live-execution-policy.json"
+  [[ "$config_root" != */releases/* ]] || fail "runtime policy root must not be release-local"
+  [[ -z "${LPFORGE_EXECUTION_POLICY_PATH:-}" || "${LPFORGE_EXECUTION_POLICY_PATH}" == "$policy" ]] || fail "runtime policy path invalid"
 else
   policy="${LPFORGE_EXECUTION_POLICY_PATH:-policies/live-execution-policy.json}"
 fi
