@@ -35,7 +35,7 @@
     "minimumIncludedBins": 35
   },
   "feeClaim": {
-    "minimumClaimValueUsd": 0.10
+    "minimumClaimValueUsd": 0.50
   },
   "settlement": {
     "residualDustThresholdUsd": 0.10
