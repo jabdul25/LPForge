@@ -282,8 +282,10 @@ async function supersedeProvisionalPartialEntryRecovery(input:{store:Phase1Store
 /**
  * A wallet snapshot alone cannot distinguish manual inventory from fees that
  * were already claimed for this position.  Lots are the receipt-bound
- * provenance record.  We may unwind only the just-withdrawn close delta plus
- * OPEN/PARTIALLY_SETTLED fee-claim lots for this exact position and mint.
+ * provenance record. We may unwind only the just-withdrawn close delta plus
+ * pre-existing receipt-backed inventory for this exact position and mint:
+ * previously claimed fees and measured entry-funding residuals. Neither is
+ * inferred from unrelated wallet inventory.
  */
 export function derivePositionAttributedTerminalUnwind(input:{
   positionAddress:string;
@@ -292,15 +294,19 @@ export function derivePositionAttributedTerminalUnwind(input:{
   newlyWithdrawnRaw:bigint;
   walletRawAfterClose:bigint;
   lots:ReadonlyArray<Pick<PositionInventoryLot,"lotId"|"positionAddress"|"planId"|"tokenMint"|"sourceEvent"|"remainingRawAmount"|"status"|"acquiredAt">>;
-}):{ok:true;amountRaw:bigint;feeLotAllocations:Array<{lotId:string;rawAmount:bigint}>}|{ok:false;reasonCodes:string[]}{
+}):{ok:true;amountRaw:bigint;feeLotAllocations:Array<{lotId:string;rawAmount:bigint}>;openResidualLotAllocations:Array<{lotId:string;rawAmount:bigint}>;lotAllocations:Array<{lotId:string;rawAmount:bigint}>}|{ok:false;reasonCodes:string[]}{
   if(input.newlyWithdrawnRaw<0n||input.walletRawAfterClose<0n)return{ok:false,reasonCodes:['P6_CLOSE_POSITION_ATTRIBUTED_INVENTORY_INVALID']};
   const feeLots=input.lots
     .filter(lot=>lot.positionAddress===input.positionAddress&&lot.tokenMint===input.tokenMint&&lot.sourceEvent==='FEE_CLAIM'&&lot.planId!==input.closePlanId&&['OPEN','PARTIALLY_SETTLED'].includes(lot.status)&&lot.remainingRawAmount>0n)
     .sort((a,b)=>a.acquiredAt.localeCompare(b.acquiredAt)||a.lotId.localeCompare(b.lotId));
   const feeLotAllocations=feeLots.map(lot=>({lotId:lot.lotId,rawAmount:lot.remainingRawAmount}));
-  const feeRaw=feeLotAllocations.reduce((total,lot)=>total+lot.rawAmount,0n),amountRaw=input.newlyWithdrawnRaw+feeRaw;
+  const openResidualLotAllocations=input.lots
+    .filter(lot=>lot.positionAddress===input.positionAddress&&lot.tokenMint===input.tokenMint&&lot.sourceEvent==='OPEN_RESIDUAL'&&lot.planId!==input.closePlanId&&['OPEN','PARTIALLY_SETTLED'].includes(lot.status)&&lot.remainingRawAmount>0n)
+    .sort((a,b)=>a.acquiredAt.localeCompare(b.acquiredAt)||a.lotId.localeCompare(b.lotId))
+    .map(lot=>({lotId:lot.lotId,rawAmount:lot.remainingRawAmount}));
+  const lotAllocations=[...feeLotAllocations,...openResidualLotAllocations],priorRaw=lotAllocations.reduce((total,lot)=>total+lot.rawAmount,0n),amountRaw=input.newlyWithdrawnRaw+priorRaw;
   if(input.walletRawAfterClose<amountRaw)return{ok:false,reasonCodes:['P6_CLOSE_POSITION_ATTRIBUTED_FEE_LOTS_WALLET_SHORTFALL']};
-  return{ok:true,amountRaw,feeLotAllocations};
+  return{ok:true,amountRaw,feeLotAllocations,openResidualLotAllocations,lotAllocations};
 }
 /** Read the chain immediately before signing.  The plan's market inputs are
  * immutable; a missing/mismatched value is a fail-closed condition, not a
@@ -3608,7 +3614,7 @@ async function executeCloseSettlement(input: {
       return{status:"UNKNOWN",planId:input.plan.planId,reasonCodes:attributed.reasonCodes,transactionSubmitted:true};
     }
     attributableTokenX=attributed.amountRaw;
-    attributableFeeLotAllocations=[...(newlyWithdrawnTokenX>0n?[{lotId:`${input.plan.planId}:close-x:lot`,rawAmount:newlyWithdrawnTokenX}]:[]),...attributed.feeLotAllocations];
+    attributableFeeLotAllocations=[...(newlyWithdrawnTokenX>0n?[{lotId:`${input.plan.planId}:close-x:lot`,rawAmount:newlyWithdrawnTokenX}]:[]),...attributed.lotAllocations];
     if(attributableTokenY>0n)
       await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:close-token-y`,positionAddress:input.positionAddress,planId:input.plan.planId,flowType:"CLOSE_WITHDRAWAL",observedAt:new Date().toISOString(),tokenMint:poolFact.tokenYMint,tokenAmountRaw:attributableTokenY.toString(),payload:{source:"REMOVE_PLUS_CLAIM_DELTA",tokenYBefore:tokenYBefore.toString(),tokenYAfter:tokenYAfter.toString()}});
     await persist("CLOSE_INVENTORY_MEASURED", {
@@ -3619,6 +3625,7 @@ async function executeCloseSettlement(input: {
       attributableTokenX: attributableTokenX.toString(),
       newlyWithdrawnTokenX:newlyWithdrawnTokenX.toString(),
       attributableFeeLotAllocations:attributableFeeLotAllocations.map(allocation=>({lotId:allocation.lotId,rawAmount:allocation.rawAmount.toString()})),
+      attributableOpenResidualLotAllocations:attributed.openResidualLotAllocations.map(allocation=>({lotId:allocation.lotId,rawAmount:allocation.rawAmount.toString()})),
       attributableTokenY:attributableTokenY.toString(),
     });
     stage = "CLOSE_INVENTORY_MEASURED";
@@ -4663,6 +4670,24 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         ) {
           if(closePending.stage==='CLOSE_POSITION_SUBMITTED'&&recoveryPositionAddress){
             await input.store.markSubmissionExpired(closePending.signature,input.now,'P6_CLOSE_PENDING_STAGE_EXPIRED_NO_CHAIN_EFFECT');
+            // A close-account child can expire after REMOVE and CLAIM have
+            // finalized but before a normal OPEN_RESIDUAL lot was included in
+            // the unwind. Re-enter the durable close stage in that exact case:
+            // it re-measures the receipt-backed lot and produces one normal
+            // unwind, rather than creating an account-close-only successor
+            // whose preconditions can never be met.
+            const removeStep=plan.steps.find(step=>step.kind==='METEORA_REMOVE'),claimStep=plan.steps.find(step=>step.kind==='METEORA_CLAIM'),unwindStep=plan.steps.find(step=>step.kind==='JUPITER_UNWIND'),
+              [removeConfirmed,claimConfirmed,unwindConfirmed]=await Promise.all([
+                removeStep?input.store.loadConfirmedSubmissionByTransactionId(removeStep.transactionId):Promise.resolve(undefined),
+                claimStep?input.store.loadConfirmedSubmissionByTransactionId(claimStep.transactionId):Promise.resolve(undefined),
+                unwindStep?input.store.loadConfirmedSubmissionByTransactionId(unwindStep.transactionId):Promise.resolve(undefined),
+              ]),dispatch=closeSettlementDispatch(plan),claimSkipped=dispatch.claimTransactionSkipped===true;
+            if(removeConfirmed&&(claimSkipped||claimConfirmed)&&!unwindConfirmed&&closeSettlementAmount(dispatch.attributableTokenX)===0n){
+              await input.store.updateExecutionJournal({idempotencyKey:plan.idempotencyKey,expectedVersion:journal.version,state:'CONFIRMED',signature:claimConfirmed?.signature??removeConfirmed.signature,updatedAt:input.now,payload:{...journal.payload,recovery:'P6_CLOSE_REHYDRATED_FOR_RECEIPT_BOUND_OPEN_RESIDUAL_UNWIND',transactionId:claimStep?.transactionId??removeStep!.transactionId,expiredAccountCloseSignature:closePending.signature}});
+              await input.store.transitionAutonomousPlan({planId:plan.planId,state:'RECONCILING',at:input.now,reasonCodes:['P6_CLOSE_REHYDRATED_FOR_RECEIPT_BOUND_OPEN_RESIDUAL_UNWIND'],payload:{stage:'CLOSE_CLAIMS_SETTLED',pendingStage:null,pendingSignature:null,closeSettlementIncomplete:true}});
+              results.push({planId:plan.planId,action:'RESUME_CLOSE_SETTLEMENT',reasonCodes:['P6_CLOSE_REHYDRATED_FOR_RECEIPT_BOUND_OPEN_RESIDUAL_UNWIND']});
+              continue;
+            }
             const successor=await createAccountCloseOnlySuccessor({store:input.store,plan,positionAddress:recoveryPositionAddress,positionTruth,now:input.now});
             if(successor.created){
               results.push({planId:plan.planId,action:'RETURN_EXISTING_PLAN',reasonCodes:successor.reasonCodes});

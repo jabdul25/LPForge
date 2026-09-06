@@ -167,3 +167,11 @@ test('recovered final account close materializes the same SOL settlement as the 
   assert.match(source,/persistLifecycleSolSettlement/);
   assert.match(source,/createLiveSolSettledLearningOutcome/);
 });
+
+test('expired account-close child rehydrates the normal close sequence when confirmed remove and claim still need a receipt-bound entry residual unwind', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile('packages/phase6-live-worker/src/index.ts', 'utf8'));
+  assert.match(source,/P6_CLOSE_REHYDRATED_FOR_RECEIPT_BOUND_OPEN_RESIDUAL_UNWIND/);
+  assert.match(source,/claimSkipped\|\|claimConfirmed/);
+  assert.match(source,/!unwindConfirmed/);
+  assert.match(source,/stage:'CLOSE_CLAIMS_SETTLED'/);
+});

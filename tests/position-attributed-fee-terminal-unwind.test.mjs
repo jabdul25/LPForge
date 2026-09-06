@@ -31,3 +31,15 @@ test('ZCAT regression: historic routine fee inventory is included, not treated a
   const result=derivePositionAttributedTerminalUnwind({positionAddress,tokenMint,closePlanId,newlyWithdrawnRaw:84003872046n,walletRawAfterClose:89877949860n,lots:[lot('zcat-claims',5874077814)]});
   assert.equal(result.ok,true);assert.equal(result.amountRaw,89877949860n);assert.deepEqual(result.feeLotAllocations,[{lotId:'zcat-claims',rawAmount:5874077814n}]);
 });
+
+test('entry funding residual is receipt-bound position inventory and is unwound at terminal close',()=>{
+  const result=derivePositionAttributedTerminalUnwind({positionAddress,tokenMint,closePlanId,newlyWithdrawnRaw:0n,walletRawAfterClose:3975128n,lots:[lot('entry-residual',3975128,{sourceEvent:'OPEN_RESIDUAL',planId:'entry-plan'})]});
+  assert.equal(result.ok,true);assert.equal(result.amountRaw,3975128n);
+  assert.deepEqual(result.openResidualLotAllocations,[{lotId:'entry-residual',rawAmount:3975128n}]);
+  assert.deepEqual(result.lotAllocations,[{lotId:'entry-residual',rawAmount:3975128n}]);
+});
+
+test('entry residual wallet shortfall fails closed and never infers unrelated inventory',()=>{
+  const result=derivePositionAttributedTerminalUnwind({positionAddress,tokenMint,closePlanId,newlyWithdrawnRaw:0n,walletRawAfterClose:3975127n,lots:[lot('entry-residual',3975128,{sourceEvent:'OPEN_RESIDUAL',planId:'entry-plan'})]});
+  assert.deepEqual(result,{ok:false,reasonCodes:['P6_CLOSE_POSITION_ATTRIBUTED_FEE_LOTS_WALLET_SHORTFALL']});
+});
