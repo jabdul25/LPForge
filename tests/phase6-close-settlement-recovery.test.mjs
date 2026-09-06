@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  canonicalizeTerminalSettlementCashflows,
   isLegacySequentialCloseJournalRecovery,
   mutationRiskPlanExpiry,
   shouldResumeCloseSettlement,
@@ -182,4 +183,10 @@ test('confirmed residual unwind followed by an expired account-close identity cr
   assert.match(source,/terminalDispatch\.error==='LPFORGE_DUPLICATE_SUBMISSION_ATTEMPT'/);
   assert.match(source,/loadConfirmedSubmissionByTransactionId\(unwindStep\.transactionId\)/);
   assert.match(source,/createAccountCloseOnlySuccessor/);
+});
+
+test('terminal successor accounting deduplicates only exact repeated receipt cashflows', () => {
+  const duplicate={flowType:'CLOSE_WITHDRAWAL',lamports:29866726n,payload:{signature:'remove'}},
+    canonicalize=canonicalizeTerminalSettlementCashflows([duplicate,{...duplicate}, {flowType:'FEE_CLAIM',lamports:1033408n,tokenMint:'So11111111111111111111111111111111111111112',payload:{signature:'claim'}},{flowType:'FEE_CLAIM',lamports:1033408n,tokenMint:'So11111111111111111111111111111111111111112',payload:{signature:'claim'}},{flowType:'FEE_CLAIM',lamports:5n,payload:{signature:'other-claim'}}]);
+  assert.equal(canonicalize.length,3);
 });

@@ -2300,6 +2300,26 @@ function settlementFlowSignature(flow:LifecycleSettlementInput["cashflows"][numb
   return typeof signature==='string'?signature:undefined;
 }
 /**
+ * A terminal account-close successor may finalize a receipt first recorded by
+ * its root close plan. Preserve both immutable raw cashflow records, but use
+ * a single receipt/type/mint/amount fact for terminal economic accounting.
+ * This is deliberately narrow: ordinary repeated claims have distinct
+ * signatures and remain distinct income.
+ */
+export function canonicalizeTerminalSettlementCashflows<T extends Pick<LifecycleSettlementInput["cashflows"][number],"flowType"|"lamports"|"tokenMint"|"tokenAmountRaw"|"payload">>(cashflows:readonly T[]):T[]{
+  const seen=new Set<string>();
+  return cashflows.filter(flow=>{
+    if(!["FEE_CLAIM","REWARD_CLAIM","CLOSE_WITHDRAWAL"].includes(flow.flowType))return true;
+    const candidateSignature=flow.payload?.transactionSignature??flow.payload?.signature,
+      signature=typeof candidateSignature==='string'?candidateSignature:undefined;
+    if(!signature)return true;
+    const amount=flow.lamports?.toString()??`${flow.tokenMint??""}:${flow.tokenAmountRaw??""}`,
+      key=`${flow.flowType}:${signature}:${flow.tokenMint??""}:${amount}`;
+    if(seen.has(key))return false;
+    seen.add(key);return true;
+  });
+}
+/**
  * Independently recomputes terminal CLOSE-plan SOL effects from confirmed RPC
  * receipts.  It intentionally does not trust the lifecycle cashflow total as
  * proof: every receipt-derived effect must have a signature-bound cashflow.
@@ -3871,19 +3891,24 @@ async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:Au
   if(!rent.ok)return{ready:false,reasonCodes:rent.reasonCodes};
   let settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
   if(!settlementInput)return{ready:false,reasonCodes:["SETTLEMENT_LIFECYCLE_MISSING"]};
+  settlementInput={...settlementInput,cashflows:canonicalizeTerminalSettlementCashflows(settlementInput.cashflows)};
   const terminalClaim=settlementInput.transactions.find(transaction=>transaction.planRole==='CLOSE'&&transaction.kind==='METEORA_CLAIM');
-  if(terminalClaim?.signature){
+  if(terminalClaim?.signature&&!settlementInput.cashflows.some(flow=>flow.flowType==='FEE_CLAIM'&&settlementFlowSignature(flow)===terminalClaim.signature)){
     const claim=await persistConfirmedClaimReceipt({store:input.store,connection:input.connection,plan:input.plan,positionAddress:input.positionAddress,signature:terminalClaim.signature,transactionId:terminalClaim.transactionId,observedAt:new Date().toISOString(),source:"CONFIRMED_TERMINAL_CLAIM_RECEIPT"});
     if(!claim.ok)return{ready:false,reasonCodes:claim.reasonCodes};
     settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
     if(!settlementInput)return{ready:false,reasonCodes:["SETTLEMENT_LIFECYCLE_MISSING"]};
+    settlementInput={...settlementInput,cashflows:canonicalizeTerminalSettlementCashflows(settlementInput.cashflows)};
   }
   const removeTransactionId=typeof dispatch.removeTransactionId==="string"?dispatch.removeTransactionId:undefined,removeSignature=removeTransactionId?settlementInput.transactions.find(transaction=>transaction.transactionId===removeTransactionId)?.signature:undefined;
   if(!removeTransactionId||!removeSignature)return{ready:false,reasonCodes:["SETTLEMENT_REMOVE_RECEIPT_MISSING"]};
-  const native=await persistConfirmedCloseNativeWithdrawal({store:input.store,connection:input.connection,plan:input.plan,positionAddress:input.positionAddress,signature:removeSignature,transactionId:removeTransactionId,observedAt:new Date().toISOString()});
-  if(!native.ok)return{ready:false,reasonCodes:native.reasonCodes};
-  settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
-  if(!settlementInput)return{ready:false,reasonCodes:["SETTLEMENT_LIFECYCLE_MISSING"]};
+  if(!settlementInput.cashflows.some(flow=>flow.flowType==='CLOSE_WITHDRAWAL'&&settlementFlowSignature(flow)===removeSignature)){
+    const native=await persistConfirmedCloseNativeWithdrawal({store:input.store,connection:input.connection,plan:input.plan,positionAddress:input.positionAddress,signature:removeSignature,transactionId:removeTransactionId,observedAt:new Date().toISOString()});
+    if(!native.ok)return{ready:false,reasonCodes:native.reasonCodes};
+    settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
+    if(!settlementInput)return{ready:false,reasonCodes:["SETTLEMENT_LIFECYCLE_MISSING"]};
+    settlementInput={...settlementInput,cashflows:canonicalizeTerminalSettlementCashflows(settlementInput.cashflows)};
+  }
   const at=new Date().toISOString(),positionCheckedAt=at,positionCheckedSlot=BigInt(positionCheck.context.slot),settlementEvidence={positionCheckedAt,positionCheckedSlot:positionCheckedSlot.toString(),rpcUrl:input.config.rpcUrl,commitment:"confirmed"};
   const chainReconciliation=await reconcileTerminalSettlementChainEffects({connection:input.connection,plan:input.plan,positionAddress:input.positionAddress,settlementInput});
   await input.store.upsertLifecycleSettlementChainReconciliation({positionAddress:input.positionAddress,closePlanId:input.plan.planId,status:chainReconciliation.ok?'RECONCILED_CHAIN':'RECONCILIATION_REQUIRED',chainSolInLamports:chainReconciliation.chainSolInLamports,chainSolOutLamports:chainReconciliation.chainSolOutLamports,dbSolInLamports:chainReconciliation.dbSolInLamports,dbSolOutLamports:chainReconciliation.dbSolOutLamports,reasonCodes:chainReconciliation.reasonCodes,payload:chainReconciliation.payload,observedAt:at});
