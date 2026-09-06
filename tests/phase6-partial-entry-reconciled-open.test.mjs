@@ -19,6 +19,14 @@ test('a reconciled OPEN resolves a partial-entry row only when construction and 
   assert.match(worker, /supersedeProvisionalPartialEntryRecovery/);
 });
 
+test('the durable partial-entry recovery state contract permits receipt-bound successful-entry supersession', () => {
+  const migration = fs.readFileSync('packages/db/migrations/M0072_partial_entry_success_supersession.sql', 'utf8');
+  assert.match(migration, /DROP CONSTRAINT IF EXISTS partial_entry_recovery_state_check/);
+  assert.match(migration, /SUPERSEDED_BY_SUCCESSFUL_ENTRY/);
+  assert.match(migration, /BEGIN;/);
+  assert.match(migration, /COMMIT;/);
+});
+
 test('autonomous plan mapping preserves the durable transaction-plan state', () => {
   const store = fs.readFileSync('packages/db/src/index.ts', 'utf8');
   assert.match(store, /state: String\(row\.state\)/);
