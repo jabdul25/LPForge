@@ -10,7 +10,15 @@ LPFORGE_HOME="${LPFORGE_HOME:-/root/systems/LPForge}"
 source scripts/runtime-config-paths.sh
 env_args=(--env-file="$LPFORGE_RUNTIME_ENV_SOURCE")
 case "$service" in
-  production) target='.build/apps/production/src/main.js' ;;
+  production)
+    # Node's --env-file intentionally does not overwrite inherited values.
+    # PM2 can retain an old environment across release replacement, so an
+    # inherited malformed P7 baseline must not mask the canonical central
+    # runtime value. These three variables are defined solely by .env for the
+    # Production control runtime.
+    unset LPFORGE_P7_DRIFT_BASELINE_JSON LPFORGE_P7_INSTANCE_ID LPFORGE_P7_RUNTIME_ID
+    target='.build/apps/production/src/main.js'
+    ;;
   discovery) target='.build/apps/discovery/src/main.js' ;;
   discovery-learning)
     target='.build/apps/discovery-learning/src/main.js'
