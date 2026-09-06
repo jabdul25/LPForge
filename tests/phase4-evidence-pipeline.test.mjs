@@ -227,6 +227,27 @@ test('collector uses its completed pool-read timestamp for both live evidence an
  const result=await collectActiveCandidateEvidence({api,adapter,rpc,store,observedAt:at,policy:{maxConcurrentPoolReads:1}});
  assert.equal(result.results[0].status,'PASS');assert.equal(liveWrites.length,1);assert.equal(maturityWrites.length,1);const observedAt=liveWrites[0].rows[0].observedAt,assessedAt=maturityWrites[0].assessedAt;assert.ok(Date.parse(assessedAt)>=Date.parse(observedAt));assert.ok(Date.parse(assessedAt)>=Date.parse(futureEventAt),'assessment includes all evidence read during the cycle instead of treating its newest event as lookahead');
 });
+
+test('an admitted raw-replay tracker is collected and recorded before ordinary fair-slice work',async()=>{
+ const writes=[],tracked=[];
+ const store={
+  reconcileRawReplayTracking:async()=>({capacity:1,trackedPoolAddresses:['REPLAY'],waitingPoolAddresses:['WAIT']}),
+  reconcileLiveEvidenceAdmission:async()=>({}),reconcileEvidenceContinuityTracking:async()=>({capacity:0,trackedPoolAddresses:[],expiredPoolAddresses:[],evictedPoolAddresses:[]}),
+  listDiscoveryCandidates:async()=>[
+   {poolAddress:'REPLAY',state:'QUALIFIED',tier:'A',priorityScore:1,lastSeenAt:at,payload:{}},
+   {poolAddress:'ORDINARY',state:'ACTIVE_CANDIDATE',tier:'A',priorityScore:1,lastSeenAt:at,payload:{}},
+  ],
+  recordRawReplayCollectionOutcome:async x=>tracked.push(x),
+  insertPoolSnapshot:async()=>{},insertBins:async()=>{},insertDataApiPool:async()=>{},insertOhlcv:async()=>{},insertFeeVolumeObservations:async()=>{},loadFeeVolumeObservations:async()=>feeBuckets(48).map(x=>({bucketAt:new Date(x.timestamp*1000).toISOString(),fees:x.fees,protocolFees:x.protocol_fees,volume:x.volume})),insertCandidateMarketObservations:async()=>{},loadCandidateMarketObservations:async()=>[{observedAt:at,sourceType:'HISTORICAL_API_BACKFILL',sourceProvider:'test',price:1,resolutionMs:300000}],loadActiveCandidateBackfill:async()=>({last_successful_at:at}),upsertActiveCandidateBackfill:async()=>{},insertSwapEvent:async()=>{},loadOperationalHistory:async()=>history(61),upsertActiveCandidateHistoryMaturity:async x=>writes.push(x),insertEconomicEstimate:async()=>{},recordLiveEvidenceCollectionOutcome:async()=>{},recordActiveCandidateEvidenceCollectorPass:async()=>{},
+ };
+ const api={getPool:async address=>({address,tvl:100000}),getHistoricalVolume:async()=>({data:feeBuckets(48)}),getOhlcv:async()=>({data:[]})},adapter={getPool:async address=>({address,activeBinId:1}),getBinsAroundActive:async()=>[],decodeEvents:async()=>[]},rpc={getSignaturesForAddress:async()=>[],getTransaction:async()=>null};
+ const result=await collectActiveCandidateEvidence({api,adapter,rpc,store,observedAt:at,policy:{maxConcurrentPoolReads:1,p95PoolCollectionMs:10_000,liveConfirmationTargetCoverageMs:60_000}});
+ assert.equal(result.rawReplay.trackedPoolAddresses[0],'REPLAY');
+ assert.equal(result.results[0].poolAddress,'REPLAY');
+ assert.equal(result.results[0].collectionTarget,'RAW_REPLAY_TRACKING');
+ assert.equal(tracked.length,1);
+ assert.equal(tracked[0].poolAddress,'REPLAY');
+});
 test('Phase-4 thresholds remain unchanged and missing flow is not treated as healthy',()=>{
  assert.deepEqual(ENTRY_RESEARCH_POLICY_V1,{id:'entry-research-v1',minReadiness:.60,minDataCompleteness:.60,maxDownsidePressure:.72,maxDangerousRegimeMass:.48,maxToxicity:.62,maxReferenceDivergenceRisk:.60,maxImmediateOorRisk:.65,minExpectedNetValue:0,maxUncertainty:.72});
  const features={downsideDeceleration:.9,supportReclaimStrength:.8,twoWayFlowStrength:0,flowRecovery:0,regimeStability:.8,volatilityExpansionRisk:.1,immediateOorRisk:.1,dataCompleteness:1,dangerousRegimeMass:.1,poolToxicity:.1,referenceDivergenceRisk:.1,downsidePressure:.1};
