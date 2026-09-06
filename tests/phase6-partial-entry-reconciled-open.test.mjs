@@ -27,6 +27,17 @@ test('the durable partial-entry recovery state contract permits receipt-bound su
   assert.match(migration, /COMMIT;/);
 });
 
+test('successful-open cleanup explicitly types the recovery supersession timestamp', () => {
+  const store = fs.readFileSync('packages/db/src/index.ts', 'utf8');
+  const start = store.indexOf('async supersedePartialEntryRecoveryIfSuccessfulOpen(v)');
+  const end = store.indexOf('async upsertOpenChunkDisposition(v)', start);
+  assert.ok(start >= 0 && end > start, 'the successful-open cleanup query must exist');
+  const query = store.slice(start, end);
+  assert.match(query, /'at',\$5::timestamptz/);
+  assert.match(query, /updated_at=\$5::timestamptz/);
+  assert.doesNotMatch(query, /'at',\$5\)(?!::timestamptz)/);
+});
+
 test('autonomous plan mapping preserves the durable transaction-plan state', () => {
   const store = fs.readFileSync('packages/db/src/index.ts', 'utf8');
   assert.match(store, /state: String\(row\.state\)/);

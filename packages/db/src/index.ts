@@ -4073,9 +4073,9 @@ return 'APPLIED';
       const r = await db.query(
         `UPDATE execution.partial_entry_recovery r
          SET state='SUPERSEDED_BY_SUCCESSFUL_ENTRY',
-             wallet_truth=r.wallet_truth||jsonb_build_object('supersededBySuccessfulEntry',jsonb_build_object('positionAddress',$2,'lifecycleState','OPEN','reconciliationStatus','MATCH','at',$5)),
-             payload=r.payload||jsonb_build_object('supersession',jsonb_build_object('reasonCode','P6_PARTIAL_RECOVERY_SUPERSEDED_BY_SUCCESSFUL_ENTRY','positionAddress',$2,'lifecycleState','OPEN','reconciliationStatus','MATCH','at',$5)),
-             updated_at=$5
+             wallet_truth=r.wallet_truth||jsonb_build_object('supersededBySuccessfulEntry',jsonb_build_object('positionAddress',$2,'lifecycleState','OPEN','reconciliationStatus','MATCH','at',$5::timestamptz)),
+             payload=r.payload||jsonb_build_object('supersession',jsonb_build_object('reasonCode','P6_PARTIAL_RECOVERY_SUPERSEDED_BY_SUCCESSFUL_ENTRY','positionAddress',$2,'lifecycleState','OPEN','reconciliationStatus','MATCH','at',$5::timestamptz)),
+             updated_at=$5::timestamptz
          WHERE r.plan_id=$1
            AND r.owner_address=$3
            AND r.pool_address=$4
