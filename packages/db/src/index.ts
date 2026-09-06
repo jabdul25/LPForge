@@ -2081,6 +2081,112 @@ function optionalFiniteDbNumber(value: unknown): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+/**
+ * A reconciliation family is a derived, current view of explicitly persisted
+ * recovery provenance.  It deliberately does not infer lineage from plan-id
+ * spelling: a child joins its parent only when its durable intent payload
+ * names that exact predecessor and the independently stored economic subject
+ * (pool, owner, position) agrees.
+ *
+ * Historical reconciliation rows are immutable.  This projection is used
+ * solely to avoid counting a provisional parent UNKNOWN and its terminal,
+ * reconciled recovery successor as two independent current drift samples.
+ */
+export interface Phase7ReconciliationFamilyMember {
+  planId: string;
+  status: "MATCH" | "MISMATCH" | "UNKNOWN";
+  observedAt: string;
+  poolAddress?: string;
+  ownerAddress?: string;
+  positionAddress?: string;
+  predecessorPlanId?: string;
+  terminalRecovery?: boolean;
+}
+
+export interface Phase7ReconciliationFamily {
+  familyId: string;
+  rootPlanId: string;
+  memberPlanIds: string[];
+  canonicalOutcome: "MATCH" | "MISMATCH" | "UNKNOWN";
+  unresolvedMemberPlanIds: string[];
+}
+
+function nonEmptyDbText(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function hasExactRecoverySubject(
+  parent: Phase7ReconciliationFamilyMember,
+  successor: Phase7ReconciliationFamilyMember,
+): boolean {
+  const parentPool = nonEmptyDbText(parent.poolAddress), successorPool = nonEmptyDbText(successor.poolAddress);
+  const parentOwner = nonEmptyDbText(parent.ownerAddress), successorOwner = nonEmptyDbText(successor.ownerAddress);
+  const parentPosition = nonEmptyDbText(parent.positionAddress), successorPosition = nonEmptyDbText(successor.positionAddress);
+  // A missing binding is ambiguity, not permission to collapse a family.
+  return Boolean(parentPool && parentOwner && parentPosition && successorPool && successorOwner && successorPosition
+    && parentPool === successorPool && parentOwner === successorOwner && parentPosition === successorPosition);
+}
+
+export function derivePhase7ReconciliationFamilies(
+  members: readonly Phase7ReconciliationFamilyMember[],
+): Phase7ReconciliationFamily[] {
+  const latestByPlan = new Map<string, Phase7ReconciliationFamilyMember>();
+  for (const member of members) {
+    const prior = latestByPlan.get(member.planId);
+    if (!prior || Date.parse(member.observedAt) >= Date.parse(prior.observedAt)) latestByPlan.set(member.planId, member);
+  }
+  const parentByChild = new Map<string, string>();
+  const childrenByParent = new Map<string, string[]>();
+  for (const successor of latestByPlan.values()) {
+    const parentPlanId = nonEmptyDbText(successor.predecessorPlanId);
+    const parent = parentPlanId ? latestByPlan.get(parentPlanId) : undefined;
+    if (!parent || parent.planId === successor.planId || !hasExactRecoverySubject(parent, successor)) continue;
+    parentByChild.set(successor.planId, parent.planId);
+    const children = childrenByParent.get(parent.planId) ?? [];
+    children.push(successor.planId);
+    childrenByParent.set(parent.planId, children);
+  }
+  const rootFor = (planId: string): string => {
+    const visited = new Set<string>(); let current = planId;
+    while (parentByChild.has(current)) {
+      if (visited.has(current)) return planId; // malformed cycle: retain singleton fail-closed.
+      visited.add(current); current = parentByChild.get(current)!;
+    }
+    return current;
+  };
+  const membersByRoot = new Map<string, string[]>();
+  for (const planId of latestByPlan.keys()) {
+    const root = rootFor(planId);
+    const grouped = membersByRoot.get(root) ?? [];
+    grouped.push(planId); membersByRoot.set(root, grouped);
+  }
+  const evaluate = (planId: string, visiting = new Set<string>()): "MATCH" | "MISMATCH" | "UNKNOWN" => {
+    if (visiting.has(planId)) return "UNKNOWN";
+    const member = latestByPlan.get(planId)!;
+    if (member.status === "MISMATCH") return "MISMATCH";
+    const children = (childrenByParent.get(planId) ?? []).filter(child => rootFor(child) === rootFor(planId));
+    if (children.length === 0) return member.status;
+    const next = new Set(visiting); next.add(planId);
+    const outcomes = children.map(child => evaluate(child, next));
+    if (outcomes.includes("MISMATCH")) return "MISMATCH";
+    if (outcomes.includes("UNKNOWN")) return "UNKNOWN";
+    // A provisional UNKNOWN is resolved only by exact *terminal* recovery
+    // successors.  A generic later MATCH is not allowed to supersede it.
+    if (member.status === "UNKNOWN" && !children.every(child => latestByPlan.get(child)?.terminalRecovery === true)) return "UNKNOWN";
+    return "MATCH";
+  };
+  return [...membersByRoot.entries()].map(([rootPlanId, planIds]) => {
+    const canonicalOutcome = evaluate(rootPlanId);
+    return {
+      familyId: `reconciliation-family:${rootPlanId}`,
+      rootPlanId,
+      memberPlanIds: [...planIds].sort(),
+      canonicalOutcome,
+      unresolvedMemberPlanIds: planIds.filter(planId => latestByPlan.get(planId)?.status === "UNKNOWN").sort(),
+    };
+  }).sort((a, b) => a.rootPlanId.localeCompare(b.rootPlanId));
+}
+
 export function operationalMarketObservationFromDbRow(r: Record<string, unknown>): {
   observedAt: string;
   price: number;
@@ -4709,7 +4815,19 @@ return 'APPLIED';
           [poolAddress, since],
         ),
         db.query(
-          `WITH latest AS (SELECT DISTINCT ON (plan_id) plan_id,status,observed_at FROM execution.reconciliations ORDER BY plan_id,observed_at DESC) SELECT count(*) FILTER (WHERE observed_at>=$1)::int AS n,count(*) FILTER (WHERE observed_at>=$1 AND status<>'MATCH')::int AS mismatch FROM latest`,
+          `WITH latest AS (
+             SELECT DISTINCT ON (plan_id) plan_id,status,observed_at
+             FROM execution.reconciliations
+             ORDER BY plan_id,observed_at DESC
+           )
+           SELECT latest.plan_id,latest.status,latest.observed_at,
+                  i.pool_address,i.owner_address,i.position_address,
+                  i.payload->>'predecessorPlanId' AS predecessor_plan_id,
+                  COALESCE(i.payload->'terminalRecovery'='true'::jsonb,false) AS terminal_recovery
+           FROM latest
+           JOIN execution.transaction_plans p ON p.plan_id=latest.plan_id
+           JOIN execution.intents i ON i.intent_id=p.intent_id
+           WHERE latest.observed_at>=$1`,
           [since],
         ),
         db.query(
@@ -4718,14 +4836,28 @@ return 'APPLIED';
         ),
       ]);
       const c = cycles.rows[0] ?? {},
-        r = recon.rows[0] ?? {},
         k = canary.rows[0] ?? {};
+      const reconciliationFamilies = derivePhase7ReconciliationFamilies(recon.rows.map((row) => {
+        const member: Phase7ReconciliationFamilyMember = {
+          planId: String(row.plan_id),
+          status: String(row.status) as "MATCH" | "MISMATCH" | "UNKNOWN",
+          observedAt: new Date(String(row.observed_at)).toISOString(),
+          terminalRecovery: row.terminal_recovery === true,
+        };
+        const poolAddress = nonEmptyDbText(row.pool_address), ownerAddress = nonEmptyDbText(row.owner_address), positionAddress = nonEmptyDbText(row.position_address), predecessorPlanId = nonEmptyDbText(row.predecessor_plan_id);
+        if (poolAddress) member.poolAddress = poolAddress;
+        if (ownerAddress) member.ownerAddress = ownerAddress;
+        if (positionAddress) member.positionAddress = positionAddress;
+        if (predecessorPlanId) member.predecessorPlanId = predecessorPlanId;
+        return member;
+      }));
+      const reconciliationMismatchCount = reconciliationFamilies.filter(family => family.canonicalOutcome !== "MATCH").length;
       return {
         cycleCount: Number(c.n ?? 0),
         noTradeCount: Number(c.no_trade ?? 0),
         entryReadyCount: Number(c.entry_ready ?? 0),
-        reconciliationCount: Number(r.n ?? 0),
-        reconciliationMismatchCount: Number(r.mismatch ?? 0),
+        reconciliationCount: reconciliationFamilies.length,
+        reconciliationMismatchCount,
         canaryCapitalLamports: Number(k.capital ?? 0),
         canaryExecutionCostLamports: Number(k.cost ?? 0),
         featureMissingCount: Number(c.feature_missing ?? 0),
