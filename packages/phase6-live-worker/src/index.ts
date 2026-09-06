@@ -331,9 +331,15 @@ function controlledCanaryAuthorization(plan:AutonomousOpenPlan):boolean{
  * durable queue. Exactly one pending execution is therefore expected: the
  * plan now being signed. Any other pending plan remains fail-closed.
  */
-export function assessFreshOpenPortfolioTruth(input:{openPositions:number;pendingExecutionCount:number;unresolvedReconciliationDebt:number}):{clean:boolean;expectedPendingExecutionCount:1;reasonCodes:string[]}{
+/**
+ * The fresh-open gate is capacity-aware.  `maxOpenPositions` is deliberately
+ * supplied by the parsed runtime policy; it must never silently fall back to
+ * a canary value or a source-code constant.
+ */
+export function assessFreshOpenPortfolioTruth(input:{openPositions:number;pendingExecutionCount:number;unresolvedReconciliationDebt:number;maxOpenPositions:number|undefined}):{clean:boolean;expectedPendingExecutionCount:1;reasonCodes:string[]}{
   const reasons:string[]=[];
-  if(input.openPositions!==0)reasons.push("P6_FRESH_EXECUTION_OPEN_POSITION_EXISTS");
+  if(!Number.isSafeInteger(input.maxOpenPositions)||input.maxOpenPositions===undefined||input.maxOpenPositions<1)reasons.push("P6_FRESH_EXECUTION_POSITION_LIMIT_INVALID");
+  else if(input.openPositions>=input.maxOpenPositions)reasons.push("P6_FRESH_EXECUTION_POSITION_LIMIT_REACHED");
   if(input.pendingExecutionCount!==1)reasons.push("P6_FRESH_EXECUTION_PENDING_PLAN_MISMATCH");
   if(input.unresolvedReconciliationDebt!==0)reasons.push("P6_FRESH_EXECUTION_RECONCILIATION_DEBT");
   return{clean:reasons.length===0,expectedPendingExecutionCount:1,reasonCodes:reasons};
@@ -371,16 +377,16 @@ export function assessExpiredNoEffectOpenRecovery(input:{
 }
 /** Loads the live authorities immediately before economic signing. Nothing in
  * this snapshot is a favorable default: an unavailable source fails closed. */
-export async function loadFreshExecutionSafetyFacts(input:{store:Pick<Phase1Store,'loadLatestPhase7ControlDecision'|'loadPhase7ControlDecision'|'loadPhase7PortfolioFacts'>;plan:AutonomousOpenPlan;config:Pick<LiveWorkerConfig,'rpcUrl'|'programId'|'controlledCanary'>;connection?:Pick<Connection,'getLatestBlockhash'>;now?:string;phase7RuntimeId?:string;protocolCompatibility?:()=>Promise<boolean>}):Promise<FreshExecutionSafetyFacts>{
+export async function loadFreshExecutionSafetyFacts(input:{store:Pick<Phase1Store,'loadLatestPhase7ControlDecision'|'loadPhase7ControlDecision'|'loadPhase7PortfolioFacts'>;plan:AutonomousOpenPlan;config:Pick<LiveWorkerConfig,'rpcUrl'|'programId'|'maxOpenPositions'|'controlledCanary'>;connection?:Pick<Connection,'getLatestBlockhash'>;now?:string;phase7RuntimeId?:string;protocolCompatibility?:()=>Promise<boolean>}):Promise<FreshExecutionSafetyFacts>{
   const now=input.now??new Date().toISOString(),reasons:string[]=[],runtimeId=input.phase7RuntimeId??(process.env.LPFORGE_P7_RUNTIME_ID??'lpforge-production').trim(),provenance=planRecord(input.plan.planPayload.provenance),binding=planRecord(provenance.phase7Control),boundDecisionId=String(binding.decisionId??'');
   let portfolio:Awaited<ReturnType<Phase1Store['loadPhase7PortfolioFacts']>>|undefined,current;
   try{
     const [currentRow,boundRow,facts]=await Promise.all([input.store.loadLatestPhase7ControlDecision(runtimeId),boundDecisionId?input.store.loadPhase7ControlDecision(runtimeId,boundDecisionId):Promise.resolve(undefined),input.store.loadPhase7PortfolioFacts(input.plan.ownerAddress)]);
     current=phase7ExecutionControlFromRow(currentRow);
-    const phase7Reasons=validateFreshOpenPhase7Safety({plan:input.plan as unknown as AutonomousPlan,current,bound:phase7ExecutionControlFromRow(boundRow),now,controlledCanary:controlledCanaryAuthorization(input.plan),maxConcurrentPositions:input.config.controlledCanary?.maxConcurrentPositions});
+    const phase7Reasons=validateFreshOpenPhase7Safety({plan:input.plan as unknown as AutonomousPlan,current,bound:phase7ExecutionControlFromRow(boundRow),now,controlledCanary:controlledCanaryAuthorization(input.plan),maxConcurrentPositions:input.config.maxOpenPositions});
     reasons.push(...phase7Reasons);portfolio=facts;
   }catch{reasons.push('P6_FRESH_EXECUTION_SAFETY_P7_OR_PORTFOLIO_UNAVAILABLE');}
-  const portfolioTruth=portfolio===undefined?undefined:assessFreshOpenPortfolioTruth(portfolio);
+  const portfolioTruth=portfolio===undefined?undefined:assessFreshOpenPortfolioTruth({...portfolio,maxOpenPositions:input.config.maxOpenPositions});
   const portfolioClean=portfolioTruth?.clean===true;
   if(!portfolioClean)reasons.push("P6_FRESH_EXECUTION_PORTFOLIO_NOT_CLEAN",...(portfolioTruth?.reasonCodes??[]));
   let rpcHealthy=false;
@@ -391,10 +397,10 @@ export async function loadFreshExecutionSafetyFacts(input:{store:Pick<Phase1Stor
 }
 /** Lightweight check after local signing and before transmission. It deliberately
  * avoids market re-simulation while still rejecting a new hard revocation. */
-export async function checkFreshOpenSubmissionSafety(input:{store:Pick<Phase1Store,'loadLatestPhase7ControlDecision'|'loadPhase7ControlDecision'|'loadPhase7PortfolioFacts'>;plan:AutonomousOpenPlan;config:Pick<LiveWorkerConfig,'controlledCanary'>;permitExpiresAt:string;now?:string;phase7RuntimeId?:string}):Promise<{approved:boolean;reasonCodes:string[]}>{
+export async function checkFreshOpenSubmissionSafety(input:{store:Pick<Phase1Store,'loadLatestPhase7ControlDecision'|'loadPhase7ControlDecision'|'loadPhase7PortfolioFacts'>;plan:AutonomousOpenPlan;config:Pick<LiveWorkerConfig,'maxOpenPositions'|'controlledCanary'>;permitExpiresAt:string;now?:string;phase7RuntimeId?:string}):Promise<{approved:boolean;reasonCodes:string[]}>{
   const now=input.now??new Date().toISOString(),reasons:string[]=[],runtimeId=input.phase7RuntimeId??(process.env.LPFORGE_P7_RUNTIME_ID??'lpforge-production').trim(),provenance=planRecord(input.plan.planPayload.provenance),binding=planRecord(provenance.phase7Control),boundDecisionId=String(binding.decisionId??'');
   if(!Number.isFinite(Date.parse(input.permitExpiresAt))||Date.parse(input.permitExpiresAt)<=Date.parse(now))reasons.push('P6_PRESUBMISSION_RISK_PERMIT_EXPIRED');
-  try{const [currentRow,boundRow,portfolio]=await Promise.all([input.store.loadLatestPhase7ControlDecision(runtimeId),boundDecisionId?input.store.loadPhase7ControlDecision(runtimeId,boundDecisionId):Promise.resolve(undefined),input.store.loadPhase7PortfolioFacts(input.plan.ownerAddress)]);reasons.push(...validateFreshOpenPhase7Safety({plan:input.plan as unknown as AutonomousPlan,current:phase7ExecutionControlFromRow(currentRow),bound:phase7ExecutionControlFromRow(boundRow),now,controlledCanary:controlledCanaryAuthorization(input.plan),maxConcurrentPositions:input.config.controlledCanary?.maxConcurrentPositions}));if(!assessFreshOpenPortfolioTruth(portfolio).clean)reasons.push("P6_PRESUBMISSION_RECONCILIATION_OR_PORTFOLIO_BLOCK");}catch{reasons.push("P6_PRESUBMISSION_SAFETY_UNAVAILABLE");}
+  try{const [currentRow,boundRow,portfolio]=await Promise.all([input.store.loadLatestPhase7ControlDecision(runtimeId),boundDecisionId?input.store.loadPhase7ControlDecision(runtimeId,boundDecisionId):Promise.resolve(undefined),input.store.loadPhase7PortfolioFacts(input.plan.ownerAddress)]);reasons.push(...validateFreshOpenPhase7Safety({plan:input.plan as unknown as AutonomousPlan,current:phase7ExecutionControlFromRow(currentRow),bound:phase7ExecutionControlFromRow(boundRow),now,controlledCanary:controlledCanaryAuthorization(input.plan),maxConcurrentPositions:input.config.maxOpenPositions}));if(!assessFreshOpenPortfolioTruth({...portfolio,maxOpenPositions:input.config.maxOpenPositions}).clean)reasons.push("P6_PRESUBMISSION_RECONCILIATION_OR_PORTFOLIO_BLOCK");}catch{reasons.push("P6_PRESUBMISSION_SAFETY_UNAVAILABLE");}
   return{approved:reasons.length===0,reasonCodes:[...new Set(reasons)].sort()};
 }
 async function governFreshOpenRisk(input:{store:Pick<Phase1Store,'loadLatestPhase7ControlDecision'|'loadPhase7ControlDecision'|'loadPhase7PortfolioFacts'>;plan:AutonomousOpenPlan;config:LiveWorkerConfig;connection?:Pick<Connection,'getLatestBlockhash'>;simulation:{ok:boolean;simulationFreshUntil:string};costApproved:boolean;fields:ReturnType<typeof planFields>}):Promise<ReturnType<typeof governExecutionRisk>>{
