@@ -83,8 +83,17 @@ import {
   type ExecutionJournal,
 } from "../../execution-recovery/src/index.js";
 import { computePlanProvenanceHmac } from "../../execution-contracts/src/index.js";
+import { enqueueAndDispatchPhase7Alert, loadPhase7TelegramConfig } from "../../phase7-alerting/src/index.js";
 
 const JUPITER_SWAP_V6_PROGRAM_ID = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+const telegramOpenConfig=loadPhase7TelegramConfig();
+function queueOpenedPositionAlert(input:{positionAddress:string;poolAddress:string;planId:string;strategy:string;orientation:string;capitalLamports:bigint;lowerBinId:number;upperBinId:number;activeBinId:number;observedAt:string}){
+  void enqueueAndDispatchPhase7Alert({databaseUrl:process.env.DATABASE_URL,config:telegramOpenConfig,alert:{severity:'INFO',code:'POSITION_OPENED',title:'Position opened',message:'A PositionV2 is durably OPEN and reconciled.',observedAt:input.observedAt,entityType:'POSITION',entityId:input.positionAddress,transitionKey:'NOT_OPEN->OPEN',topic:'TRADES',positionAddress:input.positionAddress,poolAddress:input.poolAddress,planId:input.planId,details:{Strategy:input.strategy,Orientation:input.orientation,'Capital SOL':(Number(input.capitalLamports)/1_000_000_000).toFixed(6),'Active bin':input.activeBinId,Range:`${input.lowerBinId} → ${input.upperBinId}`,Bins:input.upperBinId-input.lowerBinId+1,Reconciliation:'MATCH'}}}).catch(()=>{});
+}
+function queuePositionSettledAlert(input:{positionAddress:string;poolAddress:string;planId:string;observedAt:string;capitalLamports:bigint;realizedPnlLamports:bigint;totalInLamports:bigint;totalOutLamports:bigint}){
+  const pnlSol=Number(input.realizedPnlLamports)/1_000_000_000,capitalSol=Number(input.capitalLamports)/1_000_000_000;
+  void enqueueAndDispatchPhase7Alert({databaseUrl:process.env.DATABASE_URL,config:telegramOpenConfig,alert:{severity:'INFO',code:'POSITION_SETTLED',title:'Position settled',message:'Canonical SOL settlement is complete with no unresolved attributed inventory.',observedAt:input.observedAt,entityType:'POSITION',entityId:input.positionAddress,transitionKey:'CLOSED->SOL_SETTLED',topic:'TRADES',positionAddress:input.positionAddress,poolAddress:input.poolAddress,planId:input.planId,details:{'Initial capital SOL':capitalSol.toFixed(6),'Realized economic PnL SOL':pnlSol.toFixed(9),'Return':capitalSol>0?`${(pnlSol/capitalSol*100).toFixed(2)}%`:'N/A','SOL inflows':(Number(input.totalInLamports)/1e9).toFixed(9),'SOL outflows':(Number(input.totalOutLamports)/1e9).toFixed(9),Settlement:'FULLY_REALIZED / SOL_SETTLED'}}}).catch(()=>{});
+}
 
 export interface LiveWorkerConfig {
   rpcUrl: string;
@@ -830,6 +839,7 @@ async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:Auto
     const actualEconomicCapitalLamports=planFundingLamports+confirmedLiquiditySolAssetOut;
     await input.store.insertExecutionReconciliation({reconciliationId:`${input.plan.planId}:open`,planId:input.plan.planId,observedAt:new Date().toISOString(),status:'MATCH',expected:{owner:input.plan.ownerAddress,pool:input.plan.poolAddress,lowerBinId:input.fields.lower,upperBinId:input.fields.upper},actual:{positionAddress:input.prepared.positionSigner.publicKeyAddress},discrepancies:[],payload:{signature:lastSignature,autonomous:true,chunked:true}});
     await input.store.upsertOwnedPosition({lpforgePositionId:`position-${input.prepared.positionSigner.publicKeyAddress}`,poolAddress:input.plan.poolAddress,positionAddress:input.prepared.positionSigner.publicKeyAddress,ownerAddress:input.plan.ownerAddress,strategy:String(intent.strategy??'SPOT'),orientation:String(funding.orientation??'ONE_SIDED_Y'),lowerBinId:input.fields.lower,upperBinId:input.fields.upper,activeBinAtEntry:input.fields.plannedActiveBinId,initialCapitalLamports:input.fields.capital,entryPlanId:input.plan.planId,entrySignature:lastSignature,...(confirmedEntrySlot!==undefined?{entrySlot:confirmedEntrySlot}:{}),enteredAt:new Date().toISOString(),lifecycleState:'OPEN',lastPlanId:input.plan.planId,reconciliationStatus:'MATCH',payload:{thesisId:input.plan.thesisId,entryFunding:funding,chunked:true,actualEconomicCapitalLamports:actualEconomicCapitalLamports.toString()}});
+    queueOpenedPositionAlert({positionAddress:input.prepared.positionSigner.publicKeyAddress,poolAddress:input.plan.poolAddress,planId:input.plan.planId,strategy:String(intent.strategy??'SPOT'),orientation:String(funding.orientation??'ONE_SIDED_Y'),capitalLamports:actualEconomicCapitalLamports,lowerBinId:input.fields.lower,upperBinId:input.fields.upper,activeBinId:input.fields.plannedActiveBinId,observedAt:new Date().toISOString()});
     const positionAccount=await input.connection.getAccountInfo(new PublicKey(input.prepared.positionSigner.publicKeyAddress),'confirmed');
     await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:open-contribution`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'OPEN_CONTRIBUTION',observedAt:new Date().toISOString(),lamports:actualEconomicCapitalLamports,payload:{signature:lastSignature,source:'RECONCILED_CHUNKABLE_OPEN',requestedLiquidityCapitalLamports:input.fields.capital.toString()}});
     if(positionAccount?.lamports)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:rent-lock`,positionAddress:input.prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'RENT_LOCK',observedAt:new Date().toISOString(),lamports:BigInt(positionAccount.lamports),payload:{signature:lastSignature,recoverable:true,source:'POSITION_ACCOUNT_INFO'}});
@@ -1198,6 +1208,7 @@ export async function executeAutonomousOpen(input: {
           reconciliationStatus: "MATCH",
           payload: { thesisId: input.plan.thesisId, entryFunding: funding },
         });
+        queueOpenedPositionAlert({positionAddress:prepared.positionSigner.publicKeyAddress,poolAddress:input.plan.poolAddress,planId:input.plan.planId,strategy:String(intent.strategy??'SPOT'),orientation:String(funding.orientation??'ONE_SIDED_Y'),capitalLamports:fields.capital,lowerBinId:fields.lower,upperBinId:fields.upper,activeBinId:Number(intent.activeBinId??fields.lower),observedAt:new Date().toISOString()});
         const positionAccount=await connection.getAccountInfo(new PublicKey(prepared.positionSigner.publicKeyAddress),'confirmed');
         await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:open-contribution`,positionAddress:prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'OPEN_CONTRIBUTION',observedAt:new Date().toISOString(),lamports:fields.capital,payload:{signature:submitted.signature,source:'RECONCILED_OPEN'}});
         if(positionAccount?.lamports)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:rent-lock`,positionAddress:prepared.positionSigner.publicKeyAddress,planId:input.plan.planId,flowType:'RENT_LOCK',observedAt:new Date().toISOString(),lamports:BigInt(positionAccount.lamports),payload:{signature:submitted.signature,recoverable:true,source:'POSITION_ACCOUNT_INFO'}});
@@ -3977,6 +3988,8 @@ async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:Au
     const outcome=await input.store.createLiveSolSettledLearningOutcome({positionAddress:input.positionAddress,at});
     if(!outcome.outcome)throw new Error(`LPFORGE_LIVE_OUTCOME_MATERIALIZATION_FAILED:${outcome.reasonCodes.join(',')}`);
   }
+  const entryCapital=settlementInput.cashflows.filter(flow=>flow.flowType==='OPEN_CONTRIBUTION').reduce((total,flow)=>total+(flow.lamports??0n),0n);
+  queuePositionSettledAlert({positionAddress:input.positionAddress,poolAddress:input.plan.poolAddress,planId:input.plan.planId,observedAt:at,capitalLamports:entryCapital,realizedPnlLamports:assessment.realizedSolPnlLamports,totalInLamports:assessment.totalSolInLamports,totalOutLamports:assessment.totalSolOutLamports});
   return{ready:true,reasonCodes:[]};
 }
 
