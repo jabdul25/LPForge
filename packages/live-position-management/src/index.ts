@@ -44,6 +44,13 @@ export interface OorLifecyclePolicy {
   sustainedMinutes: number;
   /** Start of mandatory action; this is also the stale-capital boundary. */
   actionRequiredMinutes: number;
+  /**
+   * Directional stale-capital boundary for inventory stranded above the
+   * position's maximum bin.  It may equal sustainedMinutes: at that point
+   * the position is SOL-side idle capital and must close/re-enter ordinary
+   * candidate evaluation.  BELOW_MIN continues to use actionRequiredMinutes.
+   */
+  aboveMaxCloseAndReevaluateMinutes: number;
 }
 export interface OorLifecyclePriorState {
   rangeState: "IN_RANGE" | "OUT_OF_RANGE";
@@ -229,13 +236,16 @@ export function parseOorLifecyclePolicy(raw: unknown): OorLifecyclePolicy {
     v.transientMinutes,
     v.sustainedMinutes,
     v.actionRequiredMinutes,
+    v.aboveMaxCloseAndReevaluateMinutes,
   ];
   if (
     v.schemaVersion !== 1 ||
     v.policyVersion !== "oor-lifecycle-v1" ||
     values.some((value) => !Number.isSafeInteger(value) || Number(value) <= 0) ||
     !(Number(v.transientMinutes) < Number(v.sustainedMinutes)) ||
-    !(Number(v.sustainedMinutes) < Number(v.actionRequiredMinutes))
+    !(Number(v.sustainedMinutes) < Number(v.actionRequiredMinutes)) ||
+    !(Number(v.sustainedMinutes) <= Number(v.aboveMaxCloseAndReevaluateMinutes)) ||
+    !(Number(v.aboveMaxCloseAndReevaluateMinutes) <= Number(v.actionRequiredMinutes))
   ) throw new Error("LPFORGE_OOR_LIFECYCLE_POLICY_INVALID");
   return {
     schemaVersion: 1,
@@ -243,6 +253,7 @@ export function parseOorLifecyclePolicy(raw: unknown): OorLifecyclePolicy {
     transientMinutes: Number(v.transientMinutes),
     sustainedMinutes: Number(v.sustainedMinutes),
     actionRequiredMinutes: Number(v.actionRequiredMinutes),
+    aboveMaxCloseAndReevaluateMinutes: Number(v.aboveMaxCloseAndReevaluateMinutes),
   };
 }
 export function loadOorLifecyclePolicy(path = "release-policy-templates/oor-lifecycle-policy.json") {
@@ -279,6 +290,7 @@ export function assessOorLifecycle(input:{policy:OorLifecyclePolicy;prior?:OorLi
   const minutes=continuous/60;
   if(minutes<policy.transientMinutes)return{state:"TRANSIENT_OOR",action:"HOLD",...common,reasonCodes:["POSITION_OOR_ENTERED","POSITION_OOR_TRANSIENT"]};
   if(minutes<policy.sustainedMinutes)return{state:"SUSTAINED_OOR",action:"FRESH_EVALUATION",...common,reasonCodes:["POSITION_OOR_SUSTAINED","POSITION_OOR_FRESH_EVALUATION_REQUIRED"]};
+  if(direction==='ABOVE_MAX'&&minutes>=policy.aboveMaxCloseAndReevaluateMinutes)return{state:"OOR_STALE_CAPITAL",action:"CLOSE_AND_REEVALUATE",...common,reasonCodes:["POSITION_OOR_STALE_CAPITAL","POSITION_CLOSE_AND_REEVALUATE_REQUIRED","POSITION_OOR_ABOVE_MAX_DIRECTIONAL_CAP",...(observation.inventoryClassification==='SAFE_OOR_SOL'?["POSITION_SAFE_OOR_SOL_IDLE_CAPITAL"]:observation.inventoryClassification==='OOR_TOKEN_EXPOSURE'?["POSITION_OOR_TOKEN_RISK"]:["POSITION_OOR_INVENTORY_REEVALUATION_REQUIRED"])]};
   if(minutes<policy.actionRequiredMinutes){
     if(observation.inventoryClassification==='OOR_TOKEN_EXPOSURE')return{state:"OOR_ACTION_REQUIRED",action:"CLOSE",...common,reasonCodes:["POSITION_OOR_ACTION_REQUIRED","POSITION_OOR_TOKEN_RISK"]};
     return{state:"OOR_ACTION_REQUIRED",action:"TEMPORARY_HOLD",...common,reasonCodes:["POSITION_OOR_ACTION_REQUIRED","POSITION_OOR_BOUNDED_HOLD"]};

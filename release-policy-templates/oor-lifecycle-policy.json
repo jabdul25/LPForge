@@ -3,5 +3,6 @@
   "policyVersion": "oor-lifecycle-v1",
   "transientMinutes": 10,
   "sustainedMinutes": 30,
+  "aboveMaxCloseAndReevaluateMinutes": 30,
   "actionRequiredMinutes": 60
 }
