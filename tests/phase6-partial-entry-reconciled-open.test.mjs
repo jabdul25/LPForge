@@ -29,3 +29,12 @@ test('autonomous plan mapping preserves the durable transaction-plan state', () 
   assert.match(store, /SUPERSEDED_BY_SUCCESSFUL_ENTRY/);
   assert.match(store, /supersedePartialEntryRecoveryIfSuccessfulOpen/);
 });
+
+test('P6 ticket position capacity is supplied by runtime policy rather than a hard-coded value', () => {
+  const worker = fs.readFileSync('packages/phase6-live-worker/src/index.ts', 'utf8');
+  const execution = fs.readFileSync('apps/execution/src/main.ts', 'utf8');
+  assert.match(worker, /executionMaxOpenPositions\(input\.config\)/);
+  assert.match(worker, /LPFORGE_P6_RUNTIME_POSITION_LIMIT_INVALID/);
+  assert.doesNotMatch(worker, /maxOpenPositions: 1/);
+  assert.match(execution, /maxOpenPositions: policy\.maxOpenPositions/);
+});

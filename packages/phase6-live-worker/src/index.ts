@@ -106,6 +106,8 @@ export interface LiveWorkerConfig {
   dataApiMaxRps?: number;
   httpTimeoutMs?: number;
   policyHash?: string;
+  /** Parsed from the sole runtime policy authority; never defaulted in code. */
+  maxOpenPositions?: number;
   /** Present only while the explicitly approved controlled canary is armed. */
   controlledCanary?: ControlledCanaryDeploymentPolicy;
 }
@@ -499,20 +501,26 @@ function ticket(
   capital: bigint,
   now: string,
   ttlMs: number,
+  maxOpenPositions: number,
   action: AutonomousPlanAction = "OPEN",
 ) {
+  if(!Number.isSafeInteger(maxOpenPositions)||maxOpenPositions<1)throw new Error("LPFORGE_P6_RUNTIME_POSITION_LIMIT_INVALID");
   return {
     ticketId: `${plan.planId}:${action.toLowerCase()}:${Date.parse(now)}`,
     poolAddress: plan.poolAddress,
     ownerAddress: plan.ownerAddress,
     action,
     maxLamports: capital,
-    maxOpenPositions: 1,
+    maxOpenPositions,
     issuedAt: now,
     expiresAt: new Date(Date.parse(now) + ttlMs).toISOString(),
     policyHash: "autonomous-plan-bound",
     autonomousScaling: false as const,
   };
+}
+function executionMaxOpenPositions(config:Pick<LiveWorkerConfig,"maxOpenPositions">):number{
+  if(!Number.isSafeInteger(config.maxOpenPositions)||config.maxOpenPositions===undefined||config.maxOpenPositions<1)throw new Error("LPFORGE_P6_RUNTIME_POSITION_LIMIT_INVALID");
+  return config.maxOpenPositions;
 }
 
 /**
@@ -792,7 +800,7 @@ async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:Auto
       const fee=estimateExecutionFee({signatureCount:step.requiredSignerAddresses.length,computeUnitLimit:simulation.recommendedComputeUnitLimit??0,computeUnitPriceMicroLamports:0n}),cost=assessExecutionCost(fee,input.fields.capital,{maxAbsoluteFeeLamports:input.config.maxFeeLamports,maxFeeFractionOfCapital:input.config.maxFeeFraction}),risk=await governFreshOpenRisk({store:input.store,plan:input.plan,config:input.config,connection:input.connection,simulation,costApproved:cost.approved,fields:input.fields});
       if(risk.decision!=='APPROVE'||!risk.permitId||!risk.expiresAt)throw new Error(`LPFORGE_P6_CHUNK_SIMULATE_RISK:${risk.reasonCodes.join(',')}`);
       await input.store.insertExecutionRiskPermit({permitId:`${risk.permitId}:${step.transactionId}`,planId:input.plan.planId,decision:risk.decision,issuedAt:risk.issuedAt,expiresAt:risk.expiresAt,reasonCodes:risk.reasonCodes,payload:{autonomous:true,transactionId:step.transactionId,chunked:true,feeLamports:fee.totalFeeLamports.toString()}});
-      const latest=await input.connection.getLatestBlockhash('confirmed');currentStep!.lastValidBlockHeight=BigInt(latest.lastValidBlockHeight);step.transaction.recentBlockhash=latest.blockhash;step.transaction.lastValidBlockHeight=latest.lastValidBlockHeight;step.transaction.feePayer=new PublicKey(input.plan.ownerAddress);const submittedAt=new Date().toISOString(),openTicket=ticket(input.plan as unknown as AutonomousPlan,input.fields.capital,submittedAt,input.config.riskPermitTtlMs),openAuthority={phase:'P6' as const,cluster:'mainnet-beta' as const,level:'MAINNET_CANARY_OPEN' as const,liveExecution:true,canaryOnly:true,issuedAt:submittedAt,expiresAt:openTicket.expiresAt,ticketId:openTicket.ticketId,reasonCodes:['P6_AUTONOMOUS_CHUNK_FINAL_REVALIDATION',step.kind]};
+      const latest=await input.connection.getLatestBlockhash('confirmed');currentStep!.lastValidBlockHeight=BigInt(latest.lastValidBlockHeight);step.transaction.recentBlockhash=latest.blockhash;step.transaction.lastValidBlockHeight=latest.lastValidBlockHeight;step.transaction.feePayer=new PublicKey(input.plan.ownerAddress);const submittedAt=new Date().toISOString(),openTicket=ticket(input.plan as unknown as AutonomousPlan,input.fields.capital,submittedAt,input.config.riskPermitTtlMs,executionMaxOpenPositions(input.config),"OPEN"),openAuthority={phase:'P6' as const,cluster:'mainnet-beta' as const,level:'MAINNET_CANARY_OPEN' as const,liveExecution:true,canaryOnly:true,issuedAt:submittedAt,expiresAt:openTicket.expiresAt,ticketId:openTicket.ticketId,reasonCodes:['P6_AUTONOMOUS_CHUNK_FINAL_REVALIDATION',step.kind]};
       await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SIGNING',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata});
       const economicChunk=step.kind==='METEORA_OPEN'||step.kind==='METEORA_OPEN_CHUNK';
       const [chunkNativeBefore,chunkWsolBefore]=economicChunk?await Promise.all([input.connection.getBalance(new PublicKey(input.plan.ownerAddress),'confirmed').then(value=>BigInt(value)),readWalletTokenBalance({connection:input.connection,ownerAddress:input.plan.ownerAddress,mint:WSOL_MINT})]):[0n,0n];
@@ -861,6 +869,8 @@ export async function executeAutonomousOpen(input: {
           fields.capital,
           swapSignedAt,
           input.config.riskPermitTtlMs,
+          executionMaxOpenPositions(input.config),
+          "OPEN",
         ),
         swapAuthority = {
           phase: "P6" as const,
@@ -1012,6 +1022,8 @@ export async function executeAutonomousOpen(input: {
         fields.capital,
         signedAt,
         input.config.riskPermitTtlMs,
+        executionMaxOpenPositions(input.config),
+        "OPEN",
       ),
       openAuthority = {
         phase: "P6" as const,
@@ -1656,6 +1668,7 @@ async function executeJupiterUnwindStep(input: {
       input.economicReferenceLamports,
       signedAt,
       input.config.riskPermitTtlMs,
+      executionMaxOpenPositions(input.config),
       input.action,
     ),
     closeAuthority = {
@@ -2597,6 +2610,7 @@ async function executeMeteoraMutation(input: {
         capital,
         signedAt,
         input.config.riskPermitTtlMs,
+        executionMaxOpenPositions(input.config),
         input.action,
       ),
       mutationAuthority = {

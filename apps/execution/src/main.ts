@@ -209,6 +209,7 @@ function workerConfig() {
     dataApiMaxRps: Number(process.env.LPFORGE_DATA_API_MAX_RPS ?? 25),
     httpTimeoutMs: Number(process.env.LPFORGE_HTTP_TIMEOUT_MS ?? 10_000),
     policyHash: createHash('sha256').update(readFileSync(resolveLiveExecutionPolicyPath(), 'utf8')).digest('hex'),
+    maxOpenPositions: policy.maxOpenPositions,
     ...(yes(process.env.LPFORGE_MAINNET_CANARY)&&!boundedUnattendedProduction()
       ? { controlledCanary: policy.controlledCanary }
       : {}),
