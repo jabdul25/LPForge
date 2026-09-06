@@ -21,10 +21,16 @@ case "$service" in
     target='.build/apps/production/src/main.js'
     ;;
   discovery)
+    # PM2 may retain environment values from a prior execution process.  The
+    # discovery collector is read-only and must never inherit a signing mode
+    # or signer material merely because it shares the PM2 daemon.
+    unset LIVE_SIGNING LPFORGE_LIVE_SIGNING PRIVATE_KEY SEED_PHRASE WALLET_SECRET WALLET_PRIVATE_KEY SIGNER_KEYPAIR
     export LPFORGE_RPC_ROLE=DISCOVERY
     target='.build/apps/discovery/src/main.js'
     ;;
   discovery-learning)
+    # Learning has the same observation-only contract as discovery.
+    unset LIVE_SIGNING LPFORGE_LIVE_SIGNING PRIVATE_KEY SEED_PHRASE WALLET_SECRET WALLET_PRIVATE_KEY SIGNER_KEYPAIR
     export LPFORGE_RPC_ROLE=DISCOVERY
     target='.build/apps/discovery-learning/src/main.js'
     ;;
