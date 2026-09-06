@@ -213,6 +213,7 @@ async function loadLiveOpenPlanCapacity(input: {
   store: Phase1Store;
   rpcUrl: string;
   ownerAddress?: string | undefined;
+  poolAddress?: string | undefined;
 }) {
   if (!input.ownerAddress)
     return {
@@ -232,9 +233,10 @@ async function loadLiveOpenPlanCapacity(input: {
       availableWalletLamports: 0n,
       reasonCodes: ["P7_PLAN_CAPITAL_POLICY_MISSING"],
     };
-  const [facts, priorRisk] = await Promise.all([
+  const [facts, priorRisk, ownedPositions] = await Promise.all([
     input.store.loadPhase7PortfolioFacts(input.ownerAddress),
     input.store.loadPhase7PortfolioRiskState(input.ownerAddress),
+    input.poolAddress ? input.store.loadOwnedPositions(input.ownerAddress) : Promise.resolve([]),
   ]);
   const priorObservedAt = priorRisk
     ? Date.parse(String(priorRisk.observed_at))
@@ -259,18 +261,18 @@ async function loadLiveOpenPlanCapacity(input: {
     reserveLamports: capital.reserveLamports,
     minInitialPositionLamports: capital.minInitialPositionLamports,
     maxPortfolioLamports: capital.maxPortfolioLamports,
-    // Discovery admission is an additional production constraint, not merely
-    // a screening hint.  A discovered candidate therefore uses the stricter
-    // of the global and discovery-admission position limits.
-    maxOpenPositions: Math.min(
-      deployment.maxOpenPositions,
-      deployment.productionAdmission?.enabled
-        ? deployment.productionAdmission.maxOpenPositions
-        : deployment.maxOpenPositions,
-    ),
+    // The parser rejects a divergent production-admission position limit.
+    // The top-level runtime-policy field is therefore the sole global
+    // concurrent-position authority at plan preparation.
+    maxOpenPositions: deployment.maxOpenPositions,
     openPositions: facts.openPositions,
     deployedLamports: facts.deployedLamports,
     pendingReservedLamports: facts.pendingReservedLamports,
+    livePositionExistsForPoolAndOwner: Boolean(input.poolAddress) && ownedPositions.some(
+      (position) =>
+        String(position.pool_address) === input.poolAddress &&
+        String(position.owner_address) === input.ownerAddress,
+    ),
   });
   return { ...capacity, walletLamports };
 }
@@ -1122,6 +1124,7 @@ async function liveOnce() {
       store,
       rpcUrl: cfg.solanaRpcHttpUrl,
       ownerAddress: process.env.LPFORGE_OPERATOR_OWNER_ADDRESS,
+      poolAddress: pool.address,
     });
     const walletCapital = lamportsToSol(openPlanCapacity.walletLamports);
     if (!(walletCapital > 0))

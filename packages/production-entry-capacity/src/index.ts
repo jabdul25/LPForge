@@ -7,6 +7,8 @@ export interface ProductionOpenPlanCapacityInput {
   openPositions: number;
   deployedLamports: bigint;
   pendingReservedLamports: bigint;
+  /** Derived from authoritative live rows for the candidate pool and owner. */
+  livePositionExistsForPoolAndOwner?: boolean;
 }
 
 export interface ProductionOpenPlanCapacity {
@@ -30,8 +32,19 @@ export function assessProductionOpenPlanCapacity(
       ? input.walletLamports - input.reserveLamports
       : 0n;
 
-  if (input.openPositions >= input.maxOpenPositions)
+  if (!Number.isSafeInteger(input.maxOpenPositions) || input.maxOpenPositions < 1)
+    reasons.push("P7_PLAN_POSITION_LIMIT_INVALID");
+  else if (input.openPositions >= input.maxOpenPositions)
     reasons.push("P7_PLAN_OPEN_POSITION_LIMIT");
+  if (input.livePositionExistsForPoolAndOwner)
+    reasons.push("P7_PLAN_LIVE_POSITION_ALREADY_EXISTS_FOR_POOL");
+  if (
+    input.minInitialPositionLamports <= 0n ||
+    input.maxPortfolioLamports <= 0n ||
+    input.reserveLamports < 0n ||
+    input.minInitialPositionLamports > input.maxPortfolioLamports
+  )
+    reasons.push("P7_PLAN_CAPITAL_POLICY_INVALID");
   if (availableWalletLamports < input.minInitialPositionLamports)
     reasons.push("P7_PLAN_WALLET_RESERVE_INSUFFICIENT");
   if (

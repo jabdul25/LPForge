@@ -97,7 +97,7 @@ function policyPoolForPlan(input:{plan:AutonomousPlan;policy:MainnetCanaryDeploy
  // discovery facts remain current hard disqualifiers at the signing boundary.
  if(!candidate||(!activeEconomicLease&&!selectionBoundWinner)||currentHardDiscoveryDisqualification(candidate)||!Number.isFinite(age)||age<0||age>admission.maxCandidateAgeMs){reasons.push('P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return undefined;}
  if(candidate.tokenYMint!==WSOL_MINT){reasons.push('P6_PRODUCTION_REQUIRES_WSOL_TOKEN_Y');return undefined;}
- return{address:candidate.poolAddress,maxCapitalLamports:admission.maxCapitalLamports,maxOpenPositions:admission.maxOpenPositions};
+ return{address:candidate.poolAddress,maxCapitalLamports:admission.maxCapitalLamports,maxOpenPositions:input.policy.maxOpenPositions};
 }
 function equals(value:unknown, expected:unknown){return String(value??'')===String(expected??'');}
 function validTimestamp(value:unknown){return Number.isFinite(Date.parse(String(value??'')));}
@@ -212,16 +212,21 @@ export function validateClaimedPlan(input: {
     reasons.push("P6_CLAIM_CAPITAL_REQUIRED");
   if (policyPool && amount > policyPool.maxCapitalLamports)
     reasons.push("P6_CLAIM_CAPITAL_EXCEEDS_POOL_POLICY");
-  const open = input.ownedPositions.filter(
-      (row) => String(row.lifecycle_state) === "OPEN",
+  // The global capacity and the per-(pool, owner) singleton are independent
+  // contracts. The latter mirrors the partial unique index as an early,
+  // clear, application-layer rejection rather than relying on an insert race.
+  const live = input.ownedPositions.filter((row) =>
+      ["OPEN", "CLOSING", "RECONCILIATION_REQUIRED", "ENTRY_FUNDED_NOT_OPEN"].includes(String(row.lifecycle_state)),
     ),
-    poolOpen = open.filter((row) => String(row.pool_address) === p.poolAddress);
-  if (
-    p.action === "OPEN" &&
-    (open.length >= input.policy.maxOpenPositions ||
-      poolOpen.length >= policyPool?.maxOpenPositions!)
-  )
+    samePoolOwnerLive = live.some(
+      (row) =>
+        String(row.pool_address) === p.poolAddress &&
+        String(row.owner_address) === p.ownerAddress,
+    );
+  if (p.action === "OPEN" && live.length >= input.policy.maxOpenPositions)
     reasons.push("P6_CLAIM_POSITION_LIMIT");
+  if (p.action === "OPEN" && samePoolOwnerLive)
+    reasons.push("P6_CLAIM_LIVE_POSITION_ALREADY_EXISTS_FOR_POOL");
   if(input.controlledCanary){
     const canary=input.policy.controlledCanary;
     if(!canary)reasons.push('P6_CONTROLLED_CANARY_POLICY_REQUIRED');
