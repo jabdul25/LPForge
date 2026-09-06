@@ -4923,7 +4923,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     // receipt-bound accounting boundary; it cannot build, sign, or submit a
     // transaction and is idempotent against the immutable raw cashflows.
     const pendingTerminalDispatch=closeSettlementDispatch(plan);
-    if(isAccountCloseOnlyPlan(plan)&&positionTruth.exists===false&&pendingTerminalDispatch.stage==='SOL_SETTLEMENT_CHAIN_RECONCILIATION_BLOCKED'&&connection&&recoveryPositionAddress){
+    if(isAccountCloseOnlyPlan(plan)&&positionTruth.exists===false&&(pendingTerminalDispatch.stage==='SOL_SETTLEMENT_CHAIN_RECONCILIATION_BLOCKED'||pendingTerminalDispatch.stage==='SOL_SETTLEMENT_BLOCKED')&&connection&&recoveryPositionAddress){
       const settlement=await finalizeClosedPositionSettlement({store:input.store,plan,positionAddress:recoveryPositionAddress,connection,config:{rpcUrl:input.rpcUrl??'',...(input.residualDustThresholdUsd===undefined?{}:{residualDustThresholdUsd:input.residualDustThresholdUsd}),...(input.meteoraDataApiUrl===undefined?{}:{meteoraDataApiUrl:input.meteoraDataApiUrl}),...(input.dataApiMaxRps===undefined?{}:{dataApiMaxRps:input.dataApiMaxRps}),...(input.httpTimeoutMs===undefined?{}:{httpTimeoutMs:input.httpTimeoutMs}),...(input.policyHash===undefined?{}:{policyHash:input.policyHash})}});
       if(settlement.ready){
         await input.store.completeAutonomousPlan({planId:plan.planId,state:'COMPLETED',at:input.now,payload:{action:'CLOSE',recovery:'ACCOUNT_CLOSE_ONLY_SETTLEMENT_RECONCILED'}});

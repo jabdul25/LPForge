@@ -195,5 +195,6 @@ test('account-close successor replays only terminal accounting after a restart, 
   const source = await import('node:fs/promises').then(fs => fs.readFile('packages/phase6-live-worker/src/index.ts', 'utf8'));
   assert.match(source,/ACCOUNT_CLOSE_ONLY_SETTLEMENT_RECONCILED/);
   assert.match(source,/SOL_SETTLEMENT_CHAIN_RECONCILIATION_BLOCKED/);
+  assert.match(source,/SOL_SETTLEMENT_BLOCKED/);
   assert.match(source,/finalizeClosedPositionSettlement/);
 });
