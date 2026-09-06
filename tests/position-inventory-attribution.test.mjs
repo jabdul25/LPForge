@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {readFile} from 'node:fs/promises';
-import {attributedPositionInventoryRaw,settlePositionInventoryLotBalance} from '../.build/packages/db/src/index.js';
+import {assessAggregateCloseClaimAttributionCorrection,attributedPositionInventoryRaw,settlePositionInventoryLotBalance} from '../.build/packages/db/src/index.js';
 
 const lot=(positionAddress,tokenMint,remainingRawAmount)=>({positionAddress,tokenMint,remainingRawAmount});
 
@@ -25,6 +25,12 @@ test('a partial settlement retains the attributable balance and an eventual full
   const settled=settlePositionInventoryLotBalance({remainingRawAmount:partial.remainingRawAmount,settledRawAmount:40n,eventType:'SETTLED'});
   assert.deepEqual(settled,{remainingRawAmount:0n,status:'SETTLED'});
   assert.throws(()=>settlePositionInventoryLotBalance({remainingRawAmount:40n,settledRawAmount:41n,eventType:'SETTLED'}),/LPFORGE_INVENTORY_SETTLEMENT_EXCEEDS_LOT/);
+});
+
+test('same-close terminal fee lot equal to the aggregate unwind is receipt-reconcilable without another swap',()=>{
+  const result=assessAggregateCloseClaimAttributionCorrection({closeRawAmount:31_373_299_315n,claimRawAmount:31_373_299_315n,closeStatus:'SETTLED',claimStatus:'OPEN'});
+  assert.deepEqual(result,{ok:true,correctedCloseRawAmount:0n});
+  assert.deepEqual(assessAggregateCloseClaimAttributionCorrection({closeRawAmount:31_373_299_314n,claimRawAmount:31_373_299_315n,closeStatus:'SETTLED',claimStatus:'OPEN'}),{ok:false,reasonCode:'LPFORGE_INVENTORY_ATTRIBUTION_CORRECTION_INVALID'});
 });
 
 test('inventory migration keeps a durable source lot and immutable event trail',async()=>{

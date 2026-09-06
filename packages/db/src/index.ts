@@ -766,6 +766,15 @@ export function settlePositionInventoryLotBalance(input:{remainingRawAmount:bigi
   const remainingRawAmount=input.remainingRawAmount-input.settledRawAmount;
   return{remainingRawAmount,status:remainingRawAmount===0n?input.eventType:"PARTIALLY_SETTLED"};
 }
+/**
+ * A legacy aggregate CLOSE_WITHDRAWAL lot can include a terminal FEE_CLAIM
+ * credited during the same close. Equality means that claim was the entire
+ * confirmed unwind input; it does not authorize another swap.
+ */
+export function assessAggregateCloseClaimAttributionCorrection(input:{closeRawAmount:bigint;claimRawAmount:bigint;closeStatus:PositionInventoryLotStatus;claimStatus:PositionInventoryLotStatus}):{ok:true;correctedCloseRawAmount:bigint}|{ok:false;reasonCode:string}{
+  if(input.claimRawAmount<=0n||input.closeRawAmount<input.claimRawAmount||input.closeStatus!=="SETTLED"||input.claimStatus!=="OPEN")return{ok:false,reasonCode:"LPFORGE_INVENTORY_ATTRIBUTION_CORRECTION_INVALID"};
+  return{ok:true,correctedCloseRawAmount:input.closeRawAmount-input.claimRawAmount};
+}
 export interface Phase1Store {
   health(): Promise<boolean>;
   close(): Promise<void>;
@@ -3863,9 +3872,9 @@ return 'APPLIED';
         const rows=await tx.query("SELECT lot_id,raw_amount,remaining_raw_amount,status,payload FROM execution.position_inventory_lots WHERE lot_id=ANY($1::text[]) FOR UPDATE",[[v.closeLotId,v.claimLotId]]);
         const close=rows.rows.find(row=>String(row.lot_id)===v.closeLotId),claim=rows.rows.find(row=>String(row.lot_id)===v.claimLotId);
         if(!close||!claim)throw new Error('LPFORGE_INVENTORY_ATTRIBUTION_LOT_MISSING');
-        const closeRaw=BigInt(String(close.raw_amount)),claimRaw=BigInt(String(claim.raw_amount));
-        if(claimRaw!==v.claimRawAmount||closeRaw<=claimRaw||String(close.status)!=='SETTLED'||String(claim.status)!=='OPEN')throw new Error('LPFORGE_INVENTORY_ATTRIBUTION_CORRECTION_INVALID');
-        const corrected=closeRaw-claimRaw;
+        const closeRaw=BigInt(String(close.raw_amount)),claimRaw=BigInt(String(claim.raw_amount)),correction=assessAggregateCloseClaimAttributionCorrection({closeRawAmount:closeRaw,claimRawAmount:claimRaw,closeStatus:String(close.status) as PositionInventoryLotStatus,claimStatus:String(claim.status) as PositionInventoryLotStatus});
+        if(claimRaw!==v.claimRawAmount||!correction.ok)throw new Error('LPFORGE_INVENTORY_ATTRIBUTION_CORRECTION_INVALID');
+        const corrected=correction.correctedCloseRawAmount;
         const closePayload={...(close.payload as Record<string,unknown>),attributionCorrection:{...v.payload,originalRawAmount:closeRaw.toString(),correctedRawAmount:corrected.toString(),overlapRawAmount:claimRaw.toString(),transactionSignature:v.transactionSignature}};
         await tx.query("UPDATE execution.position_inventory_lots SET raw_amount=$2,updated_at=$3,payload=$4::jsonb WHERE lot_id=$1",[v.closeLotId,corrected.toString(),v.observedAt,json(closePayload)]);
         await tx.query("UPDATE execution.position_inventory_lots SET remaining_raw_amount=0,status='SETTLED',updated_at=$2,payload=payload||jsonb_build_object('terminalSettlement',$3::jsonb) WHERE lot_id=$1",[v.claimLotId,v.observedAt,json({eventType:'SETTLED',transactionSignature:v.transactionSignature,disposition:'AGGREGATE_CLOSE_UNWIND_RECEIPT_ALLOCATION',...v.payload})]);
