@@ -1831,7 +1831,12 @@ export async function recoverPartialEntryFunding(input: {
     const plan = await input.store.loadAutonomousPlan(planId);
     const plannedChunks=plan?.action==='OPEN'?plan.steps.filter(step=>step.kind==='METEORA_OPEN'||step.kind==='METEORA_OPEN_CHUNK').map((step,index)=>({transactionId:step.transactionId,sequence:index+1,kind:step.kind})):[];
     const construction=plan?.action==='OPEN'&&plannedChunks.length>1?assessOpenChunkConstruction({planned:plannedChunks,dispositions:await input.store.loadOpenChunkDispositions(planId)}):undefined;
-    if (plan?.action === "OPEN" && plan.state === "RECONCILED" && construction?.fullyConstructed) {
+    // A single METEORA_OPEN has no child-disposition ledger. It is safe to
+    // retire recovery only when the plan is reconciled *and* exactly one
+    // currently OPEN/MATCHed owned position is durably bound to this entry
+    // plan, owner, and pool. A payload address alone is never sufficient.
+    const constructionComplete=construction?construction.fullyConstructed:plannedChunks.length===1;
+    if (plan?.action === "OPEN" && plan.state === "RECONCILED" && constructionComplete && plan.positionOpenReconciled) {
       await input.store.upsertPartialEntryRecovery({
         planId,
         poolAddress: String(row.pool_address),
@@ -1848,6 +1853,7 @@ export async function recoverPartialEntryFunding(input: {
           ...(row.wallet_truth ?? {}),
           reconciledPlanId: plan.planId,
           reconciledPositionAddress: plan.positionAddress ?? null,
+          positionIdentitySource: plan.positionIdentitySource ?? null,
           refreshedAt: new Date().toISOString(),
         },
         payload: { reasonCodes: ["P6_PARTIAL_OPEN_RECONCILED_AFTER_RECOVERY"] },
