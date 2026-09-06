@@ -223,7 +223,9 @@ export function validateClaimedPlan(input: {
         String(row.pool_address) === p.poolAddress &&
         String(row.owner_address) === p.ownerAddress,
     );
-  if (p.action === "OPEN" && live.length >= input.policy.maxOpenPositions)
+  if (p.action === "OPEN" && (!Number.isSafeInteger(input.policy.maxOpenPositions) || input.policy.maxOpenPositions < 1))
+    reasons.push("P6_CLAIM_POSITION_LIMIT_INVALID");
+  else if (p.action === "OPEN" && live.length >= input.policy.maxOpenPositions)
     reasons.push("P6_CLAIM_POSITION_LIMIT");
   if (p.action === "OPEN" && samePoolOwnerLive)
     reasons.push("P6_CLAIM_LIVE_POSITION_ALREADY_EXISTS_FOR_POOL");

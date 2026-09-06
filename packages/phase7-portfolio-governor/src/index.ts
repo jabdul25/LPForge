@@ -9,7 +9,7 @@ function limit(total:bigint,bps:number):bigint{return total*BigInt(bps)/10_000n;
 function drawdown(start:bigint,current:bigint):bigint{return start>current?start-current:0n;}
 export function governPhase7Portfolio(snapshot:Phase7PortfolioSnapshot,request:Phase7CapitalRequest,policy:Phase7PortfolioPolicy):Phase7PortfolioDecision{
   for(const b of [policy.maxDeployedBps,policy.maxPoolBps,policy.maxTokenBps,policy.maxDailyDrawdownBps,policy.maxRollingDrawdownBps])if(!validBps(b))throw new Error('LPFORGE_P7_PORTFOLIO_POLICY_BPS');
-  if(policy.maxOpenPositions<1||policy.maxSnapshotAgeMs<1||policy.permitTtlMs<1000||policy.permitTtlMs>300_000||policy.minReserveLamports<0n)throw new Error('LPFORGE_P7_PORTFOLIO_POLICY');
+  if(!Number.isSafeInteger(policy.maxOpenPositions)||policy.maxOpenPositions<1||policy.maxSnapshotAgeMs<1||policy.permitTtlMs<1000||policy.permitTtlMs>300_000||policy.minReserveLamports<0n)throw new Error('LPFORGE_P7_PORTFOLIO_POLICY');
   if(request.requestedLamports<=0n)throw new Error('LPFORGE_P7_PORTFOLIO_REQUEST');
   const reasons:string[]=[];const nowMs=Date.parse(request.now),obsMs=Date.parse(snapshot.observedAt);
   if(!Number.isFinite(nowMs)||!Number.isFinite(obsMs)||obsMs>nowMs)reasons.push('P7_PORTFOLIO_TIME_INVALID');

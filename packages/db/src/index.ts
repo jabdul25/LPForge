@@ -504,7 +504,7 @@ export interface WalletPositionDiscovery {
   lastReconciledAt: string;
   payload: Record<string, unknown>;
 }
-export interface ExecutionCapitalReservationRequest {planId:string;ownerAddress:string;poolAddress:string;capitalLamports:bigint;walletLamports:bigint;reserveLamports:bigint;maxPortfolioLamports:bigint;maxPoolLamports:bigint;maxTokenLamports:bigint;maxInitialPositionLamports:bigint;now:string;}
+export interface ExecutionCapitalReservationRequest {planId:string;ownerAddress:string;poolAddress:string;capitalLamports:bigint;walletLamports:bigint;reserveLamports:bigint;maxPortfolioLamports:bigint;maxPoolLamports:bigint;maxTokenLamports:bigint;minInitialPositionLamports:bigint;maxInitialPositionLamports:bigint;now:string;}
 export interface ExecutionCapitalReservationDiagnostics {walletBalanceLamports:bigint;walletReserveLamports:bigint;pendingCashReservationLamports:bigint;walletDeployableLamports:bigint;deployedPortfolioLamports:bigint;reservedPortfolioLamports:bigint;requestedLamports:bigint;projectedPortfolioLamports:bigint;poolCurrentLamports:bigint;poolReservedLamports:bigint;poolProjectedLamports:bigint;poolLimitLamports:bigint;tokenCurrentLamports:bigint;tokenReservedLamports:bigint;tokenProjectedLamports:bigint;tokenLimitLamports:bigint;}
 export interface ExecutionCapitalReservationResult {approved:boolean;reasonCodes:string[];tokenMint?:string;deployedLamports:bigint;reservedLamports:bigint;availableLamports:bigint;diagnostics?:ExecutionCapitalReservationDiagnostics;}
 export function assessExecutionCapitalReservation(input:{request:ExecutionCapitalReservationRequest;tokenMint?:string;deployedLamports:bigint;reservedLamports:bigint;poolDeployedLamports:bigint;poolReservedLamports:bigint;tokenDeployedLamports:bigint;tokenReservedLamports:bigint;}):{approved:boolean;reasonCodes:string[];diagnostics:ExecutionCapitalReservationDiagnostics}{
@@ -516,6 +516,8 @@ export function assessExecutionCapitalReservation(input:{request:ExecutionCapita
   const diagnostics:ExecutionCapitalReservationDiagnostics={walletBalanceLamports:v.walletLamports,walletReserveLamports:v.reserveLamports,pendingCashReservationLamports:input.reservedLamports,walletDeployableLamports:walletDeployable,deployedPortfolioLamports:input.deployedLamports,reservedPortfolioLamports:input.reservedLamports,requestedLamports:v.capitalLamports,projectedPortfolioLamports:projectedPortfolio,poolCurrentLamports:input.poolDeployedLamports,poolReservedLamports:input.poolReservedLamports,poolProjectedLamports:poolProjected,poolLimitLamports:v.maxPoolLamports,tokenCurrentLamports:input.tokenDeployedLamports,tokenReservedLamports:input.tokenReservedLamports,tokenProjectedLamports:tokenProjected,tokenLimitLamports:v.maxTokenLamports};
   const reasons:string[]=[];
   if(!input.tokenMint)reasons.push('P6_CAPITAL_POOL_TOKEN_MISSING');
+  if(v.minInitialPositionLamports<=0n||v.maxInitialPositionLamports<=0n||v.minInitialPositionLamports>v.maxInitialPositionLamports)reasons.push('P6_CAPITAL_INITIAL_POSITION_POLICY_INVALID');
+  if(v.capitalLamports<=0n||v.capitalLamports<v.minInitialPositionLamports)reasons.push('P6_CAPITAL_MIN_INITIAL_POSITION');
   if(v.capitalLamports>v.maxInitialPositionLamports)reasons.push('P6_CAPITAL_MAX_INITIAL_POSITION');
   if(v.capitalLamports>walletDeployable)reasons.push('P6_CAPITAL_WALLET_OR_PORTFOLIO_LIMIT','P6_CAPITAL_WALLET_RESERVE_LIMIT');
   if(projectedPortfolio>v.maxPortfolioLamports)reasons.push('P6_CAPITAL_PORTFOLIO_LIMIT');
