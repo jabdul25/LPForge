@@ -234,7 +234,7 @@ test('an admitted raw-replay tracker is collected and recorded before ordinary f
   reconcileRawReplayTracking:async()=>({capacity:1,trackedPoolAddresses:['REPLAY'],waitingPoolAddresses:['WAIT']}),
   reconcileLiveEvidenceAdmission:async()=>({}),reconcileEvidenceContinuityTracking:async()=>({capacity:0,trackedPoolAddresses:[],expiredPoolAddresses:[],evictedPoolAddresses:[]}),
   listDiscoveryCandidates:async()=>[
-   {poolAddress:'REPLAY',state:'QUALIFIED',tier:'A',priorityScore:1,lastSeenAt:at,payload:{}},
+   {poolAddress:'REPLAY',state:'ACTIVE_CANDIDATE',tier:'A',priorityScore:1,lastSeenAt:at,payload:{}},
    {poolAddress:'ORDINARY',state:'ACTIVE_CANDIDATE',tier:'A',priorityScore:1,lastSeenAt:at,payload:{}},
   ],
   recordRawReplayCollectionOutcome:async x=>tracked.push(x),
