@@ -190,3 +190,10 @@ test('terminal successor accounting deduplicates only exact repeated receipt cas
     canonicalize=canonicalizeTerminalSettlementCashflows([duplicate,{...duplicate}, {flowType:'FEE_CLAIM',lamports:1033408n,tokenMint:'So11111111111111111111111111111111111111112',payload:{signature:'claim'}},{flowType:'FEE_CLAIM',lamports:1033408n,tokenMint:'So11111111111111111111111111111111111111112',payload:{signature:'claim'}},{flowType:'FEE_CLAIM',lamports:5n,payload:{signature:'other-claim'}}]);
   assert.equal(canonicalize.length,3);
 });
+
+test('account-close successor replays only terminal accounting after a restart, never another mutation', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile('packages/phase6-live-worker/src/index.ts', 'utf8'));
+  assert.match(source,/ACCOUNT_CLOSE_ONLY_SETTLEMENT_RECONCILED/);
+  assert.match(source,/SOL_SETTLEMENT_CHAIN_RECONCILIATION_BLOCKED/);
+  assert.match(source,/finalizeClosedPositionSettlement/);
+});

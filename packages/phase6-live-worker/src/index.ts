@@ -4918,6 +4918,19 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:claimRecovery.reasonCodes});
       continue;
     }
+    // A process may restart after the final account-close receipt but before
+    // its chain-cashflow reconciliation is persisted. Re-run only that
+    // receipt-bound accounting boundary; it cannot build, sign, or submit a
+    // transaction and is idempotent against the immutable raw cashflows.
+    const pendingTerminalDispatch=closeSettlementDispatch(plan);
+    if(isAccountCloseOnlyPlan(plan)&&positionTruth.exists===false&&pendingTerminalDispatch.stage==='SOL_SETTLEMENT_CHAIN_RECONCILIATION_BLOCKED'&&connection&&recoveryPositionAddress){
+      const settlement=await finalizeClosedPositionSettlement({store:input.store,plan,positionAddress:recoveryPositionAddress,connection,config:{rpcUrl:input.rpcUrl??'',...(input.residualDustThresholdUsd===undefined?{}:{residualDustThresholdUsd:input.residualDustThresholdUsd}),...(input.meteoraDataApiUrl===undefined?{}:{meteoraDataApiUrl:input.meteoraDataApiUrl}),...(input.dataApiMaxRps===undefined?{}:{dataApiMaxRps:input.dataApiMaxRps}),...(input.httpTimeoutMs===undefined?{}:{httpTimeoutMs:input.httpTimeoutMs}),...(input.policyHash===undefined?{}:{policyHash:input.policyHash})}});
+      if(settlement.ready){
+        await input.store.completeAutonomousPlan({planId:plan.planId,state:'COMPLETED',at:input.now,payload:{action:'CLOSE',recovery:'ACCOUNT_CLOSE_ONLY_SETTLEMENT_RECONCILED'}});
+        results.push({planId:plan.planId,action:'MARK_RECONCILED',reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_SETTLEMENT_RECONCILED']});
+      }else results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:settlement.reasonCodes});
+      continue;
+    }
     // A receipt-bound OPEN_RESIDUAL unwind may itself succeed while the
     // previously expired account-close transaction identity remains unusable.
     // Once the exact unwind receipt and all lot consumption are durable, hand
