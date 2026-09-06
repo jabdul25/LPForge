@@ -13,7 +13,7 @@ import { derivePhase3EvidenceWidthRequirement } from '../../../packages/rangefor
 function json(v:unknown){return JSON.stringify(v,(_,x)=>typeof x==='bigint'?x.toString():x,2)}
 function env(name:string,fallback?:string):string{const v=process.env[name]??fallback;if(!v)throw new Error(`LPFORGE_DISCOVERY_ENV_REQUIRED:${name}`);return v}
 async function loadPolicy():Promise<DiscoveryPolicy>{
-  const path=process.env.LPFORGE_DISCOVERY_POLICY_PATH??'policies/pool-discovery-policy.json';
+  const path=process.env.LPFORGE_DISCOVERY_POLICY_PATH??'release-policy-templates/pool-discovery-policy.json';
   const raw=JSON.parse(readFileSync(path,'utf8')) as Record<string,unknown>;
   if(process.env.LPFORGE_POOL_SOURCE_MODE) raw.sourceMode=process.env.LPFORGE_POOL_SOURCE_MODE;
   if(process.env.LPFORGE_MANUAL_POOLS) raw.manualPools=process.env.LPFORGE_MANUAL_POOLS.split(',').map(x=>x.trim()).filter(Boolean);

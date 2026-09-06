@@ -22,7 +22,7 @@ git diff --cached --quiet -- . \
   ':(exclude)SOURCE_REVISION.txt' \
   ':(exclude)SHA256SUMS.txt' || { echo 'release requires committed staged source changes' >&2; exit 1; }
 sha="$(git rev-parse HEAD)"
-policy='policies/live-execution-policy.json'
+policy='release-policy-templates/live-execution-policy.json'
 test -f "$policy" || { echo "missing policy: $policy" >&2; exit 1; }
 pnpm test:ci
 stage="$(mktemp -d)"

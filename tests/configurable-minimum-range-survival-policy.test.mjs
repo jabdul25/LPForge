@@ -10,7 +10,7 @@ const regime={transitionRisk:0};
 const universe=(minWidthBins,maxWidthBins=100,horizonMinutes=60)=>generateRangeUniverse({activeBinId:100,binStep:80,horizonMinutes,context,structure,regime,minWidthBins,maxWidthBins,enforceRequiredWidth:true});
 
 test('the live policy owns the production floor and rejects an invalid floor',()=>{
-  const policy=JSON.parse(readFileSync('policies/live-execution-policy.json','utf8'));
+  const policy=JSON.parse(readFileSync('release-policy-templates/live-execution-policy.json','utf8'));
   assert.equal(parseDeploymentPolicy(policy).range.minimumIncludedBins,35);
   assert.throws(()=>parseDeploymentPolicy({...policy,range:{minimumIncludedBins:101}}),/RANGE_MINIMUM_EXCEEDS_MAXIMUM/);
   assert.throws(()=>parseDeploymentPolicy({...policy,range:{minimumIncludedBins:0}}),/RANGE_MINIMUM_INCLUDED_BINS/);

@@ -8,7 +8,7 @@ test('enforced releases use only the stable LPForge runtime root', () => {
   const env = {
     LPFORGE_HOME: '/srv/lpforge',
     LPFORGE_RUNTIME_CONFIG_ENFORCED: 'true',
-    LPFORGE_EXECUTION_POLICY_PATH: '/release/policies/override.json',
+    LPFORGE_EXECUTION_POLICY_PATH: '/release/release-policy-templates/override.json',
   };
   assert.deepEqual(config.resolveRuntimeConfigPaths(env), {
     home: '/srv/lpforge',
@@ -22,11 +22,11 @@ test('enforced releases use only the stable LPForge runtime root', () => {
 
 test('production rejects relative and release-local policy paths rather than falling back', () => {
   const base={LPFORGE_HOME:'/root/systems/LPForge',LPFORGE_RUNTIME_CONFIG_ENFORCED:'true'};
-  for(const value of ['policies/live-execution-policy.json','./policies/live-execution-policy.json','../policies/live-execution-policy.json','/root/systems/LPForge/releases/abc/policies/live-execution-policy.json']){
+  for(const value of ['release-policy-templates/live-execution-policy.json','./release-policy-templates/live-execution-policy.json','../release-policy-templates/live-execution-policy.json','/root/systems/LPForge/releases/abc/release-policy-templates/live-execution-policy.json']){
     assert.throws(()=>config.resolveLiveExecutionPolicyPath({...base,LPFORGE_EXECUTION_POLICY_PATH:value}),/RUNTIME_POLICY_PATH_INVALID/,value);
   }
   assert.equal(config.resolveLiveExecutionPolicyPath(base),'/root/systems/LPForge/policy/live-execution-policy.json');
-  assert.equal(config.RELEASE_POLICY_TEMPLATE_PATH,'policies/live-execution-policy.json');
+  assert.equal(config.RELEASE_POLICY_TEMPLATE_PATH,'release-policy-templates/live-execution-policy.json');
 });
 
 test('development callers retain explicit policy fixtures without weakening production enforcement', () => {

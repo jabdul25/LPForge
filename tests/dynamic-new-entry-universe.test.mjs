@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import {getProductionNewEntryEligiblePools,productionManagementPoolAddresses} from '../.build/packages/phase7-production-service/src/index.js';
 
-const policyPath=new URL('../policies/live-execution-policy.json',import.meta.url).pathname;
+const policyPath=new URL('../release-policy-templates/live-execution-policy.json',import.meta.url).pathname;
 const staticPool='EsR3gRxMtqt3bBhDDsuY3SFyYNYvYzszzG9KVYpcQfs7';
 const dynamicPool='DYNAMIC_NON_POLICY_POOL';
 const env={LPFORGE_DISCOVERY_OPERATOR_ENABLED:'true',LPFORGE_EXECUTION_POLICY_PATH:policyPath,LPFORGE_PRODUCTION_OPERATOR_MAX_POOLS:'10'};

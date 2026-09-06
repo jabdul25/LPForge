@@ -5,7 +5,7 @@ to an immutable release directory.
 
 - Non-secret runtime settings: `/root/systems/LPForge/.env`
 - Protected execution settings: `/root/systems/LPForge/.env.execution`
-- Tracked release policy template: `policies/live-execution-policy.json`
+- Tracked release policy template: `release-policy-templates/live-execution-policy.json`
 - Sole canonical trading/execution runtime policy: `/root/systems/LPForge/policy/live-execution-policy.json`
 - Immutable release artifacts: `/root/systems/LPForge/releases/<sha>/`
 

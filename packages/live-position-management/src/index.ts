@@ -217,7 +217,7 @@ export function parseLivePositionManagementPolicy(
   };
 }
 export function loadLivePositionManagementPolicy(
-  path = "policies/live-position-management-policy.json",
+  path = "release-policy-templates/live-position-management-policy.json",
 ) {
   return parseLivePositionManagementPolicy(
     JSON.parse(readFileSync(path, "utf8")),
@@ -245,7 +245,7 @@ export function parseOorLifecyclePolicy(raw: unknown): OorLifecyclePolicy {
     actionRequiredMinutes: Number(v.actionRequiredMinutes),
   };
 }
-export function loadOorLifecyclePolicy(path = "policies/oor-lifecycle-policy.json") {
+export function loadOorLifecyclePolicy(path = "release-policy-templates/oor-lifecycle-policy.json") {
   return parseOorLifecyclePolicy(JSON.parse(readFileSync(path, "utf8")));
 }
 const validTime=(value:string|undefined)=>value!==undefined&&Number.isFinite(Date.parse(value));

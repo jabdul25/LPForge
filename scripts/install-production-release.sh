@@ -23,7 +23,7 @@ ln -s "$lpforge_home/node_modules" "$stage/node_modules"
 # never used as a runtime fallback and ordinary service restarts never invoke
 # this installer.  Validate the release-bound template before atomically
 # replacing the single central runtime authority.
-template_policy="$stage/policies/live-execution-policy.json"
+template_policy="$stage/release-policy-templates/live-execution-policy.json"
 runtime_policy="$lpforge_home/policy/live-execution-policy.json"
 [[ -f "$template_policy" ]] || { echo 'LPFORGE_RUNTIME_POLICY_TEMPLATE_MISSING' >&2; exit 1; }
 expected_policy_hash="$(node -e "const m=require(process.argv[1]);const h=m.runtimeExpectedPolicyHash??m.policyHash;if(!/^[0-9a-f]{64}$/i.test(String(h??'')))process.exit(2);process.stdout.write(h)" "$stage/RELEASE_MANIFEST.json")"

@@ -87,7 +87,7 @@ if [[ "${LPFORGE_RUNTIME_CONFIG_ENFORCED:-false}" == "true" ]]; then
   [[ "$config_root" != */releases/* ]] || fail "runtime policy root must not be release-local"
   [[ -z "${LPFORGE_EXECUTION_POLICY_PATH:-}" || "${LPFORGE_EXECUTION_POLICY_PATH}" == "$policy" ]] || fail "runtime policy path invalid"
 else
-  policy="${LPFORGE_EXECUTION_POLICY_PATH:-policies/live-execution-policy.json}"
+  policy="${LPFORGE_EXECUTION_POLICY_PATH:-release-policy-templates/live-execution-policy.json}"
 fi
 [[ -f "$policy" ]] || fail "canonical execution policy missing"
 actual_policy=$(sha256sum "$policy" | awk '{print $1}')

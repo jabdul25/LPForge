@@ -103,7 +103,7 @@ lpforge/
     observability/
   research/
   migrations/
-  policies/
+  release-policy-templates/
   docs/
   tests/
 ```

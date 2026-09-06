@@ -26,14 +26,14 @@ LPForge is default-deny. A valid live entry requires all applicable controls to 
 
 `WATCH` telemetry is not hidden. A genuine `CRITICAL`, stale evidence, release mismatch, reconciliation failure, unknown economic submission, or conflicting position blocks new risk. Entry authority is distinct from protective authority: a previously opened owned position remains eligible for monitoring, reconciliation, and protective closure even when new entry is blocked.
 
-The checked-in policy files are under [`policies/`](policies/). Their JSON contracts are runtime inputs; do not edit them casually on a live host.
+The checked-in policy files are release templates under [`release-policy-templates/`](release-policy-templates/). Production uses the separately mounted central policy directory; do not edit either casually on a live host.
 
 ## Repository layout
 
 ```text
 apps/        Service entry points: production, execution, discovery, learning
 packages/    Domain, economics, execution, reconciliation, and P7 modules
-policies/    Versioned runtime policy contracts
+release-policy-templates/    Versioned release policy templates
 packages/db/migrations/
               PostgreSQL migrations, currently through M0060
 scripts/     Build, PM2, release-identity, and boundary verification scripts

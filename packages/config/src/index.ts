@@ -33,7 +33,7 @@ export interface Phase1Config {
  */
 export const DEFAULT_LPFORGE_HOME = '/root/systems/LPForge';
 /** Versioned input to CI and release construction; never a live authority. */
-export const RELEASE_POLICY_TEMPLATE_PATH = 'policies/live-execution-policy.json';
+export const RELEASE_POLICY_TEMPLATE_PATH = 'release-policy-templates/live-execution-policy.json';
 export interface RuntimeConfigPaths {
   home: string;
   envFile: string;

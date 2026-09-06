@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import {ACTIVE_EVIDENCE_LEASE_TIMEOUT_MS,isPhase3ReadyConsumptionPending,isLiveEvidenceLeaseActive,liveEvidenceLeaseReleaseReason,dynamicLiveEvidenceAdmissionCapacity,selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
 import {isPhase3ReadyProductionEvaluationCandidate,getProductionNewEntryEligiblePools} from '../.build/packages/phase7-production-service/src/index.js';
-const policy=new URL('../policies/live-execution-policy.json',import.meta.url).pathname;
+const policy=new URL('../release-policy-templates/live-execution-policy.json',import.meta.url).pathname;
 const at='2026-08-22T10:00:00.000Z';
 const payload=(readyAt='2026-08-22T09:59:00.000Z')=>({liveEvidencePhase3ConsumptionState:'PENDING',liveEvidencePhase3ReadyAt:readyAt,liveEvidenceLeaseStartedAt:'2026-08-22T09:30:00.000Z',liveEvidenceLeaseExpiresAt:'2026-08-22T10:15:00.000Z'});
 test('Phase-3 readiness preserves a bounded ACTIVE lease until terminal economics',()=>{

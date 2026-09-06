@@ -24,7 +24,7 @@ function checksum(root){
   writeFileSync(path.join(root,'SHA256SUMS.txt'),`${lines.join('\n')}\n`);
 }
 function manifestFor(root,overrides={}){
-  const policyHash=hash(readFileSync(path.join(root,'policies/live-execution-policy.json')));
+  const policyHash=hash(readFileSync(path.join(root,'release-policy-templates/live-execution-policy.json')));
   const lockfileHash=hash(readFileSync(path.join(root,'pnpm-lock.yaml')));
   const migrationHead='M0001_bootstrap.sql';
   const runtimePnpmVersion=execFileSync('pnpm',['--version'],{cwd:root,encoding:'utf8'}).trim();
@@ -36,7 +36,7 @@ function createFixture(t){
   write(root,'scripts/verify-release-integrity.sh',readFileSync(path.resolve('scripts/verify-release-integrity.sh')));
   write(root,'scripts/verify-runtime-release-identity.mjs',readFileSync(path.resolve('scripts/verify-runtime-release-identity.mjs')));
   write(root,'.build/runtime.js','immutable compiled output\n');
-  write(root,'policies/live-execution-policy.json','{"policy":"canonical"}\n');
+  write(root,'release-policy-templates/live-execution-policy.json','{"policy":"canonical"}\n');
   write(root,'pnpm-lock.yaml','lockfileVersion: 9.0\n');
   write(root,'packages/db/migrations/M0001_bootstrap.sql','select 1;\n');
   write(root,'SOURCE_REVISION.txt',`source_git_commit=${sourceCommit}\n`);
@@ -60,7 +60,7 @@ test('IDENTITY-006 false LPFORGE_BUILD_ID is rejected',t=>fails(run(createFixtur
 test('IDENTITY-007 changed lockfile fails explicit lockfile verification',t=>{const root=createFixture(t);write(root,'pnpm-lock.yaml','lockfileVersion: 9.1\n');resealChecksums(root);fails(run(root));});
 test('IDENTITY-008 manifest lockfile hash mutation fails',t=>{const root=createFixture(t),manifest=JSON.parse(readFileSync(path.join(root,'RELEASE_MANIFEST.json'),'utf8'));manifest.lockfileHash='f'.repeat(64);write(root,'RELEASE_MANIFEST.json',`${JSON.stringify(manifest)}\n`);resealChecksums(root);fails(run(root));});
 test('IDENTITY-009 Node version mismatch fails',t=>{const root=createFixture(t),manifest=JSON.parse(readFileSync(path.join(root,'RELEASE_MANIFEST.json'),'utf8'));manifest.nodeVersion='v0.0.0';write(root,'RELEASE_MANIFEST.json',`${JSON.stringify(manifest)}\n`);resealChecksums(root);fails(run(root));});
-test('IDENTITY-010 policy mutation fails canonical policy verification',t=>{const root=createFixture(t);write(root,'policies/live-execution-policy.json','{"policy":"tampered"}\n');resealChecksums(root);fails(run(root));});
+test('IDENTITY-010 policy mutation fails canonical policy verification',t=>{const root=createFixture(t);write(root,'release-policy-templates/live-execution-policy.json','{"policy":"tampered"}\n');resealChecksums(root);fails(run(root));});
 test('IDENTITY-011 / 012 migration head and count mismatch fail',t=>{const root=createFixture(t);write(root,'packages/db/migrations/M0002_next.sql','select 2;\n');resealChecksums(root);fails(run(root));});
 test('IDENTITY-013 checksum member omission fails closed',t=>{const root=createFixture(t),lines=readFileSync(path.join(root,'SHA256SUMS.txt'),'utf8').trim().split('\n');write(root,'SHA256SUMS.txt',`${lines.filter(line=>!line.endsWith(' ./.build/runtime.js')).join('\n')}\n`);fails(run(root));});
 test('IDENTITY-014 corrupted checksum fails closed',t=>{const root=createFixture(t);const lines=readFileSync(path.join(root,'SHA256SUMS.txt'),'utf8').split('\n');lines[0]=`f${lines[0].slice(1)}`;write(root,'SHA256SUMS.txt',lines.join('\n'));fails(run(root));});

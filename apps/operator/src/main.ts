@@ -467,15 +467,15 @@ async function observeAndPlanOwnedPositions(input: {
   if(!deployment.feeClaim)throw new Error('LPFORGE_FEE_CLAIM_POLICY_MISSING');
   const policy = {...loadLivePositionManagementPolicy(
       process.env.LPFORGE_LIVE_MANAGEMENT_POLICY_PATH ??
-        "policies/live-position-management-policy.json",
+        "release-policy-templates/live-position-management-policy.json",
     ),minimumClaimValueUsd:deployment.feeClaim.minimumClaimValueUsd},
     oorPolicy = loadOorLifecyclePolicy(
       process.env.LPFORGE_OOR_LIFECYCLE_POLICY_PATH ??
-        "policies/oor-lifecycle-policy.json",
+        "release-policy-templates/oor-lifecycle-policy.json",
     ),
     exitPolicy = loadLiveExitGovernorPolicy(
       process.env.LPFORGE_LIVE_EXIT_POLICY_PATH ??
-        "policies/live-exit-governor-policy.json",
+        "release-policy-templates/live-exit-governor-policy.json",
     ),
     positions = await input.store.loadOwnedPositions(input.ownerAddress);
   let planned = 0,
@@ -1128,7 +1128,7 @@ async function liveOnce() {
       throw new Error("LPFORGE_OPERATOR_WALLET_BALANCE_UNAVAILABLE");
     const entryPolicy = loadAutonomousEntryPolicy(
       process.env.LPFORGE_AUTONOMOUS_ENTRY_POLICY_PATH ??
-        "policies/autonomous-entry-policy.json",
+        "release-policy-templates/autonomous-entry-policy.json",
     );
     const productionCapital = loadProductionCapitalEnvelope(pool.address);
     const swapQuoteProvider =
