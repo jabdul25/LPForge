@@ -50,7 +50,7 @@ import {
   fixturePool,
   fixtureSwaps,
 } from "../../../packages/test-fixtures/src/index.js";
-import { CONTROLLED_CANARY_LIQUIDITY_CAPITAL_LAMPORTS, loadDeploymentPolicyFile } from "../../../packages/deployment-policy/src/index.js";
+import { loadDeploymentPolicyFile } from "../../../packages/deployment-policy/src/index.js";
 import { assessProductionOpenPlanCapacity } from "../../../packages/production-entry-capacity/src/index.js";
 import { assessPostEntryAuthority } from "../../../packages/phase7-post-entry-authority/src/index.js";
 import { refreshCanonicalHistoricalBackfill, refreshCurrentPhase3Evidence } from "../../../packages/active-candidate-evidence/src/index.js";
@@ -280,10 +280,10 @@ async function persistTransactionPlan(
 ) {
   const deployment=loadDeploymentPolicyFile(resolveLiveExecutionPolicyPath());
   const boundedUnattended=process.env.LPFORGE_BOUNDED_UNATTENDED_PRODUCTION==='true';
-  // The controlled-canary probe remains read-only; its plan-only marker still
-  // enforces the exact capital and no-replacement envelope before signing.
+  // The controlled-canary probe remains read-only; its policy-derived
+  // capital and no-replacement envelope are bound before signing.
   if(!boundedUnattended&&(process.env.LPFORGE_MAINNET_CANARY==='true'||process.env.LPFORGE_CONTROLLED_CANARY_PLAN==='true')&&deployment.controlledCanary){
-    if(plan.intent.action==='OPEN'&&plan.intent.capitalLamports!==CONTROLLED_CANARY_LIQUIDITY_CAPITAL_LAMPORTS)
+    if(plan.intent.action==='OPEN'&&plan.intent.capitalLamports!==deployment.controlledCanary.exactLiquidityCapitalLamports)
       throw new Error('LPFORGE_P6_CONTROLLED_CANARY_EXACT_CAPITAL_REQUIRED');
     if(['ADD','RESHAPE','REBALANCE'].includes(plan.intent.action))
       throw new Error('LPFORGE_P6_CONTROLLED_CANARY_REPLACEMENT_OPEN_BLOCKED');
@@ -310,7 +310,7 @@ async function persistTransactionPlan(
     thesisId:plan.intent.thesisId,
     intentId:plan.intent.intentId,
     capitalLamports:plan.intent.capitalLamports?.toString()??'',
-    maxConcurrentPositions:1,
+    maxConcurrentPositions:deployment.controlledCanary!.maxConcurrentPositions,
   }:undefined;
   // `candidateId` is intentionally persisted as JSON null for a protective
   // lifecycle plan that has no entry candidate.  Bind the exact persisted

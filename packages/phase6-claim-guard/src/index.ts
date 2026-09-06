@@ -115,11 +115,11 @@ function validateCanaryHardRevocation(input:{current:Phase7ExecutionControl|unde
  if((control.revokedApprovalIds??[]).includes(input.approvalId))reasons.push('P6_CANARY_APPROVAL_REVOKED');
  return reasons.sort();
 }
-function validateBoundCanaryAuthorization(input:{plan:AutonomousPlan;provenance:Record<string,unknown>;bound:Phase7ExecutionControl|undefined;current:Phase7ExecutionControl|undefined;now:string}):string[]{
+function validateBoundCanaryAuthorization(input:{plan:AutonomousPlan;provenance:Record<string,unknown>;bound:Phase7ExecutionControl|undefined;current:Phase7ExecutionControl|undefined;now:string;maxConcurrentPositions:number}):string[]{
  const authorization=record(input.provenance.controlledCanaryAuthorization),intent=record(input.plan.planPayload.intent),binding=record(input.provenance.phase7Control),reasons:string[]=[];
  const approvalId=String(authorization.approvalId??''),issuedAt=String(authorization.issuedAt??''),expiresAt=String(authorization.expiresAt??''),boundDecisionId=String(authorization.boundControlDecisionId??'');
  if(authorization.schemaVersion!==1||authorization.action!=='PROMOTE_PRODUCTION'||!approvalId||!String(authorization.operatorId??'')||!validTimestamp(issuedAt)||!validTimestamp(expiresAt)||Date.parse(expiresAt)<=Date.parse(issuedAt))reasons.push('P6_CANARY_AUTHORIZATION_INVALID');
- if(!equals(authorization.planId,input.plan.planId)||!equals(authorization.wallet,input.plan.ownerAddress)||!equals(authorization.pool,input.plan.poolAddress)||!equals(authorization.thesisId,input.plan.thesisId)||!equals(authorization.intentId,input.plan.intentId)||!equals(authorization.candidateId,intent.candidateId)||!equals(authorization.capitalLamports,intent.capitalLamports)||authorization.maxConcurrentPositions!==1)reasons.push('P6_CANARY_AUTHORIZATION_SCOPE_MISMATCH');
+ if(!equals(authorization.planId,input.plan.planId)||!equals(authorization.wallet,input.plan.ownerAddress)||!equals(authorization.pool,input.plan.poolAddress)||!equals(authorization.thesisId,input.plan.thesisId)||!equals(authorization.intentId,input.plan.intentId)||!equals(authorization.candidateId,intent.candidateId)||!equals(authorization.capitalLamports,intent.capitalLamports)||Number(authorization.maxConcurrentPositions)!==input.maxConcurrentPositions)reasons.push('P6_CANARY_AUTHORIZATION_SCOPE_MISMATCH');
  if(!boundDecisionId||!equals(boundDecisionId,binding.decisionId)||!equals(boundDecisionId,input.bound?.decisionId))reasons.push('P6_CANARY_BOUND_CONTROL_MISMATCH');
  if(Date.parse(input.plan.expiresAt)<=Date.parse(input.now))reasons.push('P6_CANARY_PLAN_EXPIRED');
  if(!validTimestamp(expiresAt)||Date.parse(expiresAt)<=Date.parse(input.now))reasons.push('P6_CANARY_APPROVAL_EXPIRED');
@@ -129,9 +129,9 @@ function validateBoundCanaryAuthorization(input:{plan:AutonomousPlan;provenance:
  return [...new Set(reasons)].sort();
 }
 /** Fresh pre-sign safety preserves a bound controlled-canary authorization across harmless later observe-only controls, while still applying every current hard revocation. */
-export function validateFreshOpenPhase7Safety(input:{plan:AutonomousPlan;current:Phase7ExecutionControl|undefined;bound:Phase7ExecutionControl|undefined;now:string;controlledCanary:boolean}):string[]{
+export function validateFreshOpenPhase7Safety(input:{plan:AutonomousPlan;current:Phase7ExecutionControl|undefined;bound:Phase7ExecutionControl|undefined;now:string;controlledCanary:boolean;maxConcurrentPositions?:number|undefined}):string[]{
  const provenance=record(record(input.plan.planPayload).provenance),boundCanary=input.plan.action==="OPEN"&&input.controlledCanary&&Object.keys(record(provenance.controlledCanaryAuthorization)).length>0;
- return boundCanary?validateBoundCanaryAuthorization({plan:input.plan,provenance,bound:input.bound,current:input.current,now:input.now}):validateFreshPhase7ExecutionControl(input.current,input.now);
+ return boundCanary?validateBoundCanaryAuthorization({plan:input.plan,provenance,bound:input.bound,current:input.current,now:input.now,maxConcurrentPositions:input.maxConcurrentPositions??0}):validateFreshPhase7ExecutionControl(input.current,input.now);
 }
 
 /** Signing-boundary validation. A PostgreSQL plan is untrusted until this passes. */
@@ -257,7 +257,7 @@ export function validateClaimedPlan(input: {
     // chronological control-before-plan is expected, not a rejection reason.
     const boundCanary=p.action==='OPEN'&&input.controlledCanary&&Object.keys(record(provenance.controlledCanaryAuthorization)).length>0;
     if(boundCanary){
-      reasons.push(...validateBoundCanaryAuthorization({plan:p,provenance,bound:input.boundPhase7Control,current:control,now:input.now??new Date().toISOString()}));
+      reasons.push(...validateBoundCanaryAuthorization({plan:p,provenance,bound:input.boundPhase7Control,current:control,now:input.now??new Date().toISOString(),maxConcurrentPositions:input.policy.controlledCanary?.maxConcurrentPositions??0}));
       if(!boundDecisionId||!boundObservedAt||!Number.isFinite(Date.parse(boundObservedAt))||Date.parse(boundObservedAt)>Date.parse(p.observedAt))reasons.push('P6_CLAIM_P7_CONTROL_BINDING_INVALID');
     }else{
       reasons.push(...validateBoundProductionAuthority({plan:p,bound:input.boundPhase7Control,current:control,now:input.now??new Date().toISOString()}));

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {P7_CONTROLLED_CANARY_CLAIM_FRESHNESS_BUDGET_MS,controlledCanaryRevokedApprovalIds,phase7BoundedDecisionHealthProbePoolAddresses,phase7DecisionHealthPoolAddress,phase7DecisionHealthProbePoolAddresses,phase7NextDecisionHealthPoolAddress,phase7VerifiedDecisionHealthPoolAddress,resolveControlledCanaryWatch} from '../.build/packages/phase7-production-service/src/index.js';
+import {P7_CONTROLLED_CANARY_CLAIM_FRESHNESS_BUDGET_MS,controlledCanaryRevokedApprovalIds,phase7BoundedDecisionHealthProbePoolAddresses,phase7DecisionHealthPoolAddress,phase7DecisionHealthProbePoolAddresses,phase7NextDecisionHealthPoolAddress,phase7VerifiedDecisionHealthPoolAddress,resolveControlledCanaryWatch as resolvePolicyControlledCanaryWatch} from '../.build/packages/phase7-production-service/src/index.js';
 
 const now='2026-08-20T12:00:00.000Z';
 const env={
@@ -12,6 +12,8 @@ const env={
 };
 const portfolio={openPositions:0,pendingExecutionCount:0,pendingReservedLamports:0n,unresolvedReconciliationDebt:0};
 const authorized={entryEvaluationId:'entry-live',thesisId:'thesis-live',poolAddress:'pool-live',observedAt:now,expiresAt:'2026-08-20T12:04:00.000Z',confidence:.8,reasonCodes:['ENTRY_TIMING_APPROVED'],payload:{}};
+const policy={controlledCanary:{maxConcurrentPositions:2,exactLiquidityCapitalLamports:30_000_000n,replacementOpenAllowed:false}};
+const resolveControlledCanaryWatch=input=>resolvePolicyControlledCanaryWatch({policy,...input});
 
 test('controlled canary watch never promotes without a fresh Phase-4 authorization',()=>{
   const result=resolveControlledCanaryWatch({env,now,portfolio});
@@ -28,7 +30,7 @@ test('controlled canary watch refuses expired or waiting Phase-4 records',()=>{
   assert.ok(waiting.reasonCodes.includes('P7_CONTROLLED_CANARY_AUTHORIZATION_NOT_CLEAN'));
 });
 
-test('controlled canary watch promotes only one clean fresh authorization with the fixed envelope',()=>{
+test('controlled canary watch promotes only a clean fresh authorization under the policy-derived envelope',()=>{
   const result=resolveControlledCanaryWatch({env,now,portfolio,authorization:authorized,decisionObservedAt:'2026-08-20T11:59:30.000Z'});
   assert.equal(result.activate,true);
   assert.equal(result.approval?.action,'PROMOTE_PRODUCTION');

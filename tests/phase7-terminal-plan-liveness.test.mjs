@@ -5,7 +5,7 @@ import {
   EXECUTION_TERMINAL_PLAN_STATES,
   executionPlanCountsAsPendingForPortfolio,
 } from '../.build/packages/db/src/index.js';
-import {resolveControlledCanaryWatch} from '../.build/packages/phase7-production-service/src/index.js';
+import {resolveControlledCanaryWatch as resolvePolicyControlledCanaryWatch} from '../.build/packages/phase7-production-service/src/index.js';
 
 const now='2026-08-29T12:00:00.000Z';
 const env={
@@ -31,6 +31,8 @@ const cleanPortfolio={
   pendingReservedLamports:0n,
   unresolvedReconciliationDebt:0,
 };
+const policy={controlledCanary:{maxConcurrentPositions:2,exactLiquidityCapitalLamports:30_000_000n,replacementOpenAllowed:false}};
+const resolveControlledCanaryWatch=input=>resolvePolicyControlledCanaryWatch({policy,...input});
 
 test('terminal historical execution cannot resurrect pending portfolio work',()=>{
   assert.ok(EXECUTION_TERMINAL_PLAN_STATES.includes('RECONCILED'));
