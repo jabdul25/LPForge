@@ -1237,7 +1237,7 @@ export interface Phase1Store {
     reasonCodes?: string[];
     payload: Record<string, unknown>;
   }): Promise<void>;
-  resumePreSubmissionClosePlan(value:{planId:string;at:string;expiresAt:string;reasonCodes:string[];payload:Record<string,unknown>}):Promise<boolean>;
+  resumePreSubmissionClosePlan(value:{planId:string;at:string;reasonCodes:string[];payload:Record<string,unknown>}):Promise<boolean>;
   completeAutonomousPlan(value: {
     planId: string;
     state:
@@ -3498,7 +3498,7 @@ return 'APPLIED';
         [now],
       );
       const claimed = await db.query(
-        `WITH candidate AS (SELECT p.plan_id FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id WHERE p.cluster='mainnet-beta' AND p.state='PLANNED' AND p.expires_at>$1::timestamptz AND i.action IN ('OPEN','ADD','CLAIM','REDUCE','RESHAPE','REBALANCE','CLOSE','EMERGENCY_CLOSE') AND NOT EXISTS (SELECT 1 FROM execution.transaction_plans pending JOIN execution.intents pi ON pi.intent_id=pending.intent_id WHERE pending.plan_id<>p.plan_id AND pending.cluster='mainnet-beta' AND pending.state IN ('CLAIMED','DISPATCHING','BUILDING','BUILT','SIMULATING','SIMULATED','RISK_APPROVED','SIGNING','SIGNED','SUBMITTING','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILING') AND ((i.position_address IS NOT NULL AND pi.position_address=i.position_address) OR (i.action='OPEN' AND pi.action='OPEN' AND pi.pool_address=i.pool_address AND pi.owner_address=i.owner_address))) ORDER BY CASE i.action WHEN 'EMERGENCY_CLOSE' THEN 1 WHEN 'CLOSE' THEN 2 WHEN 'REDUCE' THEN 3 WHEN 'RESHAPE' THEN 4 WHEN 'REBALANCE' THEN 5 WHEN 'CLAIM' THEN 6 WHEN 'ADD' THEN 7 ELSE 8 END,p.created_at FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE execution.transaction_plans p SET state='CLAIMED',payload=p.payload||jsonb_build_object('autonomous_dispatch_claimed_at',$1::text) FROM candidate c WHERE p.plan_id=c.plan_id RETURNING p.plan_id,p.intent_id,p.expires_at,p.payload`,
+        `WITH candidate AS (SELECT p.plan_id FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id WHERE p.cluster='mainnet-beta' AND p.state='PLANNED' AND (p.expires_at>$1::timestamptz OR (i.action IN ('CLOSE','EMERGENCY_CLOSE') AND p.payload #>> '{autonomous_dispatch,preSubmissionResume}'='true')) AND i.action IN ('OPEN','ADD','CLAIM','REDUCE','RESHAPE','REBALANCE','CLOSE','EMERGENCY_CLOSE') AND NOT EXISTS (SELECT 1 FROM execution.transaction_plans pending JOIN execution.intents pi ON pi.intent_id=pending.intent_id WHERE pending.plan_id<>p.plan_id AND pending.cluster='mainnet-beta' AND pending.state IN ('CLAIMED','DISPATCHING','BUILDING','BUILT','SIMULATING','SIMULATED','RISK_APPROVED','SIGNING','SIGNED','SUBMITTING','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILING') AND ((i.position_address IS NOT NULL AND pi.position_address=i.position_address) OR (i.action='OPEN' AND pi.action='OPEN' AND pi.pool_address=i.pool_address AND pi.owner_address=i.owner_address))) ORDER BY CASE i.action WHEN 'EMERGENCY_CLOSE' THEN 1 WHEN 'CLOSE' THEN 2 WHEN 'REDUCE' THEN 3 WHEN 'RESHAPE' THEN 4 WHEN 'REBALANCE' THEN 5 WHEN 'CLAIM' THEN 6 WHEN 'ADD' THEN 7 ELSE 8 END,p.created_at FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE execution.transaction_plans p SET state='CLAIMED',payload=p.payload||jsonb_build_object('autonomous_dispatch_claimed_at',$1::text) FROM candidate c WHERE p.plan_id=c.plan_id RETURNING p.plan_id,p.intent_id,p.expires_at,p.payload`,
         [now],
       );
       const plan = claimed.rows[0];
@@ -3664,20 +3664,27 @@ return 'APPLIED';
     async resumePreSubmissionClosePlan(v) {
       // This is intentionally narrower than a generic retry.  It revives only
       // a CLOSE-family plan whose previous attempt stopped before any child
-      // signature, and grants a fresh bounded protective-action lease.
+      // signature. Its signed plan expiry is restored from the immutable
+      // intent instead of being extended: expiry participates in the HMAC.
       const prior=await db.query(
-        `UPDATE execution.transaction_plans
-         SET state='PLANNED',expires_at=$3::timestamptz,
-             payload=payload||jsonb_build_object('autonomous_dispatch_updated_at',$2::text,'autonomous_dispatch',COALESCE(payload->'autonomous_dispatch','{}'::jsonb)||$4::jsonb)
-         WHERE plan_id=$1 AND state='RECONCILIATION_REQUIRED'
-         RETURNING plan_id`,
-        [v.planId,v.at,v.expiresAt,json(v.payload)],
+        `WITH current AS (
+           SELECT state FROM execution.transaction_plans
+           WHERE plan_id=$1 AND state IN ('RECONCILIATION_REQUIRED','BLOCKED')
+           FOR UPDATE
+         ), updated AS (
+           UPDATE execution.transaction_plans
+           SET state='PLANNED',expires_at=(SELECT i.expires_at FROM execution.intents i WHERE i.intent_id=execution.transaction_plans.intent_id),
+               payload=payload||jsonb_build_object('autonomous_dispatch_updated_at',$2::text,'autonomous_dispatch',COALESCE(payload->'autonomous_dispatch','{}'::jsonb)||$3::jsonb)
+           WHERE plan_id=$1 AND EXISTS(SELECT 1 FROM current)
+           RETURNING plan_id
+         ) SELECT current.state FROM current JOIN updated ON true`,
+        [v.planId,v.at,json(v.payload)],
       );
       if(!prior.rows[0])return false;
       await db.query(
         `INSERT INTO execution.plan_state_events(plan_id,prior_state,next_state,observed_at,reason_codes,payload)
-         VALUES($1,'RECONCILIATION_REQUIRED','PLANNED',$2,$3::jsonb,$4::jsonb)`,
-        [v.planId,v.at,json(v.reasonCodes),json(v.payload)],
+         VALUES($1,$2,'PLANNED',$3,$4::jsonb,$5::jsonb)`,
+        [v.planId,String(prior.rows[0].state),v.at,json(v.reasonCodes),json(v.payload)],
       );
       return true;
     },
@@ -4142,7 +4149,7 @@ return 'APPLIED';
     },
     async loadUnresolvedAutonomousPlans() {
       const r = await db.query(
-        `SELECT p.plan_id,p.intent_id,p.state,p.expires_at,p.payload AS plan_payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,COALESCE(i.position_address,(SELECT min(l.position_address) FROM execution.lifecycle_plan_links link JOIN execution.position_lifecycles l ON l.lifecycle_id=link.lifecycle_id WHERE link.plan_id=p.plan_id AND l.status='SOL_SETTLED' HAVING count(DISTINCT l.position_address)=1)) AS position_address,CASE WHEN i.position_address IS NOT NULL THEN 'DIRECT' WHEN (SELECT count(DISTINCT l.position_address) FROM execution.lifecycle_plan_links link JOIN execution.position_lifecycles l ON l.lifecycle_id=link.lifecycle_id WHERE link.plan_id=p.plan_id AND l.status='SOL_SETTLED')=1 THEN 'LIFECYCLE_SOL_SETTLED' END AS position_identity_source,EXISTS(SELECT 1 FROM execution.lifecycle_plan_links settled_link JOIN execution.position_lifecycles settled_lifecycle ON settled_lifecycle.lifecycle_id=settled_link.lifecycle_id WHERE settled_link.plan_id=p.plan_id AND settled_lifecycle.status='SOL_SETTLED' AND (i.position_address IS NULL OR settled_lifecycle.position_address=i.position_address)) AS position_lifecycle_settled,i.thesis_id,i.observed_at,i.payload AS intent_payload,COALESCE(json_agg(json_build_object('transactionId',s.transaction_id,'sequence',s.sequence,'kind',s.kind,'state',s.state,'requiredSignerAddresses',s.required_signers,'metadata',s.metadata) ORDER BY s.sequence) FILTER (WHERE s.transaction_id IS NOT NULL),'[]'::json) AS steps FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id LEFT JOIN execution.transaction_steps s ON s.plan_id=p.plan_id WHERE p.cluster='mainnet-beta' AND (p.state IN ('CLAIMED','DISPATCHING','BUILDING','BUILT','SIMULATING','SIMULATED','RISK_APPROVED','SIGNING','SIGNED','SUBMITTING','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILING','RECOVERING','RECONCILIATION_REQUIRED') OR (p.state='FAILED' AND (EXISTS(SELECT 1 FROM execution.transaction_steps s JOIN execution.submission_attempts a ON a.transaction_id=s.transaction_id WHERE s.plan_id=p.plan_id AND a.state IN ('SENT','UNKNOWN')) OR p.payload->'autonomous_dispatch'->>'recovery'='CLOSE_PENDING_STAGE_EXPIRED_NO_CHAIN_EFFECT'))) GROUP BY p.plan_id,p.intent_id,p.state,p.expires_at,p.payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload ORDER BY p.created_at ASC`,
+        `SELECT p.plan_id,p.intent_id,p.state,p.expires_at,p.payload AS plan_payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,COALESCE(i.position_address,(SELECT min(l.position_address) FROM execution.lifecycle_plan_links link JOIN execution.position_lifecycles l ON l.lifecycle_id=link.lifecycle_id WHERE link.plan_id=p.plan_id AND l.status='SOL_SETTLED' HAVING count(DISTINCT l.position_address)=1)) AS position_address,CASE WHEN i.position_address IS NOT NULL THEN 'DIRECT' WHEN (SELECT count(DISTINCT l.position_address) FROM execution.lifecycle_plan_links link JOIN execution.position_lifecycles l ON l.lifecycle_id=link.lifecycle_id WHERE link.plan_id=p.plan_id AND l.status='SOL_SETTLED')=1 THEN 'LIFECYCLE_SOL_SETTLED' END AS position_identity_source,EXISTS(SELECT 1 FROM execution.lifecycle_plan_links settled_link JOIN execution.position_lifecycles settled_lifecycle ON settled_lifecycle.lifecycle_id=settled_link.lifecycle_id WHERE settled_link.plan_id=p.plan_id AND settled_lifecycle.status='SOL_SETTLED' AND (i.position_address IS NULL OR settled_lifecycle.position_address=i.position_address)) AS position_lifecycle_settled,i.thesis_id,i.observed_at,i.payload AS intent_payload,COALESCE(json_agg(json_build_object('transactionId',s.transaction_id,'sequence',s.sequence,'kind',s.kind,'state',s.state,'requiredSignerAddresses',s.required_signers,'metadata',s.metadata) ORDER BY s.sequence) FILTER (WHERE s.transaction_id IS NOT NULL),'[]'::json) AS steps FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id LEFT JOIN execution.transaction_steps s ON s.plan_id=p.plan_id WHERE p.cluster='mainnet-beta' AND (p.state IN ('CLAIMED','DISPATCHING','BUILDING','BUILT','SIMULATING','SIMULATED','RISK_APPROVED','SIGNING','SIGNED','SUBMITTING','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILING','RECOVERING','RECONCILIATION_REQUIRED') OR (p.state='BLOCKED' AND i.action IN ('CLOSE','EMERGENCY_CLOSE') AND p.payload #>> '{autonomous_dispatch,preSubmissionResume}'='true' AND p.payload #>> '{autonomous_dispatch,stage}'='CLOSE_INVENTORY_SNAPSHOTTED') OR (p.state='FAILED' AND (EXISTS(SELECT 1 FROM execution.transaction_steps s JOIN execution.submission_attempts a ON a.transaction_id=s.transaction_id WHERE s.plan_id=p.plan_id AND a.state IN ('SENT','UNKNOWN')) OR p.payload->'autonomous_dispatch'->>'recovery'='CLOSE_PENDING_STAGE_EXPIRED_NO_CHAIN_EFFECT'))) GROUP BY p.plan_id,p.intent_id,p.state,p.expires_at,p.payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload ORDER BY p.created_at ASC`,
       );
       return r.rows.map(autonomousPlanFromRow);
     },

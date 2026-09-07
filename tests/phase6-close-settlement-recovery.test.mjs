@@ -24,8 +24,10 @@ test('only an exact unsigned OPEN/MATCH close snapshot may resume multi-remove c
     {positionPool: 'other'},
     {stage: 'CLOSE_LIQUIDITY_REMOVED'},
     {planState: 'FAILED'},
+    {planState: 'BLOCKED'},
     {action: 'OPEN'},
   ]) assert.equal(canResumePreSubmissionClose({...base, ...incompatible}), false);
+  assert.equal(canResumePreSubmissionClose({...base, planState: 'BLOCKED', blockedPreSubmissionResume: true}), true);
 });
 
 test('multi-remove close construction persists all children and fingerprints before any child dispatch', async () => {
@@ -38,6 +40,17 @@ test('multi-remove close construction persists all children and fingerprints bef
   assert.match(source, /P6_CLOSE_REMOVE_CHILD_CONSTRUCTION_MISMATCH/);
   assert.match(source, /P6_CLOSE_MULTI_REMOVE_PRE_SUBMISSION_RESUME_READY/);
   assert.match(db, /async resumePreSubmissionClosePlan/);
+});
+
+test('pre-submission protective resume preserves signed expiry and uses only the narrow close lease', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile('packages/phase6-live-worker/src/index.ts', 'utf8'));
+  const db = await import('node:fs/promises').then(fs => fs.readFile('packages/db/src/index.ts', 'utf8'));
+  assert.match(db, /expires_at=\(SELECT i\.expires_at FROM execution\.intents/);
+  assert.match(db, /i\.action IN \('CLOSE','EMERGENCY_CLOSE'\).*preSubmissionResume/s);
+  assert.match(db, /p\.state='BLOCKED'.*preSubmissionResume.*CLOSE_INVENTORY_SNAPSHOTTED/s);
+  const recovery = source.slice(source.indexOf('const preSubmissionCloseCandidate'), source.indexOf('// Historical compatibility', source.indexOf('const preSubmissionCloseCandidate')));
+  assert.doesNotMatch(recovery, /expiresAt:/);
+  assert.match(recovery, /P6_CLOSE_MULTI_REMOVE_PRE_SUBMISSION_RESUME_READY/);
 });
 
 for (const stage of [

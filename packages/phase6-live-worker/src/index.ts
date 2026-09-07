@@ -3475,6 +3475,9 @@ export function shouldResumeCloseSettlement(value: {
 export function canResumePreSubmissionClose(value:{
   action:string;
   planState:string;
+  /** A plan may be BLOCKED only after this exact no-signature recovery path
+   * previously marked it resumable.  It is never a generic BLOCKED retry. */
+  blockedPreSubmissionResume?:boolean;
   stage:string|undefined;
   hasPendingChild:boolean;
   journalState:string;
@@ -3487,7 +3490,8 @@ export function canResumePreSubmissionClose(value:{
   removeChildrenHaveSignatures:boolean;
 }):boolean{
   return (value.action==="CLOSE"||value.action==="EMERGENCY_CLOSE")&&
-    value.planState==="RECONCILIATION_REQUIRED"&&
+    (value.planState==="RECONCILIATION_REQUIRED"||
+      (value.planState==="BLOCKED"&&value.blockedPreSubmissionResume===true))&&
     value.stage==="CLOSE_INVENTORY_SNAPSHOTTED"&&
     !value.hasPendingChild&&
     value.journalState==="PLAN_CREATED"&&
@@ -4567,6 +4571,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     const closeDispatch=closeSettlementDispatch(plan);
     const preSubmissionCloseCandidate=canResumePreSubmissionClose({
       action:plan.action,planState:plan.state,stage:closeStage,
+      blockedPreSubmissionResume:closeDispatch.preSubmissionResume===true,
       hasPendingChild:Boolean(closePending),journalState:journal.state,
       hasJournalSignature:Boolean(journal.signature),positionExists:positionTruth.exists===true,
       positionOwner:typeof positionTruth.owner==="string"?positionTruth.owner:undefined,
@@ -4581,6 +4586,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       const submissions=await Promise.all(removeSteps.map(step=>input.store.loadSubmissionAttemptByTransactionId(step.transactionId)));
       if(!canResumePreSubmissionClose({
         action:plan.action,planState:plan.state,stage:closeStage,
+        blockedPreSubmissionResume:closeDispatch.preSubmissionResume===true,
         hasPendingChild:Boolean(closePending),journalState:journal.state,
         hasJournalSignature:Boolean(journal.signature),positionExists:positionTruth.exists===true,
         positionOwner:typeof positionTruth.owner==="string"?positionTruth.owner:undefined,
@@ -4599,7 +4605,6 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       const resumed=await input.store.resumePreSubmissionClosePlan({
         planId:plan.planId,
         at:input.now,
-        expiresAt:new Date(Date.parse(input.now)+5*60_000).toISOString(),
         reasonCodes:["P6_CLOSE_MULTI_REMOVE_PRE_SUBMISSION_RESUME_READY"],
         payload:{
           stage:"CLOSE_INVENTORY_SNAPSHOTTED",
