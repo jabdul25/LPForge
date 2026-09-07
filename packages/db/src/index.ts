@@ -974,8 +974,13 @@ export interface Phase1Store {
   /** Canonical Production global-selection evidence. This is the only pool-selection lane. */
   insertProductionGlobalCandidate(value:{globalCycleId:string;poolAddress:string;operationalCycleId:string;observedAt:string;operationalState:'ENTRY_READY'|'NO_TRADE'|'WARMING'|'REJECTED';phase4State:string;recommendationId?:string;thesisId?:string;candidateId?:string;strategy?:string;orientation?:string;lowerBinId?:number;upperBinId?:number;activeBinId?:number;capitalValue?:number;horizonMinutes?:number;predictedGrossFees?:number;predictedInventoryPnl?:number;predictedNetEv?:number;riskAdjustedExpectedNetEv?:number;uncertainty?:number;confidence?:number;oorRisk?:number;eventPathEvidenceAt?:string;feeEvidenceAt?:string;volumeEvidenceAt?:string;tvl?:number;feeTvl1h?:number;feeTvl24h?:number;reasonCodes:string[];evidence:Record<string,unknown>;payload:Record<string,unknown>}):Promise<void>;
   loadProductionGlobalCandidateFacts(globalCycleId:string,poolAddresses:string[]):Promise<Array<Record<string,unknown>>>;
-  /** Verifies an exact, fresh canonical global-winner binding for Phase-6 claim admission. */
-  verifyProductionGlobalWinnerAdmission(value:{globalCycleId:string;poolAddress:string;candidateId:string;now:string}):Promise<{globalCycleId:string;poolAddress:string;candidateId:string;selectionTier:string;selectionState:string;selectionDynamicEligible:boolean}|undefined>;
+  /**
+   * Verifies an exact, fresh canonical global-winner binding for Phase-6
+   * claim admission. `winnerObservedAt` is the selection's durable decision
+   * boundary; `tokenYMint` comes from the canonical protocol pool record, not
+   * from a mutable discovery-registry snapshot.
+   */
+  verifyProductionGlobalWinnerAdmission(value:{globalCycleId:string;poolAddress:string;candidateId:string;now:string}):Promise<{globalCycleId:string;poolAddress:string;candidateId:string;selectionTier:string;selectionState:string;selectionDynamicEligible:boolean;winnerObservedAt:string;tokenYMint?:string|undefined}|undefined>;
   loadProductionPoolSettlementHistory(poolAddresses:string[],decisionCutoff:string):Promise<Array<Record<string,unknown>>>;
   insertProductionGlobalSelection(value:{globalCycleId:string;policyVersion:string;reentryContextPolicyVersion:string;decisionCutoff:string;startedAt:string;completedAt:string;eligiblePoolCount:number;evaluatedPoolCount:number;candidatePoolCount:number;coverageState:string;outcome:string;winnerPoolAddress?:string;winnerCandidateId?:string;runnerUpPoolAddress?:string;rankingMetric:string;crossPoolMetricsComparable:boolean;reasonCodes:string[];sourceCommit?:string;buildId?:string;payload:Record<string,unknown>;candidates:Array<{poolAddress:string;evaluationOrder:number;candidateRank?:number;candidateState:string;selectionTier?:string;selectionState?:string;selectionDynamicEligible?:boolean;recommendationId?:string;thesisId?:string;candidateId?:string;strategy?:string;orientation?:string;lowerBinId?:number;upperBinId?:number;activeBinId?:number;riskAdjustedExpectedNetEv?:number;predictedFees?:number;predictedInventoryPnl?:number;capitalValue?:number;horizonMinutes?:number;decisionAt?:string;expiresAt?:string;phase3State?:string;phase4State?:string;reasonCodes:string[];historyContext:Record<string,unknown>;payload:Record<string,unknown>}>}):Promise<void>;
   /** Shadow-only Phase-3 forward-validation capture. It has no authority path. */
@@ -2811,10 +2816,12 @@ export async function createPostgresStore(
       return r.rows as Array<Record<string,unknown>>;
     },
     async verifyProductionGlobalWinnerAdmission(v) {
-      const r=await db.query(`SELECT candidate.selection_tier,candidate.selection_state,candidate.selection_dynamic_eligible
+      const r=await db.query(`SELECT candidate.selection_tier,candidate.selection_state,candidate.selection_dynamic_eligible,
+          candidate.decision_at AS winner_observed_at,pool.token_y_mint
         FROM execution.production_global_selection_cycles cycle
         JOIN execution.production_global_pool_candidates candidate
           ON candidate.global_cycle_id=cycle.global_cycle_id
+        LEFT JOIN protocol.pools pool ON pool.address=candidate.pool_address
         WHERE cycle.global_cycle_id=$1
           AND cycle.outcome='GLOBAL_WINNER'
           AND cycle.coverage_state='COMPLETE'
@@ -2829,7 +2836,7 @@ export async function createPostgresStore(
           AND (candidate.expires_at IS NULL OR candidate.expires_at>$4::timestamptz)
         LIMIT 1`,[v.globalCycleId,v.poolAddress,v.candidateId,v.now]);
       const row=r.rows[0];
-      return row?{globalCycleId:v.globalCycleId,poolAddress:v.poolAddress,candidateId:v.candidateId,selectionTier:String(row.selection_tier),selectionState:String(row.selection_state),selectionDynamicEligible:Boolean(row.selection_dynamic_eligible)}:undefined;
+      return row?{globalCycleId:v.globalCycleId,poolAddress:v.poolAddress,candidateId:v.candidateId,selectionTier:String(row.selection_tier),selectionState:String(row.selection_state),selectionDynamicEligible:Boolean(row.selection_dynamic_eligible),winnerObservedAt:toIsoTimestamp(row.winner_observed_at),...(row.token_y_mint?{tokenYMint:String(row.token_y_mint)}:{})}:undefined;
     },
     async loadProductionPoolSettlementHistory(poolAddresses,decisionCutoff) {
       if(!poolAddresses.length)return [];

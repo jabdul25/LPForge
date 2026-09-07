@@ -6,9 +6,13 @@ export interface ClaimGuardResult {
   approved: boolean;
   reasonCodes: string[];
   capitalLamports: bigint;
+  admissionAudit?: DiscoveryAdmissionAudit | undefined;
 }
-export interface ProductionAdmissionCandidate {poolAddress:string;state:string;tier:string;lastSeenAt:string;tokenYMint?:string|undefined;pairedTokenMint?:string|undefined;}
-export interface VerifiedGlobalWinnerAdmission {globalCycleId:string;poolAddress:string;candidateId:string;selectionTier:string;selectionState:string;selectionDynamicEligible:boolean;verified:boolean;}
+/** `lastSeenAt` is the discovery registry's collector-observation boundary. */
+export interface ProductionAdmissionCandidate {poolAddress:string;state:string;tier:string;lastSeenAt:string;tokenYMint?:string|undefined;pairedTokenMint?:string|undefined;reasonCodes?:string[]|undefined;}
+/** Exact, database-verified winner proof. The pool identity is intentionally independent of mutable discovery state. */
+export interface VerifiedGlobalWinnerAdmission {globalCycleId:string;poolAddress:string;candidateId:string;selectionTier:string;selectionState:string;selectionDynamicEligible:boolean;winnerObservedAt:string;tokenYMint?:string|undefined;verified:boolean;}
+export interface DiscoveryAdmissionAudit {winnerBindingVerified:boolean;winnerObservedAt?:string;registryCandidatePresent:boolean;registryObservedAt?:string;registryState?:string;registryTier?:string;registryAuthorityOrder:'NOT_APPLICABLE'|'ABSENT'|'OLDER_THAN_WINNER'|'NEWER_THAN_WINNER'|'EQUAL_OR_AMBIGUOUS'|'UNVERIFIABLE';registryTerminal:boolean;decisionPredicate:string;decisionAt:string;}
 const WSOL_MINT='So11111111111111111111111111111111111111112';
 export interface Phase7ExecutionControl {decisionId?:string;cycleKey?:string;authorityMode:string;healthStatus:string;driftStatus:string;safetyMode:string;newEconomicActionAllowed:boolean;observedAt:string;poolDrift?:Record<string,string>;activeIncidentIds?:string[];releaseIntegrityValid?:boolean;portfolioValid?:boolean;revokedApprovalIds?:string[];}
 /** Canonical projection used by both claim-time and execution-time P7 checks. */
@@ -80,24 +84,45 @@ function verifiedGlobalWinnerAdmission(input:{plan:AutonomousPlan;admission:Veri
  return Boolean(admission?.verified&&admission.selectionTier==='A'&&admission.selectionDynamicEligible===true&&equals(selection.globalCycleId,admission.globalCycleId)&&equals(selection.selectedCandidateId,admission.candidateId)&&equals(intent.candidateId,admission.candidateId)&&equals(input.plan.poolAddress,admission.poolAddress));
 }
 function currentHardDiscoveryDisqualification(candidate:ProductionAdmissionCandidate|undefined){return Boolean(candidate&&(['REJECTED','QUARANTINED','OBSERVING'].includes(candidate.state)||['REJECTED','QUARANTINED'].includes(candidate.tier)));}
-function policyPoolForPlan(input:{plan:AutonomousPlan;policy:MainnetCanaryDeploymentPolicy;productionCandidates:ProductionAdmissionCandidate[];globalWinnerAdmission?:VerifiedGlobalWinnerAdmission;now:string;controlledCanary:boolean},reasons:string[]){
+function admissionAudit(input:{admission?:VerifiedGlobalWinnerAdmission|undefined;candidate?:ProductionAdmissionCandidate|undefined;now:string;predicate:string;order?:DiscoveryAdmissionAudit['registryAuthorityOrder']|undefined}):DiscoveryAdmissionAudit{
+ return{winnerBindingVerified:Boolean(input.admission?.verified),...(input.admission?.winnerObservedAt?{winnerObservedAt:input.admission.winnerObservedAt}:{}),registryCandidatePresent:Boolean(input.candidate),...(input.candidate?.lastSeenAt?{registryObservedAt:input.candidate.lastSeenAt}:{}),...(input.candidate?.state?{registryState:input.candidate.state}:{}),...(input.candidate?.tier?{registryTier:input.candidate.tier}:{}),registryAuthorityOrder:input.order??'NOT_APPLICABLE',registryTerminal:currentHardDiscoveryDisqualification(input.candidate),decisionPredicate:input.predicate,decisionAt:input.now};
+}
+type PolicyPool={address:string;maxCapitalLamports:bigint;maxOpenPositions:number;};
+type PolicyPoolDecision={policyPool?:PolicyPool|undefined;admissionAudit?:DiscoveryAdmissionAudit|undefined;};
+function policyPoolForPlan(input:{plan:AutonomousPlan;policy:MainnetCanaryDeploymentPolicy;productionCandidates:ProductionAdmissionCandidate[];globalWinnerAdmission?:VerifiedGlobalWinnerAdmission;now:string;controlledCanary:boolean},reasons:string[]):PolicyPoolDecision{
  // A static policy pool is a bounded canary/healthcheck identity, not a
  // general new-entry admission.  Ordinary risk-increasing plans, including
  // plans targeting a listed pool, must prove the same fresh dynamic admission
  // as every discovered pool.  The separately authenticated canary envelope
  // remains its explicit exception and is validated below.
- const staticPool=input.policy.pools.find(x=>x.address===input.plan.poolAddress);if(input.controlledCanary&&staticPool)return staticPool;
+ const staticPool=input.policy.pools.find(x=>x.address===input.plan.poolAddress);if(input.controlledCanary&&staticPool)return {policyPool:staticPool};
  const admission=input.policy.productionAdmission;
- if(!admission?.enabled){reasons.push('P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return undefined;}
- const candidate=input.productionCandidates.find(x=>x.poolAddress===input.plan.poolAddress),age=candidate?Date.parse(input.now)-Date.parse(candidate.lastSeenAt):NaN,
-   activeEconomicLease=candidate?.state==='ACTIVE_CANDIDATE'&&admission.eligibleTiers.includes(candidate.tier as 'A'|'B'|'C')&&input.productionCandidates.indexOf(candidate)>=0&&input.productionCandidates.indexOf(candidate)<admission.maxCandidates,
-   selectionBoundWinner=verifiedGlobalWinnerAdmission({plan:input.plan,admission:input.globalWinnerAdmission});
- // A current Tier-B/PREFILTERED rank is mutable ranking/lease drift. It
- // cannot revoke the exact, fresh Tier-A winner snapshot. Terminal and stale
- // discovery facts remain current hard disqualifiers at the signing boundary.
- if(!candidate||(!activeEconomicLease&&!selectionBoundWinner)||currentHardDiscoveryDisqualification(candidate)||!Number.isFinite(age)||age<0||age>admission.maxCandidateAgeMs){reasons.push('P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return undefined;}
- if(candidate.tokenYMint!==WSOL_MINT){reasons.push('P6_PRODUCTION_REQUIRES_WSOL_TOKEN_Y');return undefined;}
- return{address:candidate.poolAddress,maxCapitalLamports:admission.maxCapitalLamports,maxOpenPositions:input.policy.maxOpenPositions};
+ if(!admission?.enabled){reasons.push('P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return {};}
+ const candidate=input.productionCandidates.find(x=>x.poolAddress===input.plan.poolAddress), winner=input.globalWinnerAdmission,
+   selectionBoundWinner=verifiedGlobalWinnerAdmission({plan:input.plan,admission:winner}),winnerAt=Date.parse(String(winner?.winnerObservedAt??'')),registryAt=candidate?Date.parse(candidate.lastSeenAt):NaN,
+   candidateAge=candidate?Date.parse(input.now)-registryAt:NaN,
+   activeEconomicLease=candidate?.state==='ACTIVE_CANDIDATE'&&admission.eligibleTiers.includes(candidate.tier as 'A'|'B'|'C')&&input.productionCandidates.indexOf(candidate)>=0&&input.productionCandidates.indexOf(candidate)<admission.maxCandidates;
+ // A verified winner is an immutable, short-lived admission proof. The live
+ // registry is only a revocation source when it carries a deterministically
+ // newer terminal fact; absence and ordinary collector/rank lag are not facts.
+ if(selectionBoundWinner){
+   if(!Number.isFinite(winnerAt)||!winner?.tokenYMint){reasons.push('P6_DISCOVERY_WINNER_BINDING_UNVERIFIABLE','P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return {admissionAudit:admissionAudit({admission:winner,candidate,now:input.now,predicate:'WINNER_BINDING_UNVERIFIABLE',order:'UNVERIFIABLE'})};}
+   if(winner.tokenYMint!==WSOL_MINT){reasons.push('P6_PRODUCTION_REQUIRES_WSOL_TOKEN_Y');return {admissionAudit:admissionAudit({admission:winner,candidate,now:input.now,predicate:'WINNER_POOL_NOT_WSOL'})};}
+   if(!candidate)return{policyPool:{address:input.plan.poolAddress,maxCapitalLamports:admission.maxCapitalLamports,maxOpenPositions:input.policy.maxOpenPositions},admissionAudit:admissionAudit({admission:winner,now:input.now,predicate:'FRESH_WINNER_REGISTRY_ABSENT',order:'ABSENT'})};
+   if(!Number.isFinite(registryAt)){reasons.push('P6_DISCOVERY_AUTHORITY_ORDER_AMBIGUOUS','P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return {admissionAudit:admissionAudit({admission:winner,candidate,now:input.now,predicate:'REGISTRY_TIMESTAMP_UNVERIFIABLE',order:'UNVERIFIABLE'})};}
+   const order=registryAt<winnerAt?'OLDER_THAN_WINNER':registryAt>winnerAt?'NEWER_THAN_WINNER':'EQUAL_OR_AMBIGUOUS';
+   if(order==='EQUAL_OR_AMBIGUOUS'&&currentHardDiscoveryDisqualification(candidate)){reasons.push('P6_DISCOVERY_AUTHORITY_ORDER_AMBIGUOUS','P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return {admissionAudit:admissionAudit({admission:winner,candidate,now:input.now,predicate:'TERMINAL_REGISTRY_TIMESTAMP_AMBIGUOUS',order})};}
+   if(order==='NEWER_THAN_WINNER'&&currentHardDiscoveryDisqualification(candidate)){reasons.push('P6_DISCOVERY_REGISTRY_NEWER_TERMINAL_DISQUALIFICATION','P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return {admissionAudit:admissionAudit({admission:winner,candidate,now:input.now,predicate:'NEWER_TERMINAL_REGISTRY_DISQUALIFICATION',order})};}
+   // A newer collector record can be stale by refresh-age without being a new
+   // economic revocation. Plan expiry remains the winner binding's hard TTL.
+   return{policyPool:{address:input.plan.poolAddress,maxCapitalLamports:admission.maxCapitalLamports,maxOpenPositions:input.policy.maxOpenPositions},admissionAudit:admissionAudit({admission:winner,candidate,now:input.now,predicate:currentHardDiscoveryDisqualification(candidate)?'FRESH_WINNER_OLDER_TERMINAL_REGISTRY':'FRESH_WINNER_REGISTRY_NONTERMINAL',order})};
+ }
+ if(!candidate){reasons.push('P6_DISCOVERY_REGISTRY_CANDIDATE_ABSENT','P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return {admissionAudit:admissionAudit({now:input.now,predicate:'REGISTRY_CANDIDATE_ABSENT',order:'ABSENT'})};}
+ if(currentHardDiscoveryDisqualification(candidate)){reasons.push('P6_DISCOVERY_REGISTRY_TERMINALLY_DISQUALIFIED','P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return {admissionAudit:admissionAudit({candidate,now:input.now,predicate:'REGISTRY_TERMINALLY_DISQUALIFIED'})};}
+ if(!Number.isFinite(candidateAge)||candidateAge<0||candidateAge>admission.maxCandidateAgeMs){reasons.push('P6_DISCOVERY_REGISTRY_CANDIDATE_STALE','P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return {admissionAudit:admissionAudit({candidate,now:input.now,predicate:'REGISTRY_CANDIDATE_STALE'})};}
+ if(!activeEconomicLease){reasons.push('P6_DISCOVERY_REGISTRY_CANDIDATE_NOT_ACTIVE','P6_CLAIM_PRODUCTION_ADMISSION_INVALID');return {admissionAudit:admissionAudit({candidate,now:input.now,predicate:'REGISTRY_CANDIDATE_NOT_ACTIVE'})};}
+ if(candidate.tokenYMint!==WSOL_MINT){reasons.push('P6_PRODUCTION_REQUIRES_WSOL_TOKEN_Y');return {admissionAudit:admissionAudit({candidate,now:input.now,predicate:'REGISTRY_POOL_NOT_WSOL'})};}
+ return{policyPool:{address:candidate.poolAddress,maxCapitalLamports:admission.maxCapitalLamports,maxOpenPositions:input.policy.maxOpenPositions},admissionAudit:admissionAudit({candidate,now:input.now,predicate:'CURRENT_DISCOVERY_LEASE'})};
 }
 function equals(value:unknown, expected:unknown){return String(value??'')===String(expected??'');}
 function validTimestamp(value:unknown){return Number.isFinite(Date.parse(String(value??'')));}
@@ -160,9 +185,11 @@ export function validateClaimedPlan(input: {
     amount = capital(p),
     provenance = record(record(p.planPayload).provenance),
     riskIncreasing = isRiskIncreasingAction(p.action),
-    policyPool = riskIncreasing
+    policyPoolDecision = riskIncreasing
       ? policyPoolForPlan({plan:p,policy:input.policy,productionCandidates:input.productionCandidates??[],...(input.globalWinnerAdmission?{globalWinnerAdmission:input.globalWinnerAdmission}:{}),now:input.now??new Date().toISOString(),controlledCanary:Boolean(input.controlledCanary)},reasons)
-      : undefined;
+      : {},
+    policyPool = policyPoolDecision.policyPool;
+  if(riskIncreasing&&(!validTimestamp(p.expiresAt)||Date.parse(p.expiresAt)<=Date.parse(input.now??new Date().toISOString())))reasons.push('P6_CLAIM_PLAN_EXPIRED');
   if (
     provenance.producer !== "LPFORGE_PRODUCTION" ||
     provenance.schemaVersion !== 1 ||
@@ -278,5 +305,6 @@ export function validateClaimedPlan(input: {
     approved: reasons.length === 0,
     reasonCodes: reasons.sort(),
     capitalLamports: amount,
+    ...(policyPoolDecision.admissionAudit?{admissionAudit:policyPoolDecision.admissionAudit}:{}),
   };
 }

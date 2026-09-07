@@ -59,12 +59,43 @@ test('a fresh authenticated Tier-A winner remains P6-admissible across Tier-A to
  const plan={...base,poolAddress:'DISCOVERED',planPayload:{...base.planPayload,provenance:{...base.planPayload.provenance,poolAddress:'DISCOVERED',globalSelection:{globalCycleId:'global-1',selectedCandidateId:'candidate-1'}},intent:{capitalLamports:'20000000',candidateId:'candidate-1'}}};
  const qualified=[{poolAddress:'DISCOVERED',state:'PREFILTERED',tier:'B',lastSeenAt:'2026-08-13T00:04:00.000Z',tokenYMint:'So11111111111111111111111111111111111111112',pairedTokenMint:'TOKEN'}];
  const common={plan,policy,ownedPositions:[],productionCandidates:qualified,phase7Control:control,now};
- const selected={globalCycleId:'global-1',poolAddress:'DISCOVERED',candidateId:'candidate-1',selectionTier:'A',selectionState:'ACTIVE_CANDIDATE',selectionDynamicEligible:true,verified:true};
+ const selected={globalCycleId:'global-1',poolAddress:'DISCOVERED',candidateId:'candidate-1',selectionTier:'A',selectionState:'ACTIVE_CANDIDATE',selectionDynamicEligible:true,winnerObservedAt:'2026-08-13T00:04:45.000Z',tokenYMint:'So11111111111111111111111111111111111111112',verified:true};
  assert.ok(validateClaimedPlan(common).reasonCodes.includes('P6_CLAIM_PRODUCTION_ADMISSION_INVALID'),'a current Tier-B pool never self-admits');
  assert.equal(validateClaimedPlan({...common,globalWinnerAdmission:selected}).approved,true,'the exact authenticated Tier-A winner remains eligible across Tier-A-to-Tier-B rank drift');
  for(const admission of [{...selected,globalCycleId:'other'},{...selected,candidateId:'other'},{...selected,verified:false},{...selected,selectionTier:'B'},{...selected,selectionDynamicEligible:false}])assert.ok(validateClaimedPlan({...common,globalWinnerAdmission:admission}).reasonCodes.includes('P6_CLAIM_PRODUCTION_ADMISSION_INVALID'),'forged, non-Tier-A, or unverified global selection cannot bridge admission');
- assert.ok(validateClaimedPlan({...common,productionCandidates:[{...qualified[0],state:'REJECTED'}],globalWinnerAdmission:selected}).reasonCodes.includes('P6_CLAIM_PRODUCTION_ADMISSION_INVALID'),'terminally ineligible pools remain blocked');
- assert.ok(validateClaimedPlan({...common,productionCandidates:[{...qualified[0],lastSeenAt:'2026-08-12T23:40:00.000Z'}],globalWinnerAdmission:selected}).reasonCodes.includes('P6_CLAIM_PRODUCTION_ADMISSION_INVALID'),'stale candidates remain blocked');
+ assert.equal(validateClaimedPlan({...common,productionCandidates:[{...qualified[0],state:'REJECTED',tier:'REJECTED'}],globalWinnerAdmission:selected}).approved,true,'an older terminal registry row cannot override a newer exact winner');
+ assert.equal(validateClaimedPlan({...common,productionCandidates:[{...qualified[0],lastSeenAt:'2026-08-12T23:40:00.000Z'}],globalWinnerAdmission:selected}).approved,true,'an older stale row cannot override a newer exact winner');
+});
+test('P6 winner authority distinguishes registry absence, older drift, and newer terminal revocation',()=>{
+ const plan={...base,poolAddress:'DISCOVERED',planPayload:{...base.planPayload,provenance:{...base.planPayload.provenance,poolAddress:'DISCOVERED',globalSelection:{globalCycleId:'global-incident',selectedCandidateId:'candidate-incident'}},intent:{capitalLamports:'20000000',candidateId:'candidate-incident'}}};
+ const winner={globalCycleId:'global-incident',poolAddress:'DISCOVERED',candidateId:'candidate-incident',selectionTier:'A',selectionState:'ACTIVE_CANDIDATE',selectionDynamicEligible:true,winnerObservedAt:'2026-08-13T00:04:45.000Z',tokenYMint:'So11111111111111111111111111111111111111112',verified:true};
+ const common={plan,policy,ownedPositions:[],phase7Control:control,now,globalWinnerAdmission:winner};
+ const absent=validateClaimedPlan({...common,productionCandidates:[]});
+ assert.equal(absent.approved,true,'a fresh exact winner is not negated by registry absence');
+ assert.deepEqual(absent.admissionAudit?.registryAuthorityOrder,'ABSENT');
+ assert.equal(absent.admissionAudit?.decisionPredicate,'FRESH_WINNER_REGISTRY_ABSENT');
+ const olderStale=validateClaimedPlan({...common,productionCandidates:[{poolAddress:'DISCOVERED',state:'PREFILTERED',tier:'B',lastSeenAt:'2026-08-12T23:40:00.000Z',tokenYMint:'So11111111111111111111111111111111111111112'}]});
+ assert.equal(olderStale.approved,true,'an older stale collector observation cannot veto a newer winner');
+ assert.equal(olderStale.admissionAudit?.registryAuthorityOrder,'OLDER_THAN_WINNER');
+ const olderTerminal=validateClaimedPlan({...common,productionCandidates:[{poolAddress:'DISCOVERED',state:'REJECTED',tier:'REJECTED',lastSeenAt:'2026-08-13T00:04:00.000Z',tokenYMint:'So11111111111111111111111111111111111111112'}]});
+ assert.equal(olderTerminal.approved,true,'an older terminal registry observation cannot override the selected winner');
+ assert.equal(olderTerminal.admissionAudit?.decisionPredicate,'FRESH_WINNER_OLDER_TERMINAL_REGISTRY');
+ const newerTerminal=validateClaimedPlan({...common,productionCandidates:[{poolAddress:'DISCOVERED',state:'REJECTED',tier:'REJECTED',lastSeenAt:'2026-08-13T00:04:50.000Z',tokenYMint:'So11111111111111111111111111111111111111112'}]});
+ assert.ok(newerTerminal.reasonCodes.includes('P6_DISCOVERY_REGISTRY_NEWER_TERMINAL_DISQUALIFICATION'),'a newer terminal fact fails closed');
+ assert.equal(newerTerminal.admissionAudit?.registryAuthorityOrder,'NEWER_THAN_WINNER');
+ const ambiguous=validateClaimedPlan({...common,productionCandidates:[{poolAddress:'DISCOVERED',state:'REJECTED',tier:'REJECTED',lastSeenAt:winner.winnerObservedAt,tokenYMint:'So11111111111111111111111111111111111111112'}]});
+ assert.ok(ambiguous.reasonCodes.includes('P6_DISCOVERY_AUTHORITY_ORDER_AMBIGUOUS'),'an unordered terminal conflict fails closed');
+});
+test('winner proof and plan expiry remain fail-closed and ordinary plans retain current registry admission',()=>{
+ const plan={...base,poolAddress:'DISCOVERED',planPayload:{...base.planPayload,provenance:{...base.planPayload.provenance,poolAddress:'DISCOVERED',globalSelection:{globalCycleId:'global-incident',selectedCandidateId:'candidate-incident'}},intent:{capitalLamports:'20000000',candidateId:'candidate-incident'}}};
+ const unverifiable={globalCycleId:'global-incident',poolAddress:'DISCOVERED',candidateId:'candidate-incident',selectionTier:'A',selectionState:'ACTIVE_CANDIDATE',selectionDynamicEligible:true,winnerObservedAt:'not-a-timestamp',verified:true};
+ const failed=validateClaimedPlan({plan,policy,ownedPositions:[],productionCandidates:[],phase7Control:control,globalWinnerAdmission:unverifiable,now});
+ assert.ok(failed.reasonCodes.includes('P6_DISCOVERY_WINNER_BINDING_UNVERIFIABLE'));
+ const expired=validateClaimedPlan({plan:{...plan,expiresAt:'2026-08-13T00:04:59.000Z'},policy,ownedPositions:[],productionCandidates:[],phase7Control:control,now});
+ assert.ok(expired.reasonCodes.includes('P6_CLAIM_PLAN_EXPIRED'));
+ const ordinary=validateClaimedPlan({plan,policy,ownedPositions:[],productionCandidates:[],phase7Control:control,now});
+ assert.ok(ordinary.reasonCodes.includes('P6_DISCOVERY_REGISTRY_CANDIDATE_ABSENT'),'arbitrary plans do not inherit winner authority');
+ assert.equal(ordinary.admissionAudit?.decisionPredicate,'REGISTRY_CANDIDATE_ABSENT');
 });
 test('risk-increasing claims require fresh Phase-7 production control and enforce daily action limit',()=>{assert.deepEqual(validateFreshPhase7ExecutionControl(control,now),[]);assert.ok(validateClaimedPlan({plan:base,policy,ownedPositions:[],productionCandidates:admittedStatic,now}).reasonCodes.includes('P6_CLAIM_P7_CONTROL_MISSING'));assert.ok(validateClaimedPlan({plan:{...base,planPayload:{...base.planPayload,provenance:{...base.planPayload.provenance,phase7Control:undefined}}},policy,ownedPositions:[],productionCandidates:admittedStatic,phase7Control:control,now}).reasonCodes.includes('P6_CLAIM_P7_CONTROL_BINDING_MISSING'));assert.ok(validateFreshPhase7ExecutionControl({...control,safetyMode:'EMERGENCY_ONLY'},now).includes('P6_CLAIM_P7_SAFETY_NOT_NORMAL'));assert.ok(validateFreshPhase7ExecutionControl({...control,observedAt:'2026-08-12T23:00:00.000Z'},now).includes('P6_CLAIM_P7_CONTROL_STALE'));assert.ok(validateClaimedPlan({plan:base,policy,ownedPositions:[],productionCandidates:admittedStatic,phase7Control:{...control,newEconomicActionAllowed:false},actionsToday:2,now}).reasonCodes.includes('P6_CLAIM_P7_NEW_ACTION_BLOCKED'));assert.ok(validateClaimedPlan({plan:base,policy,ownedPositions:[],productionCandidates:admittedStatic,phase7Control:control,actionsToday:2,now}).reasonCodes.includes('P6_CLAIM_DAILY_ACTION_LIMIT'));});
 test('risk-increasing claims retain the authenticated P7 authority across materially equivalent healthy refreshes',()=>{

@@ -283,6 +283,7 @@ async function dispatchOne() {
         payload: {
           stage: "CLAIM_GUARD",
           capitalLamports: guard.capitalLamports.toString(),
+          ...(guard.admissionAudit?{discoveryAdmission:guard.admissionAudit}:{}),
         },
       });
       return {
