@@ -57,3 +57,13 @@ test('P6 ticket position capacity is supplied by runtime policy rather than a ha
   assert.doesNotMatch(worker, /maxOpenPositions: 1/);
   assert.match(execution, /maxOpenPositions: policy\.maxOpenPositions/);
 });
+
+test('confirmed funding uses fresh post-funding simulation authority and cannot be reported as a zero-effect block', () => {
+  const worker = fs.readFileSync('packages/phase6-live-worker/src/index.ts', 'utf8');
+  const funding = worker.indexOf('submittedAny = true;\n      lastSignature = funded.signature;');
+  const postFundingSimulation = worker.indexOf('const simulatedAt = new Date().toISOString(),', funding);
+  assert.ok(funding >= 0 && postFundingSimulation > funding, 'a confirmed funding signature must be tracked before post-funding work');
+  assert.match(worker, /P6_CONFIRMED_FUNDING_PARTIAL_ENTRY/);
+  assert.match(worker, /if\(submittedAny\|\|fundingSubmitted\)/, 'chunked opens must also preserve confirmed funding as a partial economic effect');
+  assert.match(worker, /simulatedAt,\n        input\.config\.riskPermitTtlMs/);
+});

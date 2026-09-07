@@ -901,7 +901,7 @@ async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:Auto
     await supersedeProvisionalPartialEntryRecovery({store:input.store,plan:input.plan,positionAddress:input.prepared.positionSigner.publicKeyAddress,at:new Date().toISOString()});
     await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'RECONCILED',at:new Date().toISOString(),payload:{signature:lastSignature,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,entryBasisState:entryBasis.basisState,entryBasisId:`${input.plan.planId}:entry-basis:v1`}});
     return{status:'RECONCILED',planId:input.plan.planId,reasonCodes:[],transactionSubmitted:true,positionAddress:input.prepared.positionSigner.publicKeyAddress};
-  }catch(error){const reason=error instanceof Error?error.message:'LPFORGE_P6_CHUNKABLE_OPEN_UNKNOWN';if(currentStep&&!currentStep.submitted&&!reason.startsWith('LPFORGE_P6_PRESUBMISSION_SAFETY_BLOCKED:'))await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:currentStep.transactionId,sequence:currentStep.sequence,kind:currentStep.kind,disposition:'FAILED_PRE_SIGN',...(currentStep.lastValidBlockHeight!==undefined?{lastValidBlockHeight:currentStep.lastValidBlockHeight}:{}),observedAt:new Date().toISOString(),payload:{chunked:true,error:reason}});if(currentStep?.submitted&&currentStep.signature&&reason==='LPFORGE_P6_CHUNK_CONFIRMATION_PENDING')await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:currentStep.transactionId,sequence:currentStep.sequence,kind:currentStep.kind,disposition:'UNKNOWN_SUBMISSION',signature:currentStep.signature,...(currentStep.lastValidBlockHeight!==undefined?{lastValidBlockHeight:currentStep.lastValidBlockHeight}:{}),observedAt:new Date().toISOString(),payload:{chunked:true,error:reason}});if(submittedAny){if(input.entryFundingMeasurement){await input.store.upsertPartialEntryRecovery({planId:input.plan.planId,poolAddress:input.plan.poolAddress,ownerAddress:input.plan.ownerAddress,tokenMint:input.entryFundingMeasurement.tokenMint,fundingTransactionId:input.plan.swapTransactionId??'P6_CHUNKABLE_OPEN',fundingSignature:input.entryFundingMeasurement.fundingSignature,fundedAt:new Date().toISOString(),pairedTokenAmount:input.entryFundingMeasurement.pairedTokenReceivedRaw.toString(),intendedCapitalLamports:input.fields.capital,intendedRange:{lowerBinId:input.fields.lower,upperBinId:input.fields.upper},state:'RECONCILIATION_REQUIRED',walletTruth:{refreshRequired:true,confirmedLiquiditySolAssetOutLamports:confirmedLiquiditySolAssetOut.toString(),entryFundingMeasurement:{tokenMint:input.entryFundingMeasurement.tokenMint,pairedTokenReceivedRaw:input.entryFundingMeasurement.pairedTokenReceivedRaw.toString(),pairedTokenRawBeforeFunding:input.entryFundingMeasurement.pairedTokenRawBeforeFunding.toString(),pairedTokenRawBeforeOpen:input.entryFundingMeasurement.pairedTokenRawBeforeOpen.toString(),fundingSignature:input.entryFundingMeasurement.fundingSignature}},payload:{partialEntry:true,reasonCodes:['P6_PARTIAL_OPEN_CHUNK_DISPOSITION_REQUIRED',reason],positionAddress:input.prepared.positionSigner.publicKeyAddress},updatedAt:new Date().toISOString()});}await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'RECONCILIATION_REQUIRED',{action:'OPEN',chunked:true,error:reason,positionAddress:input.prepared.positionSigner.publicKeyAddress,lastSignature,postSubmission:true},lastSignature||undefined);await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECONCILIATION_REQUIRED',at:new Date().toISOString(),reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',reason],payload:{stage:'CHUNKABLE_OPEN',error:reason,positionAddress:input.prepared.positionSigner.publicKeyAddress,lastSignature,partialEntry:true}});return{status:'UNKNOWN',planId:input.plan.planId,reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',reason],transactionSubmitted:true};}if(reason.startsWith('LPFORGE_P6_PRESUBMISSION_SAFETY_BLOCKED:'))await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'FAILED',{action:'OPEN',stage:'PRESUBMISSION_SAFETY',error:reason,chunked:true,positionAddress:input.prepared.positionSigner.publicKeyAddress});await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'BLOCKED',at:new Date().toISOString(),payload:{stage:'CHUNKABLE_OPEN',error:reason}});return{status:'BLOCKED',planId:input.plan.planId,reasonCodes:[reason],transactionSubmitted:false};}
+  }catch(error){const reason=error instanceof Error?error.message:'LPFORGE_P6_CHUNKABLE_OPEN_UNKNOWN',fundingSubmitted=input.entryFundingMeasurement!==undefined,effectiveLastSignature=lastSignature||input.entryFundingMeasurement?.fundingSignature||'';if(currentStep&&!currentStep.submitted&&!reason.startsWith('LPFORGE_P6_PRESUBMISSION_SAFETY_BLOCKED:'))await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:currentStep.transactionId,sequence:currentStep.sequence,kind:currentStep.kind,disposition:'FAILED_PRE_SIGN',...(currentStep.lastValidBlockHeight!==undefined?{lastValidBlockHeight:currentStep.lastValidBlockHeight}:{}),observedAt:new Date().toISOString(),payload:{chunked:true,error:reason}});if(currentStep?.submitted&&currentStep.signature&&reason==='LPFORGE_P6_CHUNK_CONFIRMATION_PENDING')await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:currentStep.transactionId,sequence:currentStep.sequence,kind:currentStep.kind,disposition:'UNKNOWN_SUBMISSION',signature:currentStep.signature,...(currentStep.lastValidBlockHeight!==undefined?{lastValidBlockHeight:currentStep.lastValidBlockHeight}:{}),observedAt:new Date().toISOString(),payload:{chunked:true,error:reason}});if(submittedAny||fundingSubmitted){if(input.entryFundingMeasurement){await input.store.upsertPartialEntryRecovery({planId:input.plan.planId,poolAddress:input.plan.poolAddress,ownerAddress:input.plan.ownerAddress,tokenMint:input.entryFundingMeasurement.tokenMint,fundingTransactionId:input.plan.swapTransactionId??'P6_CHUNKABLE_OPEN',fundingSignature:input.entryFundingMeasurement.fundingSignature,fundedAt:new Date().toISOString(),pairedTokenAmount:input.entryFundingMeasurement.pairedTokenReceivedRaw.toString(),intendedCapitalLamports:input.fields.capital,intendedRange:{lowerBinId:input.fields.lower,upperBinId:input.fields.upper},state:'RECONCILIATION_REQUIRED',walletTruth:{refreshRequired:true,confirmedLiquiditySolAssetOutLamports:confirmedLiquiditySolAssetOut.toString(),entryFundingMeasurement:{tokenMint:input.entryFundingMeasurement.tokenMint,pairedTokenReceivedRaw:input.entryFundingMeasurement.pairedTokenReceivedRaw.toString(),pairedTokenRawBeforeFunding:input.entryFundingMeasurement.pairedTokenRawBeforeFunding.toString(),pairedTokenRawBeforeOpen:input.entryFundingMeasurement.pairedTokenRawBeforeOpen.toString(),fundingSignature:input.entryFundingMeasurement.fundingSignature}},payload:{partialEntry:true,reasonCodes:['P6_PARTIAL_OPEN_CHUNK_DISPOSITION_REQUIRED',...(fundingSubmitted?['P6_CONFIRMED_FUNDING_PARTIAL_ENTRY']:[]),reason],positionAddress:input.prepared.positionSigner.publicKeyAddress},updatedAt:new Date().toISOString()});}await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'RECONCILIATION_REQUIRED',{action:'OPEN',chunked:true,error:reason,positionAddress:input.prepared.positionSigner.publicKeyAddress,lastSignature:effectiveLastSignature,postSubmission:true},effectiveLastSignature||undefined);await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECONCILIATION_REQUIRED',at:new Date().toISOString(),reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',...(fundingSubmitted?['P6_CONFIRMED_FUNDING_PARTIAL_ENTRY']:[]),reason],payload:{stage:'CHUNKABLE_OPEN',error:reason,positionAddress:input.prepared.positionSigner.publicKeyAddress,lastSignature:effectiveLastSignature,partialEntry:true}});return{status:'UNKNOWN',planId:input.plan.planId,reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',...(fundingSubmitted?['P6_CONFIRMED_FUNDING_PARTIAL_ENTRY']:[]),reason],transactionSubmitted:true};}if(reason.startsWith('LPFORGE_P6_PRESUBMISSION_SAFETY_BLOCKED:'))await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'FAILED',{action:'OPEN',stage:'PRESUBMISSION_SAFETY',error:reason,chunked:true,positionAddress:input.prepared.positionSigner.publicKeyAddress});await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'BLOCKED',at:new Date().toISOString(),payload:{stage:'CHUNKABLE_OPEN',error:reason}});return{status:'BLOCKED',planId:input.plan.planId,reasonCodes:[reason],transactionSubmitted:false};}
 }
 /** Executes one already-claimed plan. A caller must claim from storage before calling this function. */
 export async function executeAutonomousOpen(input: {
@@ -968,6 +968,11 @@ export async function executeAutonomousOpen(input: {
           openAuthority: swapAuthority,
         }),
         intent = input.plan.planPayload.intent as Record<string, unknown>;
+      // A confirmed funding signature is already an economic effect.  Keep
+      // the outer failure path fail-closed even if position creation later
+      // fails before its own submission.
+      submittedAny = true;
+      lastSignature = funded.signature;
       entryFundingMeasurement={
         tokenMint:funded.tokenMint,
         pairedTokenReceivedRaw:BigInt(funded.pairedTokenAmount),
@@ -1016,17 +1021,21 @@ export async function executeAutonomousOpen(input: {
         fields,
         ...(entryFundingMeasurement?{entryFundingMeasurement}:{}),
       });
-    const simAuthority = authority(
-      "MAINNET_BUILD_SIMULATE",
-      now,
-      input.config.riskPermitTtlMs,
-    );
+    // `now` is captured before the route/funding preflight. A confirmed
+    // funding swap can consume most of a short permit TTL, so the
+    // post-funding simulation must use its own fresh authority timestamp.
+    const simulatedAt = new Date().toISOString(),
+      simAuthority = authority(
+        "MAINNET_BUILD_SIMULATE",
+        simulatedAt,
+        input.config.riskPermitTtlMs,
+      );
     const simulation = await simulateExecutionTransaction({
       authority: simAuthority,
       transactionId: input.plan.transactionId,
       transaction: prepared.transaction,
       transport: createWeb3SimulationTransport(connection),
-      simulatedAt: new Date().toISOString(),
+      simulatedAt,
       freshnessMs: input.config.simulationFreshnessMs,
     });
     await input.store.insertExecutionSimulation({
@@ -1337,6 +1346,7 @@ export async function executeAutonomousOpen(input: {
     const reason =
       error instanceof Error ? error.message : "LPFORGE_P6_AUTONOMOUS_UNKNOWN";
     if (submittedAny) {
+      const confirmedFundingPartial = entryFundingMeasurement !== undefined;
       // One-shot opens get the same post-submit parity as the chunkable path:
       // never FAILED after a signature left the wallet, never resent blindly.
       await recordJournal(
@@ -1356,7 +1366,7 @@ export async function executeAutonomousOpen(input: {
         planId: input.plan.planId,
         state: "RECONCILIATION_REQUIRED",
         at: new Date().toISOString(),
-        reasonCodes: ["P6_AUTONOMOUS_OPEN_RECONCILIATION_REQUIRED", reason],
+        reasonCodes: ["P6_AUTONOMOUS_OPEN_RECONCILIATION_REQUIRED", ...(confirmedFundingPartial ? ["P6_CONFIRMED_FUNDING_PARTIAL_ENTRY"] : []), reason],
         payload: {
           stage: "AUTONOMOUS_OPEN",
           error: reason,
@@ -1367,7 +1377,7 @@ export async function executeAutonomousOpen(input: {
       return {
         status: "UNKNOWN",
         planId: input.plan.planId,
-        reasonCodes: ["P6_AUTONOMOUS_OPEN_RECONCILIATION_REQUIRED", reason],
+        reasonCodes: ["P6_AUTONOMOUS_OPEN_RECONCILIATION_REQUIRED", ...(confirmedFundingPartial ? ["P6_CONFIRMED_FUNDING_PARTIAL_ENTRY"] : []), reason],
         transactionSubmitted: true,
       };
     }
