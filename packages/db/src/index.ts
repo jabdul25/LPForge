@@ -1693,6 +1693,11 @@ export interface Phase1Store {
   loadPendingTelegramOperatorCloseRequest(positionAddress:string):Promise<Record<string,unknown>|undefined>;
   markTelegramOperatorCloseRequest(value:{requestId:string;status:'PLANNED'|'REJECTED'|'COMPLETED'|'CANCELLED';at:string;planId?:string;payload:Record<string,unknown>}):Promise<void>;
   loadTelegramOperatorOpenPositions():Promise<Record<string,unknown>[]>;
+  /**
+   * Bounded presentation read for Telegram.  This joins only the latest
+   * durable monitor/valuation facts; it never invokes chain or market I/O.
+   */
+  loadTelegramOperatorPositionSummaries():Promise<Record<string,unknown>[]>;
   resolveTelegramOperatorControlIncidents(value:{operatorId:string;at:string}):Promise<number>;
   upsertPhase7RuntimeLease(value: {
     runtimeId: string;
@@ -4673,6 +4678,36 @@ return 'APPLIED';
       const r=await db.query(`SELECT lpforge_position_id,position_address,pool_address,owner_address,strategy,orientation,lower_bin_id,upper_bin_id,initial_capital_lamports,entered_at,lifecycle_state,reconciliation_status,last_plan_id FROM execution.owned_positions WHERE lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN') ORDER BY entered_at ASC`);
       return r.rows;
     },
+    async loadTelegramOperatorPositionSummaries() {
+      // The LATERAL observation lookup uses execution_position_observations_position_time_idx.
+      // exit_state and OOR lifecycle are one current row per owned position.
+      const r=await db.query(`
+        SELECT
+          p.lpforge_position_id,p.position_address,p.pool_address,p.owner_address,p.strategy,p.orientation,
+          p.lower_bin_id,p.upper_bin_id,p.initial_capital_lamports,p.entered_at,p.lifecycle_state,
+          p.reconciliation_status,p.last_plan_id,
+          obs.observed_at AS observation_observed_at,obs.active_bin_id AS observation_active_bin_id,
+          obs.range_state AS observation_range_state,obs.stale_data AS observation_stale_data,
+          oor.range_state AS oor_range_state,oor.lifecycle_state AS oor_lifecycle_state,
+          oor.direction AS oor_direction,oor.inventory_classification AS inventory_classification,
+          oor.last_active_bin_id,oor.fee_value_lamports,oor.chain_observed_at,oor.latest_observed_at,
+          (oor.payload->>'chainTruthFresh')::boolean AS chain_truth_fresh,
+          es.observed_at AS valuation_observed_at,es.evidence_state AS valuation_state,
+          es.current_economic_value_usd,es.net_pnl_usd,es.net_return_fraction
+        FROM execution.owned_positions p
+        LEFT JOIN LATERAL (
+          SELECT observed_at,active_bin_id,range_state,stale_data
+          FROM execution.position_observations
+          WHERE lpforge_position_id=p.lpforge_position_id
+          ORDER BY observed_at DESC
+          LIMIT 1
+        ) obs ON true
+        LEFT JOIN execution.position_oor_lifecycle_state oor ON oor.position_address=p.position_address
+        LEFT JOIN execution.position_exit_state es ON es.lpforge_position_id=p.lpforge_position_id
+        WHERE p.lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN')
+        ORDER BY p.entered_at ASC`);
+      return r.rows;
+    },
     async resolveTelegramOperatorControlIncidents(v) {
       const r=await db.query(`UPDATE operations.phase7_incident_states SET status='RESOLVED',resolved_at=$1,observed_at=$1,reason_codes=reason_codes||'["P7_TELEGRAM_OPERATOR_RESUMED"]'::jsonb,payload=payload||jsonb_build_object('telegramResumedBy',$2,'telegramResumedAt',$1::timestamptz) WHERE status<>'RESOLVED' AND payload->>'telegramOperator'='true' AND incident_id IN ('telegram:pause','telegram:stop')`,[v.at,v.operatorId]);
       return Number((r as unknown as {rowCount?:number}).rowCount??0);
@@ -5355,6 +5390,7 @@ export function createMemoryStore(): Phase1Store {
     async loadPendingTelegramOperatorCloseRequest() { return undefined; },
     async markTelegramOperatorCloseRequest() {},
     async loadTelegramOperatorOpenPositions() { return []; },
+    async loadTelegramOperatorPositionSummaries() { return []; },
     async resolveTelegramOperatorControlIncidents() { return 0; },
     async upsertPhase7RuntimeLease() {},
     async getPhase7RuntimeLease() {

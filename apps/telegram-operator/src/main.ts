@@ -2,9 +2,11 @@
 // Inbound Telegram is deliberately a durable operator-intent surface.  It
 // cannot open trades, access signer material, or send chain transactions.
 import {createHash} from 'node:crypto';
-import {loadPhase1Config} from '../../../packages/config/src/index.js';
+import {loadPhase1Config,resolveLiveExecutionPolicyPath} from '../../../packages/config/src/index.js';
 import {createPostgresStore} from '../../../packages/db/src/index.js';
+import {loadDeploymentPolicyFile} from '../../../packages/deployment-policy/src/index.js';
 import {loadPhase7TelegramConfig} from '../../../packages/phase7-alerting/src/index.js';
+import {formatTelegramPositionSummaries} from '../../../packages/telegram-operator-format/src/index.js';
 
 const enabled=(v:string|undefined)=>['1','true','yes','on'].includes(String(v??'').toLowerCase());
 const sleep=(ms:number)=>new Promise(resolve=>setTimeout(resolve,ms));
@@ -28,7 +30,7 @@ async function telegram(c:CommandConfig,method:string,body:Record<string,unknown
 async function reply(c:CommandConfig,text:string){try{await telegram(c,'sendMessage',{chat_id:c.chatId,text:text.slice(0,4000),disable_web_page_preview:true});}catch(error){console.error(JSON.stringify({event:'telegram_operator_reply_failed',error:error instanceof Error?error.message:String(error)}));}}
 function command(text:string|undefined){const [raw='',...rest]=(text??'').trim().split(/\s+/);return{name:raw.replace(/@[^ ]+$/,'').toLowerCase(),args:rest};}
 function reason(args:string[]){return args.join(' ').trim().slice(0,280)||'Telegram operator request';}
-function summary(rows:Record<string,unknown>[]) {if(!rows.length)return 'No live LPForge positions.';return ['LPFORGE live positions:',...rows.map((r,i)=>`${i+1}. ${String(r.position_address)}\n   Pool: ${String(r.pool_address)}\n   ${String(r.lifecycle_state)} / ${String(r.reconciliation_status)} · capital ${(Number(r.initial_capital_lamports)/1e9).toFixed(6)} SOL`)].join('\n');}
+function maxOpenPositions():number|undefined{try{return loadDeploymentPolicyFile(resolveLiveExecutionPolicyPath()).maxOpenPositions;}catch{return undefined;}}
 
 async function processUpdate(c:CommandConfig,u:TelegramUpdate){
   const updateId=Number(u.update_id),message=u.message,chat=String(message?.chat?.id??''),operator=String(message?.from?.id??''),parsed=command(message?.text),receivedAt=now();
@@ -45,7 +47,7 @@ async function processUpdate(c:CommandConfig,u:TelegramUpdate){
     else if(parsed.name==='/status'){
       const [control,positions,blocks]=await Promise.all([store.loadLatestPhase7ControlDecision((process.env.LPFORGE_P7_RUNTIME_ID??'lpforge-production').trim()),store.loadTelegramOperatorOpenPositions(),store.loadActiveTelegramOperatorPoolBlocks()]);
       response=`LPForge status\nP7: ${control?`${String(control.authority_mode)} / ${String(control.health_status)} / ${String(control.drift_status)} / ${String(control.safety_mode)}`:'unavailable'}\nNew economic action: ${control?.new_economic_action_allowed===true?'YES':'NO'}\nOpen positions: ${positions.length}\nPool blacklist: ${blocks.length?blocks.join(', '):'none'}`;
-    } else if(parsed.name==='/positions')response=summary(await store.loadTelegramOperatorOpenPositions());
+    } else if(parsed.name==='/positions'){const max=maxOpenPositions();response=formatTelegramPositionSummaries({positions:await store.loadTelegramOperatorPositionSummaries(),...(max===undefined?{}:{maxOpenPositions:max})});}
     else if(parsed.name==='/pause'||parsed.name==='/stop'){
       const stop=parsed.name==='/stop',incidentId=stop?'telegram:stop':'telegram:pause',why=reason(parsed.args);
       await store.upsertPhase7IncidentState({incidentId,incidentType:'MANUAL_EMERGENCY',severity:stop?'CRITICAL':'WARNING',status:'OPEN',openedAt:receivedAt,observedAt:receivedAt,reasonCodes:[stop?'P7_TELEGRAM_OPERATOR_STOP':'P7_TELEGRAM_OPERATOR_PAUSE'],payload:{telegramOperator:true,operatorId:operator,reason:why,semantics:stop?'ENTRIES_AND_DISCRETIONARY_WRITES_PAUSED_PROTECTIVE_CLOSE_RECOVERY_SETTLEMENT_ALLOWED':'NEW_ENTRIES_PAUSED_PROTECTIVE_MANAGEMENT_RECOVERY_SETTLEMENT_ALLOWED'}});
@@ -58,7 +60,7 @@ async function processUpdate(c:CommandConfig,u:TelegramUpdate){
       const target=parsed.args[0]??'';const positions=await store.loadTelegramOperatorOpenPositions();const targets=target==='all'?positions.map(p=>String(p.position_address)):positions.filter(p=>String(p.position_address)===target).map(p=>String(p.position_address));if(!targets.length)throw new Error('LPFORGE_TELEGRAM_LIVE_POSITION_NOT_FOUND');let queued=0;for(const positionAddress of targets){if(await store.createTelegramOperatorCloseRequest({requestId:id('telegram-close',`${updateId}:${positionAddress}`),positionAddress,operatorId:operator,requestedAt:receivedAt,reason:reason(parsed.args.slice(1)),sourceUpdateId:BigInt(updateId),payload:{telegramOperator:true,requestType:'CLOSE'}}))queued++;}await audit('REQUEST_CLOSE',reason(parsed.args.slice(1)),'POSITION',target);response=`Canonical close request${targets.length===1?'':'s'} accepted: ${queued}/${targets.length}. The position manager will revalidate ownership, live truth, protective authority, and idempotency before it creates a close plan. No direct Telegram transaction was sent.`;
     } else {response='Unsupported command. Send /help.';}
     await persist('COMPLETED',response,{authorization:'ALLOWLISTED'});await reply(c,response);
-  }catch(error){const response=`Command not applied: ${error instanceof Error?error.message:'LPFORGE_TELEGRAM_COMMAND_FAILED'}`;try{await persist('FAILED',response);}catch{}await reply(c,response);
+  }catch(error){const response=parsed.name==='/positions'?'Unable to load position snapshot right now.':`Command not applied: ${error instanceof Error?error.message:'LPFORGE_TELEGRAM_COMMAND_FAILED'}`;try{await persist('FAILED',response);}catch{}await reply(c,response);
   }finally{await store.close();}
 }
 async function cycle(c:CommandConfig){const cfg=loadPhase1Config(),store=await createPostgresStore(cfg.databaseUrl);let offset:bigint|undefined;try{const latest=await store.loadLatestTelegramOperatorUpdateId();offset=latest===undefined?undefined:latest+1n;}finally{await store.close();}const body:Record<string,unknown>={timeout:25,allowed_updates:['message']};if(offset!==undefined)body.offset=offset.toString();const result=await telegram(c,'getUpdates',body),updates=Array.isArray(result.result)?result.result as TelegramUpdate[]:[];for(const update of updates)await processUpdate(c,update);}
