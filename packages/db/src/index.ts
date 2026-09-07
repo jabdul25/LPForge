@@ -612,6 +612,25 @@ export interface PlanCashflow {
   transactionSignature?:string;
   payload:Record<string,unknown>;
 }
+/** Immutable, receipt-backed entry basis.  It deliberately keeps LP-local
+ * principal, broader managed contribution, costs, and recoverable rent in
+ * distinct fields so no presentation or exit path can conflate them. */
+export interface PositionEntryBasis {
+  basisId:string;
+  positionAddress:string;
+  entryPlanId:string;
+  classificationVersion:number;
+  basisState:'PROVEN'|'INCOMPLETE';
+  requestedLiquidityCapitalLamports:bigint;
+  lpPositionPrincipalLamports?:bigint;
+  managedEconomicContributionLamports?:bigint;
+  executionCostLamports:bigint;
+  recoverableRentDebitsLamports:bigint;
+  recoverableRentRefundsLamports:bigint;
+  unclassifiedLamports:bigint;
+  receiptProvenance:Record<string,unknown>;
+  observedAt:string;
+}
 /**
  * A lifecycle is the durable economic boundary for one PositionV2.  A
  * replacement position deliberately receives a new lifecycle and is linked
@@ -654,7 +673,7 @@ export interface LiveLearningOutcome {outcomeId:string;outcomeKind:"LIVE_SOL_SET
 const SETTLEMENT_TERMINAL_TRANSACTION_STATES=new Set<LifecycleChildTransactionState>(["CONFIRMED","FAILED_FINAL","PROVEN_NOT_LANDED"]);
 const FEE_INCOME_CASHFLOW_TYPES=['FEE_CLAIM','REWARD_CLAIM'] as const;
 const SETTLEMENT_SOL_IN=new Set([...FEE_INCOME_CASHFLOW_TYPES,"REDUCE_WITHDRAWAL","CLOSE_WITHDRAWAL","SWAP_PROCEEDS","RENT_RECOVERY"]);
-const SETTLEMENT_SOL_OUT=new Set(["OPEN_CONTRIBUTION","ADD_CONTRIBUTION","SWAP_COST","TX_COST","RENT_LOCK"]);
+const SETTLEMENT_SOL_OUT=new Set(["OPEN_CONTRIBUTION","ENTRY_BASIS_CORRECTION","ADD_CONTRIBUTION","SWAP_COST","TX_COST","RENT_LOCK"]);
 /**
  * Canonical terminal convention: gross observed SOL/WSOL instruction flows.
  * A network fee is represented exactly once by TX_COST.  RENT_LOCK is an
@@ -1363,8 +1382,10 @@ export interface Phase1Store {
     at: string;
     payload: Record<string, unknown>;
   }): Promise<void>;
-  insertPositionCashflow(value:{cashflowId:string;positionAddress:string;planId:string;flowType:'OPEN_CONTRIBUTION'|'ADD_CONTRIBUTION'|'FEE_CLAIM'|'REWARD_CLAIM'|'REDUCE_WITHDRAWAL'|'CLOSE_WITHDRAWAL'|'SWAP_PROCEEDS'|'SWAP_COST'|'TX_COST'|'RENT_LOCK'|'RENT_RECOVERY';observedAt:string;lamports?:bigint;tokenMint?:string;tokenAmountRaw?:string;payload:Record<string,unknown>}):Promise<void>;
+  insertPositionCashflow(value:{cashflowId:string;positionAddress:string;planId:string;flowType:'OPEN_CONTRIBUTION'|'ENTRY_BASIS_CORRECTION'|'ADD_CONTRIBUTION'|'FEE_CLAIM'|'REWARD_CLAIM'|'REDUCE_WITHDRAWAL'|'CLOSE_WITHDRAWAL'|'SWAP_PROCEEDS'|'SWAP_COST'|'TX_COST'|'RENT_LOCK'|'RENT_RECOVERY';observedAt:string;lamports?:bigint;tokenMint?:string;tokenAmountRaw?:string;payload:Record<string,unknown>}):Promise<void>;
   loadPositionCashflows(positionAddress:string):Promise<Array<{flowType:string;lamports?:bigint;tokenMint?:string;tokenAmountRaw?:string;payload?:Record<string,unknown>}>>;
+  insertPositionEntryBasis(value:PositionEntryBasis):Promise<void>;
+  loadLatestPositionEntryBasis(positionAddress:string):Promise<PositionEntryBasis|undefined>;
   ensurePositionLifecycle(value:{positionAddress:string;entryPlanId?:string;ownerAddress:string;poolAddress:string;predecessorLifecycleId?:string;at:string}):Promise<PositionLifecycle>;
   linkPositionLifecyclePlan(value:{positionAddress:string;planId:string;role:"ENTRY"|"MANAGEMENT"|"CLOSE"|"RECOVERY";at:string}):Promise<void>;
   loadLifecycleSettlementInput(positionAddress:string):Promise<Omit<LifecycleSettlementInput,"positionAbsent"|"positionCheckedAt"|"positionCheckedSlot">|undefined>;
@@ -3817,7 +3838,23 @@ return 'APPLIED';
     async insertPositionManagementDecisionAudit(v){await db.query("INSERT INTO execution.position_management_decision_audit(lpforge_position_id,position_address,observed_at,active_bin_id,lower_bin_id,upper_bin_id,position_continuation_ev_lamports,expected_close_cost_lamports,uncertainty,forecast_horizon_minutes,source_decision_id,source_economics_id,geometry_identity,management_action,exit_reason_family,reason_codes,confirmation_sequence_count,valid_continuation_evidence) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18) ON CONFLICT(lpforge_position_id,observed_at) DO NOTHING",[v.lpforgePositionId,v.positionAddress,v.observedAt,v.activeBinId??null,v.lowerBinId,v.upperBinId,v.positionContinuationEvLamports?.toString()??null,v.expectedCloseCostLamports?.toString()??null,v.uncertainty??null,v.forecastHorizonMinutes??null,v.sourceDecisionId??null,v.sourceEconomicsId??null,v.geometryIdentity,v.managementAction,v.exitReasonFamily,json(v.reasonCodes),v.confirmationSequenceCount,v.validContinuationEvidence]);},
     async loadOwnedPositions(ownerAddress) {
       const r = await db.query(
-        `SELECT * FROM execution.owned_positions WHERE owner_address=$1 AND lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN') ORDER BY entered_at ASC`,
+        `SELECT o.*,basis.basis_id AS entry_basis_id,basis.entry_plan_id AS entry_basis_plan_id,
+          basis.classification_version AS entry_basis_version,basis.basis_state AS entry_basis_state,
+          basis.requested_liquidity_capital_lamports AS entry_basis_requested_lamports,
+          basis.lp_position_principal_lamports AS entry_basis_lp_principal_lamports,
+          basis.managed_economic_contribution_lamports AS entry_basis_managed_lamports,
+          basis.execution_cost_lamports AS entry_basis_execution_cost_lamports,
+          basis.recoverable_rent_debits_lamports AS entry_basis_rent_debits_lamports,
+          basis.recoverable_rent_refunds_lamports AS entry_basis_rent_refunds_lamports,
+          basis.unclassified_lamports AS entry_basis_unclassified_lamports,
+          basis.receipt_provenance AS entry_basis_receipt_provenance,basis.observed_at AS entry_basis_observed_at
+         FROM execution.owned_positions o
+         LEFT JOIN LATERAL (
+           SELECT * FROM execution.position_entry_basis_reconciliations b
+           WHERE b.position_address=o.position_address
+           ORDER BY b.classification_version DESC,b.created_at DESC LIMIT 1
+         ) basis ON true
+         WHERE o.owner_address=$1 AND o.lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN') ORDER BY o.entered_at ASC`,
         [ownerAddress],
       );
       return r.rows;
@@ -3887,6 +3924,8 @@ return 'APPLIED';
     },
     async insertPositionCashflow(v){await db.query("INSERT INTO execution.position_cashflows(cashflow_id,position_address,plan_id,flow_type,observed_at,lamports,token_mint,token_amount_raw,payload,lifecycle_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,(SELECT lifecycle_id FROM execution.position_lifecycles WHERE position_address=$2)) ON CONFLICT(cashflow_id) DO UPDATE SET lamports=EXCLUDED.lamports,token_mint=EXCLUDED.token_mint,token_amount_raw=EXCLUDED.token_amount_raw,payload=EXCLUDED.payload",[v.cashflowId,v.positionAddress,v.planId,v.flowType,v.observedAt,v.lamports?.toString()??null,v.tokenMint??null,v.tokenAmountRaw??null,json(v.payload)]);},
     async loadPositionCashflows(positionAddress){const r=await db.query("SELECT flow_type,lamports,token_mint,token_amount_raw,payload FROM execution.position_cashflows WHERE position_address=$1 ORDER BY observed_at ASC,cashflow_id ASC",[positionAddress]);return r.rows.map(row=>({flowType:String(row.flow_type),...(row.lamports!==null&&row.lamports!==undefined?{lamports:BigInt(String(row.lamports))}:{}),...(row.token_mint?{tokenMint:String(row.token_mint)}:{}),...(row.token_amount_raw?{tokenAmountRaw:String(row.token_amount_raw)}:{}),...(row.payload&&typeof row.payload==='object'?{payload:row.payload as Record<string,unknown>}:{})}));},
+    async insertPositionEntryBasis(v){await db.query("INSERT INTO execution.position_entry_basis_reconciliations(basis_id,position_address,entry_plan_id,classification_version,basis_state,requested_liquidity_capital_lamports,lp_position_principal_lamports,managed_economic_contribution_lamports,execution_cost_lamports,recoverable_rent_debits_lamports,recoverable_rent_refunds_lamports,unclassified_lamports,receipt_provenance,observed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14) ON CONFLICT(basis_id) DO NOTHING",[v.basisId,v.positionAddress,v.entryPlanId,v.classificationVersion,v.basisState,v.requestedLiquidityCapitalLamports.toString(),v.lpPositionPrincipalLamports?.toString()??null,v.managedEconomicContributionLamports?.toString()??null,v.executionCostLamports.toString(),v.recoverableRentDebitsLamports.toString(),v.recoverableRentRefundsLamports.toString(),v.unclassifiedLamports.toString(),json(v.receiptProvenance),v.observedAt]);},
+    async loadLatestPositionEntryBasis(positionAddress){const r=await db.query("SELECT basis_id,position_address,entry_plan_id,classification_version,basis_state,requested_liquidity_capital_lamports,lp_position_principal_lamports,managed_economic_contribution_lamports,execution_cost_lamports,recoverable_rent_debits_lamports,recoverable_rent_refunds_lamports,unclassified_lamports,receipt_provenance,observed_at FROM execution.position_entry_basis_reconciliations WHERE position_address=$1 ORDER BY classification_version DESC,created_at DESC LIMIT 1",[positionAddress]),row=r.rows[0];if(!row)return undefined;return{basisId:String(row.basis_id),positionAddress:String(row.position_address),entryPlanId:String(row.entry_plan_id),classificationVersion:Number(row.classification_version),basisState:String(row.basis_state) as PositionEntryBasis['basisState'],requestedLiquidityCapitalLamports:BigInt(String(row.requested_liquidity_capital_lamports)),...(row.lp_position_principal_lamports===null?{}:{lpPositionPrincipalLamports:BigInt(String(row.lp_position_principal_lamports))}),...(row.managed_economic_contribution_lamports===null?{}:{managedEconomicContributionLamports:BigInt(String(row.managed_economic_contribution_lamports))}),executionCostLamports:BigInt(String(row.execution_cost_lamports)),recoverableRentDebitsLamports:BigInt(String(row.recoverable_rent_debits_lamports)),recoverableRentRefundsLamports:BigInt(String(row.recoverable_rent_refunds_lamports)),unclassifiedLamports:BigInt(String(row.unclassified_lamports)),receiptProvenance:(row.receipt_provenance??{}) as Record<string,unknown>,observedAt:toIsoTimestamp(row.observed_at)};},
     async ensurePositionLifecycle(v){
       const lifecycleId=`lifecycle:${v.positionAddress}`;
       const r=await db.query("INSERT INTO execution.position_lifecycles(lifecycle_id,position_address,entry_plan_id,owner_address,pool_address,predecessor_lifecycle_id,status,created_at,payload) VALUES($1,$2,$3,$4,$5,$6,'OPEN',$7,'{}'::jsonb) ON CONFLICT(position_address) DO UPDATE SET entry_plan_id=COALESCE(execution.position_lifecycles.entry_plan_id,EXCLUDED.entry_plan_id),predecessor_lifecycle_id=COALESCE(execution.position_lifecycles.predecessor_lifecycle_id,EXCLUDED.predecessor_lifecycle_id) RETURNING lifecycle_id,position_address,entry_plan_id,owner_address,pool_address,predecessor_lifecycle_id,status",[lifecycleId,v.positionAddress,v.entryPlanId??null,v.ownerAddress,v.poolAddress,v.predecessorLifecycleId??null,v.at]);
@@ -4693,7 +4732,14 @@ return 'APPLIED';
           oor.last_active_bin_id,oor.fee_value_lamports,oor.chain_observed_at,oor.latest_observed_at,
           (oor.payload->>'chainTruthFresh')::boolean AS chain_truth_fresh,
           es.observed_at AS valuation_observed_at,es.evidence_state AS valuation_state,
-          es.current_economic_value_usd,es.net_pnl_usd,es.net_return_fraction
+          es.current_economic_value_usd,es.net_pnl_usd,es.net_return_fraction,
+          basis.lp_position_principal_lamports,basis.managed_economic_contribution_lamports,
+          basis.basis_state AS entry_basis_state,basis.observed_at AS entry_basis_observed_at,
+          es.payload->'lpPositionMtm'->>'state' AS lp_mtm_state,
+          es.payload->'lpPositionMtm'->>'observedAt' AS lp_mtm_observed_at,
+          (es.payload->'lpPositionMtm'->>'currentPositionValueUsd')::double precision AS lp_current_position_value_usd,
+          (es.payload->'lpPositionMtm'->>'netPnlUsd')::double precision AS lp_net_pnl_usd,
+          (es.payload->'lpPositionMtm'->>'netReturnFraction')::double precision AS lp_net_return_fraction
         FROM execution.owned_positions p
         LEFT JOIN LATERAL (
           SELECT observed_at,active_bin_id,range_state,stale_data
@@ -4704,6 +4750,11 @@ return 'APPLIED';
         ) obs ON true
         LEFT JOIN execution.position_oor_lifecycle_state oor ON oor.position_address=p.position_address
         LEFT JOIN execution.position_exit_state es ON es.lpforge_position_id=p.lpforge_position_id
+        LEFT JOIN LATERAL (
+          SELECT * FROM execution.position_entry_basis_reconciliations b
+          WHERE b.position_address=p.position_address
+          ORDER BY b.classification_version DESC,b.created_at DESC LIMIT 1
+        ) basis ON true
         WHERE p.lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN')
         ORDER BY p.entered_at ASC`);
       return r.rows;
@@ -5300,6 +5351,8 @@ export function createMemoryStore(): Phase1Store {
     async adjustOwnedPositionCapital() {},
     async insertPositionCashflow() {},
     async loadPositionCashflows() { return []; },
+    async insertPositionEntryBasis() {},
+    async loadLatestPositionEntryBasis() { return undefined; },
     async ensurePositionLifecycle(v) { return {lifecycleId:`lifecycle:${v.positionAddress}`,positionAddress:v.positionAddress,...(v.entryPlanId?{entryPlanId:v.entryPlanId}:{}),ownerAddress:v.ownerAddress,poolAddress:v.poolAddress,...(v.predecessorLifecycleId?{predecessorLifecycleId:v.predecessorLifecycleId}:{}),status:"OPEN" as const}; },
     async linkPositionLifecyclePlan() {},
     async loadLifecycleSettlementInput() { return undefined; },

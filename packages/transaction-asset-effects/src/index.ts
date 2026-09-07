@@ -8,6 +8,7 @@ export type AssetEffectClassification =
   | "SWAP_INPUT" | "SWAP_OUTPUT" | "TRANSACTION_FEE"
   | "ATA_RENT_DEBIT" | "ATA_RENT_REFUND"
   | "TEMP_ACCOUNT_RENT_DEBIT" | "TEMP_ACCOUNT_RENT_REFUND"
+  | "POSITION_RENT_LOCK"
   | "POSITION_RENT_RECOVERY" | "WSOL_WRAP" | "WSOL_UNWRAP"
   | "OTHER_KNOWN" | "UNCLASSIFIED";
 export type AssetEffectDirection = "IN" | "OUT" | "NEUTRAL";
@@ -79,7 +80,14 @@ function instructionEvidence(receipt:ConfirmedExecutionReceipt):InstructionEvide
   for(const entry of receipt.innerInstructions){const nested=record(entry)?.instructions;if(Array.isArray(nested))rows.push(...nested);}
   return rows.map(row=>{
     const value=record(row),parsed=record(value?.parsed),info=record(parsed?.info),programFromIndex=typeof value?.programIdIndex==='number'?receipt.resolvedAccountKeys[value.programIdIndex]:undefined;
-    const accounts=Array.isArray(value?.accountKeyIndexes)?value.accountKeyIndexes.filter((x):x is number=>typeof x==='number'&&Number.isInteger(x)):Array.isArray(value?.accounts)?value.accounts.flatMap(account=>typeof account==='number'&&Number.isInteger(account)?[account]:publicKey(account)?[receipt.resolvedAccountKeys.indexOf(publicKey(account)!)].filter(index=>index>=0):[]):[];
+    const directAccounts=Array.isArray(value?.accountKeyIndexes)?value.accountKeyIndexes.filter((x):x is number=>typeof x==='number'&&Number.isInteger(x)):Array.isArray(value?.accounts)?value.accounts.flatMap(account=>typeof account==='number'&&Number.isInteger(account)?[account]:publicKey(account)?[receipt.resolvedAccountKeys.indexOf(publicKey(account)!)].filter(index=>index>=0):[]):[];
+    // getParsedTransaction represents System/SPL instructions through
+    // parsed.info rather than account indexes.  Resolve those addresses too;
+    // without this, a receipt can see an ATA create but cannot prove its
+    // rent debit, which is precisely the accounting ambiguity this module is
+    // intended to remove.
+    const infoAccounts=['source','destination','account','newAccount','wallet','owner','authority','payer','fundingAccount'].flatMap(key=>publicKey(info?.[key])?[receipt.resolvedAccountKeys.indexOf(publicKey(info?.[key])!)].filter(index=>index>=0):[]);
+    const accounts=[...new Set([...directAccounts,...infoAccounts])];
     const type=typeof parsed?.type==='string'?parsed.type:typeof value?.type==='string'?value.type:undefined;
     const destination=publicKey(info?.destination)??publicKey(info?.account)??publicKey(info?.wallet);
     const programId=publicKey(value?.programId)??programFromIndex;
@@ -108,7 +116,7 @@ export function deriveTransactionAssetEffects(receipt:ConfirmedExecutionReceipt,
   base.nativeWalletDeltaLamports=ownerDelta;
   if(receipt.feeLamports!==undefined)base.transactionFeeLamports=receipt.feeLamports;
   const instructions=instructionEvidence(receipt),jupiterPrograms=new Set(context.jupiterProgramIds??[]),hasJupiter=instructions.some(instruction=>instruction.programId!==undefined&&jupiterPrograms.has(instruction.programId))||receipt.logMessages.some(log=>[...jupiterPrograms].some(program=>log.includes(program)));
-  const associatedAddresses=new Set(context.associatedTokenAccountAddresses??[]),temporaryAddresses=new Set(context.temporaryAccountAddresses??[]);
+  const associatedAddresses=new Set(context.associatedTokenAccountAddresses??[]),temporaryAddresses=new Set(context.temporaryAccountAddresses??[]),tokenAccountIndices=new Set([...receipt.preTokenBalances,...receipt.postTokenBalances].map(row=>row.accountIndex));
   let accountedNative=0n,partialLifecycle=false;
   if(receipt.feeLamports!==undefined){base.transactionFeeEffect={classification:"TRANSACTION_FEE",accountAddress:context.feePayerAddress??"UNATTRIBUTED_FEE_PAYER",accountIndex:context.feePayerAddress?receipt.resolvedAccountKeys.indexOf(context.feePayerAddress):-1,amountLamports:receipt.feeLamports,direction:"OUT",evidence:["receipt.meta.fee"]};if(context.feePayerAddress===context.ownerAddress)accountedNative-=receipt.feeLamports;}
   for(let index=0;index<receipt.resolvedAccountKeys.length;index++){
@@ -116,11 +124,15 @@ export function deriveTransactionAssetEffects(receipt:ConfirmedExecutionReceipt,
     const created=before===0n&&after>0n,closed=before>0n&&after===0n;
     if(!created&&!closed)continue;
     const ata=associatedAddresses.has(address)||instructionTouches(instructions,index,ownerIndex,context.ownerAddress,"CREATE",[ASSOCIATED_TOKEN_PROGRAM_ID]);
-    const temporary=temporaryAddresses.has(address)||(!ata&&hasJupiter&&(instructionTouches(instructions,index,ownerIndex,context.ownerAddress,"CREATE")||instructionTouches(instructions,index,ownerIndex,context.ownerAddress,"CLOSE")));
+    // A user-owned token account which is closed in this receipt returns its
+    // rent to the owner. It can be an earlier temporary WSOL account (and need
+    // not have been created by the same Jupiter route), so recognition must
+    // not depend on a route-program allowlist.
+    const temporary=temporaryAddresses.has(address)||(!ata&&(hasJupiter&&(instructionTouches(instructions,index,ownerIndex,context.ownerAddress,"CREATE")||instructionTouches(instructions,index,ownerIndex,context.ownerAddress,"CLOSE"))||(closed&&tokenAccountIndices.has(index)&&instructionTouches(instructions,index,ownerIndex,context.ownerAddress,"CLOSE"))));
     const position=context.positionAddress===address;
     const lifecycleInstruction=instructionTouches(instructions,index,ownerIndex,context.ownerAddress,created?"CREATE":"CLOSE");
     if(!lifecycleInstruction){partialLifecycle=true;continue;}
-    if(created){const classification=ata?"ATA_RENT_DEBIT":temporary?"TEMP_ACCOUNT_RENT_DEBIT":"UNCLASSIFIED",effect=native(classification,receipt,index,after,["account-created","instruction-lifecycle"]);if(classification==="UNCLASSIFIED")base.unclassifiedNativeEffects.push(effect);else{base.rentDebits.push(effect);accountedNative-=after;}}
+    if(created){const classification=position?"POSITION_RENT_LOCK":ata?"ATA_RENT_DEBIT":temporary?"TEMP_ACCOUNT_RENT_DEBIT":"UNCLASSIFIED",effect=native(classification,receipt,index,after,["account-created","instruction-lifecycle"]);if(classification==="UNCLASSIFIED")base.unclassifiedNativeEffects.push(effect);else{base.rentDebits.push(effect);accountedNative-=after;}}
     if(closed){const classification=position?"POSITION_RENT_RECOVERY":ata?"ATA_RENT_REFUND":temporary?"TEMP_ACCOUNT_RENT_REFUND":"UNCLASSIFIED",effect=native(classification,receipt,index,before,["account-closed","instruction-lifecycle"]);if(classification==="UNCLASSIFIED")base.unclassifiedNativeEffects.push(effect);else if(classification==="POSITION_RENT_RECOVERY"){base.positionRentRecoveryEffects.push(effect);base.positionRentRecoveryLamports+=before;accountedNative+=before;}else{base.rentRefunds.push(effect);accountedNative+=before;}}
   }
   const before=tokenMap(receipt.preTokenBalances),after=tokenMap(receipt.postTokenBalances),keys=new Set([...before.keys(),...after.keys()]);

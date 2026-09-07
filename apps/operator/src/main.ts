@@ -39,6 +39,7 @@ import {
 import {
   assessLiveExit,
   derivePositionEconomics,
+  deriveLpPositionMarkToMarket,
   loadLiveExitGovernorPolicy,
   type ExitHighWaterState,
   type MarketExitConfirmationState,
@@ -420,8 +421,10 @@ async function persistTransactionPlan(
 }
 function owned(row: Record<string, unknown>): OwnedLivePosition {
   const payload=(row.payload as Record<string, unknown>) ?? {};
-  let actualEconomicCapitalLamports:bigint|undefined;
-  try { if (payload.actualEconomicCapitalLamports!==undefined) actualEconomicCapitalLamports=BigInt(String(payload.actualEconomicCapitalLamports)); } catch {}
+  let lpPositionPrincipalLamports:bigint|undefined,managedEconomicContributionLamports:bigint|undefined;
+  try { if(row.entry_basis_lp_principal_lamports!==undefined&&row.entry_basis_lp_principal_lamports!==null)lpPositionPrincipalLamports=BigInt(String(row.entry_basis_lp_principal_lamports)); } catch {}
+  try { if(row.entry_basis_managed_lamports!==undefined&&row.entry_basis_managed_lamports!==null)managedEconomicContributionLamports=BigInt(String(row.entry_basis_managed_lamports)); } catch {}
+  const entryBasisState=row.entry_basis_state==='PROVEN'||row.entry_basis_state==='INCOMPLETE'?row.entry_basis_state:undefined;
   return {
     lpforgePositionId: String(row.lpforge_position_id),
     poolAddress: String(row.pool_address),
@@ -432,7 +435,9 @@ function owned(row: Record<string, unknown>): OwnedLivePosition {
     lowerBinId: Number(row.lower_bin_id),
     upperBinId: Number(row.upper_bin_id),
     initialCapitalLamports: BigInt(String(row.initial_capital_lamports)),
-    ...(actualEconomicCapitalLamports!==undefined?{actualEconomicCapitalLamports}:{}),
+    ...(lpPositionPrincipalLamports!==undefined?{lpPositionPrincipalLamports}:{}),
+    ...(managedEconomicContributionLamports!==undefined?{managedEconomicContributionLamports}:{}),
+    ...(entryBasisState?{entryBasisState}:{}),
     partialEntry: payload.partialEntry === true,
     thesisId: String(
       payload.thesisId ??
@@ -457,7 +462,7 @@ async function observeOwnedPositionsReadOnly(input:{store:Phase1Store;adapter:Re
     try{activeBinId=(await input.adapter.getPool(position.poolAddress)).activeBinId;}catch{}
     const lots=await input.store.loadPositionInventoryLots(position.positionAddress);
     let apiPool:DataApiPool|undefined,economics:{evidenceState:string;currentEconomicValueUsd?:number;netReturnFraction?:number;feesValueUsd?:number}={evidenceState:'UNAVAILABLE'};
-    if(fact)try{const [pool,cashflows]=await Promise.all([input.api.getPool(position.poolAddress),input.store.loadPositionCashflows(position.positionAddress)]);apiPool=pool;economics=derivePositionEconomics({position:fact,pool,initialCapitalLamports:position.initialCapitalLamports,observedAt:input.observedAt,realizedFeeCashflows:cashflows,attributedWalletInventory:lots.map(lot=>({tokenMint:lot.tokenMint,tokenAmountRaw:lot.remainingRawAmount.toString()})),...(position.actualEconomicCapitalLamports===undefined?{}:{actualContributedLamports:position.actualEconomicCapitalLamports})});}catch{}
+    if(fact)try{const [pool,cashflows]=await Promise.all([input.api.getPool(position.poolAddress),input.store.loadPositionCashflows(position.positionAddress)]);apiPool=pool;economics=derivePositionEconomics({position:fact,pool,initialCapitalLamports:position.initialCapitalLamports,observedAt:input.observedAt,realizedFeeCashflows:cashflows,attributedWalletInventory:lots.map(lot=>({tokenMint:lot.tokenMint,tokenAmountRaw:lot.remainingRawAmount.toString()})),...(position.managedEconomicContributionLamports===undefined?{}:{actualContributedLamports:position.managedEconomicContributionLamports}),requireReceiptProvenContribution:position.entryBasisState!==undefined});}catch{}
     const activePlans=await input.store.loadActiveAutonomousPlansForPosition(position.positionAddress);
     const rangeState=fact?(activeBinId<fact.lowerBinId||activeBinId>fact.upperBinId?'OUT_OF_RANGE':'IN_RANGE'):'UNKNOWN';
     const metrics=await persistFeeCompensationMetrics({store:input.store,position,observedAt:input.observedAt,activeBinId,...(fact?{fact}:{}),...(apiPool?{apiPool}:{}),economics,lots,activePlans,source:'LPFORGE_CONTINUOUS_POSITION_OBSERVER'});
@@ -521,9 +526,10 @@ async function observeAndPlanOwnedPositions(input: {
       try {
         const [loadedPool,cashflows] = await Promise.all([input.api.getPool(position.poolAddress),input.store.loadPositionCashflows(position.positionAddress)]);
         apiPool=loadedPool;
-        economics = derivePositionEconomics({position: fact, pool: apiPool, initialCapitalLamports: position.initialCapitalLamports, observedAt: input.observedAt,realizedFeeCashflows:cashflows,attributedWalletInventory:attributedWalletInventory.map(lot=>({tokenMint:lot.tokenMint,tokenAmountRaw:lot.remainingRawAmount.toString()})),...(position.actualEconomicCapitalLamports!==undefined?{actualContributedLamports:position.actualEconomicCapitalLamports}:{})}) as typeof economics;
+        economics = derivePositionEconomics({position: fact, pool: apiPool, initialCapitalLamports: position.initialCapitalLamports, observedAt: input.observedAt,realizedFeeCashflows:cashflows,attributedWalletInventory:attributedWalletInventory.map(lot=>({tokenMint:lot.tokenMint,tokenAmountRaw:lot.remainingRawAmount.toString()})),...(position.managedEconomicContributionLamports!==undefined?{actualContributedLamports:position.managedEconomicContributionLamports}:{}),requireReceiptProvenContribution:position.entryBasisState!==undefined}) as typeof economics;
       } catch {}
     }
+    const lpMtm=fact&&apiPool?deriveLpPositionMarkToMarket({position:fact,pool:apiPool,...(position.lpPositionPrincipalLamports===undefined?{}:{lpPositionPrincipalLamports:position.lpPositionPrincipalLamports}),observedAt:input.observedAt}):undefined;
     const priorExitRow=await input.store.loadPositionExitState(position.lpforgePositionId);
     const priorHighWater:ExitHighWaterState|undefined=priorExitRow?{
       peakNetReturnFraction:Number(priorExitRow.peak_net_return_fraction??0),
@@ -621,7 +627,7 @@ async function observeAndPlanOwnedPositions(input: {
       peakNetReturnFraction:exitDecision.highWater.peakNetReturnFraction,
       ...(exitDecision.highWater.peakEconomicValueUsd!==undefined?{peakEconomicValueUsd:exitDecision.highWater.peakEconomicValueUsd}:{}),
       peakObservedAt:exitDecision.highWater.peakObservedAt,lastAction:exitDecision.action,reasonCodes:exitDecision.reasonCodes,
-      payload:{peakGivebackFraction:exitDecision.peakGivebackFraction,reasonFamily:exitDecision.reasonFamily,urgency:exitDecision.urgency,continuationEvLamports:continuation?.continuationEvLamports.toString()??null,expectedCloseCostLamports:closeCostLamports?.toString()??null,continuationCandidateId:continuation?.candidateId??null,geometryIdentity:continuation?.geometryIdentity??null,continuationConfirmationCount:confirmationCount,marketExitConfirmation:exitDecision.marketConfirmation,regime:regime??null,toxicity:toxicity??null}
+      payload:{peakGivebackFraction:exitDecision.peakGivebackFraction,reasonFamily:exitDecision.reasonFamily,urgency:exitDecision.urgency,continuationEvLamports:continuation?.continuationEvLamports.toString()??null,expectedCloseCostLamports:closeCostLamports?.toString()??null,continuationCandidateId:continuation?.candidateId??null,geometryIdentity:continuation?.geometryIdentity??null,continuationConfirmationCount:confirmationCount,marketExitConfirmation:exitDecision.marketConfirmation,regime:regime??null,toxicity:toxicity??null,lpPositionMtm:lpMtm?{state:lpMtm.evidenceState,observedAt:lpMtm.observedAt,entryPositionValueUsd:lpMtm.entryPositionValueUsd??null,currentPositionValueUsd:lpMtm.currentPositionValueUsd??null,netPnlUsd:lpMtm.netPnlUsd??null,netReturnFraction:lpMtm.netReturnFraction??null,reasonCodes:lpMtm.reasonCodes,scope:'LP_POSITION_MTM'}:null,managedEconomicMtmScope:'MANAGED_ECONOMIC_MTM'}
     });
     await input.store.insertPositionManagementDecisionAudit({lpforgePositionId:position.lpforgePositionId,positionAddress:position.positionAddress,observedAt:input.observedAt,activeBinId,lowerBinId:position.lowerBinId,upperBinId:position.upperBinId,...(continuation?{positionContinuationEvLamports:continuation.continuationEvLamports,forecastHorizonMinutes:continuation.forecastHorizonMinutes}:{}),...(current?.shadow?.recommendationId?{sourceDecisionId:current.shadow.recommendationId}:{}),...(continuation?{sourceEconomicsId:continuation.candidateId}:{}),...(continuation?.uncertainty!==undefined?{uncertainty:continuation.uncertainty}:{}),...(closeCostLamports!==undefined?{expectedCloseCostLamports:closeCostLamports}:{}),geometryIdentity:continuation?.geometryIdentity??`${position.positionAddress}:${position.strategy}:${position.orientation}:${position.lowerBinId}:${position.upperBinId}`,managementAction:decision.action,exitReasonFamily:exitDecision.reasonFamily,reasonCodes:exitDecision.reasonCodes,confirmationSequenceCount:confirmationCount,validContinuationEvidence:continuation!==undefined&&closeCostLamports!==undefined});
     const alertBase={entityType:'POSITION' as const,entityId:position.positionAddress,positionId:position.lpforgePositionId,positionAddress:position.positionAddress,poolAddress:position.poolAddress,observedAt:input.observedAt};

@@ -2,6 +2,8 @@ import { readFileSync } from 'node:fs';
 import type { DataApiPool } from '../../data-api/src/index.js';
 import type { PositionV2Fact } from '../../domain/src/index.js';
 
+const WSOL_MINT='So11111111111111111111111111111111111111112';
+
 export type ExitEvidenceState='AVAILABLE'|'UNAVAILABLE'|'STALE'|'CONTRADICTORY';
 export type LiveExitAction='HOLD'|'REDUCE'|'CLOSE'|'EMERGENCY_CLOSE';
 export interface ProfitProtectionPolicy {enabled:boolean;triggerFraction:number;maxGivebackFraction:number;minRetainedProfitFraction:number;}
@@ -65,6 +67,23 @@ export function derivePositionMarkToMarket(input:{position:PositionV2Fact;pool:D
   if(fuy===undefined)reasons.push('EXIT_VALUATION_FEE_Y_UNAVAILABLE');
   if(reasons.length)return{evidenceState:'UNAVAILABLE',observedAt,reasonCodes:reasons.sort()};
   return{evidenceState:'AVAILABLE',observedAt,currentPositionValueUsd:xv!+yv!+fux!+fuy!,reasonCodes:['EXIT_VALUATION_POSITION_MARK_TO_MARKET']};
+}
+/**
+ * LP-local performance intentionally excludes attributed wallet residuals,
+ * realized cashflows, and execution cost.  The denominator is the
+ * receipt-proven value deposited into PositionV2, expressed at the same SOL
+ * mark as the current observation, so it is comparable to an LP UI mark and
+ * never presented as settled PnL.
+ */
+export function deriveLpPositionMarkToMarket(input:{position:PositionV2Fact;pool:DataApiPool;lpPositionPrincipalLamports?:bigint;observedAt:string}):{evidenceState:ExitEvidenceState;observedAt:string;entryPositionValueUsd?:number;currentPositionValueUsd?:number;netPnlUsd?:number;netReturnFraction?:number;reasonCodes:string[]}{
+  if(input.lpPositionPrincipalLamports===undefined||input.lpPositionPrincipalLamports<=0n)return{evidenceState:'UNAVAILABLE',observedAt:input.observedAt,reasonCodes:['LP_MTM_ENTRY_BASIS_UNPROVEN']};
+  const marked=derivePositionMarkToMarket({position:input.position,pool:input.pool,observedAt:input.observedAt});
+  const sol=[input.pool.token_x,input.pool.token_y].find(token=>token?.address===WSOL_MINT);
+  if(marked.evidenceState!=='AVAILABLE'||!finite(sol?.price)||sol.price!<=0||marked.currentPositionValueUsd===undefined)return{evidenceState:'UNAVAILABLE',observedAt:input.observedAt,reasonCodes:[...marked.reasonCodes,'LP_MTM_SOL_MARK_UNAVAILABLE'].sort()};
+  const entry=Number(input.lpPositionPrincipalLamports)/1e9*sol.price!;
+  if(!Number.isFinite(entry)||entry<=0)return{evidenceState:'UNAVAILABLE',observedAt:input.observedAt,reasonCodes:['LP_MTM_ENTRY_BASIS_INVALID']};
+  const net=marked.currentPositionValueUsd-entry;
+  return{evidenceState:'AVAILABLE',observedAt:input.observedAt,entryPositionValueUsd:entry,currentPositionValueUsd:marked.currentPositionValueUsd,netPnlUsd:net,netReturnFraction:net/entry,reasonCodes:['LP_POSITION_MARK_TO_MARKET']};
 }
 export interface ExitHighWaterState {peakNetReturnFraction:number;peakEconomicValueUsd?:number;peakObservedAt:string;}
 /**
@@ -137,7 +156,7 @@ export function valuePositionCashflows(input:{cashflows:readonly RealizedPositio
   const sol=tokens.find(token=>token.address==='So11111111111111111111111111111111111111112');
   let contributionsUsd=0,realizedFeeUsd=0,realizedWithdrawalUsd=0,executionCostUsd=0,complete=true,hasEconomicCashflow=false,hasRealizedFeeFlow=false;const reasons:string[]=[];
   for(const flow of input.cashflows){
-    if(!['OPEN_CONTRIBUTION','ADD_CONTRIBUTION','FEE_CLAIM','REWARD_CLAIM','REDUCE_WITHDRAWAL','CLOSE_WITHDRAWAL','SWAP_PROCEEDS','SWAP_COST','TX_COST'].includes(flow.flowType))continue;
+    if(!['OPEN_CONTRIBUTION','ENTRY_BASIS_CORRECTION','ADD_CONTRIBUTION','FEE_CLAIM','REWARD_CLAIM','REDUCE_WITHDRAWAL','CLOSE_WITHDRAWAL','SWAP_PROCEEDS','SWAP_COST','TX_COST'].includes(flow.flowType))continue;
     hasEconomicCashflow=true;
     // Legacy reductions stored an estimated capital basis in lamports. That
     // is not a wallet realization and is never treated as PnL.
@@ -147,7 +166,7 @@ export function valuePositionCashflows(input:{cashflows:readonly RealizedPositio
     const lamportValue=flow.lamports!==undefined&&sol?Number(flow.lamports)/1e9*(sol.price??Number.NaN):undefined;
     const value=tokenValue??lamportValue;
     if(value===undefined||!Number.isFinite(value)){complete=false;reasons.push('EXIT_CASHFLOW_VALUE_UNAVAILABLE');continue;}
-    if(flow.flowType==='OPEN_CONTRIBUTION'||flow.flowType==='ADD_CONTRIBUTION')contributionsUsd+=value;
+    if(flow.flowType==='OPEN_CONTRIBUTION'||flow.flowType==='ENTRY_BASIS_CORRECTION'||flow.flowType==='ADD_CONTRIBUTION')contributionsUsd+=value;
     else if(flow.flowType==='FEE_CLAIM'||flow.flowType==='REWARD_CLAIM'){realizedFeeUsd+=value;hasRealizedFeeFlow=true;}
     else if(flow.flowType==='REDUCE_WITHDRAWAL'||flow.flowType==='CLOSE_WITHDRAWAL'||flow.flowType==='SWAP_PROCEEDS')realizedWithdrawalUsd+=value;
     else executionCostUsd+=value;
@@ -157,10 +176,11 @@ export function valuePositionCashflows(input:{cashflows:readonly RealizedPositio
 /** Backward-compatible fee-only view for reporting callers. */
 export function valueRealizedFeeCashflows(input:{cashflows:readonly RealizedPositionCashflow[];pool:DataApiPool}){const v=valuePositionCashflows(input);return{valueUsd:v.realizedFeeUsd,complete:v.complete,reasonCodes:v.reasonCodes};}
 /** Capital-normalized economic valuation. No value is fabricated when token price/decimals are unavailable. */
-export function derivePositionEconomics(input:{position:PositionV2Fact;pool:DataApiPool;initialCapitalLamports:bigint;observedAt:string;realizedFeeCashflows?:readonly RealizedPositionCashflow[];attributedWalletInventory?:readonly AttributedWalletInventory[];actualContributedLamports?:bigint}):PositionEconomicsSnapshot{
+export function derivePositionEconomics(input:{position:PositionV2Fact;pool:DataApiPool;initialCapitalLamports:bigint;observedAt:string;realizedFeeCashflows?:readonly RealizedPositionCashflow[];attributedWalletInventory?:readonly AttributedWalletInventory[];actualContributedLamports?:bigint;requireReceiptProvenContribution?:boolean}):PositionEconomicsSnapshot{
   const {position,pool,initialCapitalLamports,observedAt}=input,x=pool.token_x,y=pool.token_y;
   const tokens=[x,y].filter((token):token is NonNullable<typeof token>=>Boolean(token));
   const sol=x?.address==='So11111111111111111111111111111111111111112'?x:y?.address==='So11111111111111111111111111111111111111112'?y:undefined;
+  if(input.requireReceiptProvenContribution&&input.actualContributedLamports===undefined)return{evidenceState:'UNAVAILABLE',observedAt,reasonCodes:['EXIT_VALUATION_ENTRY_BASIS_UNPROVEN']};
   const contributionLamports=input.actualContributedLamports??initialCapitalLamports;
   const initial=finite(sol?.price)&&sol!.price!>0?Number(contributionLamports)/1e9*sol!.price!:undefined;
   const xv=tokenUsd(position.totalXAmount,x?.decimals,x?.price),yv=tokenUsd(position.totalYAmount,y?.decimals,y?.price);

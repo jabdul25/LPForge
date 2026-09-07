@@ -55,6 +55,9 @@ function range(summary:TelegramPositionSummary):string{
 function valuationAvailable(summary:TelegramPositionSummary):boolean{
   return chainFresh(summary)&&text(summary.valuation_state,'UNAVAILABLE')==='AVAILABLE'&&number(summary.net_return_fraction)!==undefined;
 }
+function lpValuationAvailable(summary:TelegramPositionSummary):boolean{
+  return chainFresh(summary)&&text(summary.lp_mtm_state,'UNAVAILABLE')==='AVAILABLE'&&number(summary.lp_net_return_fraction)!==undefined;
+}
 function canonicalFee(summary:TelegramPositionSummary):string|undefined{
   if(!chainFresh(summary))return undefined;
   const fee=sol(summary.fee_value_lamports);
@@ -72,14 +75,21 @@ function one(summary:TelegramPositionSummary,index:number,nowMs:number):string{
     '',
     `Capital: ${sol(summary.initial_capital_lamports)??'unavailable'}`,
   ];
+  if(lpValuationAvailable(summary)){
+    const value=usd(summary.lp_current_position_value_usd),pnl=usd(summary.lp_net_pnl_usd,true),pct=signedPercent(summary.lp_net_return_fraction);
+    lines.push(`LP Value: ${value??'unavailable'}`);
+    lines.push(`LP MTM: ${pnl??'unavailable'}${pct?` (${pct})`:''}`);
+  }else lines.push('LP MTM: unavailable · entry basis pending');
+  const managedBasis=sol(summary.managed_economic_contribution_lamports);
+  if(managedBasis)lines.push(`Economic basis: ${managedBasis}`);
   if(valuationAvailable(summary)){
     const value=usd(summary.current_economic_value_usd),pnl=usd(summary.net_pnl_usd,true),pct=signedPercent(summary.net_return_fraction);
-    lines.push(`Value: ${value??'unavailable'}`);
-    lines.push(`MTM: ${pnl??'unavailable'}${pct?` (${pct})`:''}`);
+    lines.push(`Economic value: ${value??'unavailable'}`);
+    lines.push(`Economic MTM: ${pnl??'unavailable'}${pct?` (${pct})`:''}`);
   }else{
     const state=text(summary.valuation_state,'UNAVAILABLE');
-    lines.push('Value: unavailable');
-    lines.push(`MTM: unavailable${state==='STALE'||!chainFresh(summary)?' · valuation stale':''}`);
+    lines.push('Economic value: unavailable');
+    lines.push(`Economic MTM: unavailable${state==='STALE'||!chainFresh(summary)?' · valuation stale':''}`);
   }
   lines.push(`Fees: ${canonicalFee(summary)??'unavailable'}`);
   lines.push('',`Range: ${text(summary.lower_bin_id)} → ${text(summary.upper_bin_id)}`);

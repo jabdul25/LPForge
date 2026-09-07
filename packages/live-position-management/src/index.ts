@@ -121,8 +121,12 @@ export interface OwnedLivePosition {
   lowerBinId: number;
   upperBinId: number;
   initialCapitalLamports: bigint;
-  /** Actual attributable asset debit, when a chunked entry measured it. */
-  actualEconomicCapitalLamports?: bigint;
+  /** Receipt-proven LP-only capital actually deposited into PositionV2. */
+  lpPositionPrincipalLamports?: bigint;
+  /** Receipt-proven contribution including attributable entry residual inventory. */
+  managedEconomicContributionLamports?: bigint;
+  /** Capital return is unavailable until a chunked entry has a receipt basis. */
+  entryBasisState?: 'PROVEN'|'INCOMPLETE';
   /** A partial entry is never eligible for ordinary reshaping/rebalancing. */
   partialEntry?: boolean;
   thesisId: string;
