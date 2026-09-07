@@ -3356,6 +3356,25 @@ export function shouldRebuildExpiredResidualUnwind(input:{
     input.pendingStage==="CLOSE_OPEN_RESIDUAL_UNWIND_SUBMITTED";
 }
 
+/**
+ * The primary close unwind has the same no-blind-resend rule as the
+ * recovered-open-residual unwind.  Once REMOVE/CLAIM are confirmed, an
+ * expired primary Jupiter signature proves only that *that child* did not
+ * land; it does not erase the already-confirmed liquidity withdrawal.  The
+ * parent must resume from its measured inventory with a new child identity.
+ */
+export function shouldRebuildExpiredCloseUnwind(input:{
+  signatureStatusReadUnknown:boolean;
+  confirmationStatus:"PROCESSED"|"CONFIRMED"|"FINALIZED"|"EXPIRED"|"FAILED"|"UNKNOWN";
+  positionExists:boolean;
+  pendingStage:CloseSettlementPendingStage;
+}):boolean{
+  return !input.signatureStatusReadUnknown&&
+    input.confirmationStatus==="EXPIRED"&&
+    input.positionExists&&
+    input.pendingStage==="CLOSE_UNWIND_SUBMITTED";
+}
+
 /** Bounded recovery delay prevents a proven-safe retry from becoming a tight loop. */
 function recoveredResidualRetryNotBefore(now:string,retryCount:number):string{
   const delayMs=Math.min(300_000,60_000*Math.max(1,retryCount));
@@ -3856,18 +3875,28 @@ async function executeCloseSettlement(input: {
         transactionSubmitted: true,
       };
     }
+    const retryRaw=Number(closeSettlementDispatch(input.plan).closeUnwindRetryCount??0),
+      retryCount=Number.isSafeInteger(retryRaw)&&retryRaw>=0?retryRaw:0,
+      unwindTransactionId=retryCount===0
+        ? unwindStep.transactionId
+        : `${unwindStep.transactionId}:retry-${retryCount}`;
     let swapProceedsLamports=0n;
     if (attributableTokenX > 0n) {
+      // An expired primary unwind is conclusively no-effect, but it must
+      // never reuse its signed child identity.  Recovery increments this
+      // durable counter before returning here, so the retry has an
+      // independent journal/submission record and cannot replay the expired
+      // signature.
       const unwind = await executeJupiterUnwindStep({
         store: input.store,
-        plan: closeChildPlan(input.plan, unwindStep.transactionId),
+        plan: closeChildPlan(input.plan, unwindTransactionId),
         signer: input.signer,
         config: input.config,
         amount: attributableTokenX,
         economicReferenceLamports: mutationCapital(input.plan),
         action: closeAction,
-        transactionId: unwindStep.transactionId,
-        idempotencyKey: `${input.plan.idempotencyKey}:${unwindStep.transactionId}`,
+        transactionId: unwindTransactionId,
+        idempotencyKey: `${input.plan.idempotencyKey}:${unwindTransactionId}`,
         stage: "CLOSE_TOKEN_X_UNWIND",
         reasonPrefix: "P6_CLOSE_UNWIND",
         afterSubmit: async ({ signature }) => persist("CLOSE_INVENTORY_MEASURED", {
@@ -3875,6 +3904,8 @@ async function executeCloseSettlement(input: {
           tokenYBefore: tokenYBefore!.toString(),
           attributableTokenX: attributableTokenX!.toString(),
           attributableTokenY:attributableTokenY?.toString()??"0",
+          closeUnwindRetryCount: retryCount,
+          unwindTransactionId,
           pendingStage: "CLOSE_UNWIND_SUBMITTED",
           pendingSignature: signature,
         }),
@@ -3888,7 +3919,7 @@ async function executeCloseSettlement(input: {
         plan: input.plan,
         positionAddress: input.positionAddress,
         signature: unwind.signature,
-        transactionId: unwindStep.transactionId,
+        transactionId: unwindTransactionId,
         inputMint: poolFact.tokenXMint,
         inputAmountRaw: attributableTokenX,
         ...(attributableFeeLotAllocations.length?{lotAllocations:attributableFeeLotAllocations}:{}),
@@ -3902,7 +3933,8 @@ async function executeCloseSettlement(input: {
       tokenYBefore: tokenYBefore.toString(),
       attributableTokenX: attributableTokenX.toString(),
       attributableTokenY:attributableTokenY?.toString()??"0",
-      unwindTransactionId: unwindStep.transactionId,
+      closeUnwindRetryCount: retryCount,
+      unwindTransactionId,
       swapProceedsLamports:swapProceedsLamports.toString(),
     });
     stage = "CLOSE_INVENTORY_UNWOUND";
@@ -4874,6 +4906,82 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     if (closePending) {
       const settled = confirmationStatus === "CONFIRMED" || confirmationStatus === "FINALIZED";
       if (!settled) {
+        // A primary CLOSE unwind is a separately journaled token swap.  When
+        // its exact signature has expired and PositionV2 is still present,
+        // the receipt proves no swap effect but REMOVE/CLAIM remain confirmed
+        // economic facts.  Resume the same parent at its measured-inventory
+        // boundary with a fresh child identity; never resend this signature
+        // and never rebuild either confirmed liquidity child.
+        if (shouldRebuildExpiredCloseUnwind({
+          signatureStatusReadUnknown,
+          confirmationStatus,
+          positionExists:positionTruth.exists===true,
+          pendingStage:closePending.stage,
+        })) {
+          const dispatch=closeSettlementDispatch(plan),
+            priorRetryRaw=Number(dispatch.closeUnwindRetryCount??0),
+            priorRetry=Number.isSafeInteger(priorRetryRaw)&&priorRetryRaw>=0?priorRetryRaw:0,
+            nextRetry=priorRetry+1,
+            originalUnwindTransactionId=typeof dispatch.unwindTransactionId==='string'
+              ? dispatch.unwindTransactionId
+              : plan.steps.find(step=>step.kind==='JUPITER_UNWIND')?.transactionId;
+          if(!originalUnwindTransactionId){
+            await input.store.transitionAutonomousPlan({
+              planId:plan.planId,state:'RECONCILIATION_REQUIRED',at:input.now,
+              reasonCodes:['P6_CLOSE_UNWIND_RETRY_TRANSACTION_ID_MISSING'],
+              payload:{stage:'CLOSE_INVENTORY_MEASURED',pendingStage:closePending.stage,pendingSignature:closePending.signature},
+            });
+            results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:['P6_CLOSE_UNWIND_RETRY_TRANSACTION_ID_MISSING']});
+            continue;
+          }
+          await input.store.markSubmissionExpired(
+            closePending.signature,
+            input.now,
+            'P6_CLOSE_UNWIND_EXPIRED_NO_CHAIN_EFFECT',
+          );
+          await input.store.updateExecutionJournal({
+            idempotencyKey:plan.idempotencyKey,
+            expectedVersion:journal.version,
+            // A previous release may already have set the parent to FAILED.
+            // Preserve that evidence in payload while restoring only the
+            // parent’s last-confirmed boundary for this exact no-effect child.
+            state:'CONFIRMED',
+            updatedAt:input.now,
+            payload:{
+              ...journal.payload,
+              recovery:'P6_CLOSE_UNWIND_EXPIRED_NO_CHAIN_EFFECT',
+              expiredPrimaryUnwindSignature:closePending.signature,
+              expiredPrimaryUnwindTransactionId:originalUnwindTransactionId,
+              priorJournalState:journal.state,
+              confirmationStatus,
+              positionTruth,
+            },
+          });
+          await input.store.transitionAutonomousPlan({
+            planId:plan.planId,state:'RECONCILING',at:input.now,
+            reasonCodes:[
+              'P6_CLOSE_UNWIND_EXPIRED_NO_CHAIN_EFFECT',
+              'P6_CLOSE_UNWIND_REBUILD_READY',
+            ],
+            payload:{
+              stage:'CLOSE_INVENTORY_MEASURED',
+              pendingStage:null,
+              pendingSignature:null,
+              closeUnwindRetryCount:nextRetry,
+              expiredPrimaryUnwindSignature:closePending.signature,
+              expiredPrimaryUnwindTransactionId:originalUnwindTransactionId,
+            },
+          });
+          results.push({
+            planId:plan.planId,
+            action:'RESUME_CLOSE_SETTLEMENT',
+            reasonCodes:[
+              'P6_CLOSE_UNWIND_EXPIRED_NO_CHAIN_EFFECT',
+              'P6_CLOSE_UNWIND_REBUILD_READY',
+            ],
+          });
+          continue;
+        }
         // A protected residual unwind is safe to rebuild only after the
         // previous child has authoritatively expired without a chain receipt.
         // Preserve every completed close child and resume the parent at the

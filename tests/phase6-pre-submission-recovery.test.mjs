@@ -1,6 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {recoverUnfinishedAutonomousPlans,reconcileWalletWidePositions,assessExpiredNoEffectOpenRecovery} from '../.build/packages/phase6-live-worker/src/index.js';
+import {recoverUnfinishedAutonomousPlans,reconcileWalletWidePositions,assessExpiredNoEffectOpenRecovery,shouldRebuildExpiredCloseUnwind} from '../.build/packages/phase6-live-worker/src/index.js';
+
+test('a proven-expired primary CLOSE unwind is rebuilt as a new child only', async()=>{
+  const base={signatureStatusReadUnknown:false,confirmationStatus:'EXPIRED',positionExists:true,pendingStage:'CLOSE_UNWIND_SUBMITTED'};
+  assert.equal(shouldRebuildExpiredCloseUnwind(base),true);
+  assert.equal(shouldRebuildExpiredCloseUnwind({...base,signatureStatusReadUnknown:true}),false,'unknown signature truth never authorizes a retry');
+  assert.equal(shouldRebuildExpiredCloseUnwind({...base,confirmationStatus:'UNKNOWN'}),false);
+  assert.equal(shouldRebuildExpiredCloseUnwind({...base,positionExists:false}),false);
+  assert.equal(shouldRebuildExpiredCloseUnwind({...base,pendingStage:'CLOSE_REMOVE_SUBMITTED'}),false);
+  const source=await (await import('node:fs/promises')).readFile('packages/phase6-live-worker/src/index.ts','utf8');
+  assert.match(source,/P6_CLOSE_UNWIND_EXPIRED_NO_CHAIN_EFFECT/);
+  assert.match(source,/P6_CLOSE_UNWIND_REBUILD_READY/);
+  assert.match(source,/unwindStep\.transactionId\}:retry-\$\{retryCount\}/,'the replacement uses a new durable child identity');
+  assert.match(source,/stage:'CLOSE_INVENTORY_MEASURED'/,'recovery resumes after confirmed removal/claim, not from child zero');
+});
 
 test("expired no-effect OPEN is terminal only with complete absence evidence",()=>{
   const clean={confirmationStatus:"EXPIRED",economicEffect:"ABSENT",positionAbsenceProven:true,signatureStatusReadUnknown:false,hasFundingChild:false,partialEntryRecoveryPresent:false,planCashflowCount:0,chunkDispositions:[]};
