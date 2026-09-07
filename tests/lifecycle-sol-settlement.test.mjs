@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import {assessLifecycleSettlement,lifecycleSettlementEvidenceHash} from '../.build/packages/db/src/index.js';
+import {assessLifecycleSettlement,lifecycleSettlementEvidenceHash,shouldIncludeLifecycleTransactionForSettlement} from '../.build/packages/db/src/index.js';
 
 const lifecycle={lifecycleId:'life-1',positionAddress:'position-1',entryPlanId:'entry-1',ownerAddress:'owner',poolAddress:'pool',status:'CLOSED'};
 const base={lifecycle,positionAbsent:true,positionCheckedAt:'2026-08-16T00:00:00.000Z',reconciliationClean:true,reservationClean:true,inventoryLots:[],transactions:[{transactionId:'open',signature:'sig-open',state:'CONFIRMED'},{transactionId:'close',signature:'sig-close',state:'CONFIRMED'}]};
@@ -35,6 +35,17 @@ const assess=(cashflows,more={})=>assessLifecycleSettlement({...base,cashflows,.
 }
 // Fixture F: an uncertain child signature is a hard terminal boundary.
 assert.equal(assess([], {transactions:[{transactionId:'unwind',signature:'sig',state:'UNKNOWN'}]}).ready,false);
+// A historical close plan can be retained in a lifecycle after construction
+// failed before its first submission. Its unsigned PLANNED children cannot
+// have a chain effect and must not manufacture missing-receipt debt. This is
+// deliberately narrower than ignoring uncertain attempts: once an attempt
+// exists, it remains part of the terminal reconciliation input.
+assert.equal(shouldIncludeLifecycleTransactionForSettlement({hasSubmissionAttempt:false,stepState:'PLANNED'}),false);
+assert.equal(shouldIncludeLifecycleTransactionForSettlement({hasSubmissionAttempt:false,stepState:'PREPARED'}),false);
+assert.equal(shouldIncludeLifecycleTransactionForSettlement({hasSubmissionAttempt:true,stepState:'PLANNED'}),true);
+assert.equal(shouldIncludeLifecycleTransactionForSettlement({hasSubmissionAttempt:true,stepState:'EXPIRED'}),true);
+assert.equal(shouldIncludeLifecycleTransactionForSettlement({hasSubmissionAttempt:false,stepState:'EXPIRED'}),true);
+assert.equal(shouldIncludeLifecycleTransactionForSettlement({hasSubmissionAttempt:false,stepState:'PROVEN_NOT_LANDED'}),true);
 // Fixture G: a missing PositionV2 absence proof is a hard terminal boundary.
 assert.equal(assess([], {positionAbsent:false}).ready,false);
 
