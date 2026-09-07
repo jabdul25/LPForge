@@ -52,9 +52,17 @@ test('normal management is bound to the position pool context',()=>{
 test('only emergency protective management may proceed without a matching pool context',()=>{
   const emergency=assessLiveManagementContext({positionPoolAddress:'POOL_B',managementPoolAddress:'POOL_A',action:'EMERGENCY_CLOSE'});
   const ordinaryClose=assessLiveManagementContext({positionPoolAddress:'POOL_B',managementPoolAddress:'POOL_A',action:'CLOSE'});
+  const hardStop=assessLiveManagementContext({positionPoolAddress:'POOL_B',managementPoolAddress:'POOL_A',action:'CLOSE',terminalProtectiveClose:true});
   assert.equal(emergency.planAllowed,true);
   assert.deepEqual(emergency.reasonCodes,['LIVE_MANAGEMENT_CONTEXT_EMERGENCY_INDEPENDENT']);
   assert.equal(ordinaryClose.planAllowed,false);
+  assert.equal(hardStop.planAllowed,true);
+  assert.deepEqual(hardStop.reasonCodes,['LIVE_MANAGEMENT_CONTEXT_HARD_STOP_INDEPENDENT']);
+});
+test('hard-stop close is explicitly wired as terminal protective management',()=>{
+  const src=fs.readFileSync(new URL('../apps/operator/src/main.ts',import.meta.url),'utf8');
+  assert.match(src,/terminalProtectiveClose:/);
+  assert.match(src,/EXIT_HARD_POSITION_STOP_LOSS/);
 });
 test('lifecycle worker contains ordered replacement, chain-aware recovery, and token-X attribution',()=>{const src=fs.readFileSync(new URL('../packages/phase6-live-worker/src/index.ts',import.meta.url),'utf8');for(const token of ['REMOVE_OLD','AWAIT_REMOVE_RECONCILIATION','REFRESH_WALLET_TRUTH','BUILD_REPLACEMENT','getSignatureStatus','getPositionV2','P6_SEQUENCE_CHAIN_TRUTH_PENDING','recordPositionTokenXLot','sourceEvent:"FEE_CLAIM"','sourceEvent:"REDUCE_WITHDRAWAL"'])assert.match(src,new RegExp(token));assert.ok(src.indexOf('P6_MANAGEMENT_OLD_POSITION_STILL_EXISTS')<src.indexOf('BUILD_REPLACEMENT'));});
 test("continuation close wiring is geometry-bound and cannot use generic pool EV",()=>{const src=fs.readFileSync(new URL("../apps/operator/src/main.ts",import.meta.url),"utf8");for(const token of ["loadPositionContinuationEconomics","candidate.strategy===position.strategy","candidate.lowerBinId===position.lowerBinId","estimateExpectedCloseCostLamports","forwardEvConfirmationCount","insertPositionManagementDecisionAudit"])assert.match(src,new RegExp(token));});

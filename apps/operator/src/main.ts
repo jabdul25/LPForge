@@ -616,6 +616,8 @@ async function observeAndPlanOwnedPositions(input: {
       positionPoolAddress: position.poolAddress,
       ...(current ? { managementPoolAddress: current.poolAddress } : {}),
       action: decision.action,
+      terminalProtectiveClose:
+        decision.action === "CLOSE" && exitDecision.reasonCodes.includes("EXIT_HARD_POSITION_STOP_LOSS"),
       oorLifecycleClose: decision.reasonCodes.includes("POSITION_OOR_STALE_CAPITAL") || decision.reasonCodes.includes("POSITION_OOR_TOKEN_RISK"),
     });
     await input.store.upsertPositionExitState({
