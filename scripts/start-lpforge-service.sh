@@ -41,6 +41,14 @@ case "$service" in
     env_args+=(--env-file="$execution_env")
     target='.build/apps/execution/src/main.js'
     ;;
+  telegram-operator)
+    # This process receives operator intent only.  It never imports signer
+    # material or execution transport, and it is safe to run disabled until
+    # the explicit allowlist is configured in the external runtime env.
+    unset LIVE_SIGNING LPFORGE_LIVE_SIGNING PRIVATE_KEY SEED_PHRASE WALLET_SECRET WALLET_PRIVATE_KEY SIGNER_KEYPAIR
+    export LPFORGE_RPC_ROLE=PRODUCTION
+    target='.build/apps/telegram-operator/src/main.js'
+    ;;
   *) echo "LPFORGE_SERVICE_UNKNOWN:${service}" >&2; exit 1 ;;
 esac
 

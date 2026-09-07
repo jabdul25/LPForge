@@ -14,12 +14,12 @@ export interface ProductionAdmissionCandidate {poolAddress:string;state:string;t
 export interface VerifiedGlobalWinnerAdmission {globalCycleId:string;poolAddress:string;candidateId:string;selectionTier:string;selectionState:string;selectionDynamicEligible:boolean;winnerObservedAt:string;tokenYMint?:string|undefined;verified:boolean;}
 export interface DiscoveryAdmissionAudit {winnerBindingVerified:boolean;winnerObservedAt?:string;registryCandidatePresent:boolean;registryObservedAt?:string;registryState?:string;registryTier?:string;registryAuthorityOrder:'NOT_APPLICABLE'|'ABSENT'|'OLDER_THAN_WINNER'|'NEWER_THAN_WINNER'|'EQUAL_OR_AMBIGUOUS'|'UNVERIFIABLE';registryTerminal:boolean;decisionPredicate:string;decisionAt:string;}
 const WSOL_MINT='So11111111111111111111111111111111111111112';
-export interface Phase7ExecutionControl {decisionId?:string;cycleKey?:string;authorityMode:string;healthStatus:string;driftStatus:string;safetyMode:string;newEconomicActionAllowed:boolean;observedAt:string;poolDrift?:Record<string,string>;activeIncidentIds?:string[];releaseIntegrityValid?:boolean;portfolioValid?:boolean;revokedApprovalIds?:string[];}
+export interface Phase7ExecutionControl {decisionId?:string;cycleKey?:string;authorityMode:string;healthStatus:string;driftStatus:string;safetyMode:string;newEconomicActionAllowed:boolean;observedAt:string;poolDrift?:Record<string,string>;blockedPools?:string[];activeIncidentIds?:string[];releaseIntegrityValid?:boolean;portfolioValid?:boolean;revokedApprovalIds?:string[];}
 /** Canonical projection used by both claim-time and execution-time P7 checks. */
 export function phase7ExecutionControlFromRow(controlRow:Record<string,unknown>|undefined):Phase7ExecutionControl|undefined{
  if(!controlRow)return undefined;
  const payload=record(controlRow.payload),rawPoolDrift=Array.isArray(payload.poolDrift)?payload.poolDrift:[],releaseIdentity=record(payload.releaseIdentity),portfolio=record(payload.portfolio),strings=(value:unknown)=>Array.isArray(value)?value.map(String).filter(Boolean):[];
- return{decisionId:String(controlRow.decision_id),cycleKey:String(controlRow.cycle_key),authorityMode:String(controlRow.authority_mode),healthStatus:String(controlRow.health_status),driftStatus:String(controlRow.drift_status),safetyMode:String(controlRow.safety_mode),newEconomicActionAllowed:Boolean(controlRow.new_economic_action_allowed),observedAt:new Date(String(controlRow.observed_at)).toISOString(),poolDrift:Object.fromEntries(rawPoolDrift.filter(row=>row&&typeof row==="object").map(row=>{const value=row as Record<string,unknown>;return[String(value.poolAddress??""),String(value.rawStatus??value.status??"")]}).filter(([pool])=>Boolean(pool))),activeIncidentIds:strings(payload.activeIncidentIds),releaseIntegrityValid:releaseIdentity.valid===true,portfolioValid:portfolio.valid===true,revokedApprovalIds:strings(payload.controlledCanaryRevokedApprovalIds)};
+ return{decisionId:String(controlRow.decision_id),cycleKey:String(controlRow.cycle_key),authorityMode:String(controlRow.authority_mode),healthStatus:String(controlRow.health_status),driftStatus:String(controlRow.drift_status),safetyMode:String(controlRow.safety_mode),newEconomicActionAllowed:Boolean(controlRow.new_economic_action_allowed),observedAt:new Date(String(controlRow.observed_at)).toISOString(),poolDrift:Object.fromEntries(rawPoolDrift.filter(row=>row&&typeof row==="object").map(row=>{const value=row as Record<string,unknown>;return[String(value.poolAddress??""),String(value.rawStatus??value.status??"")]}).filter(([pool])=>Boolean(pool))),blockedPools:strings(payload.blockedPools),activeIncidentIds:strings(payload.activeIncidentIds),releaseIntegrityValid:releaseIdentity.valid===true,portfolioValid:portfolio.valid===true,revokedApprovalIds:strings(payload.controlledCanaryRevokedApprovalIds)};
 }
 export function validateFreshPhase7ExecutionControl(control:Phase7ExecutionControl|undefined,now:string,maxAgeMs=60_000):string[]{
  if(!control)return ['P6_CLAIM_P7_CONTROL_MISSING'];
@@ -256,6 +256,10 @@ export function validateClaimedPlan(input: {
     reasons.push("P6_CLAIM_POSITION_LIMIT");
   if (p.action === "OPEN" && samePoolOwnerLive)
     reasons.push("P6_CLAIM_LIVE_POSITION_ALREADY_EXISTS_FOR_POOL");
+  // Pool blocks are explicit operator entry vetoes carried by the canonical
+  // P7 control record. They never apply to protective management actions.
+  if (riskIncreasing && input.phase7Control?.blockedPools?.includes(p.poolAddress))
+    reasons.push("P6_CLAIM_OPERATOR_POOL_BLACKLISTED");
   if(input.controlledCanary){
     const canary=input.policy.controlledCanary;
     if(!canary)reasons.push('P6_CONTROLLED_CANARY_POLICY_REQUIRED');

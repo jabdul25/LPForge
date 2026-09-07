@@ -78,5 +78,24 @@ module.exports = {
     out_file: path.join(__dirname, 'logs', 'lpforge-discovery-learning.out.log'),
     error_file: path.join(__dirname, 'logs', 'lpforge-discovery-learning.err.log'),
     env: { NODE_ENV: 'production', PATH: runtimePath }
+  },{
+    name: 'lpforge-telegram-operator',
+    cwd: __dirname,
+    script: '/bin/bash',
+    args: 'scripts/start-lpforge-service.sh telegram-operator',
+    exec_mode: 'fork',
+    instances: 1,
+    autorestart: true,
+    watch: false,
+    min_uptime: '30s',
+    max_restarts: 10,
+    restart_delay: 5000,
+    exp_backoff_restart_delay: 100,
+    kill_timeout: 15000,
+    time: true,
+    merge_logs: true,
+    out_file: path.join(__dirname, 'logs', 'lpforge-telegram-operator.out.log'),
+    error_file: path.join(__dirname, 'logs', 'lpforge-telegram-operator.err.log'),
+    env: { NODE_ENV: 'production', PATH: runtimePath }
   }]
 };

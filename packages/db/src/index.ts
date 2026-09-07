@@ -1683,6 +1683,17 @@ export interface Phase1Store {
     result: "APPLIED" | "WORKFLOW_REQUESTED";
     payload: Record<string, unknown>;
   }): Promise<void>;
+  /** Durable Telegram command de-duplication.  A duplicate update is never
+   * allowed to repeat a control action or create a second close workflow. */
+  recordTelegramOperatorCommand(value:{telegramUpdateId:bigint;chatId:string;operatorId?:string;command:string;arguments:Record<string,unknown>;receivedAt:string;status:'ACCEPTED'|'REJECTED'|'COMPLETED'|'FAILED';response?:string;payload:Record<string,unknown>}):Promise<boolean>;
+  loadLatestTelegramOperatorUpdateId():Promise<bigint|undefined>;
+  upsertTelegramOperatorPoolBlock(value:{poolAddress:string;status:'ACTIVE'|'REMOVED';operatorId:string;at:string;reason:string;sourceUpdateId?:bigint;payload:Record<string,unknown>}):Promise<void>;
+  loadActiveTelegramOperatorPoolBlocks():Promise<string[]>;
+  createTelegramOperatorCloseRequest(value:{requestId:string;positionAddress:string;operatorId:string;requestedAt:string;reason:string;sourceUpdateId?:bigint;payload:Record<string,unknown>}):Promise<boolean>;
+  loadPendingTelegramOperatorCloseRequest(positionAddress:string):Promise<Record<string,unknown>|undefined>;
+  markTelegramOperatorCloseRequest(value:{requestId:string;status:'PLANNED'|'REJECTED'|'COMPLETED'|'CANCELLED';at:string;planId?:string;payload:Record<string,unknown>}):Promise<void>;
+  loadTelegramOperatorOpenPositions():Promise<Record<string,unknown>[]>;
+  resolveTelegramOperatorControlIncidents(value:{operatorId:string;at:string}):Promise<number>;
   upsertPhase7RuntimeLease(value: {
     runtimeId: string;
     holderId: string;
@@ -4632,6 +4643,40 @@ return 'APPLIED';
         ],
       );
     },
+    async recordTelegramOperatorCommand(v) {
+      const r=await db.query(`INSERT INTO operations.telegram_operator_commands(telegram_update_id,chat_id,operator_id,command,arguments,received_at,status,response,payload) VALUES($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9::jsonb) ON CONFLICT(telegram_update_id) DO NOTHING RETURNING telegram_update_id`,[v.telegramUpdateId.toString(),v.chatId,v.operatorId??null,v.command,json(v.arguments),v.receivedAt,v.status,v.response??null,json(v.payload)]);
+      return r.rows.length===1;
+    },
+    async loadLatestTelegramOperatorUpdateId() {
+      const r=await db.query(`SELECT max(telegram_update_id)::text AS id FROM operations.telegram_operator_commands`);
+      return r.rows[0]?.id===null||r.rows[0]?.id===undefined?undefined:BigInt(String(r.rows[0].id));
+    },
+    async upsertTelegramOperatorPoolBlock(v) {
+      await db.query(`INSERT INTO operations.telegram_operator_pool_blocks(pool_address,status,requested_by,requested_at,reason,source_update_id,payload,updated_at,removed_by,removed_at) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$4,CASE WHEN $2='REMOVED' THEN $3 ELSE NULL END,CASE WHEN $2='REMOVED' THEN $4 ELSE NULL END) ON CONFLICT(pool_address) DO UPDATE SET status=EXCLUDED.status,reason=EXCLUDED.reason,source_update_id=EXCLUDED.source_update_id,payload=EXCLUDED.payload,updated_at=EXCLUDED.updated_at,removed_by=CASE WHEN EXCLUDED.status='REMOVED' THEN EXCLUDED.requested_by ELSE NULL END,removed_at=CASE WHEN EXCLUDED.status='REMOVED' THEN EXCLUDED.requested_at ELSE NULL END`,[v.poolAddress,v.status,v.operatorId,v.at,v.reason,v.sourceUpdateId?.toString()??null,json(v.payload)]);
+    },
+    async loadActiveTelegramOperatorPoolBlocks() {
+      const r=await db.query(`SELECT pool_address FROM operations.telegram_operator_pool_blocks WHERE status='ACTIVE' ORDER BY pool_address ASC`);
+      return r.rows.map(row=>String(row.pool_address));
+    },
+    async createTelegramOperatorCloseRequest(v) {
+      const r=await db.query(`INSERT INTO operations.telegram_operator_close_requests(request_id,position_address,requested_by,requested_at,status,reason,source_update_id,payload) VALUES($1,$2,$3,$4,'PENDING',$5,$6,$7::jsonb) ON CONFLICT DO NOTHING RETURNING request_id`,[v.requestId,v.positionAddress,v.operatorId,v.requestedAt,v.reason,v.sourceUpdateId?.toString()??null,json(v.payload)]);
+      return r.rows.length===1;
+    },
+    async loadPendingTelegramOperatorCloseRequest(positionAddress) {
+      const r=await db.query(`SELECT * FROM operations.telegram_operator_close_requests WHERE position_address=$1 AND status='PENDING' ORDER BY requested_at ASC LIMIT 1`,[positionAddress]);
+      return r.rows[0];
+    },
+    async markTelegramOperatorCloseRequest(v) {
+      await db.query(`UPDATE operations.telegram_operator_close_requests SET status=$2,plan_id=COALESCE($3,plan_id),resolved_at=CASE WHEN $2 IN ('REJECTED','COMPLETED','CANCELLED') THEN $4 ELSE resolved_at END,payload=payload||$5::jsonb,updated_at=$4 WHERE request_id=$1`,[v.requestId,v.status,v.planId??null,v.at,json(v.payload)]);
+    },
+    async loadTelegramOperatorOpenPositions() {
+      const r=await db.query(`SELECT lpforge_position_id,position_address,pool_address,owner_address,strategy,orientation,lower_bin_id,upper_bin_id,initial_capital_lamports,entered_at,lifecycle_state,reconciliation_status,last_plan_id FROM execution.owned_positions WHERE lifecycle_state IN ('OPEN','CLOSING','RECONCILIATION_REQUIRED','ENTRY_FUNDED_NOT_OPEN') ORDER BY entered_at ASC`);
+      return r.rows;
+    },
+    async resolveTelegramOperatorControlIncidents(v) {
+      const r=await db.query(`UPDATE operations.phase7_incident_states SET status='RESOLVED',resolved_at=$1,observed_at=$1,reason_codes=reason_codes||'["P7_TELEGRAM_OPERATOR_RESUMED"]'::jsonb,payload=payload||jsonb_build_object('telegramResumedBy',$2,'telegramResumedAt',$1::timestamptz) WHERE status<>'RESOLVED' AND payload->>'telegramOperator'='true' AND incident_id IN ('telegram:pause','telegram:stop')`,[v.at,v.operatorId]);
+      return Number((r as unknown as {rowCount?:number}).rowCount??0);
+    },
     async upsertPhase7RuntimeLease(v) {
       await db.query(
         `INSERT INTO operations.phase7_runtime_leases(runtime_id,holder_id,acquired_at,expires_at,generation) VALUES($1,$2,$3,$4,$5) ON CONFLICT(runtime_id) DO UPDATE SET holder_id=EXCLUDED.holder_id,acquired_at=EXCLUDED.acquired_at,expires_at=EXCLUDED.expires_at,generation=EXCLUDED.generation`,
@@ -5302,6 +5347,15 @@ export function createMemoryStore(): Phase1Store {
     async insertPhase6CanaryObservation() {},
     async insertPhase6StageEvidence() {},
     async insertPhase7OperatorAction() {},
+    async recordTelegramOperatorCommand() { return true; },
+    async loadLatestTelegramOperatorUpdateId() { return undefined; },
+    async upsertTelegramOperatorPoolBlock() {},
+    async loadActiveTelegramOperatorPoolBlocks() { return []; },
+    async createTelegramOperatorCloseRequest() { return true; },
+    async loadPendingTelegramOperatorCloseRequest() { return undefined; },
+    async markTelegramOperatorCloseRequest() {},
+    async loadTelegramOperatorOpenPositions() { return []; },
+    async resolveTelegramOperatorControlIncidents() { return 0; },
     async upsertPhase7RuntimeLease() {},
     async getPhase7RuntimeLease() {
       return undefined;

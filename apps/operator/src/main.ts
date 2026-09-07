@@ -587,7 +587,7 @@ async function observeAndPlanOwnedPositions(input: {
     await input.store.upsertPositionOorLifecycleState({lpforgePositionId:position.lpforgePositionId,positionAddress:position.positionAddress,poolAddress:position.poolAddress,policyVersion:oorPolicy.policyVersion,rangeState:isOor?'OUT_OF_RANGE':'IN_RANGE',lifecycleState:oor.state,...(oor.direction?{direction:oor.direction}:{}),inventoryClassification:oor.inventoryClassification,...(oor.firstOorDetectedAt?{firstOorDetectedAt:oor.firstOorDetectedAt}:{}),...(oor.continuousOorStartedAt?{continuousOorStartedAt:oor.continuousOorStartedAt}:{}),latestObservedAt:oor.latestObservedAt,...(oor.lastReenteredAt?{lastReenteredAt:oor.lastReenteredAt}:{}),excursionCount:oor.excursionCount,totalOorDurationSeconds:oor.totalOorDurationSeconds,continuousOorDurationSeconds:oor.continuousOorDurationSeconds,activeBinId,lowerBinId:position.lowerBinId,upperBinId:position.upperBinId,...(feeAtOorStart===undefined?{}:{feeValueAtOorStartLamports:feeAtOorStart}),...(claimExpectedValueLamports===undefined?{}:{feeValueLamports:claimExpectedValueLamports}),...(feeSinceOor===undefined?{}:{feeSinceOorLamports:feeSinceOor}),...(activeFeeRate===undefined?{}:{activeFeeRateLamportsPerHour:activeFeeRate}),recommendation:oor.action,reasonCodes:oor.reasonCodes,...(fact?{chainObservedAt:fact.stamp.observedAt}:{}),...(fact?.stamp.chainSlot===undefined?{}:{chainSlot:fact.stamp.chainSlot}),payload:{policyVersion:oorPolicy.policyVersion,chainTruthFresh:Boolean(fact&&activeBinChainFresh),continuationEvLamports:continuation?.continuationEvLamports.toString()??null,expectedCloseCostLamports:closeCostLamports?.toString()??null,activeFeeRateLamportsPerHour:activeFeeRate?.toString()??null}});
     const priorLifecycleState=storedOor?.lifecycle_state===undefined?undefined:String(storedOor.lifecycle_state);
     if(priorLifecycleState!==oor.state)input.log?.info(oor.state==='IN_RANGE'&&priorLifecycleState&&priorLifecycleState!=='IN_RANGE'?"POSITION_OOR_REENTERED":oor.state==='TRANSIENT_OOR'?"POSITION_OOR_ENTERED":oor.state==='SUSTAINED_OOR'?"POSITION_OOR_SUSTAINED":oor.state==='OOR_ACTION_REQUIRED'?"POSITION_OOR_ACTION_REQUIRED":"POSITION_OOR_STALE_CAPITAL",{position:position.positionAddress,pool:position.poolAddress,direction:oor.direction??null,continuousOorDurationSeconds:oor.continuousOorDurationSeconds,inventory:oor.inventoryClassification,currentBin:activeBinId,lowerBinId:position.lowerBinId,upperBinId:position.upperBinId,policyVersion:oorPolicy.policyVersion,recommendation:oor.action,reasonCodes:oor.reasonCodes});
-    const decision = decideLivePositionManagement({
+    let decision = decideLivePositionManagement({
       policy,
       owned: position,
       ...(fact ? { position: fact } : {}),
@@ -598,6 +598,14 @@ async function observeAndPlanOwnedPositions(input: {
       ...(typeof currentForwardEv==='number'?{currentForwardEv}:{}),
       oor,
     });
+    // Telegram close requests are durable operator intent, not a direct
+    // signing channel.  The owned-position monitor rechecks ownership,
+    // chain truth, P7 protective authority, and active-plan idempotency
+    // before it constructs the ordinary canonical CLOSE plan.
+    const telegramCloseRequest=await input.store.loadPendingTelegramOperatorCloseRequest(position.positionAddress);
+    if(telegramCloseRequest){
+      decision={...decision,action:'CLOSE',reasonCodes:[...new Set([...decision.reasonCodes,'P7_TELEGRAM_OPERATOR_CLOSE_REQUEST'])].sort()};
+    }
     const managementContext = assessLiveManagementContext({
       positionPoolAddress: position.poolAddress,
       ...(current ? { managementPoolAddress: current.poolAddress } : {}),
@@ -682,15 +690,16 @@ async function observeAndPlanOwnedPositions(input: {
       ["RESHAPE", "REBALANCE"].includes(decision.action);
     const planAction = containmentTerminalClose ? "CLOSE" : decision.action;
     const planRiskIncreasing = ["ADD", "RESHAPE", "REBALANCE"].includes(planAction);
+    const managementPlanAllowed=managementContext.planAllowed||Boolean(telegramCloseRequest);
     if (
       decision.action === "HOLD" ||
-      !managementContext.planAllowed ||
+      !managementPlanAllowed ||
       (planRiskIncreasing
         ? !input.allowRiskIncreasingPlans
         : !input.allowProtectiveManagementPlans) ||
       (await input.store.hasActiveAutonomousPlan(position.positionAddress))
     ) {
-      if (decision.action !== "HOLD" && !managementContext.planAllowed)
+      if (decision.action !== "HOLD" && !managementPlanAllowed)
         skippedNoMatchingContext++;
       continue;
     }
@@ -742,6 +751,7 @@ async function observeAndPlanOwnedPositions(input: {
       },
     });
     await persistTransactionPlan(input.store, plan);
+    if(telegramCloseRequest)await input.store.markTelegramOperatorCloseRequest({requestId:String(telegramCloseRequest.request_id),status:'PLANNED',at:input.observedAt,planId:plan.planId,payload:{positionAddress:position.positionAddress,poolAddress:position.poolAddress,canonicalPlanCreated:true}});
     planned++;
   }
   return { observed: positions.length, planned, skippedNoMatchingContext };

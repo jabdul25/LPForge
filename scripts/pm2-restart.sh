@@ -9,7 +9,9 @@ source "$release_dir/scripts/runtime-config-paths.sh"
 # old launchers, or the prior immutable release continues running unnoticed.
 pm2 delete lpforge-execution || true
 pm2 delete lpforge-production || true
+pm2 delete lpforge-telegram-operator || true
 pm2 start ecosystem.config.cjs --only lpforge-production
 pm2 start ecosystem.config.cjs --only lpforge-execution
+pm2 start ecosystem.config.cjs --only lpforge-telegram-operator
 pm2 save
-pm2 status lpforge-production lpforge-execution
+pm2 status lpforge-production lpforge-execution lpforge-telegram-operator
