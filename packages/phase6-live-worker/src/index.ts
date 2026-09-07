@@ -5,6 +5,7 @@ import {
   Transaction,
   VersionedTransaction,
 } from "@solana/web3.js";
+import { createHash } from "node:crypto";
 import { loadConfirmedExecutionReceipt } from "../../transaction-receipt/src/index.js";
 import { deriveTransactionAssetEffects } from "../../transaction-asset-effects/src/index.js";
 import {
@@ -480,10 +481,17 @@ async function recordJournal(
   const existing = await store.getExecutionJournal(plan.idempotencyKey);
   if (!existing) {
     await store.createExecutionJournal({
-      journalId: `journal-${plan.planId}`,
+      // A terminal workflow can have several independently signed children.
+      // Their journals must never share a state machine: child 1 may be
+      // CONFIRMED while child 2 is only about to be signed.
+        journalId: plan.idempotencyKey.includes(":close-child:")
+        ? `journal-${plan.idempotencyKey}`
+        : `journal-${plan.planId}`,
       idempotencyKey: plan.idempotencyKey,
       planId: plan.planId,
-      ...(plan.steps[0] ? { transactionId: plan.steps[0].transactionId } : {}),
+      ...(typeof payload.transactionId === "string"
+        ? { transactionId: payload.transactionId }
+        : plan.steps[0] ? { transactionId: plan.steps[0].transactionId } : {}),
       state,
       ...(signature ? { signature } : {}),
       version: 1,
@@ -3217,6 +3225,46 @@ function closeSettlementPending(plan: AutonomousPlan): {
     : undefined;
 }
 
+type DurableCloseRemoveChild = {
+  transactionId:string;
+  index:number;
+  count:number;
+  built:BuiltMeteoraTransaction;
+};
+
+function closeRemoveChildTransactionId(parentTransactionId:string,index:number):string{
+  return index===0?parentTransactionId:`${parentTransactionId}:close-remove:${index}`;
+}
+
+function closeChildPlan(plan:AutonomousPlan,transactionId:string):AutonomousPlan{
+  // Each child owns an independent journal and submission idempotency key.
+  // The parent plan id remains the economic lifecycle and settlement owner.
+  return {...plan,idempotencyKey:`${plan.idempotencyKey}:close-child:${transactionId}`};
+}
+
+/**
+ * Durable construction proof for a removal child.  The raw Transaction is
+ * deliberately not retained in process memory across restart; rebuilding is
+ * safe only when the SDK reproduces the exact instruction program/key/data
+ * sequence recorded before the first child was signed.
+ */
+function closeRemoveConstructionFingerprint(built:BuiltMeteoraTransaction):string{
+  const transaction=built.transaction as Transaction|VersionedTransaction;
+  const instructions=transaction instanceof Transaction
+    ? transaction.instructions.map(instruction=>({
+        programId:instruction.programId.toBase58(),
+        keys:instruction.keys.map(key=>({pubkey:key.pubkey.toBase58(),isSigner:key.isSigner,isWritable:key.isWritable})),
+        data:Buffer.from(instruction.data).toString("hex"),
+      }))
+    : [{versioned:true,serialized:Buffer.from(transaction.serialize()).toString("base64")}];
+  return createHash("sha256").update(JSON.stringify({
+    builder:built.builder,
+    requiredSignerAddresses:built.requiredSignerAddresses,
+    metadata:built.metadata,
+    instructions,
+  })).digest("hex");
+}
+
 /**
  * Compatibility recovery for the one historical failure mode where a
  * multi-child protective close had already confirmed its unwind, but a
@@ -3419,6 +3467,38 @@ export function shouldResumeCloseSettlement(value: {
 }
 
 /**
+ * A deterministic pre-submission CLOSE failure has no economic effect only
+ * when every boundary below is independently true. This predicate is shared
+ * by recovery and tests so a generic reconciliation-required plan cannot be
+ * accidentally revived as a multi-remove continuation.
+ */
+export function canResumePreSubmissionClose(value:{
+  action:string;
+  planState:string;
+  stage:string|undefined;
+  hasPendingChild:boolean;
+  journalState:string;
+  hasJournalSignature:boolean;
+  positionExists:boolean;
+  positionOwner:string|undefined;
+  positionPool:string|undefined;
+  planOwner:string;
+  planPool:string;
+  removeChildrenHaveSignatures:boolean;
+}):boolean{
+  return (value.action==="CLOSE"||value.action==="EMERGENCY_CLOSE")&&
+    value.planState==="RECONCILIATION_REQUIRED"&&
+    value.stage==="CLOSE_INVENTORY_SNAPSHOTTED"&&
+    !value.hasPendingChild&&
+    value.journalState==="PLAN_CREATED"&&
+    !value.hasJournalSignature&&
+    value.positionExists&&
+    value.positionOwner===value.planOwner&&
+    value.positionPool===value.planPool&&
+    !value.removeChildrenHaveSignatures;
+}
+
+/**
  * A CLOSE is a durable settlement workflow, not one opaque mutation.  A stage
  * is recorded only after the preceding chain action is confirmed.  Therefore
  * a restarted worker can continue from a completed stage without resending a
@@ -3538,32 +3618,68 @@ async function executeCloseSettlement(input: {
         bps: 10_000,
         claimAndClose: false,
       });
-    if (built.length !== 1)
-      throw new Error("LPFORGE_P6_MULTI_TRANSACTION_REMOVE_UNSUPPORTED");
-    built[0]!.metadata.transactionId = removeStep.transactionId;
-    const removed = await executeMeteoraMutation({
-      ...input,
-      built: built[0]!,
-      action: closeAction,
-      deferCompletion: true,
-      afterSubmit: async ({ signature }) => persist("CLOSE_INVENTORY_SNAPSHOTTED", {
-        tokenXBefore: tokenXBefore!.toString(),
-        tokenYBefore: tokenYBefore!.toString(),
-        pendingStage: "CLOSE_REMOVE_SUBMITTED",
-        pendingSignature: signature,
-      }),
-      afterConfirmed: async ({signature}) => {
-        const native=await persistConfirmedCloseNativeWithdrawal({store:input.store,connection,plan:input.plan,positionAddress:input.positionAddress,signature,transactionId:removeStep.transactionId});
-        if(!native.ok)throw new Error(native.reasonCodes.join(","));
-      },
+    if(built.length===0)throw new Error("LPFORGE_P6_CLOSE_REMOVE_CONSTRUCTION_EMPTY");
+    // Construct and journal the complete SDK sequence before signing child 0.
+    // This turns SDK transaction splitting into durable parent-plan facts.
+    const children:DurableCloseRemoveChild[]=built.map((item,index)=>{
+      const transactionId=closeRemoveChildTransactionId(removeStep.transactionId,index);
+      const constructionFingerprint=closeRemoveConstructionFingerprint(item);
+      const previous=input.plan.steps.find(step=>step.transactionId===transactionId);
+      const previousFingerprint=previous?.metadata.closeRemoveConstructionFingerprint;
+      if(typeof previousFingerprint==='string'&&previousFingerprint!==constructionFingerprint)
+        throw new Error("LPFORGE_P6_CLOSE_REMOVE_CHILD_CONSTRUCTION_MISMATCH");
+      item.metadata={...item.metadata,transactionId,closeRemoveChildIndex:index,closeRemoveChildCount:built.length,closeRemoveConstructionFingerprint:constructionFingerprint,parentPlanId:input.plan.planId,positionAddress:input.positionAddress,poolAddress:input.plan.poolAddress,ownerAddress:input.plan.ownerAddress};
+      return{transactionId,index,count:built.length,built:item};
     });
-    // No preceding child exists yet. A pre-send REMOVE rejection is a normal
-    // block; only later phases must carry parent-level submitted truth.
-    if (removed.status !== "RECONCILED") return removed;
+    for(const child of children)await input.store.ensureExecutionTransactionStep({
+      planId:input.plan.planId,transactionId:child.transactionId,kind:"METEORA_REMOVE",state:"PLANNED",requiredSignerAddresses:child.built.requiredSignerAddresses,
+      metadata:child.built.metadata,
+    });
+    const persistedCount=Number(dispatch.removeChildCount??children.length);
+    if(!Number.isInteger(persistedCount)||persistedCount!==children.length)
+      throw new Error("LPFORGE_P6_CLOSE_REMOVE_CHILD_CONSTRUCTION_MISMATCH");
+    const priorConfirmed=Array.isArray(dispatch.removeChildrenConfirmed)?new Set(dispatch.removeChildrenConfirmed.filter((value):value is string=>typeof value==="string")):new Set<string>();
+    const allIds=children.map(child=>child.transactionId);
+    // A child is only skipped when its own durable submission ledger proves it
+    // confirmed.  Parent stage text is never sufficient authority to skip it.
+    for(const child of children){
+      if(priorConfirmed.has(child.transactionId)){
+        const confirmed=await input.store.loadConfirmedSubmissionByTransactionId(child.transactionId);
+        if(!confirmed)throw new Error("LPFORGE_P6_CLOSE_REMOVE_CHILD_CONFIRMATION_MISSING");
+        continue;
+      }
+      const childPlan=closeChildPlan(input.plan,child.transactionId);
+      const removed=await executeMeteoraMutation({
+        ...input,
+        plan:childPlan,
+        built:child.built,
+        action:closeAction,
+        deferCompletion:true,
+        afterSubmit:async({signature})=>persist("CLOSE_INVENTORY_SNAPSHOTTED",{
+          tokenXBefore:tokenXBefore!.toString(),tokenYBefore:tokenYBefore!.toString(),
+          removeChildCount:children.length,removeChildTransactionIds:allIds,
+          removeChildIndex:child.index,pendingStage:"CLOSE_REMOVE_SUBMITTED",pendingSignature:signature,
+        }),
+        afterConfirmed:async({signature})=>{
+          const native=await persistConfirmedCloseNativeWithdrawal({store:input.store,connection,plan:input.plan,positionAddress:input.positionAddress,signature,transactionId:child.transactionId});
+          if(!native.ok)throw new Error(native.reasonCodes.join(","));
+        },
+      });
+      if(removed.status!=="RECONCILED")return removed;
+      priorConfirmed.add(child.transactionId);
+      await persist("CLOSE_INVENTORY_SNAPSHOTTED",{
+        tokenXBefore:tokenXBefore!.toString(),tokenYBefore:tokenYBefore!.toString(),
+        removeChildCount:children.length,removeChildTransactionIds:allIds,
+        removeChildrenConfirmed:[...priorConfirmed],lastConfirmedRemoveChild:child.index,
+      });
+    }
     await persist("CLOSE_LIQUIDITY_REMOVED", {
       tokenXBefore: tokenXBefore.toString(),
       tokenYBefore: tokenYBefore.toString(),
-      removeTransactionId: removeStep.transactionId,
+      removeTransactionId: children[0]!.transactionId,
+      removeTransactionIds: allIds,
+      removeChildCount:children.length,
+      removeChildrenConfirmed:[...priorConfirmed],
     });
     stage = "CLOSE_LIQUIDITY_REMOVED";
   }
@@ -3600,6 +3716,7 @@ async function executeCloseSettlement(input: {
       claimBuilt[0]!.metadata.transactionId = transactionId;
       const claimed = await executeMeteoraMutation({
         ...input,
+        plan: closeChildPlan(input.plan, transactionId),
         built: claimBuilt[0]!,
         action: closeAction,
         deferCompletion: true,
@@ -3682,7 +3799,7 @@ async function executeCloseSettlement(input: {
     if (attributableTokenX > 0n) {
       const unwind = await executeJupiterUnwindStep({
         store: input.store,
-        plan: input.plan,
+        plan: closeChildPlan(input.plan, unwindStep.transactionId),
         signer: input.signer,
         config: input.config,
         amount: attributableTokenX,
@@ -3782,7 +3899,7 @@ async function executeCloseSettlement(input: {
           : `${input.plan.planId}:recovered-open-residual-unwind:retry-${retryCount}`,
         unwind=await executeJupiterUnwindStep({
           store:input.store,
-          plan:input.plan,
+          plan:closeChildPlan(input.plan,transactionId),
           signer:input.signer,
           config:input.config,
           amount:recoveredOpenResidual.rawAmount,
@@ -3861,6 +3978,7 @@ async function executeCloseSettlement(input: {
   closedBuilt.metadata.transactionId = closeStep.transactionId;
   const closed = await executeMeteoraMutation({
     ...input,
+    plan: closeChildPlan(input.plan, closeStep.transactionId),
     built: closedBuilt,
     action: closeAction,
     afterSubmit: async ({ signature }) => persist("CLOSE_INVENTORY_UNWOUND", {
@@ -3911,14 +4029,22 @@ async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:Au
     if(!settlementInput)return{ready:false,reasonCodes:["SETTLEMENT_LIFECYCLE_MISSING"]};
     settlementInput={...settlementInput,cashflows:canonicalizeTerminalSettlementCashflows(settlementInput.cashflows)};
   }
-  const removeTransactionId=typeof dispatch.removeTransactionId==="string"?dispatch.removeTransactionId:undefined,removeSignature=removeTransactionId?settlementInput.transactions.find(transaction=>transaction.transactionId===removeTransactionId)?.signature:undefined;
-  if(!removeTransactionId||!removeSignature)return{ready:false,reasonCodes:["SETTLEMENT_REMOVE_RECEIPT_MISSING"]};
-  if(!settlementInput.cashflows.some(flow=>flow.flowType==='CLOSE_WITHDRAWAL'&&settlementFlowSignature(flow)===removeSignature)){
-    const native=await persistConfirmedCloseNativeWithdrawal({store:input.store,connection:input.connection,plan:input.plan,positionAddress:input.positionAddress,signature:removeSignature,transactionId:removeTransactionId,observedAt:new Date().toISOString()});
-    if(!native.ok)return{ready:false,reasonCodes:native.reasonCodes};
-    settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
-    if(!settlementInput)return{ready:false,reasonCodes:["SETTLEMENT_LIFECYCLE_MISSING"]};
-    settlementInput={...settlementInput,cashflows:canonicalizeTerminalSettlementCashflows(settlementInput.cashflows)};
+  const removeTransactionIds=Array.isArray(dispatch.removeTransactionIds)
+    ? dispatch.removeTransactionIds.filter((value):value is string=>typeof value==="string")
+    : typeof dispatch.removeTransactionId==="string"?[dispatch.removeTransactionId]:[];
+  if(removeTransactionIds.length===0)return{ready:false,reasonCodes:["SETTLEMENT_REMOVE_RECEIPT_MISSING"]};
+  let primaryRemoveSignature:string|undefined;
+  for(const removeTransactionId of removeTransactionIds){
+    const removeSignature=settlementInput.transactions.find(transaction=>transaction.transactionId===removeTransactionId)?.signature;
+    if(!removeSignature)return{ready:false,reasonCodes:["SETTLEMENT_REMOVE_RECEIPT_MISSING"]};
+    primaryRemoveSignature??=removeSignature;
+    if(!settlementInput.cashflows.some(flow=>flow.flowType==='CLOSE_WITHDRAWAL'&&settlementFlowSignature(flow)===removeSignature)){
+      const native=await persistConfirmedCloseNativeWithdrawal({store:input.store,connection:input.connection,plan:input.plan,positionAddress:input.positionAddress,signature:removeSignature,transactionId:removeTransactionId,observedAt:new Date().toISOString()});
+      if(!native.ok)return{ready:false,reasonCodes:native.reasonCodes};
+      settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
+      if(!settlementInput)return{ready:false,reasonCodes:["SETTLEMENT_LIFECYCLE_MISSING"]};
+      settlementInput={...settlementInput,cashflows:canonicalizeTerminalSettlementCashflows(settlementInput.cashflows)};
+    }
   }
   const at=new Date().toISOString(),positionCheckedAt=at,positionCheckedSlot=BigInt(positionCheck.context.slot),settlementEvidence={positionCheckedAt,positionCheckedSlot:positionCheckedSlot.toString(),rpcUrl:input.config.rpcUrl,commitment:"confirmed"};
   const chainReconciliation=await reconcileTerminalSettlementChainEffects({connection:input.connection,plan:input.plan,positionAddress:input.positionAddress,settlementInput});
@@ -3980,7 +4106,8 @@ async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:Au
   const persisted=await input.store.persistLifecycleSolSettlement({assessment,input:{...settlementInput,positionAbsent:true,positionCheckedAt,positionCheckedSlot},...(process.env.LPFORGE_SOURCE_COMMIT?{sourceCommit:process.env.LPFORGE_SOURCE_COMMIT}:{}),...(process.env.LPFORGE_P7_POLICY_HASH?{policyHash:process.env.LPFORGE_P7_POLICY_HASH}:{}),migrationHead:"M0067_terminal_fee_claim_settlement_reconciliation.sql",...(process.env.LPFORGE_BUILD_ID?{buildId:process.env.LPFORGE_BUILD_ID}:{}),at});
   const claimSignature=settlementInput.transactions.find(transaction=>transaction.planRole==='CLOSE'&&transaction.transactionId.endsWith(':claim'))?.signature,
     rootClosePlanId=typeof dispatch.terminalRootClosePlanId==='string'?dispatch.terminalRootClosePlanId:input.plan.planId;
-  await input.store.finalizeCloseFeeAttribution({closePlanId:rootClosePlanId,positionAddress:input.positionAddress,removeSignature,...(claimSignature===undefined?{}:{claimSignature}),terminalSettlementId:persisted.settlementId,at});
+  if(!primaryRemoveSignature)return{ready:false,reasonCodes:["SETTLEMENT_REMOVE_RECEIPT_MISSING"]};
+  await input.store.finalizeCloseFeeAttribution({closePlanId:rootClosePlanId,positionAddress:input.positionAddress,removeSignature:primaryRemoveSignature,...(claimSignature===undefined?{}:{claimSignature}),terminalSettlementId:persisted.settlementId,at});
   await input.store.compactPositionManagementDecisionAudit({positionAddress:input.positionAddress,at});
   // Existing research outcomes are immutable. A settlement supersession fixes
   // the accounting authority without mutating or duplicating V3 evidence.
@@ -4431,6 +4558,65 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     // transaction confirmed.  If the PositionV2 is still present, the next
     // close stage is safe to resume; no already-submitted stage is resent.
     const closeStage = closeSettlementStage(plan), closePending = closeSettlementPending(plan);
+    // A pre-M0060 worker stopped before signing whenever Meteora returned more
+    // than one REMOVE transaction.  This is the one safe migration path for
+    // that historical capability gap: the parent journal is still at its
+    // pre-network state, every REMOVE child has no durable signature, and the
+    // exact PositionV2 is still present with the bound owner/pool.  It is not
+    // a generic retry of reconciliation-required CLOSE plans.
+    const closeDispatch=closeSettlementDispatch(plan);
+    const preSubmissionCloseCandidate=canResumePreSubmissionClose({
+      action:plan.action,planState:plan.state,stage:closeStage,
+      hasPendingChild:Boolean(closePending),journalState:journal.state,
+      hasJournalSignature:Boolean(journal.signature),positionExists:positionTruth.exists===true,
+      positionOwner:typeof positionTruth.owner==="string"?positionTruth.owner:undefined,
+      positionPool:typeof positionTruth.pool==="string"?positionTruth.pool:undefined,
+      planOwner:plan.ownerAddress,planPool:plan.poolAddress,
+      // Submission ledgers are read below before mutation; this first pass
+      // simply prevents any broad class of unresolved plans from entering it.
+      removeChildrenHaveSignatures:false,
+    });
+    if(preSubmissionCloseCandidate){
+      const removeSteps=plan.steps.filter(step=>step.kind==="METEORA_REMOVE");
+      const submissions=await Promise.all(removeSteps.map(step=>input.store.loadSubmissionAttemptByTransactionId(step.transactionId)));
+      if(!canResumePreSubmissionClose({
+        action:plan.action,planState:plan.state,stage:closeStage,
+        hasPendingChild:Boolean(closePending),journalState:journal.state,
+        hasJournalSignature:Boolean(journal.signature),positionExists:positionTruth.exists===true,
+        positionOwner:typeof positionTruth.owner==="string"?positionTruth.owner:undefined,
+        positionPool:typeof positionTruth.pool==="string"?positionTruth.pool:undefined,
+        planOwner:plan.ownerAddress,planPool:plan.poolAddress,
+        removeChildrenHaveSignatures:submissions.some(Boolean),
+      })){
+        await input.store.transitionAutonomousPlan({
+          planId:plan.planId,state:"RECONCILIATION_REQUIRED",at:input.now,
+          reasonCodes:["P6_CLOSE_MULTI_REMOVE_PRE_SUBMISSION_SIGNATURE_CONFLICT"],
+          payload:{stage:closeStage,preSubmissionResume:"SIGNATURE_CONFLICT"},
+        });
+        results.push({planId:plan.planId,action:"HOLD_FOR_OPERATOR",reasonCodes:["P6_CLOSE_MULTI_REMOVE_PRE_SUBMISSION_SIGNATURE_CONFLICT"]});
+        continue;
+      }
+      const resumed=await input.store.resumePreSubmissionClosePlan({
+        planId:plan.planId,
+        at:input.now,
+        expiresAt:new Date(Date.parse(input.now)+5*60_000).toISOString(),
+        reasonCodes:["P6_CLOSE_MULTI_REMOVE_PRE_SUBMISSION_RESUME_READY"],
+        payload:{
+          stage:"CLOSE_INVENTORY_SNAPSHOTTED",
+          priorError:typeof closeDispatch.error==="string"?closeDispatch.error:null,
+          preSubmissionResume:true,
+          positionAddress:recoveryPositionAddress,
+          pendingStage:null,
+          pendingSignature:null,
+        },
+      });
+      results.push({
+        planId:plan.planId,
+        action:"RETURN_EXISTING_PLAN",
+        reasonCodes:[resumed?"P6_CLOSE_MULTI_REMOVE_PRE_SUBMISSION_RESUME_READY":"P6_CLOSE_MULTI_REMOVE_PRE_SUBMISSION_RESUME_NOT_APPLIED"],
+      });
+      continue;
+    }
     // Historical compatibility: before the sequential-child journal contract
     // was deployed, a confirmed CLAIM/UNWIND could leave the shared close
     // journal FAILED when the next child attempted CONFIRMED -> SIGNING.  Do

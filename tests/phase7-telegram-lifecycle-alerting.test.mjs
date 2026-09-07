@@ -2,6 +2,14 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {loadPhase7TelegramConfig,phase7AlertFingerprint,phase7AlertTopic,renderPhase7TelegramAlert,Phase7TelegramDeliveryError} from '../.build/packages/phase7-alerting/src/index.js';
 
+test('terminal close transition awaits the durable Telegram outbox but contains delivery failures', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile('apps/operator/src/main.ts', 'utf8'));
+  assert.match(source, /async function queueLifecycleAlert/);
+  assert.match(source, /await enqueueAndDispatchPhase7Alert/);
+  assert.match(source, /await queueLifecycleAlert\(\{\.\.\.alertBase,severity:decision\.action==='EMERGENCY_CLOSE'/);
+  assert.match(source, /lpforge_telegram_alert_failed/);
+});
+
 const base={severity:'WARNING',code:'POSITION_OOR_STARTED',title:'Position out of range',message:'Canonical range lifecycle changed.',observedAt:'2026-09-06T00:00:00.000Z',entityType:'POSITION',transitionKey:'IN_RANGE->OUT_OF_RANGE',reasonCodes:['POSITION_OOR_STARTED']};
 test('same lifecycle code for two positions has distinct durable identities',()=>{
   assert.notEqual(phase7AlertFingerprint({...base,entityId:'position-a'}),phase7AlertFingerprint({...base,entityId:'position-b'}));

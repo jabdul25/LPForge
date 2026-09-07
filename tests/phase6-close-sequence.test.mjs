@@ -33,7 +33,7 @@ test('close plans are a drain → unwind → close sequence with one durable ste
 test('worker close sequence snapshots → drains → claims → unwinds only attributable token-X → closes',()=>{
   const worker=fs.readFileSync('packages/phase6-live-worker/src/index.ts','utf8');
   const closeAt=worker.indexOf('async function executeCloseSettlement');
-  const drainAt=worker.indexOf('deferCompletion: true,',closeAt);
+  const drainAt=worker.indexOf('deferCompletion:true,',closeAt);
   const snapshotAt=worker.indexOf('[tokenXBefore,tokenYBefore]=await Promise.all',closeAt);
   const claimAt=worker.indexOf('buildClaimTransactions(input.pool, {',drainAt);
   const claimStepAt=worker.indexOf('CLOSE_CLAIM_RESIDUAL',claimAt);
@@ -47,7 +47,7 @@ test('worker close sequence snapshots → drains → claims → unwinds only att
   assert.match(worker,/P6_CLOSE_SETTLEMENT_RECONCILIATION_REQUIRED/,'a child failure after REMOVE is parent-level reconciliation debt, not a clean block');
   assert.match(worker,/pendingStage:\s*"CLOSE_(?:REMOVE|CLAIM|UNWIND|POSITION)_SUBMITTED"/,'every submitted child has a durable parent settlement marker before confirmation');
   assert.match(worker,/LPFORGE_METEORA_CLAIM_NOTHING_TO_CLAIM/);
-  assert.match(worker,/idempotencyKey:\s*`\$\{input\.plan\.idempotencyKey\}:\$\{unwindStep\.transactionId\}`/);
+  assert.match(worker,/closeChildPlan\(input\.plan, unwindStep\.transactionId\)/);
   assert.match(worker,/tokenXAfter > tokenXBefore \? tokenXAfter - tokenXBefore : 0n/,'only position-attributable inventory may be unwound');
   assert.match(worker,/tokenYAfter>tokenYBefore\?tokenYAfter-tokenYBefore:0n/,'the close ledger also records the position-attributable SOL-side withdrawal');
   assert.match(worker,/flowType:\s*["']SWAP_PROCEEDS["']/,'token-X close inventory is represented by its actual SOL-side Jupiter output, not a second marked token-X withdrawal');
@@ -59,7 +59,7 @@ test('worker close sequence snapshots → drains → claims → unwinds only att
   // The drain and claim phases must defer completion: a death between phases
   // leaves a durable stage for recovery rather than marking a half-executed
   // close reconciled or blindly repeating its already-confirmed mutation.
-  const drainDefer=worker.slice(closeAt,closeBuilderAt).match(/deferCompletion:\s*true/g);
+  const drainDefer=worker.slice(closeAt,closeBuilderAt).match(/deferCompletion\s*:\s*true/g);
   assert.ok(drainDefer&&drainDefer.length>=2,'drain and claim phases both defer completion');
   // The final close verifies chain truth before completing the plan.
   const verifyAt=worker.indexOf('CLOSE_CHAIN_VERIFIED');

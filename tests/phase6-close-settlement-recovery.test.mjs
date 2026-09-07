@@ -2,10 +2,43 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   canonicalizeTerminalSettlementCashflows,
+  canResumePreSubmissionClose,
   isLegacySequentialCloseJournalRecovery,
   mutationRiskPlanExpiry,
   shouldResumeCloseSettlement,
 } from '../.build/packages/phase6-live-worker/src/index.js';
+
+test('only an exact unsigned OPEN/MATCH close snapshot may resume multi-remove construction', () => {
+  const base = {
+    action: 'CLOSE', planState: 'RECONCILIATION_REQUIRED',
+    stage: 'CLOSE_INVENTORY_SNAPSHOTTED', hasPendingChild: false,
+    journalState: 'PLAN_CREATED', hasJournalSignature: false,
+    positionExists: true, positionOwner: 'owner', positionPool: 'pool',
+    planOwner: 'owner', planPool: 'pool', removeChildrenHaveSignatures: false,
+  };
+  assert.equal(canResumePreSubmissionClose(base), true);
+  for (const incompatible of [
+    {hasJournalSignature: true},
+    {removeChildrenHaveSignatures: true},
+    {positionOwner: 'other'},
+    {positionPool: 'other'},
+    {stage: 'CLOSE_LIQUIDITY_REMOVED'},
+    {planState: 'FAILED'},
+    {action: 'OPEN'},
+  ]) assert.equal(canResumePreSubmissionClose({...base, ...incompatible}), false);
+});
+
+test('multi-remove close construction persists all children and fingerprints before any child dispatch', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile('packages/phase6-live-worker/src/index.ts', 'utf8'));
+  const db = await import('node:fs/promises').then(fs => fs.readFile('packages/db/src/index.ts', 'utf8'));
+  assert.match(source, /closeRemoveConstructionFingerprint/);
+  assert.match(source, /for\(const child of children\)await input\.store\.ensureExecutionTransactionStep/);
+  assert.match(source, /for\(const child of children\)\{/);
+  assert.match(source, /loadConfirmedSubmissionByTransactionId\(child\.transactionId\)/);
+  assert.match(source, /P6_CLOSE_REMOVE_CHILD_CONSTRUCTION_MISMATCH/);
+  assert.match(source, /P6_CLOSE_MULTI_REMOVE_PRE_SUBMISSION_RESUME_READY/);
+  assert.match(db, /async resumePreSubmissionClosePlan/);
+});
 
 for (const stage of [
   'CLOSE_LIQUIDITY_REMOVED',

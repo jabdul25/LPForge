@@ -1237,6 +1237,7 @@ export interface Phase1Store {
     reasonCodes?: string[];
     payload: Record<string, unknown>;
   }): Promise<void>;
+  resumePreSubmissionClosePlan(value:{planId:string;at:string;expiresAt:string;reasonCodes:string[];payload:Record<string,unknown>}):Promise<boolean>;
   completeAutonomousPlan(value: {
     planId: string;
     state:
@@ -3461,7 +3462,9 @@ return 'APPLIED';
       await db.query(
         `INSERT INTO execution.transaction_steps(transaction_id,plan_id,sequence,kind,state,required_signers,metadata)
          SELECT $1,$2,COALESCE((SELECT MAX(sequence)+1 FROM execution.transaction_steps WHERE plan_id=$2),1),$3,$4,$5::jsonb,$6::jsonb
-         ON CONFLICT(transaction_id) DO NOTHING`,
+         ON CONFLICT(transaction_id) DO UPDATE
+         SET required_signers=EXCLUDED.required_signers,
+             metadata=execution.transaction_steps.metadata||EXCLUDED.metadata`,
         [
           v.transactionId,
           v.planId,
@@ -3657,6 +3660,26 @@ return 'APPLIED';
           `UPDATE execution.execution_journal SET state=$2,updated_at=$3,payload=payload||jsonb_build_object('terminalPlanState',$4::text,'terminalizedAt',$3::timestamptz) WHERE plan_id=$1 AND state IN ('PLAN_CREATED','BUILT','SIMULATED','APPROVED','SIGNING','SIGNED','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILIATION_REQUIRED')`,
           [v.planId, terminalJournalState, v.at, v.state],
         );
+    },
+    async resumePreSubmissionClosePlan(v) {
+      // This is intentionally narrower than a generic retry.  It revives only
+      // a CLOSE-family plan whose previous attempt stopped before any child
+      // signature, and grants a fresh bounded protective-action lease.
+      const prior=await db.query(
+        `UPDATE execution.transaction_plans
+         SET state='PLANNED',expires_at=$3::timestamptz,
+             payload=payload||jsonb_build_object('autonomous_dispatch_updated_at',$2::text,'autonomous_dispatch',COALESCE(payload->'autonomous_dispatch','{}'::jsonb)||$4::jsonb)
+         WHERE plan_id=$1 AND state='RECONCILIATION_REQUIRED'
+         RETURNING plan_id`,
+        [v.planId,v.at,v.expiresAt,json(v.payload)],
+      );
+      if(!prior.rows[0])return false;
+      await db.query(
+        `INSERT INTO execution.plan_state_events(plan_id,prior_state,next_state,observed_at,reason_codes,payload)
+         VALUES($1,'RECONCILIATION_REQUIRED','PLANNED',$2,$3::jsonb,$4::jsonb)`,
+        [v.planId,v.at,json(v.reasonCodes),json(v.payload)],
+      );
+      return true;
     },
     async completeAutonomousPlan(v) {
       await db.query(
@@ -5144,6 +5167,7 @@ export function createMemoryStore(): Phase1Store {
       return undefined;
     },
     async transitionAutonomousPlan() {},
+    async resumePreSubmissionClosePlan() { return false; },
     async completeAutonomousPlan() {},
     async upsertOwnedPosition() {},
     async insertPositionObservation() {},

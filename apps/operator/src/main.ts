@@ -70,10 +70,17 @@ function json(v: unknown) {
   );
 }
 const telegramLifecycleConfig=loadPhase7TelegramConfig();
-function queueLifecycleAlert(alert:Phase7Alert){
+async function queueLifecycleAlert(alert:Phase7Alert):Promise<void>{
   // Alert persistence/delivery is intentionally detached from management.  A
-  // Telegram or alert-DB failure must never alter a position decision.
-  void enqueueAndDispatchPhase7Alert({databaseUrl:process.env.DATABASE_URL,alert,config:telegramLifecycleConfig}).catch(error=>console.error(json({event:'lpforge_telegram_alert_failed',code:alert.code,error:error instanceof Error?error.message:String(error)})));
+  // Telegram or alert-DB failure must never alter a position decision.  Calls
+  // that are state-transition boundaries may await this best-effort durable
+  // outbox enqueue so the process cannot discard the transition on teardown;
+  // errors are contained here and never change trading authority.
+  try{
+    await enqueueAndDispatchPhase7Alert({databaseUrl:process.env.DATABASE_URL,alert,config:telegramLifecycleConfig});
+  }catch(error){
+    console.error(json({event:'lpforge_telegram_alert_failed',code:alert.code,error:error instanceof Error?error.message:String(error)}));
+  }
 }
 const pct=(value:number|null|undefined)=>value===undefined||value===null||!Number.isFinite(value)?'N/A':`${(value*100).toFixed(2)}%`;
 const lamportsToSol = (value: bigint) => Number(value) / 1_000_000_000;
@@ -618,7 +625,7 @@ async function observeAndPlanOwnedPositions(input: {
     const priorPeak=priorHighWater?.peakNetReturnFraction??0,currentReturn=exitDecision.economics.netReturnFraction;
     if(exitPolicy.profitProtection.enabled&&priorPeak<exitPolicy.profitProtection.triggerFraction&&exitDecision.highWater.peakNetReturnFraction>=exitPolicy.profitProtection.triggerFraction)queueLifecycleAlert({...alertBase,severity:'INFO',code:'POSITION_PROFIT_PROTECTION_ARMED',title:'Profit protection armed',message:'The canonical high-water return crossed the configured profit-protection trigger.',transitionKey:'NOT_ARMED->ARMED',topic:'TRADES',details:{'Marked return':pct(currentReturn),'Peak return':pct(exitDecision.highWater.peakNetReturnFraction),'Trigger':pct(exitPolicy.profitProtection.triggerFraction),'Max giveback':pct(exitPolicy.profitProtection.maxGivebackFraction),'Retained floor':pct(exitPolicy.profitProtection.minRetainedProfitFraction),'Fees USD':exitDecision.economics.feesValueUsd??null,'Range':isOor?'OUT OF RANGE':'IN RANGE'}});
     for(const milestone of telegramLifecycleConfig.returnMilestones)if(priorPeak<milestone&&exitDecision.highWater.peakNetReturnFraction>=milestone)queueLifecycleAlert({...alertBase,severity:'INFO',code:'POSITION_RETURN_MILESTONE',title:'Position return milestone reached',message:'Marked return crossed a configured Telegram-only milestone.',transitionKey:`RETURN<${milestone}->RETURN>=${milestone}`,topic:'TRADES',details:{Milestone:pct(milestone),'Marked return':pct(currentReturn),'Peak return':pct(exitDecision.highWater.peakNetReturnFraction),'Fees USD':exitDecision.economics.feesValueUsd??null}});
-    if((decision.action==='CLOSE'||decision.action==='EMERGENCY_CLOSE')&&priorExitRow?.last_action!==decision.action)queueLifecycleAlert({...alertBase,severity:decision.action==='EMERGENCY_CLOSE'?'CRITICAL':'WARNING',code:decision.action==='EMERGENCY_CLOSE'?'POSITION_EMERGENCY_CLOSE_TRIGGERED':'POSITION_CLOSE_TRIGGERED',title:decision.action==='EMERGENCY_CLOSE'?'Emergency close triggered':'Close triggered',message:'Canonical position management transitioned to a terminal close action.',transitionKey:`${priorExitRow?.last_action??'HOLD'}->${decision.action}`,topic:decision.action==='EMERGENCY_CLOSE'?'RISK':'TRADES',reasonCodes:decision.reasonCodes,details:{Family:exitDecision.reasonFamily,Action:decision.action,Urgency:exitDecision.urgency,'Marked return':pct(currentReturn),'Peak return':pct(exitDecision.highWater.peakNetReturnFraction),'Peak giveback':pct(exitDecision.peakGivebackFraction),'Range':isOor?'OUT OF RANGE':'IN RANGE'}});
+    if((decision.action==='CLOSE'||decision.action==='EMERGENCY_CLOSE')&&priorExitRow?.last_action!==decision.action)await queueLifecycleAlert({...alertBase,severity:decision.action==='EMERGENCY_CLOSE'?'CRITICAL':'WARNING',code:decision.action==='EMERGENCY_CLOSE'?'POSITION_EMERGENCY_CLOSE_TRIGGERED':'POSITION_CLOSE_TRIGGERED',title:decision.action==='EMERGENCY_CLOSE'?'Emergency close triggered':'Close triggered',message:'Canonical position management transitioned to a terminal close action.',transitionKey:`${priorExitRow?.last_action??'HOLD'}->${decision.action}`,topic:decision.action==='EMERGENCY_CLOSE'?'RISK':'TRADES',reasonCodes:decision.reasonCodes,details:{Family:exitDecision.reasonFamily,Action:decision.action,Urgency:exitDecision.urgency,'Marked return':pct(currentReturn),'Peak return':pct(exitDecision.highWater.peakNetReturnFraction),'Peak giveback':pct(exitDecision.peakGivebackFraction),'Range':isOor?'OUT OF RANGE':'IN RANGE'}});
     const metrics=await persistFeeCompensationMetrics({store:input.store,position,observedAt:input.observedAt,activeBinId,...(fact?{fact}:{}),...(apiPool?{apiPool}:{}),economics,lots:attributedWalletInventory,...(continuation?{continuation:{continuationEvLamports:continuation.continuationEvLamports,...(continuation.uncertainty===undefined?{}:{uncertainty:continuation.uncertainty})}}:{}),...(current?{current}:{}),activePlans,managementAction:decision.action,source:'LPFORGE_PRODUCTION_OWNED_POSITION_MONITOR'});
     await input.store.insertPositionObservation({
       lpforgePositionId: position.lpforgePositionId,
