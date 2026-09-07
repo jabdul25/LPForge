@@ -18,7 +18,7 @@ test('telegram positions reports no live positions without external dependencies
 test('telegram positions renders a fresh canonical marked snapshot without inventing SOL MTM',()=>{
   const rendered=formatTelegramPositionSummaries({positions:[position],maxOpenPositions:2,nowMs:now});
   assert.match(rendered,/📊 LPForge Positions — 1\/2/);assert.match(rendered,/5odbT7…jT2X/);assert.match(rendered,/EAf6sh…zpzZ/);
-  assert.match(rendered,/Capital: 0\.030000 SOL/);assert.match(rendered,/Value: \$4\.8142/);assert.match(rendered,/MTM: \+\$0\.2725 \(\+6\.00%\)/);
+  assert.match(rendered,/Capital: 0\.030000 SOL/);assert.match(rendered,/Economic value: \$4\.8142/);assert.match(rendered,/Economic MTM: \+\$0\.2725 \(\+6\.00%\)/);
   assert.match(rendered,/Fees: \+0\.000260 SOL/);assert.match(rendered,/Range: -1381 → -1347/);assert.match(rendered,/Active: -1352/);assert.match(rendered,/Updated: 18s ago/);
   assert.doesNotMatch(rendered,/Realized PnL/);
 });
@@ -31,7 +31,7 @@ test('stale or missing valuation is unavailable rather than a stale marked fact'
   const stale=formatTelegramPositionSummaries({positions:[{...position,observation_stale_data:true,valuation_state:'STALE'}],nowMs:now});
   assert.match(stale,/CHAIN DATA STALE/);assert.match(stale,/MTM: unavailable · valuation stale/);assert.doesNotMatch(stale,/\+\$0\.2725/);
   const missing=formatTelegramPositionSummaries({positions:[{...position,valuation_state:'UNAVAILABLE',net_pnl_usd:null,net_return_fraction:null,current_economic_value_usd:null}],nowMs:now});
-  assert.match(missing,/Value: unavailable/);assert.match(missing,/MTM: unavailable/);
+  assert.match(missing,/Economic value: unavailable/);assert.match(missing,/Economic MTM: unavailable/);
   const chainStale=formatTelegramPositionSummaries({positions:[{...position,chain_truth_fresh:false}],nowMs:now});
   assert.match(chainStale,/CHAIN DATA STALE/);assert.match(chainStale,/MTM: unavailable · valuation stale/);
 });

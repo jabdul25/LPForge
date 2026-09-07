@@ -107,7 +107,14 @@ export function formatTelegramPositionSummaries(input:{positions:readonly Telegr
   const sections=[header];const nowMs=input.nowMs??Date.now();
   for(let i=0;i<input.positions.length;i++){
     const next=one(input.positions[i]!,i+1,nowMs),candidate=[...sections,next].join('\n\n');
-    if(candidate.length>maxLength){sections.push(`… ${input.positions.length-i} additional position${input.positions.length-i===1?'':'s'} omitted; use canonical operator controls for an exact position.`);break;}
+    const omitted=`… ${input.positions.length-i} additional position${input.positions.length-i===1?'':'s'} omitted; use canonical operator controls for an exact position.`;
+    // Reserve space for an explicit, non-truncating omission marker. Telegram
+    // must never receive a slice through an otherwise complete position block.
+    if(candidate.length>maxLength||i<input.positions.length-1&&candidate.length+2+omitted.length>maxLength){
+      const withOmission=[...sections,omitted].join('\n\n');
+      if(withOmission.length<=maxLength)sections.push(omitted);
+      break;
+    }
     sections.push(next);
   }
   return sections.join('\n\n');
