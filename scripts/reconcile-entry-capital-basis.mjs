@@ -66,3 +66,8 @@ try{
     console.log(JSON.stringify({...summary,openContributionCorrectionLamports:correction.toString(),dryRun:false},null,2));
   }
 }finally{await db.end();}
+// createPostgresStore intentionally owns a long-lived application pool. This
+// one-shot repair has already durably completed (or thrown) above; terminate
+// only the repair process so a successful idempotent run cannot hold an SSH
+// deployment session open.
+process.exit(0);
