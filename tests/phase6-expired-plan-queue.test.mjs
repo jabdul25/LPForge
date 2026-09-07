@@ -11,5 +11,6 @@ test('P6 finalizes expired planned plans before attempting an autonomous claim',
   assert.match(source, /UPDATE execution\.transaction_plans[\s\S]*?state='EXPIRED'/);
   assert.match(source, /P6_PLAN_EXPIRED_BEFORE_CLAIM/);
   assert.match(source, /'PLANNED','EXPIRED'/);
+  assert.match(source, /COALESCE\(payload #>> '\{autonomous_dispatch,preSubmissionResume\}','false'\)<>'true'/);
   assert.match(source, /p\.state='PLANNED' AND \(p\.expires_at>\$1::timestamptz OR \(i\.action IN \('CLOSE','EMERGENCY_CLOSE'\) AND p\.payload #>> '\{autonomous_dispatch,preSubmissionResume\}'='true'\)\)/);
 });

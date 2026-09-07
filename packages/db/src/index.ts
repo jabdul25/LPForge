@@ -3489,6 +3489,12 @@ return 'APPLIED';
                  'autonomous_dispatch',jsonb_build_object('reason','P6_PLAN_EXPIRED_BEFORE_CLAIM')
                )
            WHERE state='PLANNED' AND expires_at<=$1::timestamptz
+             -- A durable unsigned protective-close recovery has already
+             -- revalidated exact owner/pool/position truth. It is claimed by
+             -- the narrow CLOSE lease below; do not expire it between resume
+             -- and that claim merely because the original entry-era deadline
+             -- participates in its immutable provenance HMAC.
+             AND COALESCE(payload #>> '{autonomous_dispatch,preSubmissionResume}','false')<>'true'
            RETURNING plan_id
          )
          INSERT INTO execution.plan_state_events(plan_id,prior_state,next_state,observed_at,reason_codes,payload)
