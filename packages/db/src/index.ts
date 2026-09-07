@@ -3686,6 +3686,16 @@ return 'APPLIED';
          VALUES($1,$2,'PLANNED',$3,$4::jsonb,$5::jsonb)`,
         [v.planId,String(prior.rows[0].state),v.at,json(v.reasonCodes),json(v.payload)],
       );
+      // A claim-guard HMAC rejection after the earlier pre-submission resume
+      // has no signature or chain effect. Rehydrate only that terminalized
+      // parent journal; child journals and all signed journals remain intact.
+      await db.query(
+        `UPDATE execution.execution_journal
+         SET state='PLAN_CREATED',updated_at=$2,payload=payload||jsonb_build_object('preSubmissionCloseRehydratedAt',$2::timestamptz)
+         WHERE plan_id=$1 AND state='FAILED' AND signature IS NULL
+           AND payload->>'terminalPlanState'='BLOCKED'`,
+        [v.planId,v.at],
+      );
       return true;
     },
     async completeAutonomousPlan(v) {

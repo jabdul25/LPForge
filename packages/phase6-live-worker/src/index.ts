@@ -3497,9 +3497,12 @@ export function canResumePreSubmissionClose(value:{
     // The preSubmissionResume marker was written before that claim, so this
     // remains an exact, durable no-signature continuation—not a BLOCKED retry.
     (value.stage==="CLOSE_INVENTORY_SNAPSHOTTED"||
-      (value.planState==="BLOCKED"&&value.blockedPreSubmissionResume===true&&value.stage==="CLAIM_GUARD"))&&
+      (value.blockedPreSubmissionResume===true&&value.stage==="CLAIM_GUARD"&&
+        (value.planState==="BLOCKED"||value.planState==="RECONCILIATION_REQUIRED")&&
+        value.journalState==="FAILED"))&&
     !value.hasPendingChild&&
-    value.journalState==="PLAN_CREATED"&&
+    (value.journalState==="PLAN_CREATED"||
+      (value.blockedPreSubmissionResume===true&&value.stage==="CLAIM_GUARD"&&value.journalState==="FAILED"))&&
     !value.hasJournalSignature&&
     value.positionExists&&
     value.positionOwner===value.planOwner&&
