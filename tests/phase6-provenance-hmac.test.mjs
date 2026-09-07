@@ -113,7 +113,7 @@ test('a four-step Jupiter and Meteora OPEN plan with valid provenance passes P6 
  provenance.hmac=computePlanProvenanceHmac({...provenance,action:'OPEN',ownerAddress:'OWNER',positionAddress:null,expiresAt:'2026-09-03T20:39:54.000Z',immutablePlan},secret);
  const plan={planId:'fixture-d52',intentId:'incident-intent',idempotencyKey:'fixture-d52',action:'OPEN',poolAddress:'DYNAMIC',ownerAddress:'OWNER',thesisId:'t',observedAt:provenance.observedAt,expiresAt:'2026-09-03T20:39:54.000Z',intentPayload:{},planPayload:{provenance,intent},steps};
  const candidate={poolAddress:'DYNAMIC',state:'PREFILTERED',tier:'B',lastSeenAt:'2026-09-03T20:34:50.000Z',tokenYMint:'So11111111111111111111111111111111111111112',pairedTokenMint:'TOKEN'};
- const globalWinnerAdmission={globalCycleId:'production-global:incident',poolAddress:'DYNAMIC',candidateId:intent.candidateId,selectionTier:'A',selectionState:'ACTIVE_CANDIDATE',selectionDynamicEligible:true,verified:true};
+ const globalWinnerAdmission={globalCycleId:'production-global:incident',poolAddress:'DYNAMIC',candidateId:intent.candidateId,selectionTier:'A',selectionState:'ACTIVE_CANDIDATE',selectionDynamicEligible:true,winnerObservedAt:'2026-09-03T20:34:54.000Z',tokenYMint:'So11111111111111111111111111111111111111112',verified:true};
  const result=validateClaimedPlan({plan,policy,ownedPositions:[],productionCandidates:[candidate],globalWinnerAdmission,phase7Control:current,boundPhase7Control:current,provenanceSecret:secret,now:'2026-09-03T20:35:00.000Z'});
  assert.equal(result.approved,true,JSON.stringify(result.reasonCodes));
 });
