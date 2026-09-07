@@ -42,6 +42,7 @@ test('multi-remove close construction persists all children and fingerprints bef
   assert.match(source, /loadConfirmedSubmissionByTransactionId\(child\.transactionId\)/);
   assert.match(source, /P6_CLOSE_REMOVE_CHILD_CONSTRUCTION_MISMATCH/);
   assert.match(source, /P6_CLOSE_MULTI_REMOVE_PRE_SUBMISSION_RESUME_READY/);
+  assert.match(source, /const recoveryCloseStage=closeStage\?\?/);
   assert.match(db, /async resumePreSubmissionClosePlan/);
 });
 

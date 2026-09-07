@@ -4577,8 +4577,12 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     // exact PositionV2 is still present with the bound owner/pool.  It is not
     // a generic retry of reconciliation-required CLOSE plans.
     const closeDispatch=closeSettlementDispatch(plan);
+    // CLAIM_GUARD is intentionally not a normal settlement stage. Preserve it
+    // here solely so the exact unsigned legacy recovery can prove why the
+    // parent journal was terminalized before any network boundary.
+    const recoveryCloseStage=closeStage??(typeof closeDispatch.stage==="string"?closeDispatch.stage:undefined);
     const preSubmissionCloseCandidate=canResumePreSubmissionClose({
-      action:plan.action,planState:plan.state,stage:closeStage,
+      action:plan.action,planState:plan.state,stage:recoveryCloseStage,
       blockedPreSubmissionResume:closeDispatch.preSubmissionResume===true,
       hasPendingChild:Boolean(closePending),journalState:journal.state,
       hasJournalSignature:Boolean(journal.signature),positionExists:positionTruth.exists===true,
@@ -4593,7 +4597,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       const removeSteps=plan.steps.filter(step=>step.kind==="METEORA_REMOVE");
       const submissions=await Promise.all(removeSteps.map(step=>input.store.loadSubmissionAttemptByTransactionId(step.transactionId)));
       if(!canResumePreSubmissionClose({
-        action:plan.action,planState:plan.state,stage:closeStage,
+        action:plan.action,planState:plan.state,stage:recoveryCloseStage,
         blockedPreSubmissionResume:closeDispatch.preSubmissionResume===true,
         hasPendingChild:Boolean(closePending),journalState:journal.state,
         hasJournalSignature:Boolean(journal.signature),positionExists:positionTruth.exists===true,
