@@ -3492,7 +3492,12 @@ export function canResumePreSubmissionClose(value:{
   return (value.action==="CLOSE"||value.action==="EMERGENCY_CLOSE")&&
     (value.planState==="RECONCILIATION_REQUIRED"||
       (value.planState==="BLOCKED"&&value.blockedPreSubmissionResume===true))&&
-    value.stage==="CLOSE_INVENTORY_SNAPSHOTTED"&&
+    // CLAIM_GUARD is retained only when the prior release attempted this
+    // exact resume and the immutable plan HMAC rejected its altered expiry.
+    // The preSubmissionResume marker was written before that claim, so this
+    // remains an exact, durable no-signature continuation—not a BLOCKED retry.
+    (value.stage==="CLOSE_INVENTORY_SNAPSHOTTED"||
+      (value.planState==="BLOCKED"&&value.blockedPreSubmissionResume===true&&value.stage==="CLAIM_GUARD"))&&
     !value.hasPendingChild&&
     value.journalState==="PLAN_CREATED"&&
     !value.hasJournalSignature&&
