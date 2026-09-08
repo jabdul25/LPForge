@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {recoverUnfinishedAutonomousPlans,reconcileWalletWidePositions,assessExpiredNoEffectOpenRecovery,shouldRebuildExpiredCloseUnwind} from '../.build/packages/phase6-live-worker/src/index.js';
+import {recoverUnfinishedAutonomousPlans,reconcileWalletWidePositions,assessExpiredNoEffectOpenRecovery,shouldRebuildExpiredCloseUnwind,shouldRebuildExpiredCloseRemove} from '../.build/packages/phase6-live-worker/src/index.js';
 
 test('a proven-expired primary CLOSE unwind is rebuilt as a new child only', async()=>{
   const base={signatureStatusReadUnknown:false,confirmationStatus:'EXPIRED',positionExists:true,pendingStage:'CLOSE_UNWIND_SUBMITTED'};
@@ -14,6 +14,23 @@ test('a proven-expired primary CLOSE unwind is rebuilt as a new child only', asy
   assert.match(source,/P6_CLOSE_UNWIND_REBUILD_READY/);
   assert.match(source,/unwindStep\.transactionId\}:retry-\$\{retryCount\}/,'the replacement uses a new durable child identity');
   assert.match(source,/stage:'CLOSE_INVENTORY_MEASURED'/,'recovery resumes after confirmed removal/claim, not from child zero');
+});
+
+test('a proven-expired first CLOSE remove is rebuilt only with exact no-effect provenance',async()=>{
+  const base={signatureStatusReadUnknown:false,confirmationStatus:'EXPIRED',positionExists:true,pendingStage:'CLOSE_REMOVE_SUBMITTED',pendingChildIndex:0,confirmedRemoveChildCount:0};
+  assert.equal(shouldRebuildExpiredCloseRemove(base),true);
+  assert.equal(shouldRebuildExpiredCloseRemove({...base,signatureStatusReadUnknown:true}),false,'unknown signature truth must remain fail-closed');
+  assert.equal(shouldRebuildExpiredCloseRemove({...base,confirmationStatus:'FAILED'}),false,'only blockhash-expired absence authorizes a rebuild');
+  assert.equal(shouldRebuildExpiredCloseRemove({...base,pendingChildIndex:1}),false,'a later child can have a confirmed predecessor');
+  assert.equal(shouldRebuildExpiredCloseRemove({...base,confirmedRemoveChildCount:1}),false,'confirmed liquidity must never be replayed');
+  assert.equal(shouldRebuildExpiredCloseRemove({...base,pendingStage:'CLOSE_UNWIND_SUBMITTED'}),false);
+  const source=await (await import('node:fs/promises')).readFile('packages/phase6-live-worker/src/index.ts','utf8');
+  assert.match(source,/P6_CLOSE_REMOVE_EXPIRED_NO_CHAIN_EFFECT/);
+  assert.match(source,/P6_CLOSE_REMOVE_REBUILD_READY/);
+  assert.match(source,/closeRemoveRetryCount/);
+  assert.match(source,/retryCount===0\?base:`\$\{base\}:retry-\$\{retryCount\}`/,'retry must receive a new durable child identity');
+  assert.match(source,/pendingAttempt\?\.signature!==closePending\.signature/,'the pending signature must bind to child zero before rebuilding');
+  assert.match(source,/confirmedChildren\.some\(Boolean\)/,'any confirmed removal child prevents replay');
 });
 
 test("expired no-effect OPEN is terminal only with complete absence evidence",()=>{

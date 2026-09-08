@@ -3291,8 +3291,11 @@ type DurableCloseRemoveChild = {
   built:BuiltMeteoraTransaction;
 };
 
-function closeRemoveChildTransactionId(parentTransactionId:string,index:number):string{
-  return index===0?parentTransactionId:`${parentTransactionId}:close-remove:${index}`;
+function closeRemoveChildTransactionId(parentTransactionId:string,index:number,retryCount=0):string{
+  const base=index===0?parentTransactionId:`${parentTransactionId}:close-remove:${index}`;
+  // A blockhash-expired child is never resent under its original durable
+  // identity.  A proven no-effect retry owns a new ledger/journal identity.
+  return retryCount===0?base:`${base}:retry-${retryCount}`;
 }
 
 function closeChildPlan(plan:AutonomousPlan,transactionId:string):AutonomousPlan{
@@ -3383,6 +3386,28 @@ export function shouldRebuildExpiredCloseUnwind(input:{
     input.confirmationStatus==="EXPIRED"&&
     input.positionExists&&
     input.pendingStage==="CLOSE_UNWIND_SUBMITTED";
+}
+
+/**
+ * The first REMOVE child is safe to rebuild only after its exact signature
+ * has expired, PositionV2 is still present, and no earlier remove child could
+ * have changed liquidity.  Callers additionally prove the pending signature
+ * belongs to child zero and that no remove child has a confirmed receipt.
+ */
+export function shouldRebuildExpiredCloseRemove(input:{
+  signatureStatusReadUnknown:boolean;
+  confirmationStatus:"PROCESSED"|"CONFIRMED"|"FINALIZED"|"EXPIRED"|"FAILED"|"UNKNOWN";
+  positionExists:boolean;
+  pendingStage:CloseSettlementPendingStage;
+  pendingChildIndex:number | undefined;
+  confirmedRemoveChildCount:number;
+}):boolean{
+  return !input.signatureStatusReadUnknown&&
+    input.confirmationStatus==="EXPIRED"&&
+    input.positionExists&&
+    input.pendingStage==="CLOSE_REMOVE_SUBMITTED"&&
+    input.pendingChildIndex===0&&
+    input.confirmedRemoveChildCount===0;
 }
 
 /** Bounded recovery delay prevents a proven-safe retry from becoming a tight loop. */
@@ -3720,8 +3745,10 @@ async function executeCloseSettlement(input: {
     if(built.length===0)throw new Error("LPFORGE_P6_CLOSE_REMOVE_CONSTRUCTION_EMPTY");
     // Construct and journal the complete SDK sequence before signing child 0.
     // This turns SDK transaction splitting into durable parent-plan facts.
+    const removeRetryRaw=Number(dispatch.closeRemoveRetryCount??0),
+      removeRetryCount=Number.isSafeInteger(removeRetryRaw)&&removeRetryRaw>=0?removeRetryRaw:0;
     const children:DurableCloseRemoveChild[]=built.map((item,index)=>{
-      const transactionId=closeRemoveChildTransactionId(removeStep.transactionId,index);
+      const transactionId=closeRemoveChildTransactionId(removeStep.transactionId,index,removeRetryCount);
       const constructionFingerprint=closeRemoveConstructionFingerprint(item);
       const previous=input.plan.steps.find(step=>step.transactionId===transactionId);
       const previousFingerprint=previous?.metadata.closeRemoveConstructionFingerprint;
@@ -3755,9 +3782,10 @@ async function executeCloseSettlement(input: {
         action:closeAction,
         deferCompletion:true,
         afterSubmit:async({signature})=>persist("CLOSE_INVENTORY_SNAPSHOTTED",{
-          tokenXBefore:tokenXBefore!.toString(),tokenYBefore:tokenYBefore!.toString(),
-          removeChildCount:children.length,removeChildTransactionIds:allIds,
-          removeChildIndex:child.index,pendingStage:"CLOSE_REMOVE_SUBMITTED",pendingSignature:signature,
+        tokenXBefore:tokenXBefore!.toString(),tokenYBefore:tokenYBefore!.toString(),
+        removeChildCount:children.length,removeChildTransactionIds:allIds,
+        removeChildIndex:child.index,closeRemoveRetryCount:removeRetryCount,
+        pendingStage:"CLOSE_REMOVE_SUBMITTED",pendingSignature:signature,
         }),
         afterConfirmed:async({signature})=>{
           const native=await persistConfirmedCloseNativeWithdrawal({store:input.store,connection,plan:input.plan,positionAddress:input.positionAddress,signature,transactionId:child.transactionId});
@@ -3770,6 +3798,7 @@ async function executeCloseSettlement(input: {
         tokenXBefore:tokenXBefore!.toString(),tokenYBefore:tokenYBefore!.toString(),
         removeChildCount:children.length,removeChildTransactionIds:allIds,
         removeChildrenConfirmed:[...priorConfirmed],lastConfirmedRemoveChild:child.index,
+        closeRemoveRetryCount:removeRetryCount,
       });
     }
     await persist("CLOSE_LIQUIDITY_REMOVED", {
@@ -3779,6 +3808,7 @@ async function executeCloseSettlement(input: {
       removeTransactionIds: allIds,
       removeChildCount:children.length,
       removeChildrenConfirmed:[...priorConfirmed],
+      closeRemoveRetryCount:removeRetryCount,
     });
     stage = "CLOSE_LIQUIDITY_REMOVED";
   }
@@ -4940,6 +4970,103 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     if (closePending) {
       const settled = confirmationStatus === "CONFIRMED" || confirmationStatus === "FINALIZED";
       if (!settled) {
+        // The first REMOVE child has no predecessor effect to preserve.  Once
+        // its exact signature is proven expired and PositionV2 is still the
+        // exact bound open position, rebuild the complete removal sequence
+        // under retry identities.  This is deliberately narrower than a
+        // generic close retry: child zero only, no confirmed remove child,
+        // and every durable binding must agree before the parent is resumed.
+        const pendingRemoveDispatch=closeSettlementDispatch(plan),
+          pendingRemoveChildIndex=typeof pendingRemoveDispatch.removeChildIndex==='number'
+            ? pendingRemoveDispatch.removeChildIndex
+            : undefined,
+          pendingRemoveConfirmedChildCount=Array.isArray(pendingRemoveDispatch.removeChildrenConfirmed)
+            ? pendingRemoveDispatch.removeChildrenConfirmed.filter((value):value is string=>typeof value==='string').length
+            : 0;
+        if (shouldRebuildExpiredCloseRemove({
+          signatureStatusReadUnknown,
+          confirmationStatus,
+          positionExists:positionTruth.exists===true,
+          pendingStage:closePending.stage,
+          pendingChildIndex:pendingRemoveChildIndex,
+          confirmedRemoveChildCount:pendingRemoveConfirmedChildCount,
+        })) {
+          const dispatch=closeSettlementDispatch(plan),
+            persistedIds=Array.isArray(dispatch.removeChildTransactionIds)
+              ? dispatch.removeChildTransactionIds.filter((value):value is string=>typeof value==='string')
+              : [],
+            removeChildIds=persistedIds.length>0
+              ? persistedIds
+              : plan.steps.filter(step=>step.kind==='METEORA_REMOVE').map(step=>step.transactionId),
+            pendingChildIndex=Number(dispatch.removeChildIndex),
+            pendingChildId=Number.isInteger(pendingChildIndex)&&pendingChildIndex>=0
+              ? removeChildIds[pendingChildIndex]
+              : undefined,
+            priorRetryRaw=Number(dispatch.closeRemoveRetryCount??0),
+            priorRetry=Number.isSafeInteger(priorRetryRaw)&&priorRetryRaw>=0?priorRetryRaw:0,
+            nextRetry=priorRetry+1;
+          const [pendingAttempt,confirmedChildren]=await Promise.all([
+            pendingChildId?input.store.loadSubmissionAttemptByTransactionId(pendingChildId):Promise.resolve(undefined),
+            Promise.all(removeChildIds.map(transactionId=>input.store.loadConfirmedSubmissionByTransactionId(transactionId))),
+          ]);
+          if(!pendingChildId||pendingAttempt?.signature!==closePending.signature||confirmedChildren.some(Boolean)){
+            await input.store.transitionAutonomousPlan({
+              planId:plan.planId,state:'RECONCILIATION_REQUIRED',at:input.now,
+              reasonCodes:['P6_CLOSE_REMOVE_REBUILD_PROVENANCE_MISMATCH'],
+              payload:{stage:'CLOSE_INVENTORY_SNAPSHOTTED',pendingStage:closePending.stage,pendingSignature:closePending.signature,removeChildTransactionIds:removeChildIds,removeChildIndex:dispatch.removeChildIndex??null},
+            });
+            results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:['P6_CLOSE_REMOVE_REBUILD_PROVENANCE_MISMATCH']});
+            continue;
+          }
+          await input.store.markSubmissionExpired(
+            closePending.signature,
+            input.now,
+            'P6_CLOSE_REMOVE_EXPIRED_NO_CHAIN_EFFECT',
+          );
+          await input.store.updateExecutionJournal({
+            idempotencyKey:plan.idempotencyKey,
+            expectedVersion:journal.version,
+            // This parent has no confirmed child.  The expired signature
+            // remains immutable in its child ledger; PLAN_CREATED simply
+            // represents the next safe parent boundary.
+            state:'PLAN_CREATED',
+            updatedAt:input.now,
+            payload:{
+              ...journal.payload,
+              recovery:'P6_CLOSE_REMOVE_EXPIRED_NO_CHAIN_EFFECT',
+              expiredRemoveSignature:closePending.signature,
+              expiredRemoveTransactionId:pendingChildId,
+              priorJournalState:journal.state,
+              confirmationStatus,
+              positionTruth,
+            },
+          });
+          await input.store.transitionAutonomousPlan({
+            planId:plan.planId,state:'RECONCILING',at:input.now,
+            reasonCodes:[
+              'P6_CLOSE_REMOVE_EXPIRED_NO_CHAIN_EFFECT',
+              'P6_CLOSE_REMOVE_REBUILD_READY',
+            ],
+            payload:{
+              stage:'CLOSE_INVENTORY_SNAPSHOTTED',
+              pendingStage:null,
+              pendingSignature:null,
+              closeRemoveRetryCount:nextRetry,
+              expiredRemoveSignature:closePending.signature,
+              expiredRemoveTransactionId:pendingChildId,
+              removeChildrenConfirmed:[],
+            },
+          });
+          results.push({
+            planId:plan.planId,
+            action:'RESUME_CLOSE_SETTLEMENT',
+            reasonCodes:[
+              'P6_CLOSE_REMOVE_EXPIRED_NO_CHAIN_EFFECT',
+              'P6_CLOSE_REMOVE_REBUILD_READY',
+            ],
+          });
+          continue;
+        }
         // A primary CLOSE unwind is a separately journaled token swap.  When
         // its exact signature has expired and PositionV2 is still present,
         // the receipt proves no swap effect but REMOVE/CLAIM remain confirmed
