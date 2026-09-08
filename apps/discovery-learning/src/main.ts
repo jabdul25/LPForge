@@ -119,7 +119,7 @@ async function matureCandidateCounterfactualOutcomes(store:Awaited<ReturnType<ty
  // is derived state, so bounded oldest-first repair compares durable outcomes
  // rather than relying on an in-memory increment from that prior process.
  for(const recommendationId of await store.loadStaleCandidateUniverseForwardOutcomeCoverage(bounded('LPFORGE_FULL_UNIVERSE_MANIFEST_REFRESH_MAX_BATCH',8,32)))await store.refreshCandidateUniverseForwardOutcomeCoverage(recommendationId,now);
- const retentionLimit=bounded('LPFORGE_RESET3C_RETENTION_MAX_BATCH',8,50),terminalEligible=await store.markTerminalEligibleReset3cValidationUniverses(now,retentionLimit),purged=await store.purgeTerminalEligibleReset3cValidationEvidence(now,retentionLimit),rerankCompacted=await store.compactEligibleCandidateUniverseRerankRetention(now,bounded('LPFORGE_CANDIDATE_UNIVERSE_RETENTION_MAX_BATCH',8,50));
+ const terminalEligible=0,purged=0,rerankCompacted=0;
  memory('candidate-counterfactual:complete');
  return{processed:fullUniverseRows.length+v3Rows.length+historicalRows.length,fullUniverseBackfill,fullUniverseSelected:fullUniverseRows.length,v3Selected:v3Rows.length,historicalSelected:historicalRows.length,failures:fullUniverseFailures+v3Failures+historicalFailures,terminalEligible,purged,rerankCompacted};
 }
@@ -130,6 +130,16 @@ async function runBinSnapshotRetentionCycle(){
   const result=await runBoundedBinSnapshotRetention({store,now,limit:Number(process.env.LPFORGE_BIN_SNAPSHOT_RETENTION_MAX_DELETE??2000),dryRun:process.env.LPFORGE_BIN_SNAPSHOT_RETENTION_DRY_RUN!=='false',emit:event=>console.log(json({...event,authority:'RESEARCH_ONLY_NO_POLICY_MUTATION'}))}),telemetry=await store.loadBinSnapshotRetentionTelemetry(result.protectionFloor),filesystemFree=filesystemFreeBytes();
   console.log(json({event:'BIN_SNAPSHOT_RETENTION_TELEMETRY',authority:'RESEARCH_ONLY_NO_POLICY_MUTATION',observedAt:now,state:result.state,dryRun:result.dryRun,reasonCodes:result.reasonCodes,...(result.protectionFloor?{protectionFloor:result.protectionFloor}:{}),deletedRows:result.deleted,...telemetry,estimatedReclaimableBytes:telemetry.deadTuples>0&&telemetry.estimatedRemainingRows>0?Math.floor(telemetry.tableBytes*(telemetry.deadTuples/(telemetry.deadTuples+telemetry.estimatedRemainingRows))):0,...(filesystemFree===undefined?{}:{filesystemFreeBytes:filesystemFree})}));
  }catch(error){console.error(json({event:'BIN_SNAPSHOT_RETENTION_FAILED',authority:'RESEARCH_ONLY_NO_POLICY_MUTATION',error:error instanceof Error?error.message:String(error)}));}
+ finally{await store.close();}
+}
+/** Existing Reset3c/M0062 compaction is terminal-only and must not be held
+ * behind slower counterfactual work. It has no production-policy consumer. */
+async function runResearchEvidenceCompactionCycle(){
+ const store=await createPostgresStore(env('DATABASE_URL')),now=new Date().toISOString();
+ try{
+  const reset3cLimit=bounded('LPFORGE_RESET3C_RETENTION_MAX_BATCH',8,50),rerankLimit=bounded('LPFORGE_CANDIDATE_UNIVERSE_RETENTION_MAX_BATCH',8,50),terminalEligible=await store.markTerminalEligibleReset3cValidationUniverses(now,reset3cLimit),purged=await store.purgeTerminalEligibleReset3cValidationEvidence(now,reset3cLimit),rerankCompacted=await store.compactEligibleCandidateUniverseRerankRetention(now,rerankLimit);
+  console.log(json({event:'RESEARCH_EVIDENCE_COMPACTION',authority:'RESEARCH_ONLY_NO_POLICY_MUTATION',observedAt:now,reset3cBatchLimit:reset3cLimit,terminalEligible,purged,rerankBatchLimit:rerankLimit,rerankCompacted}));
+ }catch(error){console.error(json({event:'RESEARCH_EVIDENCE_COMPACTION_FAILED',authority:'RESEARCH_ONLY_NO_POLICY_MUTATION',error:error instanceof Error?error.message:String(error)}));}
  finally{await store.close();}
 }
 /** Read the immutable snapshot copied into the terminal outcome, never a newer recommendation or a live token price. */
@@ -174,10 +184,12 @@ const cmd=process.argv[2]??'once';if(cmd==='once')await once();else if(cmd==='st
  const marketContextTelemetryMs=Math.max(30_000,Math.min(300_000,Number(process.env.LPFORGE_MARKET_CONTEXT_TELEMETRY_INTERVAL_MS??60_000)));
  const inventoryForecastV2Ms=Math.max(30_000,Math.min(300_000,Number(process.env.LPFORGE_INVENTORY_FORECAST_V2_INTERVAL_MS??60_000)));
  const binSnapshotRetentionMs=Math.max(30_000,Math.min(300_000,Number(process.env.LPFORGE_BIN_SNAPSHOT_RETENTION_INTERVAL_MS??60_000)));
+ const researchEvidenceCompactionMs=Math.max(30_000,Math.min(300_000,Number(process.env.LPFORGE_RESEARCH_EVIDENCE_COMPACTION_INTERVAL_MS??60_000)));
  startIndependentForwardMaturationLoop({intervalMs:forwardMaturationMs,run:async()=>{const store=await createPostgresStore(env('DATABASE_URL')),now=new Date().toISOString();try{await maturePhase3ForwardOutcomes(store,now,{includeCalibration:false});await matureCandidateCounterfactualOutcomes(store,now);}finally{await store.close();}},onError:(error)=>console.error(json({event:'FORWARD_MATURATION_FAILED',error:error instanceof Error?error.message:String(error),authority:'RESEARCH_ONLY_NO_POLICY_MUTATION'}))});
  startIndependentPostEntryTelemetryLoop({intervalMs:postEntryTelemetryMs,run:async()=>{const store=await createPostgresStore(env('DATABASE_URL'));try{await runPostEntryTelemetryCapture({store,now:new Date().toISOString()});}finally{await store.close();}},onError:(error)=>console.error(json({event:'POST_ENTRY_TELEMETRY_CAPTURE_FAILED',error:error instanceof Error?error.message:String(error),authority:'RESEARCH_ONLY_NO_POLICY_MUTATION'}))});
  startIndependentProspectiveMarketContextTelemetryLoop({intervalMs:marketContextTelemetryMs,run:async()=>{const store=await createPostgresStore(env('DATABASE_URL'));try{await runProspectiveMarketContextTelemetryCapture({store,now:new Date().toISOString()});}finally{await store.close();}},onError:(error)=>console.error(json({event:'M0050_MARKET_CONTEXT_TELEMETRY_CAPTURE_FAILED',error:error instanceof Error?error.message:String(error),authority:'RESEARCH_ONLY_NO_POLICY_MUTATION'}))});
  startIndependentProspectiveInventoryForecastV2Loop({intervalMs:inventoryForecastV2Ms,run:async()=>{const store=await createPostgresStore(env('DATABASE_URL'));try{await runProspectiveInventoryForecastV2Capture({store,now:new Date().toISOString()});}finally{await store.close();}},onError:(error)=>console.error(json({event:'INVENTORY_FORECAST_V2_SHADOW_CAPTURE_FAILED',error:error instanceof Error?error.message:String(error),authority:'RESEARCH_ONLY_NO_POLICY_MUTATION'}))});
  startIndependentForwardMaturationLoop({intervalMs:binSnapshotRetentionMs,run:runBinSnapshotRetentionCycle,onError:(error)=>console.error(json({event:'BIN_SNAPSHOT_RETENTION_LOOP_FAILED',error:error instanceof Error?error.message:String(error),authority:'RESEARCH_ONLY_NO_POLICY_MUTATION'}))});
+ startIndependentForwardMaturationLoop({intervalMs:researchEvidenceCompactionMs,run:runResearchEvidenceCompactionCycle,onError:(error)=>console.error(json({event:'RESEARCH_EVIDENCE_COMPACTION_LOOP_FAILED',error:error instanceof Error?error.message:String(error),authority:'RESEARCH_ONLY_NO_POLICY_MUTATION'}))});
  for(;;){try{await once({includeForwardMaturation:false})}catch(error){console.error(json({status:'ERROR',error:error instanceof Error?error.message:String(error)}))}await new Promise(resolve=>setTimeout(resolve,learningMs));}
 }else throw new Error(`LPFORGE_DISCOVERY_LEARNING_COMMAND:${cmd}`);

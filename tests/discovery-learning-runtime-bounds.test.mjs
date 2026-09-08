@@ -32,6 +32,10 @@ test('both selected and counterfactual forward queues run independently with bou
   assert.match(source, /runBoundedBinSnapshotRetention/);
   assert.match(source, /runBinSnapshotRetentionCycle/);
   assert.match(source, /startIndependentForwardMaturationLoop\(\{intervalMs:binSnapshotRetentionMs,run:runBinSnapshotRetentionCycle/);
+  assert.match(source, /runResearchEvidenceCompactionCycle/);
+  assert.match(source, /markTerminalEligibleReset3cValidationUniverses\(now,reset3cLimit\)/);
+  assert.match(source, /purgeTerminalEligibleReset3cValidationEvidence\(now,reset3cLimit\)/);
+  assert.match(source, /startIndependentForwardMaturationLoop\(\{intervalMs:researchEvidenceCompactionMs,run:runResearchEvidenceCompactionCycle/);
   assert.match(source, /LPFORGE_BIN_SNAPSHOT_RETENTION_MAX_DELETE/);
   assert.doesNotMatch(source, /Promise\.all\([^)]*loadOperationalHistory/);
 });
