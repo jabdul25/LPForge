@@ -362,6 +362,32 @@ export function derivePositionAttributedTerminalUnwind(input:{
   if(input.walletRawAfterClose<amountRaw)return{ok:false,reasonCodes:['P6_CLOSE_POSITION_ATTRIBUTED_FEE_LOTS_WALLET_SHORTFALL']};
   return{ok:true,amountRaw,feeLotAllocations,openResidualLotAllocations,lotAllocations};
 }
+
+/**
+ * A final account-close child may expire after the normal close unwind has
+ * already settled, while a receipt-backed fee claim remains in the owner
+ * wallet.  That inventory is still position-attributable, but it is not safe
+ * to infer it from a wallet-wide balance.  Select only open fee-claim lots
+ * bound to this exact position and mint; the caller separately proves the
+ * current wallet can cover the exact durable lot total before constructing a
+ * fresh unwind child.
+ */
+export function selectReceiptBoundFeeClaimResidual(input:{
+  positionAddress:string;
+  tokenMint:string;
+  lots:ReadonlyArray<Pick<PositionInventoryLot,"lotId"|"positionAddress"|"tokenMint"|"sourceEvent"|"remainingRawAmount"|"status"|"acquiredAt">>;
+}):Array<{lotId:string;rawAmount:bigint}>{
+  return input.lots
+    .filter(lot=>
+      lot.positionAddress===input.positionAddress&&
+      lot.tokenMint===input.tokenMint&&
+      lot.sourceEvent==='FEE_CLAIM'&&
+      ['OPEN','PARTIALLY_SETTLED'].includes(lot.status)&&
+      lot.remainingRawAmount>0n,
+    )
+    .sort((a,b)=>a.acquiredAt.localeCompare(b.acquiredAt)||a.lotId.localeCompare(b.lotId))
+    .map(lot=>({lotId:lot.lotId,rawAmount:lot.remainingRawAmount}));
+}
 /** Read the chain immediately before signing.  The plan's market inputs are
  * immutable; a missing/mismatched value is a fail-closed condition, not a
  * reason to substitute the planned lower bin. */
@@ -4383,14 +4409,22 @@ async function executeCloseSettlement(input: {
       stage="CLOSE_RECOVERED_OPEN_RESIDUAL_UNWOUND";
     }
   }
+  // A conclusively expired account-close child is no-effect evidence, not a
+  // reusable transaction identity.  Retrying after all prerequisite inventory
+  // is settled therefore receives a distinct durable child id.
+  const closeAccountRetryRaw=Number(closeSettlementDispatch(input.plan).closeAccountRetryCount??0),
+    closeAccountRetryCount=Number.isSafeInteger(closeAccountRetryRaw)&&closeAccountRetryRaw>=0?closeAccountRetryRaw:0,
+    closeAccountTransactionId=closeAccountRetryCount===0
+      ? closeStep.transactionId
+      : `${closeStep.transactionId}:retry-${closeAccountRetryCount}`;
   const closedBuilt = await buildClosePositionTransaction(input.pool, {
     userAddress: input.plan.ownerAddress,
     positionAddress: input.positionAddress,
   });
-  closedBuilt.metadata.transactionId = closeStep.transactionId;
+  closedBuilt.metadata.transactionId = closeAccountTransactionId;
   const closed = await executeMeteoraMutation({
     ...input,
-    plan: closeChildPlan(input.plan, closeStep.transactionId),
+    plan: closeChildPlan(input.plan, closeAccountTransactionId),
     built: closedBuilt,
     action: closeAction,
     afterSubmit: async ({ signature }) => persist("CLOSE_INVENTORY_UNWOUND", {
@@ -4398,6 +4432,8 @@ async function executeCloseSettlement(input: {
       tokenYBefore: tokenYBefore!.toString(),
       attributableTokenX: attributableTokenX?.toString() ?? "0",
       attributableTokenY:attributableTokenY?.toString()??"0",
+      closeAccountRetryCount,
+      transactionId:closeAccountTransactionId,
       pendingStage: "CLOSE_POSITION_SUBMITTED",
       pendingSignature: signature,
     }),
@@ -4408,7 +4444,7 @@ async function executeCloseSettlement(input: {
         plan:input.plan,
         positionAddress:input.positionAddress,
         signature,
-        transactionId:closeStep.transactionId,
+        transactionId:closeAccountTransactionId,
       });
       if(!rent.ok)throw new Error(rent.reasonCodes.join(","));
     },
@@ -5693,6 +5729,56 @@ export async function recoverUnfinishedAutonomousPlans(input: {
               await input.store.transitionAutonomousPlan({planId:plan.planId,state:'RECONCILING',at:input.now,reasonCodes:['P6_CLOSE_REHYDRATED_FOR_RECEIPT_BOUND_OPEN_RESIDUAL_UNWIND'],payload:{stage:'CLOSE_CLAIMS_SETTLED',pendingStage:null,pendingSignature:null,closeSettlementIncomplete:true}});
               results.push({planId:plan.planId,action:'RESUME_CLOSE_SETTLEMENT',reasonCodes:['P6_CLOSE_REHYDRATED_FOR_RECEIPT_BOUND_OPEN_RESIDUAL_UNWIND']});
               continue;
+            }
+            // The normal unwind may have confirmed before a fee-claim lot was
+            // recorded or allocated.  If the account-close child then expires
+            // without effect, an account-only successor would be impossible:
+            // it must not close an account while receipt-bound inventory is
+            // still attributable.  Resume the same parent from a fresh,
+            // separately identified unwind using only exact FEE_CLAIM lots.
+            // No wallet-wide balance is attributed; the balance is merely a
+            // sufficiency proof for the immutable lots selected below.
+            const tokenMint=typeof dispatch.tokenXMint==='string'?dispatch.tokenXMint:undefined;
+            if(removesConfirmed&&(claimSkipped||claimsConfirmed)&&unwindConfirmed&&unwindId&&lastConfirmedId&&lastConfirmed&&tokenMint&&connection){
+              const feeLots=selectReceiptBoundFeeClaimResidual({
+                positionAddress:recoveryPositionAddress,
+                tokenMint,
+                lots:await input.store.loadPositionInventoryLots(recoveryPositionAddress,tokenMint),
+              });
+              const feeResidual=feeLots.reduce((total,lot)=>total+lot.rawAmount,0n);
+              let walletTokenX:bigint|undefined;
+              try{walletTokenX=await readWalletTokenBalance({connection,ownerAddress:plan.ownerAddress,mint:tokenMint});}catch{}
+              if(feeResidual>0n&&walletTokenX!==undefined&&walletTokenX>=feeResidual){
+                const retryRaw=Number(dispatch.closeUnwindRetryCount??0),
+                  priorRetry=Number.isSafeInteger(retryRaw)&&retryRaw>=0?retryRaw:0,
+                  accountRetryRaw=Number(dispatch.closeAccountRetryCount??0),
+                  priorAccountRetry=Number.isSafeInteger(accountRetryRaw)&&accountRetryRaw>=0?accountRetryRaw:0;
+                await input.store.updateExecutionJournal({
+                  idempotencyKey:plan.idempotencyKey,
+                  expectedVersion:journal.version,
+                  transactionId:unwindId,
+                  state:'CONFIRMED',
+                  signature:unwindConfirmed.signature,
+                  updatedAt:input.now,
+                  payload:{...journal.payload,recovery:'P6_CLOSE_REHYDRATED_FOR_RECEIPT_BOUND_FEE_CLAIM_RESIDUAL_UNWIND',expiredAccountCloseSignature:closePending.signature,feeClaimResidualLotIds:feeLots.map(lot=>lot.lotId)},
+                });
+                await input.store.transitionAutonomousPlan({
+                  planId:plan.planId,state:'RECONCILING',at:input.now,
+                  reasonCodes:['P6_CLOSE_REHYDRATED_FOR_RECEIPT_BOUND_FEE_CLAIM_RESIDUAL_UNWIND'],
+                  payload:{
+                    stage:'CLOSE_INVENTORY_MEASURED',
+                    pendingStage:null,pendingSignature:null,
+                    attributableTokenX:feeResidual.toString(),
+                    attributableFeeLotAllocations:feeLots.map(lot=>({lotId:lot.lotId,rawAmount:lot.rawAmount.toString()})),
+                    closeUnwindRetryCount:priorRetry+1,
+                    closeAccountRetryCount:priorAccountRetry+1,
+                    expiredAccountCloseSignature:closePending.signature,
+                    expiredAccountCloseTransactionId:typeof dispatch.transactionId==='string'?dispatch.transactionId:null,
+                  },
+                });
+                results.push({planId:plan.planId,action:'RESUME_CLOSE_SETTLEMENT',reasonCodes:['P6_CLOSE_REHYDRATED_FOR_RECEIPT_BOUND_FEE_CLAIM_RESIDUAL_UNWIND']});
+                continue;
+              }
             }
             const successor=await createAccountCloseOnlySuccessor({store:input.store,plan,positionAddress:recoveryPositionAddress,positionTruth,now:input.now});
             if(successor.created){

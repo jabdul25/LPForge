@@ -5,8 +5,31 @@ import {
   canResumePreSubmissionClose,
   isLegacySequentialCloseJournalRecovery,
   mutationRiskPlanExpiry,
+  selectReceiptBoundFeeClaimResidual,
   shouldResumeCloseSettlement,
 } from '../.build/packages/phase6-live-worker/src/index.js';
+
+test('expired account-close resumes a receipt-bound fee-claim residual before a fresh close child', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile('packages/phase6-live-worker/src/index.ts', 'utf8'));
+  assert.match(source, /P6_CLOSE_REHYDRATED_FOR_RECEIPT_BOUND_FEE_CLAIM_RESIDUAL_UNWIND/);
+  assert.match(source, /selectReceiptBoundFeeClaimResidual/);
+  assert.match(source, /walletTokenX>=feeResidual/);
+  assert.match(source, /closeAccountRetryCount:priorAccountRetry\+1/);
+  assert.match(source, /closeAccountTransactionId=closeAccountRetryCount===0/);
+  assert.match(source, /closeAccountTransactionId=closeAccountRetryCount===0/);
+});
+
+test('only an open receipt-bound fee-claim lot can be selected for post-close residual unwind', () => {
+  const lots = selectReceiptBoundFeeClaimResidual({
+    positionAddress: 'position', tokenMint: 'mint', lots: [
+      {lotId: 'claim', positionAddress: 'position', tokenMint: 'mint', sourceEvent: 'FEE_CLAIM', remainingRawAmount: 61n, status: 'OPEN', acquiredAt: '2026-09-08T21:25:27.000Z'},
+      {lotId: 'other-position', positionAddress: 'other', tokenMint: 'mint', sourceEvent: 'FEE_CLAIM', remainingRawAmount: 99n, status: 'OPEN', acquiredAt: '2026-09-08T21:25:27.000Z'},
+      {lotId: 'settled', positionAddress: 'position', tokenMint: 'mint', sourceEvent: 'FEE_CLAIM', remainingRawAmount: 1n, status: 'SETTLED', acquiredAt: '2026-09-08T21:25:27.000Z'},
+      {lotId: 'withdrawal', positionAddress: 'position', tokenMint: 'mint', sourceEvent: 'CLOSE_WITHDRAWAL', remainingRawAmount: 2n, status: 'OPEN', acquiredAt: '2026-09-08T21:25:27.000Z'},
+    ],
+  });
+  assert.deepEqual(lots, [{lotId: 'claim', rawAmount: 61n}]);
+});
 
 test('only an exact unsigned OPEN/MATCH close snapshot may resume multi-remove construction', () => {
   const base = {
