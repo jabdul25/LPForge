@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {executionJournalPlanId,P6PostSubmissionConfirmationPending} from '../.build/packages/phase6-live-worker/src/index.js';
+import {executionJournalPlanId,P6PostSubmissionConfirmationPending,recordPostSubmissionReconciliation} from '../.build/packages/phase6-live-worker/src/index.js';
 import {executionJournalFromRow} from '../.build/packages/db/src/index.js';
 import { readFile } from 'node:fs/promises';
 import {
@@ -31,6 +31,19 @@ test('submitted swap post-submission handoff preserves exact durable identity an
   assert.equal(error.message,'LPFORGE_P6_CONFIRM_EXPIRED');
   assert.equal(error.submissionReason,'LPFORGE_P6_CONFIRM_EXPIRED');
   assert.deepEqual({planId:error.planId,transactionId:error.transactionId,attemptId:error.attemptId,signature:error.signature},{planId:'plan',transactionId:'swap',attemptId:'swap:attempt:1',signature:'signature'});
+});
+
+test('submitted Jupiter child repairs a missing parent journal prefix before reconciliation',async()=>{
+  let row={journalId:'journal',idempotencyKey:'idem',planId:'plan',transactionId:'open',state:'PLAN_CREATED',version:1,updatedAt:now,payload:{action:'OPEN'}};
+  const store={
+    getExecutionJournal:async()=>row,
+    updateExecutionJournal:async v=>{assert.equal(v.expectedVersion,row.version);assertExecutionJournalTransition(row.state,v.state);row={...row,state:v.state,version:row.version+1,updatedAt:v.updatedAt,transactionId:v.transactionId??row.transactionId,signature:v.signature??row.signature,payload:v.payload};return true;},
+    createExecutionJournal:async()=>true,
+  };
+  await recordPostSubmissionReconciliation({store,plan:{planId:'plan',idempotencyKey:'idem',action:'OPEN',steps:[]},transactionId:'swap',signature:'sig',payload:{stage:'JUPITER_SWAP'}});
+  assert.equal(row.state,'RECONCILIATION_REQUIRED');
+  assert.equal(row.transactionId,'swap');
+  assert.equal(row.signature,'sig');
 });
 
 test('execution journal source state contract is exactly represented by M0059',async()=>{

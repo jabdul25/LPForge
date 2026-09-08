@@ -676,6 +676,39 @@ async function recordJournal(
   if (!updated)
     throw new Error("LPFORGE_EXECUTION_JOURNAL_CONCURRENT_UPDATE");
 }
+
+/**
+ * A durable submission attempt is stronger evidence than an interrupted
+ * parent-journal write.  Complete only the otherwise-missing normal journal
+ * boundaries, then enter reconciliation.  This is deliberately narrow: it
+ * is usable only with the exact attempt/signature that crossed submission.
+ */
+export async function recordPostSubmissionReconciliation(input:{store:Phase1Store;plan:AutonomousPlan;transactionId:string;signature:string;payload:Record<string,unknown>}) {
+  const base={...input.payload,action:input.plan.action,transactionId:input.transactionId,postSubmission:true};
+  let current=await input.store.getExecutionJournal(input.plan.idempotencyKey);
+  if(!current){
+    await recordJournal(input.store,input.plan,'SIGNING',base);
+    current=await input.store.getExecutionJournal(input.plan.idempotencyKey);
+  }
+  if(!current)throw new Error('LPFORGE_EXECUTION_JOURNAL_POST_SUBMISSION_MISSING');
+  const state=String(current.state) as ExecutionJournalState;
+  if(['PLAN_CREATED','BUILT','SIMULATED','APPROVED'].includes(state))
+    await recordJournal(input.store,input.plan,'SIGNING',base);
+  const afterSigning=await input.store.getExecutionJournal(input.plan.idempotencyKey);
+  if(!afterSigning)throw new Error('LPFORGE_EXECUTION_JOURNAL_POST_SUBMISSION_MISSING');
+  if(String(afterSigning.state)==='SIGNING')
+    await recordJournal(input.store,input.plan,'SIGNED',base);
+  const afterSigned=await input.store.getExecutionJournal(input.plan.idempotencyKey);
+  if(!afterSigned)throw new Error('LPFORGE_EXECUTION_JOURNAL_POST_SUBMISSION_MISSING');
+  if(String(afterSigned.state)==='SIGNED')
+    await recordJournal(input.store,input.plan,'UNKNOWN_SUBMISSION',base,input.signature);
+  const submitted=await input.store.getExecutionJournal(input.plan.idempotencyKey);
+  if(!submitted)throw new Error('LPFORGE_EXECUTION_JOURNAL_POST_SUBMISSION_MISSING');
+  if(['SUBMITTED','UNKNOWN_SUBMISSION'].includes(String(submitted.state)))
+    await recordJournal(input.store,input.plan,'RECONCILIATION_REQUIRED',base,input.signature);
+  else if(String(submitted.state)!=='RECONCILIATION_REQUIRED')
+    throw new Error(`LPFORGE_EXECUTION_JOURNAL_POST_SUBMISSION_STATE_INVALID:${String(submitted.state)}`);
+}
 function authority(
   level: "MAINNET_BUILD_SIMULATE" | "MAINNET_CANARY",
   now: string,
@@ -914,6 +947,7 @@ async function executeRequiredJupiterSwap(input: {
   });
   const envelope = createVersionedMainnetEnvelope(transaction),
     signedAt = new Date().toISOString();
+  await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SIGNING',{action:'OPEN',transactionId:input.plan.swapTransactionId,stage:'JUPITER_SWAP'});
   await signMainnetCanary({
     authority: input.openAuthority,
     ticket: input.openTicket,
@@ -923,6 +957,7 @@ async function executeRequiredJupiterSwap(input: {
     envelope,
     signedAt,
   });
+  await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SIGNED',{action:'OPEN',transactionId:input.plan.swapTransactionId,stage:'JUPITER_SWAP'});
   const finalSafety=await checkFreshOpenSubmissionSafety({store:input.store,plan:input.plan,config:input.config,permitExpiresAt:risk.expiresAt!});
   if(!finalSafety.approved)throw new Error(`LPFORGE_P6_PRESUBMISSION_SAFETY_BLOCKED:${finalSafety.reasonCodes.join(',')}`);
   const record = await submitSignedTransaction({
@@ -948,6 +983,7 @@ async function executeRequiredJupiterSwap(input: {
   // identity through every subsequent confirmation/receipt failure so the
   // parent cannot misclassify it as a pre-submission block.
   try {
+  await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SUBMITTED',{action:'OPEN',transactionId:input.plan.swapTransactionId,stage:'JUPITER_SWAP'},record.signature);
   if (
     !(await awaitConfirmation({
       connection: input.connection,
@@ -1524,18 +1560,15 @@ export async function executeAutonomousOpen(input: {
       const confirmedFundingPartial = entryFundingMeasurement !== undefined;
       // One-shot opens get the same post-submit parity as the chunkable path:
       // never FAILED after a signature left the wallet, never resent blindly.
-      await recordJournal(
-        input.store,
-        input.plan as unknown as AutonomousPlan,
-        "RECONCILIATION_REQUIRED",
-        {
-          action: "OPEN",
-          error: reason,
-          positionAddress: openPositionAddress,
-          lastSignature,
-          postSubmission: true,
-        },
-        lastSignature || undefined,
+      if(lastSignature)await recordPostSubmissionReconciliation({
+        store:input.store,plan:input.plan as unknown as AutonomousPlan,
+        transactionId:error instanceof P6PostSubmissionConfirmationPending?error.transactionId:input.plan.transactionId,
+        signature:lastSignature,
+        payload:{error:reason,positionAddress:openPositionAddress,lastSignature},
+      });
+      else await recordJournal(
+        input.store,input.plan as unknown as AutonomousPlan,"RECONCILIATION_REQUIRED",
+        {action:"OPEN",error:reason,positionAddress:openPositionAddress,postSubmission:true},
       );
       await input.store.transitionAutonomousPlan({
         planId: input.plan.planId,
