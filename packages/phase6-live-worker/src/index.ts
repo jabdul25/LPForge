@@ -538,9 +538,20 @@ function ledger(store: Phase1Store): SubmissionLedger {
  * would turn a second update of the same child into a false identity
  * conflict.  Do not relax the check: normalize the one canonical field.
  */
-export function executionJournalPlanId(row: Record<string, unknown>): string | undefined {
+export function executionJournalPlanId(row: {planId?:unknown;plan_id?:unknown}): string | undefined {
   const value = row.planId ?? row.plan_id;
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/** A nested child crossed the submission boundary but has no proven terminal
+ * confirmation. Its identity must reach the parent state machine; it is never
+ * permission to resend. */
+export class P6PostSubmissionConfirmationPending extends Error {
+  readonly planId:string; readonly transactionId:string; readonly attemptId:string; readonly signature:string;
+  constructor(v:{planId:string;transactionId:string;attemptId:string;signature:string}) {
+    super("LPFORGE_P6_SWAP_CONFIRMATION_PENDING"); this.name="P6PostSubmissionConfirmationPending";
+    this.planId=v.planId;this.transactionId=v.transactionId;this.attemptId=v.attemptId;this.signature=v.signature;
+  }
 }
 
 async function recordJournal(
@@ -892,7 +903,7 @@ async function executeRequiredJupiterSwap(input: {
       attempts: input.config.confirmAttempts,
     }))
   )
-    throw new Error("LPFORGE_P6_SWAP_CONFIRMATION_PENDING");
+    throw new P6PostSubmissionConfirmationPending({planId:input.plan.planId,transactionId:input.plan.swapTransactionId,attemptId:`${input.plan.swapTransactionId}:attempt:1`,signature:record.signature});
   const [nativeLamportsAfter,wsolRawAfter,pairedTokenRawAfter]=await Promise.all([
     input.connection.getBalance(new PublicKey(input.plan.ownerAddress),"confirmed").then(value=>BigInt(value)),
     readWalletTokenBalance({connection:input.connection,ownerAddress:input.plan.ownerAddress,mint:WSOL_MINT}),
@@ -1437,6 +1448,11 @@ export async function executeAutonomousOpen(input: {
   } catch (error) {
     const reason =
       error instanceof Error ? error.message : "LPFORGE_P6_AUTONOMOUS_UNKNOWN";
+    if(error instanceof P6PostSubmissionConfirmationPending){
+      // The submission ledger is authoritative; a nested return value cannot
+      // turn a submitted swap into a pre-submission block.
+      submittedAny=true;submissionStatusUnknown=true;lastSignature=error.signature;
+    }
     if (submittedAny||submissionStatusUnknown) {
       const confirmedFundingPartial = entryFundingMeasurement !== undefined;
       // One-shot opens get the same post-submit parity as the chunkable path:
@@ -4832,24 +4848,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       });
       continue;
     }
-    const journal = {
-      journalId: String(raw.journal_id),
-      idempotencyKey: String(raw.idempotency_key),
-      planId: String(raw.plan_id),
-      ...(raw.transaction_id
-        ? { transactionId: String(raw.transaction_id) }
-        : {}),
-      state: String(raw.state) as ExecutionJournal["state"],
-      ...(raw.signature ? { signature: String(raw.signature) } : {}),
-      ...(raw.blockhash ? { blockhash: String(raw.blockhash) } : {}),
-      ...(raw.last_valid_block_height !== null &&
-      raw.last_valid_block_height !== undefined
-        ? { lastValidBlockHeight: Number(raw.last_valid_block_height) }
-        : {}),
-      version: Number(raw.version),
-      updatedAt: new Date(String(raw.updated_at)).toISOString(),
-      payload: (raw.payload ?? {}) as Record<string, unknown>,
-    };
+    const journal:ExecutionJournal={...raw,state:raw.state as ExecutionJournal["state"]};
     // Jupiter unwind is a separate durable transaction step. Its parent-close
     // marker is written before confirmation, so recovery must query that exact
     // child signature rather than whichever earlier mutation last updated the
@@ -6528,7 +6527,7 @@ export async function reconcileWalletWidePositions(input: {
       entryPlanId: plan.planId,
       entrySignature: signature,
       ...(fact.chainSlot === undefined ? {} : { entrySlot: fact.chainSlot }),
-      enteredAt: typeof journal?.updated_at === "string" ? journal.updated_at : at,
+      enteredAt: journal?.updatedAt ?? at,
       lifecycleState: "OPEN",
       lastPlanId: plan.planId,
       reconciliationStatus: "MATCH",

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {executionJournalPlanId} from '../.build/packages/phase6-live-worker/src/index.js';
+import {executionJournalPlanId,P6PostSubmissionConfirmationPending} from '../.build/packages/phase6-live-worker/src/index.js';
+import {executionJournalFromRow} from '../.build/packages/db/src/index.js';
 import { readFile } from 'node:fs/promises';
 import {
   assertExecutionJournalTransition,
@@ -17,6 +18,18 @@ test('journal ownership recognizes the PostgreSQL plan_id row shape on later chi
   assert.equal(executionJournalPlanId({planId:'plan-close'}),'plan-close');
   assert.equal(executionJournalPlanId({plan_id:'other',planId:'plan-close'}),'plan-close');
   assert.equal(executionJournalPlanId({}),undefined);
+});
+
+test('PostgreSQL journal rows normalize once before P6 consumes durable identity',()=>{
+  const journal=executionJournalFromRow({journal_id:'journal',idempotency_key:'idem',plan_id:'plan-close',transaction_id:'child',state:'SIGNED',signature:'sig',blockhash:'hash',last_valid_block_height:99,version:2,updated_at:'2026-09-08T00:00:00.000Z',payload:{child:1}});
+  assert.deepEqual(journal,{journalId:'journal',idempotencyKey:'idem',planId:'plan-close',transactionId:'child',state:'SIGNED',signature:'sig',blockhash:'hash',lastValidBlockHeight:99,version:2,updatedAt:'2026-09-08T00:00:00.000Z',payload:{child:1}});
+  assert.equal(executionJournalPlanId(journal),'plan-close');
+});
+
+test('submitted swap confirmation-pending handoff preserves exact durable identity',()=>{
+  const error=new P6PostSubmissionConfirmationPending({planId:'plan',transactionId:'swap',attemptId:'swap:attempt:1',signature:'signature'});
+  assert.equal(error.message,'LPFORGE_P6_SWAP_CONFIRMATION_PENDING');
+  assert.deepEqual({planId:error.planId,transactionId:error.transactionId,attemptId:error.attemptId,signature:error.signature},{planId:'plan',transactionId:'swap',attemptId:'swap:attempt:1',signature:'signature'});
 });
 
 test('execution journal source state contract is exactly represented by M0059',async()=>{

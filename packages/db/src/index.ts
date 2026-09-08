@@ -1621,7 +1621,7 @@ export interface Phase1Store {
   }): Promise<boolean>;
   getExecutionJournal(
     idempotencyKey: string,
-  ): Promise<Record<string, unknown> | undefined>;
+  ): Promise<ExecutionJournalRecord | undefined>;
   insertCanaryRun(value: {
     runId: string;
     planId?: string;
@@ -2035,6 +2035,16 @@ export function toIsoTimestamp(value: unknown): string {
   const date = value instanceof Date ? value : new Date(String(value));
   if (!Number.isFinite(date.getTime())) throw new Error("LPFORGE_DB_TIMESTAMP_INVALID");
   return date.toISOString();
+}
+/** Raw PostgreSQL names end at this store boundary. P6 never decides whether
+ * a durable journal row is snake_case or camelCase while protecting work. */
+export interface ExecutionJournalRecord {
+  journalId:string; idempotencyKey:string; planId:string; transactionId?:string;
+  state:ExecutionJournalState; signature?:string; blockhash?:string;
+  lastValidBlockHeight?:number; version:number; updatedAt:string; payload:Record<string,unknown>;
+}
+export function executionJournalFromRow(row:Record<string,unknown>):ExecutionJournalRecord {
+  return {journalId:String(row.journal_id),idempotencyKey:String(row.idempotency_key),planId:String(row.plan_id),...(row.transaction_id?{transactionId:String(row.transaction_id)}:{}),state:String(row.state) as ExecutionJournalState,...(row.signature?{signature:String(row.signature)}:{}),...(row.blockhash?{blockhash:String(row.blockhash)}:{}),...(row.last_valid_block_height===null||row.last_valid_block_height===undefined?{}:{lastValidBlockHeight:Number(row.last_valid_block_height)}),version:Number(row.version),updatedAt:toIsoTimestamp(row.updated_at),payload:(row.payload??{}) as Record<string,unknown>};
 }
 function autonomousPlanFromRow(row: Record<string, unknown>): AutonomousPlan {
   const rawSteps = Array.isArray(row.steps) ? row.steps : [];
@@ -4670,7 +4680,7 @@ return 'APPLIED';
            WHERE j.idempotency_key=$1`,
         [idempotencyKey],
       );
-      return r.rows[0];
+      return r.rows[0] ? executionJournalFromRow(r.rows[0] as Record<string,unknown>) : undefined;
     },
     async loadOperationalHistory(poolAddress, since, limit, through) {
       const lim = Math.max(1, Math.min(2000, limit));

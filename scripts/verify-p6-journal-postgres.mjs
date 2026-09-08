@@ -52,7 +52,12 @@ try{
   if(!await store.createExecutionJournal({journalId:id('JOURNAL'),idempotencyKey:journalKey,planId:plan,transactionId:tx1,state:'SIGNED',signature,blockhash:id('BLOCKHASH'),lastValidBlockHeight:1234,version:1,updatedAt:t0,payload:{child:1}}))throw new Error('JOURNAL_INSERT_FAILED');
   await store.updateExecutionJournal({idempotencyKey:journalKey,expectedVersion:1,transactionId:tx2,state:'SIGNING',updatedAt:t1,payload:{child:2}});
   const journal=await store.getExecutionJournal(journalKey);
-  if(journal?.transaction_id!==tx2||journal?.signature!=null||Number(journal?.version)!==2)throw new Error('JOURNAL_CHILD_IDENTITY_NOT_REPLACED_ATOMICALLY');
+  // This is the real PostgreSQL store boundary used by P6. The verifier must
+  // reject a regression to raw plan_id/transaction_id consumption.
+  if(journal?.planId!==plan||journal?.transactionId!==tx2||journal?.signature!==undefined||Number(journal?.version)!==2)throw new Error('JOURNAL_CHILD_IDENTITY_NOT_REPLACED_ATOMICALLY');
+  await store.updateExecutionJournal({idempotencyKey:journalKey,expectedVersion:2,transactionId:tx2,state:'SIGNED',updatedAt:'2026-09-08T12:02:00.000Z',payload:{child:2,signed:true}});
+  const signedChild=await store.getExecutionJournal(journalKey);
+  if(signedChild?.planId!==plan||signedChild.transactionId!==tx2||signedChild.state!=='SIGNED'||signedChild.updatedAt!=='2026-09-08T12:02:00.000Z')throw new Error('JOURNAL_POSTGRES_SECOND_CHILD_UPDATE_FAILED');
   await expectReject(()=>store.updateExecutionJournal({idempotencyKey:journalKey,expectedVersion:1,state:'FAILED',updatedAt:t1,payload:{stale:true}}),'LPFORGE_EXECUTION_JOURNAL_VERSION_CONFLICT');
 
   await store.upsertOpenChunkDisposition({planId:plan,transactionId:tx2,sequence:2,kind:'METEORA_OPEN',disposition:'PENDING',observedAt:t0,payload:{}});
