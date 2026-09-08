@@ -3410,6 +3410,27 @@ export function shouldRebuildExpiredCloseRemove(input:{
     input.confirmedRemoveChildCount===0;
 }
 
+/**
+ * A terminal claim may be rebuilt only after its exact signature expires
+ * without a receipt and every preceding REMOVE child is independently
+ * confirmed.  It cannot authorize a rewind of removal or a blind resend.
+ */
+export function shouldRebuildExpiredCloseClaim(input:{
+  signatureStatusReadUnknown:boolean;
+  confirmationStatus:"PROCESSED"|"CONFIRMED"|"FINALIZED"|"EXPIRED"|"FAILED"|"UNKNOWN";
+  positionExists:boolean;
+  pendingStage:CloseSettlementPendingStage;
+  confirmedRemoveChildCount:number;
+  requiredRemoveChildCount:number;
+}):boolean{
+  return !input.signatureStatusReadUnknown&&
+    input.confirmationStatus==="EXPIRED"&&
+    input.positionExists&&
+    input.pendingStage==="CLOSE_CLAIM_SUBMITTED"&&
+    input.requiredRemoveChildCount>0&&
+    input.confirmedRemoveChildCount===input.requiredRemoveChildCount;
+}
+
 /** Bounded recovery delay prevents a proven-safe retry from becoming a tight loop. */
 function recoveredResidualRetryNotBefore(now:string,retryCount:number):string{
   const delayMs=Math.min(300_000,60_000*Math.max(1,retryCount));
@@ -3814,6 +3835,12 @@ async function executeCloseSettlement(input: {
   }
 
   if (stage === "CLOSE_LIQUIDITY_REMOVED") {
+    const claimRetryRaw=Number(dispatch.closeClaimRetryCount??0),
+      claimRetryCount=Number.isSafeInteger(claimRetryRaw)&&claimRetryRaw>=0?claimRetryRaw:0,
+      claimBaseTransactionId=`${closeStep.transactionId}:claim`,
+      claimTransactionId=claimRetryCount===0
+        ? claimBaseTransactionId
+        : `${claimBaseTransactionId}:retry-${claimRetryCount}`;
     let claimBuilt: BuiltMeteoraTransaction[] | undefined;
     try {
       claimBuilt = await buildClaimTransactions(input.pool, {
@@ -3830,7 +3857,7 @@ async function executeCloseSettlement(input: {
     if (claimBuilt) {
       if (claimBuilt.length !== 1)
         throw new Error("LPFORGE_P6_MULTI_TRANSACTION_CLAIM_UNSUPPORTED");
-      const transactionId = `${closeStep.transactionId}:claim`;
+      const transactionId=claimTransactionId;
       await input.store.ensureExecutionTransactionStep({
         planId: input.plan.planId,
         transactionId,
@@ -3852,6 +3879,8 @@ async function executeCloseSettlement(input: {
         afterSubmit: async ({ signature }) => persist("CLOSE_LIQUIDITY_REMOVED", {
           tokenXBefore: tokenXBefore!.toString(),
           tokenYBefore: tokenYBefore!.toString(),
+          claimTransactionId:transactionId,
+          closeClaimRetryCount:claimRetryCount,
           pendingStage: "CLOSE_CLAIM_SUBMITTED",
           pendingSignature: signature,
         }),
@@ -3865,6 +3894,8 @@ async function executeCloseSettlement(input: {
     await persist("CLOSE_CLAIMS_SETTLED", {
       tokenXBefore: tokenXBefore.toString(),
       tokenYBefore: tokenYBefore.toString(),
+      claimTransactionId:claimBuilt?claimTransactionId:undefined,
+      closeClaimRetryCount:claimBuilt?claimRetryCount:undefined,
       claimTransactionSkipped: !claimBuilt,
     });
     stage = "CLOSE_CLAIMS_SETTLED";
@@ -5065,6 +5096,82 @@ export async function recoverUnfinishedAutonomousPlans(input: {
               'P6_CLOSE_REMOVE_REBUILD_READY',
             ],
           });
+          continue;
+        }
+        // A claim follows confirmed liquidity removal.  If the claim's exact
+        // signature expires with no receipt, retain the confirmed remove
+        // boundary and build a fresh claim child.  This never repeats REMOVE
+        // and never treats an unknown claim as no-effect.
+        const pendingClaimDispatch=closeSettlementDispatch(plan),
+          pendingClaimRemoveIds=Array.isArray(pendingClaimDispatch.removeChildTransactionIds)
+            ? pendingClaimDispatch.removeChildTransactionIds.filter((value):value is string=>typeof value==='string')
+            : [],
+          pendingClaimRequiredRemoveCount=Number(pendingClaimDispatch.removeChildCount??pendingClaimRemoveIds.length),
+          pendingClaimConfirmedRemoveCount=Array.isArray(pendingClaimDispatch.removeChildrenConfirmed)
+            ? pendingClaimDispatch.removeChildrenConfirmed.filter((value):value is string=>typeof value==='string').length
+            : 0;
+        if(shouldRebuildExpiredCloseClaim({
+          signatureStatusReadUnknown,
+          confirmationStatus,
+          positionExists:positionTruth.exists===true,
+          pendingStage:closePending.stage,
+          confirmedRemoveChildCount:pendingClaimConfirmedRemoveCount,
+          requiredRemoveChildCount:pendingClaimRequiredRemoveCount,
+        })){
+          const dispatch=closeSettlementDispatch(plan),
+            claimSteps=plan.steps.filter(step=>step.kind==='METEORA_CLAIM'),
+            pendingClaimTransactionId=typeof dispatch.claimTransactionId==='string'
+              ? dispatch.claimTransactionId
+              : claimSteps.at(-1)?.transactionId,
+            removeChildIds=pendingClaimRemoveIds.length>0
+              ? pendingClaimRemoveIds
+              : plan.steps.filter(step=>step.kind==='METEORA_REMOVE').map(step=>step.transactionId),
+            priorRetryRaw=Number(dispatch.closeClaimRetryCount??0),
+            priorRetry=Number.isSafeInteger(priorRetryRaw)&&priorRetryRaw>=0?priorRetryRaw:0,
+            nextRetry=priorRetry+1;
+          const [pendingAttempt,confirmedRemoves]=await Promise.all([
+            pendingClaimTransactionId?input.store.loadSubmissionAttemptByTransactionId(pendingClaimTransactionId):Promise.resolve(undefined),
+            Promise.all(removeChildIds.map(transactionId=>input.store.loadConfirmedSubmissionByTransactionId(transactionId))),
+          ]);
+          if(!pendingClaimTransactionId||pendingAttempt?.signature!==closePending.signature||confirmedRemoves.length!==pendingClaimRequiredRemoveCount||confirmedRemoves.some(value=>!value)){
+            await input.store.transitionAutonomousPlan({
+              planId:plan.planId,state:'RECONCILIATION_REQUIRED',at:input.now,
+              reasonCodes:['P6_CLOSE_CLAIM_REBUILD_PROVENANCE_MISMATCH'],
+              payload:{stage:'CLOSE_LIQUIDITY_REMOVED',pendingStage:closePending.stage,pendingSignature:closePending.signature,claimTransactionId:pendingClaimTransactionId??null,removeChildTransactionIds:removeChildIds},
+            });
+            results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:['P6_CLOSE_CLAIM_REBUILD_PROVENANCE_MISMATCH']});
+            continue;
+          }
+          await input.store.markSubmissionExpired(closePending.signature,input.now,'P6_CLOSE_CLAIM_EXPIRED_NO_CHAIN_EFFECT');
+          await input.store.updateExecutionJournal({
+            idempotencyKey:plan.idempotencyKey,
+            expectedVersion:journal.version,
+            state:'CONFIRMED',
+            signature:confirmedRemoves[0]!.signature,
+            updatedAt:input.now,
+            payload:{
+              ...journal.payload,
+              recovery:'P6_CLOSE_CLAIM_EXPIRED_NO_CHAIN_EFFECT',
+              expiredClaimSignature:closePending.signature,
+              expiredClaimTransactionId:pendingClaimTransactionId,
+              priorJournalState:journal.state,
+              confirmationStatus,
+              positionTruth,
+            },
+          });
+          await input.store.transitionAutonomousPlan({
+            planId:plan.planId,state:'RECONCILING',at:input.now,
+            reasonCodes:['P6_CLOSE_CLAIM_EXPIRED_NO_CHAIN_EFFECT','P6_CLOSE_CLAIM_REBUILD_READY'],
+            payload:{
+              stage:'CLOSE_LIQUIDITY_REMOVED',
+              pendingStage:null,
+              pendingSignature:null,
+              closeClaimRetryCount:nextRetry,
+              expiredClaimSignature:closePending.signature,
+              expiredClaimTransactionId:pendingClaimTransactionId,
+            },
+          });
+          results.push({planId:plan.planId,action:'RESUME_CLOSE_SETTLEMENT',reasonCodes:['P6_CLOSE_CLAIM_EXPIRED_NO_CHAIN_EFFECT','P6_CLOSE_CLAIM_REBUILD_READY']});
           continue;
         }
         // A primary CLOSE unwind is a separately journaled token swap.  When
