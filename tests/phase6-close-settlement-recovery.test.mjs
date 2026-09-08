@@ -11,12 +11,15 @@ import {
 
 test('expired account-close resumes a receipt-bound fee-claim residual before a fresh close child', async () => {
   const source = await import('node:fs/promises').then(fs => fs.readFile('packages/phase6-live-worker/src/index.ts', 'utf8'));
+  const db = await import('node:fs/promises').then(fs => fs.readFile('packages/db/src/index.ts', 'utf8'));
   assert.match(source, /P6_CLOSE_REHYDRATED_FOR_RECEIPT_BOUND_FEE_CLAIM_RESIDUAL_UNWIND/);
   assert.match(source, /selectReceiptBoundFeeClaimResidual/);
   assert.match(source, /walletTokenX>=feeResidual/);
   assert.match(source, /closeAccountRetryCount:priorAccountRetry\+1/);
   assert.match(source, /closeAccountTransactionId=closeAccountRetryCount===0/);
   assert.match(source, /closeAccountTransactionId=closeAccountRetryCount===0/);
+  assert.match(db, /state IN \('PREPARED','SENT','UNKNOWN','EXPIRED'\)/);
+  assert.match(db, /CASE WHEN state='EXPIRED' THEN payload ELSE/);
 });
 
 test('only an open receipt-bound fee-claim lot can be selected for post-close residual unwind', () => {

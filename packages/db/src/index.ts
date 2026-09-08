@@ -4507,7 +4507,14 @@ return 'APPLIED';
     },
     async markSubmissionExpired(signature, at, reason) {
       const result=await db.query(
-        `UPDATE execution.submission_attempts SET state='EXPIRED',payload=payload||jsonb_build_object('terminal_recovery_reason',$3::text,'terminal_recovered_at',$2::timestamptz) WHERE signature=$1 AND state IN ('PREPARED','SENT','UNKNOWN') RETURNING attempt_id`,
+        // Recovery can restart after the exact signature has already been
+        // terminalized.  Treat that exact durable EXPIRED record as an
+        // idempotent observation, while preserving its original immutable
+        // terminal provenance rather than rewriting it on every retry.
+        `UPDATE execution.submission_attempts
+         SET state='EXPIRED',payload=CASE WHEN state='EXPIRED' THEN payload ELSE payload||jsonb_build_object('terminal_recovery_reason',$3::text,'terminal_recovered_at',$2::timestamptz) END
+         WHERE signature=$1 AND state IN ('PREPARED','SENT','UNKNOWN','EXPIRED')
+         RETURNING attempt_id`,
         [signature, at, reason],
       );
       if(result.rows.length!==1)throw new Error("LPFORGE_SUBMISSION_ATTEMPT_MISSING_AT_EXPIRY");
