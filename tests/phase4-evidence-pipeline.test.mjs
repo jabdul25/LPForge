@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {assessHistoryMaturity,deriveEventPathEconomicEstimate,collectActiveCandidateEvidence,selectActiveCandidateCollectionSlice,requiredActiveCandidateCollectionCapacity,calculateServiceableActiveCandidateCapacity,calculateCompletionAwareCollectionSliceSize,completionAwareCollectorDelayMs,assessCollectorRevisitBudget} from '../.build/packages/active-candidate-evidence/src/index.js';
+import {assessHistoryMaturity,deriveEventPathEconomicEstimate,collectActiveCandidateEvidence,selectActiveCandidateCollectionSlice,requiredActiveCandidateCollectionCapacity,calculateServiceableActiveCandidateCapacity,calculateCompletionAwareCollectionSliceSize,completionAwareCollectorDelayMs,assessCollectorRevisitBudget,deriveEvidenceServiceGapMs} from '../.build/packages/active-candidate-evidence/src/index.js';
 import {estimateOpportunityEconomics} from '../.build/packages/opportunity/src/index.js';
 import {evaluateEntry,ENTRY_RESEARCH_POLICY_V1} from '../.build/packages/entry-intelligence/src/index.js';
 import {ACTIVE_EVIDENCE_LEASE_TIMEOUT_MS,EVIDENCE_CONTINUITY_TRACKING_CAP,EVIDENCE_CONTINUITY_TRACKING_TTL_MS,LIVE_EVIDENCE_MIN_ACTIVE_DWELL_MS,POST_EVIDENCE_EVALUATION_WINDOW_MS,dynamicLiveEvidenceAdmissionCapacity,evidenceContinuityTrackingExpiresAt,freshDiscoveryEconomicPriority,freshLiveEvidenceEconomicQuality,isEvidenceMaturityNoTrade,isLiveEvidenceAdmissionTerminal,isLiveEvidenceAdmissionTerminalForCurrentLease,isLiveEvidenceLeaseActive,isPhase3ReadyConsumptionPending,isPostEvidenceEvaluationEligible,liveEvidenceLeaseExpiresAt,liveEvidenceLeaseReleaseReason,selectLiveEvidenceAdmissionCandidates} from '../.build/packages/db/src/index.js';
@@ -28,6 +28,12 @@ test('completion-aware collection services both ACTIVE leases within the existin
  assert.equal(slice,2);
  const budget=assessCollectorRevisitBudget({activePoolCount:2,collectionSliceSize:slice,maxConcurrentPoolReads:1,p95PoolCollectionMs:90_000,revisitBudgetMs:180_000});
  assert.deepEqual(budget,{projectedRevisitMs:180_000,capacityViolation:false});
+});
+test('a newly admitted active lease measures its first collection from the lease start, not pre-admission history',()=>{
+ const input={collectionTarget:'ACTIVE_ECONOMIC',previousSuccessAt:'2026-09-08T09:31:52.558Z',leaseStartedAt:'2026-09-08T12:06:41.577Z',observedAt:'2026-09-08T12:07:58.403Z'};
+ assert.equal(deriveEvidenceServiceGapMs(input),76_826);
+ assert.equal(deriveEvidenceServiceGapMs({...input,collectionTarget:'RAW_REPLAY_TRACKING'}),9_365_845,'non-active collection retains its own prior-success continuity baseline');
+ assert.equal(deriveEvidenceServiceGapMs({...input,previousSuccessAt:'2026-09-08T12:07:20.000Z'}),38_403,'a successful read inside the active lease remains the continuity baseline');
 });
 test('evidence-maturity NO_TRADE is eligible for the bounded two-slot continuity lane through its existing replay horizon',()=>{
  assert.equal(EVIDENCE_CONTINUITY_TRACKING_CAP,2);
@@ -80,6 +86,10 @@ test('serviceable admission is bounded by measured p95 collection cadence before
  const capacity=calculateServiceableActiveCandidateCapacity({p3BudgetRps:3,estimatedP3CallsPerPool:12,p95PoolCollectionMs:90_000,maxConcurrentPoolReads:3,targetCoverageMs:180_000,serviceabilitySafetyMargin:.70,hardCap:30});
  assert.equal(capacity,6);
  assert.equal(calculateServiceableActiveCandidateCapacity({p3BudgetRps:3,estimatedP3CallsPerPool:12,p95PoolCollectionMs:90_000,maxConcurrentPoolReads:3,targetCoverageMs:180_000,serviceabilitySafetyMargin:.70,hardCap:4}),4);
+});
+test('two bounded reader lanes admit four active evidence leases while retaining the 180-second contract',()=>{
+ assert.equal(calculateServiceableActiveCandidateCapacity({p3BudgetRps:3,estimatedP3CallsPerPool:12,p95PoolCollectionMs:90_000,maxConcurrentPoolReads:2,targetCoverageMs:180_000,serviceabilitySafetyMargin:.70,hardCap:30}),4);
+ assert.deepEqual(assessCollectorRevisitBudget({activePoolCount:4,collectionSliceSize:4,maxConcurrentPoolReads:2,p95PoolCollectionMs:90_000,revisitBudgetMs:180_000}),{projectedRevisitMs:180_000,capacityViolation:false});
 });
 
 test('static policy monitoring does not consume dynamic active admission slots',()=>{
