@@ -45,10 +45,25 @@ case "$service" in
     # silently disable a configured live executor (or mask signer rotation).
     # The canonical policy path is intentionally not cleared: runtime-config-
     # paths.sh has already bound it to the central policy authority.
-    unset LIVE_SIGNING LPFORGE_LIVE_SIGNING LPFORGE_LIVE_EXECUTION \
+    # Keep this list in lock-step with .env.execution.example. It is the
+    # complete execution-owned namespace; DATABASE_URL and provenance secret
+    # deliberately remain shared-runtime authority.
+    unset NODE_ENV LPFORGE_CLUSTER SOLANA_RPC_HTTP_URL \
+      LPFORGE_P6_PRIVATE_WRITE_RPC_URL LPFORGE_RPC_CLASS \
+      LPFORGE_OPERATOR_OWNER_ADDRESS LPFORGE_EXECUTION_POLICY_PATH \
+      LIVE_SIGNING LPFORGE_LIVE_SIGNING LPFORGE_LIVE_EXECUTION \
       LPFORGE_MAINNET_CANARY LPFORGE_MAINNET_CANARY_CAMPAIGN_ID \
-      LPFORGE_P6_PRIVATE_KEY LPFORGE_P6_PRIVATE_WRITE_RPC_URL \
-      LPFORGE_P6_SIGNER_BACKEND_ID LPFORGE_P6_SIGNER_MODE \
+      LPFORGE_P6_EXECUTION_RUNNER_ENABLED \
+      LPFORGE_P6_EXECUTION_RUNNER_INTERVAL_MS \
+      LPFORGE_P6_RECONCILIATION_INTERVAL_MS \
+      LPFORGE_P6_WALLET_SWEEP_INTERVAL_MS LPFORGE_P6_MAX_FEE_LAMPORTS \
+      LPFORGE_P6_MAX_FEE_FRACTION LPFORGE_P6_SIMULATION_FRESHNESS_MS \
+      LPFORGE_P6_RISK_PERMIT_TTL_MS \
+      LPFORGE_P6_MAX_PRESIGN_ACTIVE_BIN_DRIFT_BINS \
+      LPFORGE_P6_MAX_PRESIGN_REFERENCE_DIVERGENCE_BPS \
+      LPFORGE_P6_CONFIRM_POLL_MS LPFORGE_P6_CONFIRM_ATTEMPTS \
+      LPFORGE_P6_PRIVATE_KEY LPFORGE_P6_SIGNER_BACKEND_ID \
+      LPFORGE_P6_SIGNER_MODE LPFORGE_P6_SIGNER_CUSTODY_MODE \
       LPFORGE_P6_SIGNER_PUBLIC_KEY
     export LPFORGE_RPC_ROLE=EXECUTION
     # Node applies later env files as overrides. Load the shared runtime file

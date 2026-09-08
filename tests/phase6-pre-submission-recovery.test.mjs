@@ -16,21 +16,23 @@ test('a proven-expired primary CLOSE unwind is rebuilt as a new child only', asy
   assert.match(source,/stage:'CLOSE_INVENTORY_MEASURED'/,'recovery resumes after confirmed removal/claim, not from child zero');
 });
 
-test('a proven-expired first CLOSE remove is rebuilt only with exact no-effect provenance',async()=>{
-  const base={signatureStatusReadUnknown:false,confirmationStatus:'EXPIRED',positionExists:true,pendingStage:'CLOSE_REMOVE_SUBMITTED',pendingChildIndex:0,confirmedRemoveChildCount:0};
+test('a proven-expired CLOSE remove rebuilds from an exact confirmed prefix only',async()=>{
+  const base={signatureStatusReadUnknown:false,confirmationStatus:'EXPIRED',positionExists:true,pendingStage:'CLOSE_REMOVE_SUBMITTED',pendingChildIndex:0,confirmedRemoveChildCount:0,confirmedRemoveChildIndexes:[]};
   assert.equal(shouldRebuildExpiredCloseRemove(base),true);
   assert.equal(shouldRebuildExpiredCloseRemove({...base,signatureStatusReadUnknown:true}),false,'unknown signature truth must remain fail-closed');
   assert.equal(shouldRebuildExpiredCloseRemove({...base,confirmationStatus:'FAILED'}),false,'only blockhash-expired absence authorizes a rebuild');
-  assert.equal(shouldRebuildExpiredCloseRemove({...base,pendingChildIndex:1}),false,'a later child can have a confirmed predecessor');
-  assert.equal(shouldRebuildExpiredCloseRemove({...base,confirmedRemoveChildCount:1}),false,'confirmed liquidity must never be replayed');
+  assert.equal(shouldRebuildExpiredCloseRemove({...base,pendingChildIndex:1,confirmedRemoveChildCount:1,confirmedRemoveChildIndexes:[0]}),true,'a later child may retry only after its exact confirmed prefix');
+  assert.equal(shouldRebuildExpiredCloseRemove({...base,pendingChildIndex:2,confirmedRemoveChildCount:1,confirmedRemoveChildIndexes:[0]}),false,'a missing predecessor remains fail-closed');
+  assert.equal(shouldRebuildExpiredCloseRemove({...base,pendingChildIndex:1,confirmedRemoveChildCount:1,confirmedRemoveChildIndexes:[1]}),false,'non-prefix confirmation cannot authorize retry');
   assert.equal(shouldRebuildExpiredCloseRemove({...base,pendingStage:'CLOSE_UNWIND_SUBMITTED'}),false);
   const source=await (await import('node:fs/promises')).readFile('packages/phase6-live-worker/src/index.ts','utf8');
   assert.match(source,/P6_CLOSE_REMOVE_EXPIRED_NO_CHAIN_EFFECT/);
   assert.match(source,/P6_CLOSE_REMOVE_REBUILD_READY/);
   assert.match(source,/closeRemoveRetryCount/);
   assert.match(source,/retryCount===0\?base:`\$\{base\}:retry-\$\{retryCount\}`/,'retry must receive a new durable child identity');
-  assert.match(source,/pendingAttempt\?\.signature!==closePending\.signature/,'the pending signature must bind to child zero before rebuilding');
-  assert.match(source,/confirmedChildren\.some\(Boolean\)/,'any confirmed removal child prevents replay');
+  assert.match(source,/pendingAttempt\?\.signature!==closePending\.signature/,'the pending signature must bind to its exact child before rebuilding');
+  assert.match(source,/exactConfirmedPrefix/,'confirmed predecessors must be the exact ordered prefix');
+  assert.match(source,/closeRemoveRetryFromChildIndex/,'retry resumes at the expired child rather than replaying its prefix');
 });
 
 test('a proven-expired CLOSE claim retains confirmed removal and rebuilds only the claim child',async()=>{
@@ -46,6 +48,13 @@ test('a proven-expired CLOSE claim retains confirmed removal and rebuilds only t
   assert.match(source,/closeClaimRetryCount/);
   assert.match(source,/function closeClaimChildTransactionId[\s\S]*retryCount===0\?base:`\$\{base\}:retry-\$\{retryCount\}`/,'claim retry must use a new durable child identity');
   assert.match(source,/confirmedRemoves\.some\(value=>!value\)/,'claim rebuild requires every remove receipt');
+});
+
+test('expired unwind retries require exact submission-attempt provenance',async()=>{
+  const source=await (await import('node:fs/promises')).readFile('packages/phase6-live-worker/src/index.ts','utf8');
+  assert.match(source,/P6_CLOSE_UNWIND_RETRY_PROVENANCE_MISMATCH/);
+  assert.match(source,/P6_CLOSE_RESIDUAL_UNWIND_RETRY_PROVENANCE_MISMATCH/);
+  assert.match(source,/loadSubmissionAttemptByTransactionId\(originalUnwindTransactionId\)/);
 });
 
 test("expired no-effect OPEN is terminal only with complete absence evidence",()=>{

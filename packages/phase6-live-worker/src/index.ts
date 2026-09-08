@@ -6,6 +6,7 @@ import {
   VersionedTransaction,
 } from "@solana/web3.js";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { loadConfirmedExecutionReceipt, loadParsedConfirmedExecutionReceipt } from "../../transaction-receipt/src/index.js";
 import { deriveTransactionAssetEffects } from "../../transaction-asset-effects/src/index.js";
 import { deriveReceiptBackedEntryBasis, deriveReceiptBoundSolContribution, receiptBoundOwnerTokenDebits } from "../../entry-capital-basis/src/index.js";
@@ -3408,6 +3409,14 @@ function closeSettlementAmount(value: unknown): bigint | undefined {
   }
 }
 
+/** Immutable-release provenance, never a hand-maintained migration literal. */
+function runtimeMigrationHead(): string | undefined {
+  try {
+    const value=JSON.parse(readFileSync("RELEASE_MANIFEST.json","utf8")) as {migrationHead?:unknown};
+    return typeof value.migrationHead==='string'&&/^M\d{4}_.+\.sql$/.test(value.migrationHead)?value.migrationHead:undefined;
+  } catch { return undefined; }
+}
+
 function closeSettlementPending(plan: AutonomousPlan): {
   stage: CloseSettlementPendingStage;
   signature: string;
@@ -3579,13 +3588,16 @@ export function shouldRebuildExpiredCloseRemove(input:{
   pendingStage:CloseSettlementPendingStage;
   pendingChildIndex:number | undefined;
   confirmedRemoveChildCount:number;
+  confirmedRemoveChildIndexes:readonly number[];
 }):boolean{
   return !input.signatureStatusReadUnknown&&
     input.confirmationStatus==="EXPIRED"&&
     input.positionExists&&
     input.pendingStage==="CLOSE_REMOVE_SUBMITTED"&&
-    input.pendingChildIndex===0&&
-    input.confirmedRemoveChildCount===0;
+    input.pendingChildIndex!==undefined&&input.pendingChildIndex>=0&&
+    input.confirmedRemoveChildCount===input.pendingChildIndex&&
+    input.confirmedRemoveChildIndexes.length===input.pendingChildIndex&&
+    input.confirmedRemoveChildIndexes.every((value,index)=>value===index);
 }
 
 /**
@@ -3946,12 +3958,24 @@ async function executeCloseSettlement(input: {
     // This turns SDK transaction splitting into durable parent-plan facts.
     const removeRetryRaw=Number(dispatch.closeRemoveRetryCount??0),
       removeRetryCount=Number.isSafeInteger(removeRetryRaw)&&removeRetryRaw>=0?removeRetryRaw:0;
+    const persistedIds=Array.isArray(dispatch.removeChildTransactionIds)
+      ? dispatch.removeChildTransactionIds.filter((value):value is string=>typeof value==='string')
+      : [],
+      retryFromRaw=Number(dispatch.closeRemoveRetryFromChildIndex??0),
+      retryFromChildIndex=Number.isInteger(retryFromRaw)&&retryFromRaw>=0?retryFromRaw:0,
+      persistedConfirmed=Array.isArray(dispatch.removeChildrenConfirmed)
+        ? dispatch.removeChildrenConfirmed.filter((value):value is string=>typeof value==='string')
+        : [];
     const children:DurableCloseRemoveChild[]=built.map((item,index)=>{
-      const transactionId=closeRemoveChildTransactionId(removeStep.transactionId,index,removeRetryCount);
+      // A retry after child N expiry preserves the exact confirmed prefix
+      // (0..N-1); only N and its unsubmitted suffix receive fresh identities.
+      const transactionId=index<retryFromChildIndex&&persistedIds[index]
+        ? persistedIds[index]!
+        : closeRemoveChildTransactionId(removeStep.transactionId,index,removeRetryCount);
       const constructionFingerprint=closeRemoveConstructionFingerprint(item);
       const previous=input.plan.steps.find(step=>step.transactionId===transactionId);
       const previousFingerprint=previous?.metadata.closeRemoveConstructionFingerprint;
-      if(typeof previousFingerprint==='string'&&previousFingerprint!==constructionFingerprint)
+      if(index>=retryFromChildIndex&&typeof previousFingerprint==='string'&&previousFingerprint!==constructionFingerprint)
         throw new Error("LPFORGE_P6_CLOSE_REMOVE_CHILD_CONSTRUCTION_MISMATCH");
       item.metadata={...item.metadata,transactionId,closeRemoveChildIndex:index,closeRemoveChildCount:built.length,closeRemoveConstructionFingerprint:constructionFingerprint,parentPlanId:input.plan.planId,positionAddress:input.positionAddress,poolAddress:input.plan.poolAddress,ownerAddress:input.plan.ownerAddress};
       return{transactionId,index,count:built.length,built:item};
@@ -3963,8 +3987,10 @@ async function executeCloseSettlement(input: {
     const persistedCount=Number(dispatch.removeChildCount??children.length);
     if(!Number.isInteger(persistedCount)||persistedCount!==children.length)
       throw new Error("LPFORGE_P6_CLOSE_REMOVE_CHILD_CONSTRUCTION_MISMATCH");
-    const priorConfirmed=Array.isArray(dispatch.removeChildrenConfirmed)?new Set(dispatch.removeChildrenConfirmed.filter((value):value is string=>typeof value==="string")):new Set<string>();
+    const priorConfirmed=new Set(persistedConfirmed);
     const allIds=children.map(child=>child.transactionId);
+    if(retryFromChildIndex>0&&(!persistedIds.length||persistedIds.length!==children.length||persistedConfirmed.length!==retryFromChildIndex||persistedConfirmed.some((id,index)=>id!==persistedIds[index])))
+      throw new Error("LPFORGE_P6_CLOSE_REMOVE_RETRY_PREFIX_INVALID");
     // A child is only skipped when its own durable submission ledger proves it
     // confirmed.  Parent stage text is never sufficient authority to skip it.
     for(const child of children){
@@ -4465,7 +4491,8 @@ async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:Au
     await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:"RECONCILIATION_REQUIRED",at,reasonCodes:assessment.reasonCodes,payload:{stage:"SOL_SETTLEMENT_BLOCKED",lifecycleId:settlementInput.lifecycle.lifecycleId}});
     return{ready:false,reasonCodes:assessment.reasonCodes};
   }
-  const persisted=await input.store.persistLifecycleSolSettlement({assessment,input:{...settlementInput,positionAbsent:true,positionCheckedAt,positionCheckedSlot},...(process.env.LPFORGE_SOURCE_COMMIT?{sourceCommit:process.env.LPFORGE_SOURCE_COMMIT}:{}),...(process.env.LPFORGE_P7_POLICY_HASH?{policyHash:process.env.LPFORGE_P7_POLICY_HASH}:{}),migrationHead:"M0067_terminal_fee_claim_settlement_reconciliation.sql",...(process.env.LPFORGE_BUILD_ID?{buildId:process.env.LPFORGE_BUILD_ID}:{}),at});
+  const migrationHead=runtimeMigrationHead();
+  const persisted=await input.store.persistLifecycleSolSettlement({assessment,input:{...settlementInput,positionAbsent:true,positionCheckedAt,positionCheckedSlot},...(process.env.LPFORGE_SOURCE_COMMIT?{sourceCommit:process.env.LPFORGE_SOURCE_COMMIT}:{}),...(process.env.LPFORGE_P7_POLICY_HASH?{policyHash:process.env.LPFORGE_P7_POLICY_HASH}:{}),...(migrationHead?{migrationHead}:{}),...(process.env.LPFORGE_BUILD_ID?{buildId:process.env.LPFORGE_BUILD_ID}:{}),at});
   const rootClosePlanId=typeof dispatch.terminalRootClosePlanId==='string'?dispatch.terminalRootClosePlanId:input.plan.planId,
     claimSignatures=confirmedTerminalClaimTransactions(settlementInput.transactions)
       .filter(transaction=>transaction.planId===rootClosePlanId)
@@ -5235,7 +5262,10 @@ export async function recoverUnfinishedAutonomousPlans(input: {
             : undefined,
           pendingRemoveConfirmedChildCount=Array.isArray(pendingRemoveDispatch.removeChildrenConfirmed)
             ? pendingRemoveDispatch.removeChildrenConfirmed.filter((value):value is string=>typeof value==='string').length
-            : 0;
+            : 0,
+          pendingRemoveConfirmedChildIndexes=Array.isArray(pendingRemoveDispatch.removeChildTransactionIds)&&Array.isArray(pendingRemoveDispatch.removeChildrenConfirmed)
+            ? pendingRemoveDispatch.removeChildrenConfirmed.map(value=>(pendingRemoveDispatch.removeChildTransactionIds as unknown[]).indexOf(value)).filter(index=>index>=0)
+            : [];
         if (shouldRebuildExpiredCloseRemove({
           signatureStatusReadUnknown,
           confirmationStatus,
@@ -5243,6 +5273,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
           pendingStage:closePending.stage,
           pendingChildIndex:pendingRemoveChildIndex,
           confirmedRemoveChildCount:pendingRemoveConfirmedChildCount,
+          confirmedRemoveChildIndexes:pendingRemoveConfirmedChildIndexes,
         })) {
           const dispatch=closeSettlementDispatch(plan),
             persistedIds=Array.isArray(dispatch.removeChildTransactionIds)
@@ -5262,7 +5293,10 @@ export async function recoverUnfinishedAutonomousPlans(input: {
             pendingChildId?input.store.loadSubmissionAttemptByTransactionId(pendingChildId):Promise.resolve(undefined),
             Promise.all(removeChildIds.map(transactionId=>input.store.loadConfirmedSubmissionByTransactionId(transactionId))),
           ]);
-          if(!pendingChildId||pendingAttempt?.signature!==closePending.signature||confirmedChildren.some(Boolean)){
+          const confirmedPrefixIds=removeChildIds.slice(0,pendingChildIndex),
+            confirmedIds=Array.isArray(dispatch.removeChildrenConfirmed)?dispatch.removeChildrenConfirmed.filter((value):value is string=>typeof value==='string'):[],
+            exactConfirmedPrefix=confirmedIds.length===confirmedPrefixIds.length&&confirmedIds.every((value,index)=>value===confirmedPrefixIds[index])&&confirmedChildren.slice(0,pendingChildIndex).every(Boolean)&&confirmedChildren.slice(pendingChildIndex).every(value=>!value);
+          if(!pendingChildId||pendingAttempt?.signature!==closePending.signature||!exactConfirmedPrefix){
             await input.store.transitionAutonomousPlan({
               planId:plan.planId,state:'RECONCILIATION_REQUIRED',at:input.now,
               reasonCodes:['P6_CLOSE_REMOVE_REBUILD_PROVENANCE_MISMATCH'],
@@ -5276,14 +5310,14 @@ export async function recoverUnfinishedAutonomousPlans(input: {
             input.now,
             'P6_CLOSE_REMOVE_EXPIRED_NO_CHAIN_EFFECT',
           );
+          const lastConfirmedIndex=pendingChildIndex-1,lastConfirmed=lastConfirmedIndex>=0?confirmedChildren[lastConfirmedIndex]:undefined;
           await input.store.updateExecutionJournal({
             idempotencyKey:plan.idempotencyKey,
             expectedVersion:journal.version,
-            // This parent has no confirmed child.  The expired signature
-            // remains immutable in its child ledger; PLAN_CREATED simply
-            // represents the next safe parent boundary.
-            state:'PLAN_CREATED',
-            clearTransactionIdentity:true,
+            // Preserve the durable confirmed prefix.  The expired child stays
+            // immutable in its submission ledger; the parent resumes exactly
+            // at that child, never from child zero.
+            ...(lastConfirmed&&confirmedPrefixIds[lastConfirmedIndex]?{transactionId:confirmedPrefixIds[lastConfirmedIndex],state:'CONFIRMED' as const,signature:lastConfirmed.signature}:{state:'PLAN_CREATED' as const,clearTransactionIdentity:true}),
             updatedAt:input.now,
             payload:{
               ...journal.payload,
@@ -5308,7 +5342,9 @@ export async function recoverUnfinishedAutonomousPlans(input: {
               closeRemoveRetryCount:nextRetry,
               expiredRemoveSignature:closePending.signature,
               expiredRemoveTransactionId:pendingChildId,
-              removeChildrenConfirmed:[],
+              removeChildTransactionIds:removeChildIds,
+              removeChildrenConfirmed:confirmedPrefixIds,
+              closeRemoveRetryFromChildIndex:pendingChildIndex,
             },
           });
           results.push({
@@ -5437,6 +5473,12 @@ export async function recoverUnfinishedAutonomousPlans(input: {
             results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:['P6_CLOSE_UNWIND_RETRY_TRANSACTION_ID_MISSING']});
             continue;
           }
+          const unwindAttempt=await input.store.loadSubmissionAttemptByTransactionId(originalUnwindTransactionId);
+          if(unwindAttempt?.signature!==closePending.signature){
+            await input.store.transitionAutonomousPlan({planId:plan.planId,state:'RECONCILIATION_REQUIRED',at:input.now,reasonCodes:['P6_CLOSE_UNWIND_RETRY_PROVENANCE_MISMATCH'],payload:{stage:'CLOSE_INVENTORY_MEASURED',pendingStage:closePending.stage,pendingSignature:closePending.signature,expectedTransactionId:originalUnwindTransactionId}});
+            results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:['P6_CLOSE_UNWIND_RETRY_PROVENANCE_MISMATCH']});
+            continue;
+          }
           await input.store.markSubmissionExpired(
             closePending.signature,
             input.now,
@@ -5509,6 +5551,13 @@ export async function recoverUnfinishedAutonomousPlans(input: {
             priorRetry=Number.isSafeInteger(priorRetryRaw)&&priorRetryRaw>=0?priorRetryRaw:0,
             nextRetry=priorRetry+1,
             rebuildNotBefore=recoveredResidualRetryNotBefore(input.now,nextRetry);
+          const residualTransactionId=typeof dispatch.recoveredOpenResidualUnwindTransactionId==='string'?dispatch.recoveredOpenResidualUnwindTransactionId:undefined,
+            residualAttempt=residualTransactionId?await input.store.loadSubmissionAttemptByTransactionId(residualTransactionId):undefined;
+          if(!residualTransactionId||residualAttempt?.signature!==closePending.signature){
+            await input.store.transitionAutonomousPlan({planId:plan.planId,state:'RECONCILIATION_REQUIRED',at:input.now,reasonCodes:['P6_CLOSE_RESIDUAL_UNWIND_RETRY_PROVENANCE_MISMATCH'],payload:{stage:'CLOSE_CLAIMS_SETTLED',pendingStage:closePending.stage,pendingSignature:closePending.signature,expectedTransactionId:residualTransactionId??null}});
+            results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:['P6_CLOSE_RESIDUAL_UNWIND_RETRY_PROVENANCE_MISMATCH']});
+            continue;
+          }
           await input.store.markSubmissionExpired(
             closePending.signature,
             input.now,
