@@ -30,6 +30,8 @@ test('both selected and counterfactual forward queues run independently with bou
   assert.match(source, /historicalRows=await store\.loadDueCandidateCounterfactualOutcomes\(now,batchLimit-v3Rows\.length,'HISTORICAL'\),historicalFailures=await matureCandidateCounterfactualRows\(store,historicalRows,now\)/);
   assert.match(source, /COUNTERFACTUAL_MATURATION_RUNTIME_ERROR/);
   assert.match(source, /runBoundedBinSnapshotRetention/);
+  assert.match(source, /runBinSnapshotRetentionCycle/);
+  assert.match(source, /startIndependentForwardMaturationLoop\(\{intervalMs:binSnapshotRetentionMs,run:runBinSnapshotRetentionCycle/);
   assert.match(source, /LPFORGE_BIN_SNAPSHOT_RETENTION_MAX_DELETE/);
   assert.doesNotMatch(source, /Promise\.all\([^)]*loadOperationalHistory/);
 });

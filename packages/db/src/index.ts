@@ -1095,6 +1095,8 @@ export interface Phase1Store {
   /** Dynamic, fail-closed retention protection for raw protocol bin history. */
   loadBinSnapshotRetentionPlan(now:string):Promise<{state:'READY'|'UNKNOWN';protectionFloor?:string;protectionInputs:Partial<Record<'SELECTED_FORWARD'|'CANDIDATE_COUNTERFACTUAL'|'INVENTORY_FORECAST_V2'|'OPERATIONAL_HISTORY',string>>;reasonCodes:string[]}>;
   deleteBinSnapshotsBefore(protectionFloor:string,limit:number):Promise<{deleted:number;oldestDeletedAt?:string;newestDeletedAt?:string}>;
+  /** Read-only operational telemetry; it has no authority consumer. */
+  loadBinSnapshotRetentionTelemetry(protectionFloor?:string):Promise<{estimatedRemainingRows:number;eligibleRows?:number;tableBytes:number;indexBytes:number;totalBytes:number;deadTuples:number;lastAutovacuum?:string;lastVacuum?:string;lastAnalyze?:string}>;
   preparePostEntryTelemetryEpisodes(capturedAt:string,limit?:number):Promise<{created:number}>;
   loadDuePostEntryTelemetryCheckpoints(now:string,limit:number):Promise<Array<{
     telemetryEpisodeId:string;checkpointKey:string;observationType:'ENTRY'|'CHECKPOINT'|'FINALIZATION';targetAt:string;decisionAt:string;sourceVersion:string;frozenHeader:Record<string,unknown>;decisionPayload:Record<string,unknown>;decisionCheckpointContent?:Record<string,unknown>;previousCheckpointContent?:Record<string,unknown>;terminalOutcomes?:Array<Record<string,unknown>>;
@@ -3139,6 +3141,11 @@ return 'APPLIED';
       ) SELECT count(*)::integer AS deleted,min(observed_at) AS oldest_deleted_at,max(observed_at) AS newest_deleted_at FROM deleted`,[protectionFloor,lim]);
       const row=r.rows[0]??{},asIso=(value:unknown)=>{if(!value)return undefined;const t=Date.parse(String(value));return Number.isFinite(t)?new Date(t).toISOString():undefined;};
       return{deleted:Math.max(0,Number(row.deleted??0)),...(asIso(row.oldest_deleted_at)?{oldestDeletedAt:asIso(row.oldest_deleted_at)!}:{}),...(asIso(row.newest_deleted_at)?{newestDeletedAt:asIso(row.newest_deleted_at)!}:{})};
+    },
+    async loadBinSnapshotRetentionTelemetry(protectionFloor) {
+      const r=await db.query(`SELECT c.reltuples::bigint AS estimated_remaining_rows,COALESCE(s.n_dead_tup,0)::bigint AS dead_tuples,pg_relation_size(c.oid)::bigint AS table_bytes,pg_indexes_size(c.oid)::bigint AS index_bytes,pg_total_relation_size(c.oid)::bigint AS total_bytes,s.last_autovacuum,s.last_vacuum,s.last_analyze,CASE WHEN $1::timestamptz IS NULL THEN NULL ELSE (SELECT count(*)::bigint FROM protocol.bin_snapshots b WHERE b.observed_at<$1::timestamptz) END AS eligible_rows FROM pg_class c LEFT JOIN pg_stat_user_tables s ON s.relid=c.oid WHERE c.oid='protocol.bin_snapshots'::regclass`,[protectionFloor??null]);
+      const row=r.rows[0]??{},asIso=(value:unknown)=>{if(!value)return undefined;const t=Date.parse(String(value));return Number.isFinite(t)?new Date(t).toISOString():undefined;};
+      return{estimatedRemainingRows:Math.max(0,Number(row.estimated_remaining_rows??0)),...(row.eligible_rows===null||row.eligible_rows===undefined?{}:{eligibleRows:Math.max(0,Number(row.eligible_rows))}),tableBytes:Math.max(0,Number(row.table_bytes??0)),indexBytes:Math.max(0,Number(row.index_bytes??0)),totalBytes:Math.max(0,Number(row.total_bytes??0)),deadTuples:Math.max(0,Number(row.dead_tuples??0)),...(asIso(row.last_autovacuum)?{lastAutovacuum:asIso(row.last_autovacuum)!}:{}),...(asIso(row.last_vacuum)?{lastVacuum:asIso(row.last_vacuum)!}:{}),...(asIso(row.last_analyze)?{lastAnalyze:asIso(row.last_analyze)!}:{})};
     },
     async loadDuePhase3ForwardOutcomes(now, limit) {
       const lim=Math.max(1,Math.min(200,Math.floor(limit)));
@@ -5498,6 +5505,7 @@ export function createMemoryStore(): Phase1Store {
     async persistCandidateCounterfactualOutcome() { return 'APPLIED' as const; },
     async loadBinSnapshotRetentionPlan(now) { return {state:'READY' as const,protectionFloor:new Date(Date.parse(now)-4*60*60_000).toISOString(),protectionInputs:{OPERATIONAL_HISTORY:new Date(Date.parse(now)-4*60*60_000).toISOString()},reasonCodes:[]}; },
     async deleteBinSnapshotsBefore() { return {deleted:0}; },
+    async loadBinSnapshotRetentionTelemetry() { return {estimatedRemainingRows:0,tableBytes:0,indexBytes:0,totalBytes:0,deadTuples:0}; },
     async insertPhase3ForwardDecision() { return false; },
     async ensurePhase3ForwardOutcome() { return false; },
     async loadDuePhase3ForwardOutcomes() { return []; },

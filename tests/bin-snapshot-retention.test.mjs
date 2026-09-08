@@ -55,6 +55,7 @@ test('retention SQL is dynamic, fails closed on missing references, and deletes 
   const db=await readFile('packages/db/src/index.ts','utf8'),main=await readFile('apps/discovery-learning/src/main.ts','utf8'),migration=await readFile('packages/db/migrations/M0057_bin_snapshot_retention_index.sql','utf8');
   assert.match(db,/research\.phase3_forward_outcomes/);assert.match(db,/research\.candidate_counterfactual_forward_outcomes/);assert.match(db,/research\.inventory_forecast_v2_activation/);
   assert.match(db,/RETENTION_CANDIDATE_DECISION_REFERENCE_MISSING/);assert.match(db,/WITH candidates AS MATERIALIZED/);assert.match(db,/observed_at<\$1::timestamptz ORDER BY observed_at ASC LIMIT \$2/);
-  assert.match(main,/runBoundedBinSnapshotRetention/);assert.match(main,/LPFORGE_BIN_SNAPSHOT_RETENTION_MAX_DELETE/);
+  assert.match(db,/loadBinSnapshotRetentionTelemetry/);assert.match(db,/pg_indexes_size/);
+  assert.match(main,/runBinSnapshotRetentionCycle/);assert.match(main,/startIndependentForwardMaturationLoop\(\{intervalMs:binSnapshotRetentionMs,run:runBinSnapshotRetentionCycle/);assert.match(main,/LPFORGE_BIN_SNAPSHOT_RETENTION_MAX_DELETE/);assert.match(main,/BIN_SNAPSHOT_RETENTION_TELEMETRY/);
   assert.match(migration,/bin_snapshots_observed_at_idx/);assert.match(migration,/BEGIN;/);assert.match(migration,/COMMIT;/);
 });
