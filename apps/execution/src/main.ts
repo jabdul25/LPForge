@@ -21,7 +21,7 @@ import { readFileSync } from "node:fs";
 import { EXPECTED_DLMM_PROGRAM_ID } from "../../../packages/meteora/src/index.js";
 import { loadDeploymentPolicyFile } from "../../../packages/deployment-policy/src/index.js";
 import { resolveLiveExecutionPolicyPath } from "../../../packages/config/src/index.js";
-import { validateClaimedPlan, type Phase7ExecutionControl } from "../../../packages/phase6-claim-guard/src/index.js";
+import { mayRequeueStaleOnlyOpenClaim, validateClaimedPlan, type Phase7ExecutionControl } from "../../../packages/phase6-claim-guard/src/index.js";
 import { createGovernedConnection, createMeteoraReadAdapter } from "../../../packages/meteora/src/index.js";
 import { assertPreinitializedMeteoraBinArrays } from "../../../packages/meteora-execution/src/index.js";
 import { alertsForExecutionResult,enqueueAndDispatchPhase7Alert,loadPhase7TelegramConfig,type Phase7Alert } from "../../../packages/phase7-alerting/src/index.js";
@@ -277,6 +277,31 @@ async function dispatchOne() {
       ...(positionTruth ? { positionTruth } : {}),
     });
     if (!guard.approved) {
+      if (mayRequeueStaleOnlyOpenClaim({action:plan.action,expiresAt:plan.expiresAt,now,reasonCodes:guard.reasonCodes})) {
+        // The stale control has never authorized a chain boundary.  Preserve
+        // the immutable plan, return it to the normal claim queue, and make
+        // the next cycle prove every P6/P7 condition again against a fresh
+        // P7 decision.  No signature, reservation, or submission exists yet.
+        await store.transitionAutonomousPlan({
+          planId: plan.planId,
+          state: "PLANNED",
+          at: new Date().toISOString(),
+          reasonCodes: ["P6_CLAIM_P7_CONTROL_STALE_REQUEUED"],
+          payload: {
+            stage: "CLAIM_GUARD",
+            retryDisposition: "AWAIT_FRESH_P7_CONTROL",
+            priorReasonCodes: guard.reasonCodes,
+            noChainEffect: true,
+          },
+        });
+        return {
+          service: "lpforge-execution",
+          status: "AWAITING_FRESH_P7_CONTROL",
+          planId: plan.planId,
+          reasonCodes: guard.reasonCodes,
+          transactionSubmitted: false,
+        };
+      }
       await store.transitionAutonomousPlan({
         planId: plan.planId,
         state: "BLOCKED",

@@ -29,6 +29,19 @@ export function validateFreshPhase7ExecutionControl(control:Phase7ExecutionContr
  return reasons.sort();
 }
 /**
+ * A P7-control freshness miss has no chain effect: it occurs before capital
+ * reservation, signing, or submission.  It is therefore safe to return an
+ * otherwise-current autonomous OPEN to PLANNED and require a brand-new full
+ * claim-guard evaluation on the next worker cycle.  This deliberately does
+ * not relax the 60-second control requirement and is not a generic retry.
+ */
+export function mayRequeueStaleOnlyOpenClaim(input:{action:string;expiresAt:string;now:string;reasonCodes:readonly string[]}):boolean{
+ return input.action==='OPEN'&&
+   input.reasonCodes.length===1&&input.reasonCodes[0]==='P6_CLAIM_P7_CONTROL_STALE'&&
+   validTimestamp(input.expiresAt)&&validTimestamp(input.now)&&
+   Date.parse(input.expiresAt)>Date.parse(input.now);
+}
+/**
  * A production OPEN is HMAC-bound to the P7 decision that governed plan
  * preparation. P7 deliberately emits a new control record every cycle, so
  * equality with the latest decision id would turn harmless healthy refreshes

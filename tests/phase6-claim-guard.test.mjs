@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {validateClaimedPlan,validateFreshPhase7ExecutionControl} from '../.build/packages/phase6-claim-guard/src/index.js';
+import {mayRequeueStaleOnlyOpenClaim,validateClaimedPlan,validateFreshPhase7ExecutionControl} from '../.build/packages/phase6-claim-guard/src/index.js';
 import {assertControlledCanaryOpen} from '../.build/packages/phase6-live-worker/src/index.js';
 
 const policy={schemaVersion:1,policyId:'p',status:'ENABLED',approvalTtlMs:15000,minDevnetConfirmedRuns:1,maxActionsPerDay:2,maxOpenPositions:2,pools:[{address:'POOL',maxCapitalLamports:20_000_000n,maxOpenPositions:2}],productionAdmission:{enabled:true,eligibleTiers:['A'],maxCandidates:1,maxCandidateAgeMs:900000,maxCapitalLamports:20_000_000n,maxOpenPositions:2}};
@@ -106,6 +106,15 @@ test('winner proof and plan expiry remain fail-closed and ordinary plans retain 
  assert.equal(ordinary.admissionAudit?.decisionPredicate,'REGISTRY_CANDIDATE_ABSENT');
 });
 test('risk-increasing claims require fresh Phase-7 production control and enforce daily action limit',()=>{assert.deepEqual(validateFreshPhase7ExecutionControl(control,now),[]);assert.ok(validateClaimedPlan({plan:base,policy,ownedPositions:[],productionCandidates:admittedStatic,now}).reasonCodes.includes('P6_CLAIM_P7_CONTROL_MISSING'));assert.ok(validateClaimedPlan({plan:{...base,planPayload:{...base.planPayload,provenance:{...base.planPayload.provenance,phase7Control:undefined}}},policy,ownedPositions:[],productionCandidates:admittedStatic,phase7Control:control,now}).reasonCodes.includes('P6_CLAIM_P7_CONTROL_BINDING_MISSING'));assert.ok(validateFreshPhase7ExecutionControl({...control,safetyMode:'EMERGENCY_ONLY'},now).includes('P6_CLAIM_P7_SAFETY_NOT_NORMAL'));assert.ok(validateFreshPhase7ExecutionControl({...control,observedAt:'2026-08-12T23:00:00.000Z'},now).includes('P6_CLAIM_P7_CONTROL_STALE'));assert.ok(validateClaimedPlan({plan:base,policy,ownedPositions:[],productionCandidates:admittedStatic,phase7Control:{...control,newEconomicActionAllowed:false},actionsToday:2,now}).reasonCodes.includes('P6_CLAIM_P7_NEW_ACTION_BLOCKED'));assert.ok(validateClaimedPlan({plan:base,policy,ownedPositions:[],productionCandidates:admittedStatic,phase7Control:control,actionsToday:2,now}).reasonCodes.includes('P6_CLAIM_DAILY_ACTION_LIMIT'));});
+test('only an unexpired OPEN blocked solely by a stale P7 control may return to the claim queue',()=>{
+ assert.equal(mayRequeueStaleOnlyOpenClaim({action:'OPEN',expiresAt:'2026-08-13T00:09:45.000Z',now,reasonCodes:['P6_CLAIM_P7_CONTROL_STALE']}),true);
+ for(const input of [
+  {action:'CLOSE',expiresAt:'2026-08-13T00:09:45.000Z',now,reasonCodes:['P6_CLAIM_P7_CONTROL_STALE']},
+  {action:'OPEN',expiresAt:'2026-08-13T00:04:59.000Z',now,reasonCodes:['P6_CLAIM_P7_CONTROL_STALE']},
+  {action:'OPEN',expiresAt:'2026-08-13T00:09:45.000Z',now,reasonCodes:['P6_CLAIM_P7_CONTROL_STALE','P6_CLAIM_P7_HEALTH_NOT_HEALTHY']},
+  {action:'OPEN',expiresAt:'2026-08-13T00:09:45.000Z',now,reasonCodes:['P6_CLAIM_P7_CONTROL_MISSING']},
+ ]) assert.equal(mayRequeueStaleOnlyOpenClaim(input),false);
+});
 test('risk-increasing claims retain the authenticated P7 authority across materially equivalent healthy refreshes',()=>{
  const input={plan:base,policy,ownedPositions:[],productionCandidates:admittedStatic,boundPhase7Control:control,now};
  assert.equal(validateClaimedPlan({...input,phase7Control:control}).approved,true,'the exact fresh decision passes the binding check');
