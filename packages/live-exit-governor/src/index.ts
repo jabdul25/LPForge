@@ -41,6 +41,23 @@ export interface PositionEconomicsSnapshot {
   reasonCodes:string[];
 }
 /**
+ * LP-local performance uses the same economic scope as a DLMM position UI:
+ * position liquidity, unclaimed/claimed LP fees, and withdrawals, less the
+ * immutable receipt-backed value deposited into PositionV2.  It deliberately
+ * excludes execution cost, rent and position-attributable wallet inventory.
+ */
+export interface LpPositionMarkToMarketSnapshot {
+  evidenceState:ExitEvidenceState;
+  observedAt:string;
+  entryPositionValueUsd?:number;
+  currentPositionValueUsd?:number;
+  netPnlUsd?:number;
+  netReturnFraction?:number;
+  realizedFeeValueUsd?:number;
+  realizedWithdrawalValueUsd?:number;
+  reasonCodes:string[];
+}
+/**
  * Wallet inventory is included only when a durable position inventory lot
  * identifies it as belonging to this PositionV2.  Aggregate wallet balances
  * are intentionally not accepted here: they may include manual holdings or
@@ -75,15 +92,23 @@ export function derivePositionMarkToMarket(input:{position:PositionV2Fact;pool:D
  * mark as the current observation, so it is comparable to an LP UI mark and
  * never presented as settled PnL.
  */
-export function deriveLpPositionMarkToMarket(input:{position:PositionV2Fact;pool:DataApiPool;lpPositionPrincipalLamports?:bigint;observedAt:string}):{evidenceState:ExitEvidenceState;observedAt:string;entryPositionValueUsd?:number;currentPositionValueUsd?:number;netPnlUsd?:number;netReturnFraction?:number;reasonCodes:string[]}{
+export function deriveLpPositionMarkToMarket(input:{position:PositionV2Fact;pool:DataApiPool;lpPositionPrincipalLamports?:bigint;observedAt:string;realizedCashflows?:readonly RealizedPositionCashflow[]}):LpPositionMarkToMarketSnapshot{
   if(input.lpPositionPrincipalLamports===undefined||input.lpPositionPrincipalLamports<=0n)return{evidenceState:'UNAVAILABLE',observedAt:input.observedAt,reasonCodes:['LP_MTM_ENTRY_BASIS_UNPROVEN']};
   const marked=derivePositionMarkToMarket({position:input.position,pool:input.pool,observedAt:input.observedAt});
   const sol=[input.pool.token_x,input.pool.token_y].find(token=>token?.address===WSOL_MINT);
   if(marked.evidenceState!=='AVAILABLE'||!finite(sol?.price)||sol.price!<=0||marked.currentPositionValueUsd===undefined)return{evidenceState:'UNAVAILABLE',observedAt:input.observedAt,reasonCodes:[...marked.reasonCodes,'LP_MTM_SOL_MARK_UNAVAILABLE'].sort()};
   const entry=Number(input.lpPositionPrincipalLamports)/1e9*sol.price!;
   if(!Number.isFinite(entry)||entry<=0)return{evidenceState:'UNAVAILABLE',observedAt:input.observedAt,reasonCodes:['LP_MTM_ENTRY_BASIS_INVALID']};
-  const net=marked.currentPositionValueUsd-entry;
-  return{evidenceState:'AVAILABLE',observedAt:input.observedAt,entryPositionValueUsd:entry,currentPositionValueUsd:marked.currentPositionValueUsd,netPnlUsd:net,netReturnFraction:net/entry,reasonCodes:['LP_POSITION_MARK_TO_MARKET']};
+  const realized=valueLpPositionCashflows({cashflows:input.realizedCashflows??[],pool:input.pool});
+  if(!realized.complete)return{evidenceState:'UNAVAILABLE',observedAt:input.observedAt,reasonCodes:realized.reasonCodes};
+  // Cumulative SDK claimed-fee counters are useful reconciliation hints but
+  // not an immutable receipt. A claimed amount with no matching durable claim
+  // ledger is therefore not decision-grade and cannot create a close signal.
+  let claimedRaw=0n;try{claimedRaw=BigInt(input.position.claimedFeeX??'0')+BigInt(input.position.claimedFeeY??'0');}catch{return{evidenceState:'UNAVAILABLE',observedAt:input.observedAt,reasonCodes:['LP_MTM_CLAIM_COUNTER_INVALID']};}
+  if(claimedRaw>0n&&!realized.hasClaim)return{evidenceState:'UNAVAILABLE',observedAt:input.observedAt,reasonCodes:['LP_MTM_CLAIM_RECEIPT_UNAVAILABLE']};
+  const current=marked.currentPositionValueUsd+realized.feesUsd+realized.withdrawalsUsd;
+  const net=current-entry;
+  return{evidenceState:'AVAILABLE',observedAt:input.observedAt,entryPositionValueUsd:entry,currentPositionValueUsd:current,netPnlUsd:net,netReturnFraction:net/entry,realizedFeeValueUsd:realized.feesUsd,realizedWithdrawalValueUsd:realized.withdrawalsUsd,reasonCodes:['LP_POSITION_MARK_TO_MARKET','LP_POSITION_RECEIPT_BACKED_DEPOSIT']};
 }
 export interface ExitHighWaterState {peakNetReturnFraction:number;peakEconomicValueUsd?:number;peakObservedAt:string;}
 /**
@@ -113,6 +138,13 @@ export interface LiveExitGovernorInput {
   positionAgeMinutes?:number;
   /** True only when the PositionV2 and valuation inputs were fetched for this management cycle. */
   completeNavFresh?:boolean;
+  /**
+   * The receipt-backed LP-local mark. Hard/emergency stop policy consumes
+   * this scope, never the broader managed-economic accounting mark.
+   */
+  lpPositionMtm?:LpPositionMarkToMarketSnapshot;
+  /** True only when the LP mark has current chain facts and durable provenance. */
+  lpPositionMtmFresh?:boolean;
   /** Model/market evidence with source-family provenance, supplied by the live operator. */
   marketEvidence?:readonly MarketExitEvidence[];
   marketConfirmation?:MarketExitConfirmationState;
@@ -173,6 +205,25 @@ export function valuePositionCashflows(input:{cashflows:readonly RealizedPositio
   }
   return{contributionsUsd,realizedFeeUsd,realizedWithdrawalUsd,executionCostUsd,complete,hasEconomicCashflow,hasRealizedFeeFlow,reasonCodes:[...new Set(reasons)].sort()};
 }
+/** LP-local realization ledger: only LP fee claims and position withdrawals. */
+function valueLpPositionCashflows(input:{cashflows:readonly RealizedPositionCashflow[];pool:DataApiPool}):{feesUsd:number;withdrawalsUsd:number;hasClaim:boolean;complete:boolean;reasonCodes:string[]}{
+  const tokens=[input.pool.token_x,input.pool.token_y].filter((x):x is NonNullable<typeof x>=>Boolean(x));
+  const sol=tokens.find(token=>token.address===WSOL_MINT);
+  let feesUsd=0,withdrawalsUsd=0,hasClaim=false,complete=true;const reasons:string[]=[];
+  for(const flow of input.cashflows){
+    if(!['FEE_CLAIM','REWARD_CLAIM','REDUCE_WITHDRAWAL','CLOSE_WITHDRAWAL'].includes(flow.flowType))continue;
+    // A legacy basis-only row is not an actual withdrawal receipt.
+    if((flow.flowType==='REDUCE_WITHDRAWAL'||flow.flowType==='CLOSE_WITHDRAWAL')&&!flow.tokenMint&&!flow.tokenAmountRaw)continue;
+    const token=tokens.find(candidate=>candidate.address===flow.tokenMint);
+    const tokenValue=flow.tokenMint?tokenUsd(flow.tokenAmountRaw,token?.decimals,token?.price):undefined;
+    const lamportValue=flow.lamports!==undefined&&sol?Number(flow.lamports)/1e9*(sol.price??Number.NaN):undefined;
+    const value=tokenValue??lamportValue;
+    if(value===undefined||!Number.isFinite(value)){complete=false;reasons.push('LP_MTM_REALIZATION_VALUE_UNAVAILABLE');continue;}
+    if(flow.flowType==='FEE_CLAIM'||flow.flowType==='REWARD_CLAIM'){feesUsd+=value;hasClaim=true;}
+    else withdrawalsUsd+=value;
+  }
+  return{feesUsd,withdrawalsUsd,hasClaim,complete,reasonCodes:[...new Set(reasons)].sort()};
+}
 /** Backward-compatible fee-only view for reporting callers. */
 export function valueRealizedFeeCashflows(input:{cashflows:readonly RealizedPositionCashflow[];pool:DataApiPool}){const v=valuePositionCashflows(input);return{valueUsd:v.realizedFeeUsd,complete:v.complete,reasonCodes:v.reasonCodes};}
 /** Capital-normalized economic valuation. No value is fabricated when token price/decimals are unavailable. */
@@ -207,7 +258,7 @@ function nextHighWater(e:PositionEconomicsSnapshot,prior?:ExitHighWaterState):Ex
   if(!prior||current>prior.peakNetReturnFraction)return{peakNetReturnFraction:Number.isFinite(current)?current:prior?.peakNetReturnFraction??0,...(e.currentEconomicValueUsd!==undefined?{peakEconomicValueUsd:e.currentEconomicValueUsd}:{}),peakObservedAt:e.observedAt};
   return prior;
 }
-function completeNav(input:LiveExitGovernorInput){const e=input.economics;return input.completeNavFresh===true&&e.evidenceState==='AVAILABLE'&&e.reasonCodes.includes('EXIT_VALUATION_COMPLETE_MANAGED_NAV')&&finite(e.netReturnFraction);}
+function completeLpPositionMtm(input:LiveExitGovernorInput){const e=input.lpPositionMtm;return input.lpPositionMtmFresh===true&&e?.evidenceState==='AVAILABLE'&&e.reasonCodes.includes('LP_POSITION_MARK_TO_MARKET')&&finite(e.netReturnFraction);}
 function marketAuthority(input:LiveExitGovernorInput):{confirmed:boolean;pending:boolean;reasonCodes:string[];confirmation:MarketExitConfirmationState}{
   const prior=input.marketConfirmation?.families??{}, next:Partial<Record<MarketExitEvidenceFamily,number>>={}, trustworthy=new Map<MarketExitEvidenceFamily,MarketExitEvidence>();
   for(const evidence of input.marketEvidence??[]){
@@ -228,14 +279,15 @@ export function assessLiveExit(input:LiveExitGovernorInput):LiveExitGovernorDeci
   const out=(action:LiveExitAction,family:LiveExitGovernorDecision['reasonFamily'],codes:string[],urgency:number,reduceFraction=0):LiveExitGovernorDecision=>({action,reasonFamily:family,reasonCodes:[...new Set(codes)].sort(),urgency:clamp(urgency),reduceFraction,economics:e,highWater:hw,peakGivebackFraction:giveback,marketConfirmation:authority.confirmation});
   if(!p.enabled)return out('HOLD','NONE',['EXIT_GOVERNOR_DISABLED'],0);
   const tox=finite(input.toxicityProbability)?input.toxicityProbability:0;
-  // The -20% stop is a verified complete-NAV safety boundary.  Market-model
-  // signals, including liquidity, toxicity, thesis, and risk labels, are
-  // deliberately below it and must pass marketAuthority().
-  if(completeNav(input)&&finite(current)&&current<=-p.emergencyStopLossFraction)return out('EMERGENCY_CLOSE','EMERGENCY',['EXIT_EMERGENCY_STOP_LOSS'],1,1);
+  const lpReturn=input.lpPositionMtm?.netReturnFraction;
+  // Hard capital-loss actions use the receipt-backed LP-position return. The
+  // broader managed NAV remains an accounting/risk context, but execution
+  // cost, rent and wallet residuals must not independently close an LP.
+  if(completeLpPositionMtm(input)&&finite(lpReturn)&&lpReturn<=-p.emergencyStopLossFraction)return out('EMERGENCY_CLOSE','EMERGENCY',['EXIT_EMERGENCY_STOP_LOSS'],1,1);
   const defaultEvidence:MarketExitEvidence[]=[
     ...(input.liquidityCollapse?[{family:'LIQUIDITY' as const,code:'EXIT_LIQUIDITY_COLLAPSE',severe:true,quality:'TRUSTWORTHY' as const}]:[]),
     ...(tox>=p.toxicityEmergencyThreshold?[{family:'TOXICITY' as const,code:'EXIT_TOXICITY_EMERGENCY',severe:true,quality:'TRUSTWORTHY' as const}]:tox>=p.toxicityCloseThreshold?[{family:'TOXICITY' as const,code:'EXIT_TOXICITY_TOO_HIGH',severe:true,quality:'TRUSTWORTHY' as const}]:[]),
-    ...(completeNav(input)&&finite(current)&&current<=-p.hardStopLossFraction?[{family:'COMPLETE_NAV' as const,code:'EXIT_HARD_POSITION_STOP_LOSS',severe:true,quality:'TRUSTWORTHY' as const}]:[]),
+    ...(completeLpPositionMtm(input)&&finite(lpReturn)&&lpReturn<=-p.hardStopLossFraction?[{family:'COMPLETE_NAV' as const,code:'EXIT_HARD_POSITION_STOP_LOSS',severe:true,quality:'TRUSTWORTHY' as const}]:[]),
     ...((input.thesisStatus==='EMERGENCY'||(p.closeOnThesisInvalidated&&input.thesisStatus==='INVALIDATED'))?[{family:'THESIS' as const,code:input.thesisStatus==='EMERGENCY'?'EXIT_THESIS_EMERGENCY':'EXIT_THESIS_INVALIDATED',severe:true,quality:'TRUSTWORTHY' as const}]:[]),
   ];
   // Callers that provide provenance own the complete evidence set.  The

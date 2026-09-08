@@ -63,6 +63,28 @@ test('LP-local and managed-economic marks remain explicitly separate',()=>{
   assert.equal(managed.reasonCodes.includes('EXIT_VALUATION_COMPLETE_MANAGED_NAV'),true);
 });
 
+test('LP MTM follows position value plus LP claims and withdrawals less receipt-backed deposit',()=>{
+  const pool={token_x:{address:'TOKEN',decimals:6,price:2},token_y:{address:'So11111111111111111111111111111111111111112',decimals:9,price:100}};
+  const position={totalXAmount:'0',totalYAmount:'50000000',feeX:'0',feeY:'0',claimedFeeX:'0',claimedFeeY:'0'};
+  const lp=deriveLpPositionMarkToMarket({position,pool,lpPositionPrincipalLamports:100_000_000n,observedAt:'2026-09-08T00:00:00.000Z',realizedCashflows:[
+    {flowType:'REDUCE_WITHDRAWAL',tokenMint:'So11111111111111111111111111111111111111112',tokenAmountRaw:'40000000'},
+    {flowType:'FEE_CLAIM',tokenMint:'TOKEN',tokenAmountRaw:'1000000'},
+  ]});
+  // $5 still in PositionV2 + $4 withdrawn + $2 claimed fees - $10 deposit.
+  assert.equal(lp.evidenceState,'AVAILABLE');
+  assert.equal(lp.currentPositionValueUsd,11);
+  assert.equal(lp.netPnlUsd,1);
+  assert.equal(lp.netReturnFraction,.1);
+});
+
+test('LP MTM fails closed when an SDK claimed-fee counter lacks a durable claim receipt',()=>{
+  const pool={token_x:{address:'TOKEN',decimals:6,price:2},token_y:{address:'So11111111111111111111111111111111111111112',decimals:9,price:100}};
+  const position={totalXAmount:'0',totalYAmount:'100000000',feeX:'0',feeY:'0',claimedFeeX:'1000000',claimedFeeY:'0'};
+  const lp=deriveLpPositionMarkToMarket({position,pool,lpPositionPrincipalLamports:100_000_000n,observedAt:'2026-09-08T00:00:00.000Z'});
+  assert.equal(lp.evidenceState,'UNAVAILABLE');
+  assert.deepEqual(lp.reasonCodes,['LP_MTM_CLAIM_RECEIPT_UNAVAILABLE']);
+});
+
 test('a required receipt basis cannot silently fall back to requested capital',()=>{
   const pool={token_x:{address:'TOKEN',decimals:6,price:2},token_y:{address:'So11111111111111111111111111111111111111112',decimals:9,price:100}};
   const position={totalXAmount:'0',totalYAmount:'100000000',feeX:'0',feeY:'0',claimedFeeX:'0',claimedFeeY:'0'};

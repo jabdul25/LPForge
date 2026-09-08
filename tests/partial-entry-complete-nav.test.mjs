@@ -36,13 +36,13 @@ test('complete managed NAV includes attributed wallet inventory and prevents the
   assert.equal(complete.walletInventoryValueUsd,1);
 });
 
-test('complete managed NAV still triggers the unchanged emergency stop on a real complete loss',()=>{
+test('a hard-stop decision requires a receipt-backed LP-position loss, not only managed NAV',()=>{
   const loss=derivePositionEconomics({position:{totalXAmount:'0',totalYAmount:'10000000',feeX:'0',feeY:'0',claimedFeeX:'0',claimedFeeY:'0'},pool,initialCapitalLamports:30_000_000n,actualContributedLamports:30_000_000n,observedAt:'2026-08-29T04:53:16.672Z',attributedWalletInventory:[{tokenMint:'POOL',tokenAmountRaw:'100000'}]});
   assert.equal(loss.evidenceState,'AVAILABLE');assert.ok((loss.netReturnFraction??0)<=-.20);
-  const decision=assessLiveExit({policy,economics:loss,completeNavFresh:true});assert.equal(decision.action,'EMERGENCY_CLOSE');assert.ok(decision.reasonCodes.includes('EXIT_EMERGENCY_STOP_LOSS'));
+  const decision=assessLiveExit({policy,economics:loss,lpPositionMtm:{evidenceState:'AVAILABLE',observedAt:loss.observedAt,netReturnFraction:-.21,reasonCodes:['LP_POSITION_MARK_TO_MARKET']},lpPositionMtmFresh:true});assert.equal(decision.action,'EMERGENCY_CLOSE');assert.ok(decision.reasonCodes.includes('EXIT_EMERGENCY_STOP_LOSS'));
 });
 
-test('the immutable canary exit fixture is profitable only when the material residual and actual asset baseline are both present',()=>{
+test('managed wallet residuals remain accounting context and cannot independently trigger a position stop',()=>{
   const tokenPrice=.000513935671534359,solPrice=103.84570846028;
   const incidentPool={token_x:{address:'POOL',decimals:6,price:tokenPrice},token_y:{address:sol,decimals:9,price:solPrice}};
   const position={totalXAmount:'4274138735',totalYAmount:'0',feeX:'0',feeY:'0',claimedFeeX:'0',claimedFeeY:'0'};
@@ -52,7 +52,7 @@ test('the immutable canary exit fixture is profitable only when the material res
   assert.ok(Math.abs((full.netReturnFraction??0)-.06478448)<.000001,'complete NAV reproduces the +6.4784% exit-cycle result');
   assert.ok(Math.abs((historicalMistake.netReturnFraction??0)+.294905)<.00001,'PositionV2-only requested-capital comparison reproduces the false -29.4905% premise');
   assert.equal(assessLiveExit({policy,economics:full}).action,'HOLD');
-  assert.equal(assessLiveExit({policy,economics:historicalMistake,completeNavFresh:true}).action,'EMERGENCY_CLOSE');
+  assert.equal(assessLiveExit({policy,economics:historicalMistake}).action,'HOLD');
 });
 
 test('the first-observation regression remains above the unchanged emergency threshold under complete NAV',()=>{
