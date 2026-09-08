@@ -58,7 +58,7 @@ function envInt(name:string,fallback:number,min:number){const value=Number(proce
 // lanes reached the shared three-RPS permit boundary together. Keep the cap
 // intact and wait through bounded coordinator windows instead. P4 remains
 // explicitly lower priority and independently configurable.
-const priorityWaitMs:Record<RpcPriority,number>={P0_EXECUTION_CRITICAL:60_000,P1_RECOVERY_CRITICAL:60_000,P2_POSITION_MANAGEMENT:10_000,P3_DISCOVERY:envInt('LPFORGE_RPC_P3_MAX_WAIT_MS',15_000,1_500),P4_BACKFILL:envInt('LPFORGE_RPC_P4_MAX_WAIT_MS',1_500,250)};
+const priorityWaitMs:Record<RpcPriority,number>={P0_EXECUTION_CRITICAL:60_000,P1_RECOVERY_CRITICAL:60_000,P2_POSITION_MANAGEMENT:10_000,P3_DISCOVERY:envInt('LPFORGE_RPC_P3_MAX_WAIT_MS',15_000,1_500),P4_BACKFILL:envInt('LPFORGE_RPC_P4_MAX_WAIT_MS',15_000,250)};
 function rpcBudgetConfig():RpcBudgetConfig{const total=envInt('LPFORGE_RPC_GLOBAL_MAX_RPS',12,3);const p0=envInt('LPFORGE_RPC_P0_RESERVED_RPS',3,0);const p1=envInt('LPFORGE_RPC_P1_RESERVED_RPS',3,0);if(p0+p1>=total)throw new Error('LPFORGE_RPC_BUDGET_INVALID');return{total,p0,p1,p2:envInt('LPFORGE_RPC_P2_MAX_RPS',Math.max(1,total-p0-p1),1),p3:envInt('LPFORGE_RPC_P3_MAX_RPS',Math.max(1,Math.floor((total-p0-p1)/2)),1),p4:envInt('LPFORGE_RPC_P4_MAX_RPS',1,1)};}
 class PostgresRpcCoordinator implements RpcCoordinator {
   private client:PgClient|undefined; private readonly providerKey:string; private readonly config=rpcBudgetConfig();
