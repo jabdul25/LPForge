@@ -531,6 +531,18 @@ function ledger(store: Phase1Store): SubmissionLedger {
       }),
   };
 }
+/**
+ * PostgreSQL store rows are deliberately returned as their durable column
+ * names.  Journal ownership checks run on both the create-race and ordinary
+ * update paths, so accepting only the in-memory camelCase representation
+ * would turn a second update of the same child into a false identity
+ * conflict.  Do not relax the check: normalize the one canonical field.
+ */
+export function executionJournalPlanId(row: Record<string, unknown>): string | undefined {
+  const value = row.planId ?? row.plan_id;
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
 async function recordJournal(
   store: Phase1Store,
   plan: AutonomousPlan,
@@ -565,7 +577,7 @@ async function recordJournal(
     const raced = await store.getExecutionJournal(plan.idempotencyKey);
     if (!raced)
       throw new Error("LPFORGE_EXECUTION_JOURNAL_CREATE_CONFLICT_UNRESOLVED");
-    if(String(raced.planId)!==plan.planId)
+    if(executionJournalPlanId(raced)!==plan.planId)
       throw new Error("LPFORGE_EXECUTION_JOURNAL_IDEMPOTENCY_IDENTITY_CONFLICT");
     assertExecutionJournalTransition(String(raced.state) as ExecutionJournalState, state);
     const updated = await store.updateExecutionJournal({
@@ -583,7 +595,7 @@ async function recordJournal(
       throw new Error("LPFORGE_EXECUTION_JOURNAL_CONCURRENT_UPDATE");
     return;
   }
-  if(String(existing.planId)!==plan.planId)
+  if(executionJournalPlanId(existing)!==plan.planId)
     throw new Error("LPFORGE_EXECUTION_JOURNAL_IDEMPOTENCY_IDENTITY_CONFLICT");
   assertExecutionJournalTransition(String(existing.state) as ExecutionJournalState, state);
   const updated = await store.updateExecutionJournal({

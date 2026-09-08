@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import {executionJournalPlanId} from '../.build/packages/phase6-live-worker/src/index.js';
 import { readFile } from 'node:fs/promises';
 import {
   assertExecutionJournalTransition,
@@ -10,6 +11,13 @@ import {
 
 const now='2026-08-28T00:00:00.000Z';
 const journal={journalId:'journal',idempotencyKey:'idem',planId:'plan',state:'PLAN_CREATED',version:1,updatedAt:now,payload:{action:'OPEN'}};
+
+test('journal ownership recognizes the PostgreSQL plan_id row shape on later child updates',()=>{
+  assert.equal(executionJournalPlanId({plan_id:'plan-close'}),'plan-close');
+  assert.equal(executionJournalPlanId({planId:'plan-close'}),'plan-close');
+  assert.equal(executionJournalPlanId({plan_id:'other',planId:'plan-close'}),'plan-close');
+  assert.equal(executionJournalPlanId({}),undefined);
+});
 
 test('execution journal source state contract is exactly represented by M0059',async()=>{
   const migration=await readFile('packages/db/migrations/M0059_execution_journal_state_contract.sql','utf8');
