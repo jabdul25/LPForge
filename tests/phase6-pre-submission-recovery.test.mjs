@@ -133,7 +133,7 @@ test('P6 recovery status-read failure never rebuilds an expired submitted plan',
   const calls=[];
   const store={
     async loadUnresolvedAutonomousPlans(){return[{planId:'plan-status-unknown',idempotencyKey:'idem-status-unknown',action:'OPEN',poolAddress:'pool',ownerAddress:'owner',expiresAt:'2030-01-01T00:00:00.000Z'}];},
-    async getExecutionJournal(){return{journal_id:'journal-status-unknown',idempotency_key:'idem-status-unknown',plan_id:'plan-status-unknown',state:'SUBMITTED',signature:'sig',last_valid_block_height:1,version:3,updated_at:'2026-08-14T00:00:00.000Z',payload:{action:'OPEN'}};},
+    async getExecutionJournal(){return{journalId:'journal-status-unknown',idempotencyKey:'idem-status-unknown',planId:'plan-status-unknown',state:'SUBMITTED',signature:'sig',lastValidBlockHeight:1,version:3,updatedAt:'2026-08-14T00:00:00.000Z',payload:{action:'OPEN'}};},
     async transitionAutonomousPlan(value){calls.push(value);},
   };
   const result=await recoverUnfinishedAutonomousPlans({store,currentBlockHeight:2,now:'2026-08-14T00:01:00.000Z',signatureStatusProvider:async()=>{throw new Error('rpc unavailable');}});
@@ -172,7 +172,7 @@ test('P6 reconciles an expired no-effect close only through an exact SOL_SETTLED
   const plan={planId:'historical-close',idempotencyKey:'historical-close-idem',action:'CLOSE',poolAddress:'pool',ownerAddress:'owner',positionAddress:'8HU47vhj6ciFv7nhHsby4iQD68s8NpBKSNZbb9C81Pzw',positionIdentitySource:'LIFECYCLE_SOL_SETTLED',positionLifecycleSettled:true,expiresAt:'2030-01-01T00:00:00.000Z',planPayload:{autonomous_dispatch:{pendingStage:'CLOSE_REMOVE_SUBMITTED',pendingSignature:'expired-remove'}}};
   const store={
     async loadUnresolvedAutonomousPlans(){return[plan];},
-    async getExecutionJournal(){return{journal_id:'journal-historical',idempotency_key:plan.idempotencyKey,plan_id:plan.planId,state:'SUBMITTED',signature:'expired-remove',last_valid_block_height:1,version:1,updated_at:'2026-08-29T00:00:00.000Z',payload:{action:'CLOSE'}};},
+    async getExecutionJournal(){return{journalId:'journal-historical',idempotencyKey:plan.idempotencyKey,planId:plan.planId,state:'SUBMITTED',signature:'expired-remove',lastValidBlockHeight:1,version:1,updatedAt:'2026-08-29T00:00:00.000Z',payload:{action:'CLOSE'}};},
     async markSubmissionExpired(...value){calls.push(['expired',value]);},
     async updateExecutionJournal(value){calls.push(['journal',value]);return true;},
     async completeAutonomousPlan(value){calls.push(['complete',value]);},

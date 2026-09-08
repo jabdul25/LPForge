@@ -2044,7 +2044,12 @@ export interface ExecutionJournalRecord {
   lastValidBlockHeight?:number; version:number; updatedAt:string; payload:Record<string,unknown>;
 }
 export function executionJournalFromRow(row:Record<string,unknown>):ExecutionJournalRecord {
-  return {journalId:String(row.journal_id),idempotencyKey:String(row.idempotency_key),planId:String(row.plan_id),...(row.transaction_id?{transactionId:String(row.transaction_id)}:{}),state:String(row.state) as ExecutionJournalState,...(row.signature?{signature:String(row.signature)}:{}),...(row.blockhash?{blockhash:String(row.blockhash)}:{}),...(row.last_valid_block_height===null||row.last_valid_block_height===undefined?{}:{lastValidBlockHeight:Number(row.last_valid_block_height)}),version:Number(row.version),updatedAt:toIsoTimestamp(row.updated_at),payload:(row.payload??{}) as Record<string,unknown>};
+  // The PostgreSQL adapter supplies snake_case. Accepting the typed form too
+  // keeps in-memory recovery fixtures on the same canonical boundary; P6
+  // itself receives only this camelCase representation.
+  const value=(snake:string,camel:string)=>row[snake]??row[camel];
+  const transactionId=value("transaction_id","transactionId"),lastValid=value("last_valid_block_height","lastValidBlockHeight");
+  return {journalId:String(value("journal_id","journalId")),idempotencyKey:String(value("idempotency_key","idempotencyKey")),planId:String(value("plan_id","planId")),...(transactionId?{transactionId:String(transactionId)}:{}),state:String(row.state) as ExecutionJournalState,...(row.signature?{signature:String(row.signature)}:{}),...(row.blockhash?{blockhash:String(row.blockhash)}:{}),...(lastValid===null||lastValid===undefined?{}:{lastValidBlockHeight:Number(lastValid)}),version:Number(row.version),updatedAt:toIsoTimestamp(value("updated_at","updatedAt")),payload:(row.payload??{}) as Record<string,unknown>};
 }
 function autonomousPlanFromRow(row: Record<string, unknown>): AutonomousPlan {
   const rawSteps = Array.isArray(row.steps) ? row.steps : [];
