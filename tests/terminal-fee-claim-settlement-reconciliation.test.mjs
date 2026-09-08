@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
 import { assessLifecycleSettlement } from '../.build/packages/db/src/index.js';
-import { reconcileTerminalSettlementChainEffects } from '../.build/packages/phase6-live-worker/src/index.js';
+import { confirmedTerminalClaimTransactions, reconcileTerminalSettlementChainEffects } from '../.build/packages/phase6-live-worker/src/index.js';
 
 const OWNER='OWNER',POSITION='POSITION',PLAN='close-plan',SIGNATURE='claim-signature';
 function claimReceipt({gross=801_666n,fee=5_000n}={}){
@@ -22,6 +22,14 @@ test('terminal claim receipt is independently reconciled and cannot be omitted f
   assert.equal(ok.ok,true);assert.equal(ok.chainSolInLamports,801_666n);assert.equal(ok.chainSolOutLamports,5_000n);assert.equal(ok.dbSolInLamports,801_666n);
   const missing=await reconcileTerminalSettlementChainEffects({connection,plan:{planId:PLAN,ownerAddress:OWNER},positionAddress:POSITION,settlementInput:input({includeClaim:false})});
   assert.equal(missing.ok,false);assert.ok(missing.reasonCodes.includes('SETTLEMENT_CHAIN_TERMINAL_CLAIM_MISSING:close:claim'));assert.ok(missing.reasonCodes.includes('SETTLEMENT_CHAIN_CASHFLOW_TOTAL_MISMATCH'));
+});
+test('terminal settlement ignores an expired claim predecessor and selects its confirmed retry',()=>{
+  const claims=confirmedTerminalClaimTransactions([
+    {transactionId:'close:claim',signature:'expired-claim',state:'FAILED_FINAL',planId:PLAN,planRole:'CLOSE',kind:'METEORA_CLAIM'},
+    {transactionId:'close:claim:retry-1',signature:'confirmed-claim',state:'CONFIRMED',planId:PLAN,planRole:'CLOSE',kind:'METEORA_CLAIM'},
+    {transactionId:'close:remove',signature:'remove',state:'CONFIRMED',planId:PLAN,planRole:'CLOSE',kind:'METEORA_REMOVE'},
+  ]);
+  assert.deepEqual(claims.map(claim=>[claim.transactionId,claim.signature]),[['close:claim:retry-1','confirmed-claim']]);
 });
 test('HVEbGM terminal cashflow regression is -1,925,242 lamports, not the stale -2,726,908',()=>{
   const result=assessLifecycleSettlement({lifecycle:{lifecycleId:'hve',positionAddress:'HVE',ownerAddress:OWNER,poolAddress:'pool',status:'CLOSED'},positionAbsent:true,positionCheckedAt:'2026-08-31T18:07:00.000Z',reconciliationClean:true,reservationClean:true,inventoryLots:[],transactions:[],cashflows:[

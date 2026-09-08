@@ -72,6 +72,7 @@ import { assessLifecycleSettlement } from "../../db/src/index.js";
 import type {
   AutonomousPlan,
   AutonomousPlanAction,
+  LifecycleChildTransaction,
   LifecycleSettlementInput,
   OpenChunkDispositionRecord,
   Phase1Store,
@@ -4183,6 +4184,25 @@ async function executeCloseSettlement(input: {
   return closed;
 }
 
+/**
+ * Only a claim with a durable confirmed/reconciled child outcome can require
+ * receipt-backed fee attribution.  Earlier claim attempts may be retained as
+ * immutable EXPIRED/FAILED evidence; selecting one of those attempts merely
+ * because it sorts first would make a completed close permanently retry a
+ * receipt that cannot exist.
+ */
+export function confirmedTerminalClaimTransactions(
+  transactions: readonly LifecycleChildTransaction[],
+): LifecycleChildTransaction[] {
+  return transactions.filter(
+    (transaction) =>
+      transaction.planRole === "CLOSE" &&
+      transaction.kind === "METEORA_CLAIM" &&
+      transaction.state === "CONFIRMED" &&
+      typeof transaction.signature === "string",
+  );
+}
+
 /** A recovered close reaches the same durable settlement boundary as a normal close. */
 async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:AutonomousPlan;positionAddress:string;connection:Connection;config:Pick<LiveWorkerConfig,"rpcUrl"|"residualDustThresholdUsd"|"meteoraDataApiUrl"|"dataApiMaxRps"|"httpTimeoutMs"|"policyHash">}):Promise<{ready:boolean;reasonCodes:string[]}>{
   const positionCheck=await input.connection.getAccountInfoAndContext(new PublicKey(input.positionAddress),"confirmed");
@@ -4194,8 +4214,10 @@ async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:Au
   let settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
   if(!settlementInput)return{ready:false,reasonCodes:["SETTLEMENT_LIFECYCLE_MISSING"]};
   settlementInput={...settlementInput,cashflows:canonicalizeTerminalSettlementCashflows(settlementInput.cashflows)};
-  const terminalClaim=settlementInput.transactions.find(transaction=>transaction.planRole==='CLOSE'&&transaction.kind==='METEORA_CLAIM');
-  if(terminalClaim?.signature&&!settlementInput.cashflows.some(flow=>flow.flowType==='FEE_CLAIM'&&settlementFlowSignature(flow)===terminalClaim.signature)){
+  // A retry is a distinct child.  Reconcile every confirmed claim child that
+  // lacks its own cashflow; never ask RPC for a proven no-effect predecessor.
+  for(const terminalClaim of confirmedTerminalClaimTransactions(settlementInput.transactions)){
+    if(!terminalClaim.signature||settlementInput.cashflows.some(flow=>flow.flowType==='FEE_CLAIM'&&settlementFlowSignature(flow)===terminalClaim.signature))continue;
     const claim=await persistConfirmedClaimReceipt({store:input.store,connection:input.connection,plan:input.plan,positionAddress:input.positionAddress,signature:terminalClaim.signature,transactionId:terminalClaim.transactionId,observedAt:new Date().toISOString(),source:"CONFIRMED_TERMINAL_CLAIM_RECEIPT"});
     if(!claim.ok)return{ready:false,reasonCodes:claim.reasonCodes};
     settlementInput=await input.store.loadLifecycleSettlementInput(input.positionAddress);
