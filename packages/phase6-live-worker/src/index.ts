@@ -4458,6 +4458,18 @@ async function executeCloseSettlement(input: {
     positionAddress: input.positionAddress,
   });
   closedBuilt.metadata.transactionId = closeAccountTransactionId;
+  // A no-effect expired close receives a fresh transaction identity.  That
+  // identity must be materialized as a child step before its simulation (the
+  // simulation/submission ledgers intentionally have a transaction-step FK).
+  // Do not rely on the original close step: it is immutable expiry evidence.
+  await input.store.ensureExecutionTransactionStep({
+    planId:input.plan.planId,
+    transactionId:closeAccountTransactionId,
+    kind:"METEORA_CLOSE",
+    state:"PLANNED",
+    requiredSignerAddresses:closedBuilt.requiredSignerAddresses,
+    metadata:{...closedBuilt.metadata,closeAccountRetryCount},
+  });
   const closed = await executeMeteoraMutation({
     ...input,
     plan: closeChildPlan(input.plan, closeAccountTransactionId),

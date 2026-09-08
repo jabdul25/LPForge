@@ -61,6 +61,15 @@ test('future close separates remove token truth from a later claim and reconcile
   assert.match(source, /primaryUnwindInputRaw===input\.combinedCloseWithdrawalRaw\+input\.openResidualRaw/);
 });
 
+test('a fresh account-close retry materializes its child step before the simulation foreign-key boundary', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile('packages/phase6-live-worker/src/index.ts', 'utf8'));
+  const close = source.slice(source.indexOf('const closeAccountRetryRaw='), source.indexOf('if(closed.status!=="RECONCILED")', source.indexOf('const closeAccountRetryRaw=')));
+  assert.match(close,/ensureExecutionTransactionStep\(\{/);
+  assert.match(close,/transactionId:closeAccountTransactionId/);
+  assert.match(close,/kind:"METEORA_CLOSE"/);
+  assert.ok(close.indexOf('ensureExecutionTransactionStep')<close.indexOf('executeMeteoraMutation'),'the retry step exists before simulation/signing');
+});
+
 test('only an exact unsigned OPEN/MATCH close snapshot may resume multi-remove construction', () => {
   const base = {
     action: 'CLOSE', planState: 'RECONCILIATION_REQUIRED',
