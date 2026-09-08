@@ -26,9 +26,10 @@ test('PostgreSQL journal rows normalize once before P6 consumes durable identity
   assert.equal(executionJournalPlanId(journal),'plan-close');
 });
 
-test('submitted swap confirmation-pending handoff preserves exact durable identity',()=>{
-  const error=new P6PostSubmissionConfirmationPending({planId:'plan',transactionId:'swap',attemptId:'swap:attempt:1',signature:'signature'});
-  assert.equal(error.message,'LPFORGE_P6_SWAP_CONFIRMATION_PENDING');
+test('submitted swap post-submission handoff preserves exact durable identity and reason',()=>{
+  const error=new P6PostSubmissionConfirmationPending({planId:'plan',transactionId:'swap',attemptId:'swap:attempt:1',signature:'signature',reason:'LPFORGE_P6_CONFIRM_EXPIRED'});
+  assert.equal(error.message,'LPFORGE_P6_CONFIRM_EXPIRED');
+  assert.equal(error.submissionReason,'LPFORGE_P6_CONFIRM_EXPIRED');
   assert.deepEqual({planId:error.planId,transactionId:error.transactionId,attemptId:error.attemptId,signature:error.signature},{planId:'plan',transactionId:'swap',attemptId:'swap:attempt:1',signature:'signature'});
 });
 

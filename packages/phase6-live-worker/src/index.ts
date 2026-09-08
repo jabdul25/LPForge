@@ -548,9 +548,12 @@ export function executionJournalPlanId(row: {planId?:unknown;plan_id?:unknown}):
  * permission to resend. */
 export class P6PostSubmissionConfirmationPending extends Error {
   readonly planId:string; readonly transactionId:string; readonly attemptId:string; readonly signature:string;
-  constructor(v:{planId:string;transactionId:string;attemptId:string;signature:string}) {
-    super("LPFORGE_P6_SWAP_CONFIRMATION_PENDING"); this.name="P6PostSubmissionConfirmationPending";
+  /** Diagnostic reason only; the persisted attempt remains authoritative. */
+  readonly submissionReason:string;
+  constructor(v:{planId:string;transactionId:string;attemptId:string;signature:string;reason?:string}) {
+    super(v.reason??"LPFORGE_P6_SWAP_CONFIRMATION_PENDING"); this.name="P6PostSubmissionConfirmationPending";
     this.planId=v.planId;this.transactionId=v.transactionId;this.attemptId=v.attemptId;this.signature=v.signature;
+    this.submissionReason=v.reason??"LPFORGE_P6_SWAP_CONFIRMATION_PENDING";
   }
 }
 
@@ -891,6 +894,10 @@ async function executeRequiredJupiterSwap(input: {
     transport: createWeb3SubmissionTransport(input.connection),
     submittedAt: signedAt,
   });
+  // A successful submit has crossed the economic boundary. Preserve its
+  // identity through every subsequent confirmation/receipt failure so the
+  // parent cannot misclassify it as a pre-submission block.
+  try {
   if (
     !(await awaitConfirmation({
       connection: input.connection,
@@ -926,6 +933,16 @@ async function executeRequiredJupiterSwap(input: {
     wsolRawBefore: wsolRawBefore.toString(),
     fundedAt,
   };
+  } catch (error) {
+    if (error instanceof P6PostSubmissionConfirmationPending) throw error;
+    throw new P6PostSubmissionConfirmationPending({
+      planId:input.plan.planId,
+      transactionId:input.plan.swapTransactionId,
+      attemptId:`${input.plan.swapTransactionId}:attempt:1`,
+      signature:record.signature,
+      reason:error instanceof Error?error.message:"LPFORGE_P6_SWAP_POST_SUBMISSION_UNKNOWN",
+    });
+  }
 }
 /**
  * Executes an extended PositionV2 open as an ordered durable plan. Every SDK
