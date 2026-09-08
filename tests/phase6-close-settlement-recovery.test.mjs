@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   canonicalizeTerminalSettlementCashflows,
   canResumePreSubmissionClose,
+  isReceiptBoundCombinedCloseClaimDisposition,
   isLegacySequentialCloseJournalRecovery,
   mutationRiskPlanExpiry,
   selectReceiptBoundFeeClaimResidual,
@@ -32,6 +33,32 @@ test('only an open receipt-bound fee-claim lot can be selected for post-close re
     ],
   });
   assert.deepEqual(lots, [{lotId: 'claim', rawAmount: 61n}]);
+});
+
+test('only an exact combined remove-plus-claim receipt shape may settle a historical duplicate claim lot', () => {
+  const exact = {
+    primaryUnwindInputRaw: 2_919n,
+    combinedCloseWithdrawalRaw: 2_866n,
+    openResidualRaw: 53n,
+    feeClaimRaw: 61n,
+    walletTokenRaw: 0n,
+  };
+  assert.equal(isReceiptBoundCombinedCloseClaimDisposition(exact), true);
+  for (const incompatible of [
+    {walletTokenRaw: 1n},
+    {primaryUnwindInputRaw: 2_920n},
+    {feeClaimRaw: 0n},
+    {combinedCloseWithdrawalRaw: 60n},
+  ]) assert.equal(isReceiptBoundCombinedCloseClaimDisposition({...exact, ...incompatible}), false);
+});
+
+test('future close separates remove token truth from a later claim and reconciles the historical combined-delta shape append-only', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile('packages/phase6-live-worker/src/index.ts', 'utf8'));
+  assert.match(source, /tokenXAfterRemove=await readWalletTokenBalance/);
+  assert.match(source, /P6_CLOSE_REMOVE_TOKEN_SNAPSHOT_MISSING/);
+  assert.match(source, /P6_RECEIPT_BOUND_COMBINED_REMOVE_CLAIM_DELTA_RECONCILIATION/);
+  assert.match(source, /P6_CLOSE_FEE_CLAIM_COMBINED_DELTA_RECONCILED/);
+  assert.match(source, /primaryUnwindInputRaw===input\.combinedCloseWithdrawalRaw\+input\.openResidualRaw/);
 });
 
 test('only an exact unsigned OPEN/MATCH close snapshot may resume multi-remove construction', () => {

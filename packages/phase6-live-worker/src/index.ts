@@ -351,7 +351,11 @@ export function derivePositionAttributedTerminalUnwind(input:{
 }):{ok:true;amountRaw:bigint;feeLotAllocations:Array<{lotId:string;rawAmount:bigint}>;openResidualLotAllocations:Array<{lotId:string;rawAmount:bigint}>;lotAllocations:Array<{lotId:string;rawAmount:bigint}>}|{ok:false;reasonCodes:string[]}{
   if(input.newlyWithdrawnRaw<0n||input.walletRawAfterClose<0n)return{ok:false,reasonCodes:['P6_CLOSE_POSITION_ATTRIBUTED_INVENTORY_INVALID']};
   const feeLots=input.lots
-    .filter(lot=>lot.positionAddress===input.positionAddress&&lot.tokenMint===input.tokenMint&&lot.sourceEvent==='FEE_CLAIM'&&lot.planId!==input.closePlanId&&['OPEN','PARTIALLY_SETTLED'].includes(lot.status)&&lot.remainingRawAmount>0n)
+    // A terminal claim belongs to the close plan itself.  It is nevertheless
+    // receipt-bound inventory and must be included exactly once in the
+    // subsequent unwind; excluding same-plan claims caused their amount to be
+    // folded into a combined wallet delta and then left as phantom debt.
+    .filter(lot=>lot.positionAddress===input.positionAddress&&lot.tokenMint===input.tokenMint&&lot.sourceEvent==='FEE_CLAIM'&&['OPEN','PARTIALLY_SETTLED'].includes(lot.status)&&lot.remainingRawAmount>0n)
     .sort((a,b)=>a.acquiredAt.localeCompare(b.acquiredAt)||a.lotId.localeCompare(b.lotId));
   const feeLotAllocations=feeLots.map(lot=>({lotId:lot.lotId,rawAmount:lot.remainingRawAmount}));
   const openResidualLotAllocations=input.lots
@@ -387,6 +391,26 @@ export function selectReceiptBoundFeeClaimResidual(input:{
     )
     .sort((a,b)=>a.acquiredAt.localeCompare(b.acquiredAt)||a.lotId.localeCompare(b.lotId))
     .map(lot=>({lotId:lot.lotId,rawAmount:lot.remainingRawAmount}));
+}
+
+/**
+ * Historical close plans may have measured REMOVE and CLAIM together.  When
+ * the exact confirmed unwind consumed that combined balance, the separately
+ * receipt-recorded claim lot is already economically disposed of.  This is a
+ * narrow append-only reconciliation predicate, never a wallet inference.
+ */
+export function isReceiptBoundCombinedCloseClaimDisposition(input:{
+  primaryUnwindInputRaw:bigint;
+  combinedCloseWithdrawalRaw:bigint;
+  openResidualRaw:bigint;
+  feeClaimRaw:bigint;
+  walletTokenRaw:bigint;
+}):boolean{
+  return input.primaryUnwindInputRaw>0n&&
+    input.combinedCloseWithdrawalRaw>=input.feeClaimRaw&&
+    input.feeClaimRaw>0n&&
+    input.walletTokenRaw===0n&&
+    input.primaryUnwindInputRaw===input.combinedCloseWithdrawalRaw+input.openResidualRaw;
 }
 /** Read the chain immediately before signing.  The plan's market inputs are
  * immutable; a missing/mismatched value is a fail-closed condition, not a
@@ -3976,7 +4000,8 @@ async function executeCloseSettlement(input: {
   let dispatch = closeSettlementDispatch(input.plan),
     stage = closeSettlementStage(input.plan),
     tokenXBefore = closeSettlementAmount(dispatch.tokenXBefore),
-    tokenYBefore = closeSettlementAmount(dispatch.tokenYBefore);
+    tokenYBefore = closeSettlementAmount(dispatch.tokenYBefore),
+    tokenXAfterRemove = closeSettlementAmount(dispatch.tokenXAfterRemove);
   if (!stage) {
     [tokenXBefore,tokenYBefore]=await Promise.all([readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenXMint}),readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenYMint})]);
     // Final immutable PositionV2 read before the first economic close instruction.
@@ -4097,15 +4122,22 @@ async function executeCloseSettlement(input: {
         closeRemoveRetryCount:removeRetryCount,
       });
     }
+    // Capture REMOVE before CLAIM.  The later claim can credit the same mint;
+    // measuring only after both actions would fold fee inventory into the
+    // liquidity-withdrawal lot and double-count it when claim receipt
+    // attribution independently creates its own lot.
+    tokenXAfterRemove=await readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenXMint});
     await persist("CLOSE_LIQUIDITY_REMOVED", {
       tokenXBefore: tokenXBefore.toString(),
       tokenYBefore: tokenYBefore.toString(),
+      tokenXAfterRemove:tokenXAfterRemove.toString(),
       removeTransactionId: children[0]!.transactionId,
       removeTransactionIds: allIds,
       removeChildCount:children.length,
       removeChildrenConfirmed:[...priorConfirmed],
       closeRemoveRetryCount:removeRetryCount,
     });
+    dispatch={...dispatch,tokenXAfterRemove:tokenXAfterRemove.toString()};
     stage = "CLOSE_LIQUIDITY_REMOVED";
   }
 
@@ -4169,8 +4201,12 @@ async function executeCloseSettlement(input: {
   let attributableTokenX = closeSettlementAmount(dispatch.attributableTokenX),attributableTokenY=closeSettlementAmount(dispatch.attributableTokenY),attributableFeeLotAllocations:Array<{lotId:string;rawAmount:bigint}>=Array.isArray(dispatch.attributableFeeLotAllocations)?dispatch.attributableFeeLotAllocations.flatMap((value):Array<{lotId:string;rawAmount:bigint}>=>{if(!value||typeof value!=="object")return[];const row=value as Record<string,unknown>;if(typeof row.lotId!=="string"||typeof row.rawAmount!=="string")return[];try{const rawAmount=BigInt(row.rawAmount);return rawAmount>0n?[{lotId:row.lotId,rawAmount}]:[];}catch{return[];}}):[];
   if (stage === "CLOSE_CLAIMS_SETTLED") {
     const [tokenXAfter,tokenYAfter]=await Promise.all([readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenXMint}),readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenYMint})]);
+    if(tokenXAfterRemove===undefined){
+      await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:"RECONCILIATION_REQUIRED",at:new Date().toISOString(),reasonCodes:["P6_CLOSE_REMOVE_TOKEN_SNAPSHOT_MISSING"],payload:{stage:"CLOSE_POSITION_ATTRIBUTED_FEE_INVENTORY"}});
+      return{status:"UNKNOWN",planId:input.plan.planId,reasonCodes:["P6_CLOSE_REMOVE_TOKEN_SNAPSHOT_MISSING"],transactionSubmitted:true};
+    }
     const newlyWithdrawnTokenX =
-      tokenXAfter > tokenXBefore ? tokenXAfter - tokenXBefore : 0n;
+      tokenXAfterRemove > tokenXBefore ? tokenXAfterRemove - tokenXBefore : 0n;
     attributableTokenY=tokenYAfter>tokenYBefore?tokenYAfter-tokenYBefore:0n;
     // Token X is non-SOL inventory, not PnL.  Record an attributable lot
     // before the unwind so terminal settlement can require an exact
@@ -5748,6 +5784,66 @@ export async function recoverUnfinishedAutonomousPlans(input: {
               const feeResidual=feeLots.reduce((total,lot)=>total+lot.rawAmount,0n);
               let walletTokenX:bigint|undefined;
               try{walletTokenX=await readWalletTokenBalance({connection,ownerAddress:plan.ownerAddress,mint:tokenMint});}catch{}
+              // Historical releases measured REMOVE and CLAIM together.  The
+              // exact primary-unwind receipt can prove that its input already
+              // consumed the separately recorded claim lot.  Reconcile only
+              // that demonstrated duplicate representation; do not turn an
+              // unexplained wallet shortfall into a settlement.
+              const openResidualRaw=Array.isArray(dispatch.attributableOpenResidualLotAllocations)
+                ? dispatch.attributableOpenResidualLotAllocations.reduce((total,value)=>{
+                    if(!value||typeof value!=="object")return total;
+                    const row=value as Record<string,unknown>;
+                    const amount=closeSettlementAmount(row.rawAmount);
+                    return amount===undefined?total:total+amount;
+                  },0n)
+                : 0n,
+                primaryUnwindInputRaw=closeSettlementAmount(dispatch.attributableTokenX),
+                combinedCloseWithdrawalRaw=closeSettlementAmount(dispatch.newlyWithdrawnTokenX);
+              if(
+                feeResidual>0n&&walletTokenX===0n&&
+                primaryUnwindInputRaw!==undefined&&combinedCloseWithdrawalRaw!==undefined&&
+                isReceiptBoundCombinedCloseClaimDisposition({
+                  primaryUnwindInputRaw,
+                  combinedCloseWithdrawalRaw,
+                  openResidualRaw,
+                  feeClaimRaw:feeResidual,
+                  walletTokenRaw:walletTokenX,
+                })
+              ){
+                let receiptProven=false;
+                try{
+                  const receipt=await loadConfirmedExecutionReceipt(connection,unwindConfirmed.signature),
+                    effects=deriveTransactionAssetEffects(receipt,{ownerAddress:plan.ownerAddress,...(receipt.staticAccountKeys[0]===undefined?{}:{feePayerAddress:receipt.staticAccountKeys[0]}),inputMint:tokenMint,outputMint:WSOL_MINT,jupiterProgramIds:[JUPITER_SWAP_V6_PROGRAM_ID],positionAddress:recoveryPositionAddress}),
+                    settlement=deriveCloseUnwindSettlement({receipt,effects,ownerAddress:plan.ownerAddress,inputMint:tokenMint,inputAmountRaw:primaryUnwindInputRaw,outputMint:WSOL_MINT,jupiterProgramIds:[JUPITER_SWAP_V6_PROGRAM_ID]});
+                  receiptProven=settlement.state==='SETTLED'&&settlement.inputCorroborated===true;
+                }catch{}
+                if(receiptProven){
+                  for(const [index,lot] of feeLots.entries())await input.store.settlePositionInventoryLot({
+                    eventId:`${plan.planId}:fee-claim-combined-close-delta-reconciled:${index}`,
+                    lotId:lot.lotId,
+                    planId:plan.planId,
+                    eventType:'SETTLED',
+                    settledRawAmount:lot.rawAmount,
+                    observedAt:input.now,
+                    transactionSignature:unwindConfirmed.signature,
+                    payload:{
+                      source:'P6_RECEIPT_BOUND_COMBINED_REMOVE_CLAIM_DELTA_RECONCILIATION',
+                      primaryUnwindTransactionId:unwindId,
+                      primaryUnwindSignature:unwindConfirmed.signature,
+                      primaryUnwindInputRaw:primaryUnwindInputRaw.toString(),
+                      combinedCloseWithdrawalRaw:combinedCloseWithdrawalRaw.toString(),
+                      openResidualRaw:openResidualRaw.toString(),
+                      feeClaimRaw:lot.rawAmount.toString(),
+                    },
+                  });
+                  const accountRetryRaw=Number(dispatch.closeAccountRetryCount??0),
+                    priorAccountRetry=Number.isSafeInteger(accountRetryRaw)&&accountRetryRaw>=0?accountRetryRaw:0;
+                  await input.store.updateExecutionJournal({idempotencyKey:plan.idempotencyKey,expectedVersion:journal.version,transactionId:unwindId,state:'CONFIRMED',signature:unwindConfirmed.signature,updatedAt:input.now,payload:{...journal.payload,recovery:'P6_CLOSE_FEE_CLAIM_COMBINED_DELTA_RECONCILED',expiredAccountCloseSignature:closePending.signature}});
+                  await input.store.transitionAutonomousPlan({planId:plan.planId,state:'RECONCILING',at:input.now,reasonCodes:['P6_CLOSE_FEE_CLAIM_COMBINED_DELTA_RECONCILED','P6_CLOSE_ACCOUNT_RETRY_READY'],payload:{stage:'CLOSE_INVENTORY_UNWOUND',pendingStage:null,pendingSignature:null,closeAccountRetryCount:priorAccountRetry+1,expiredAccountCloseSignature:closePending.signature}});
+                  results.push({planId:plan.planId,action:'RESUME_CLOSE_SETTLEMENT',reasonCodes:['P6_CLOSE_FEE_CLAIM_COMBINED_DELTA_RECONCILED','P6_CLOSE_ACCOUNT_RETRY_READY']});
+                  continue;
+                }
+              }
               if(feeResidual>0n&&walletTokenX!==undefined&&walletTokenX>=feeResidual){
                 const retryRaw=Number(dispatch.closeUnwindRetryCount??0),
                   priorRetry=Number.isSafeInteger(retryRaw)&&retryRaw>=0?retryRaw:0,
