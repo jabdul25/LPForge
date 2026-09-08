@@ -49,6 +49,13 @@ test('bounded unattended production retains the live Phase-6 gate while removing
  assert.match(operator,/const boundedUnattended=process\.env\.LPFORGE_BOUNDED_UNATTENDED_PRODUCTION==='true'/);
  assert.match(operator,/const controlledCanaryPlan=!boundedUnattended/,'plans in bounded mode are bound to the ordinary fresh P7 control, not one campaign authorization');
 });
+test('execution uses the canonical DLMM program and clears shared bounded authority before loading central config',async()=>{
+ const [execution,launcher,productionEnv]=await Promise.all(['apps/execution/src/main.ts','scripts/start-lpforge-service.sh','.env.production.example'].map(async path=>(await import('node:fs/promises')).readFile(path,'utf8')));
+ assert.doesNotMatch(execution,/process\.env\.LPFORGE_P6_PROGRAM_ID/,'no inherited program identity may override the compiled canonical DLMM id');
+ assert.match(execution,/programId: EXPECTED_DLMM_PROGRAM_ID/);
+ assert.match(launcher,/unset[\s\S]*LPFORGE_BOUNDED_UNATTENDED_PRODUCTION/);
+ assert.match(productionEnv,/LPFORGE_BOUNDED_UNATTENDED_PRODUCTION=false/);
+});
 test('terminal recovery binds its timestamp consistently when expiring an unsent journal',async()=>{
  const db=await import('node:fs/promises').then(fs=>fs.readFile('packages/db/src/index.ts','utf8'));
  assert.match(db,/terminalizedAt',\$3::timestamptz/);

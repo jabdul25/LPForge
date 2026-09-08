@@ -130,7 +130,9 @@ function recoveryConfig() {
   return {
     rpcUrl,
     ownerAddress,
-    programId: (process.env.LPFORGE_P6_PROGRAM_ID ?? EXPECTED_DLMM_PROGRAM_ID).trim(),
+    // Execution never accepts a process-environment program override. The
+    // canonical Meteora DLMM identity is compiled and independently checked.
+    programId: EXPECTED_DLMM_PROGRAM_ID,
   };
 }
 function assertObserveLaunchable() {
@@ -192,7 +194,7 @@ function workerConfig() {
     throw new Error("LPFORGE_P6_EXECUTION_COST_CONFIG_INVALID");
   return {
     rpcUrl: process.env.LPFORGE_P6_PRIVATE_WRITE_RPC_URL ?? "",
-    programId: process.env.LPFORGE_P6_PROGRAM_ID ?? EXPECTED_DLMM_PROGRAM_ID,
+    programId: EXPECTED_DLMM_PROGRAM_ID,
     liquiditySlippageBps,
     maxFeeLamports,
     maxFeeFraction,

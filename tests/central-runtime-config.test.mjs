@@ -64,6 +64,7 @@ test('execution launcher gives the central execution authority config precedence
     'LPFORGE_P6_CONFIRM_ATTEMPTS',
     'SOLANA_RPC_HTTP_URL',
     'LPFORGE_OPERATOR_OWNER_ADDRESS',
+    'LPFORGE_BOUNDED_UNATTENDED_PRODUCTION',
   ]) assert.match(execution, new RegExp(`unset[\\s\\S]*${variable}`));
   assert.match(execution, /env_args=\(--env-file="\$LPFORGE_RUNTIME_ENV_SOURCE" --env-file="\$execution_env"\)/);
   assert.doesNotMatch(execution, /unset[\s\S]*LPFORGE_EXECUTION_POLICY_PATH/);
