@@ -22,9 +22,9 @@ test('wallet shortfall against receipt-backed position inventory fails closed',(
   assert.deepEqual(result,{ok:false,reasonCodes:['P6_CLOSE_POSITION_ATTRIBUTED_FEE_LOTS_WALLET_SHORTFALL']});
 });
 
-test('terminal claim belonging to this close is carried by the close delta and never double counted',()=>{
-  const result=derivePositionAttributedTerminalUnwind({positionAddress,tokenMint,closePlanId,newlyWithdrawnRaw:80n,walletRawAfterClose:85n,lots:[lot('historic',5),lot('terminal',7,{planId:closePlanId})]});
-  assert.equal(result.ok,true);assert.equal(result.amountRaw,85n);assert.deepEqual(result.feeLotAllocations,[{lotId:'historic',rawAmount:5n}]);
+test('terminal claim belonging to this close is separately receipt-attributed after the remove snapshot',()=>{
+  const result=derivePositionAttributedTerminalUnwind({positionAddress,tokenMint,closePlanId,newlyWithdrawnRaw:80n,walletRawAfterClose:92n,lots:[lot('historic',5),lot('terminal',7,{planId:closePlanId})]});
+  assert.equal(result.ok,true);assert.equal(result.amountRaw,92n);assert.deepEqual(result.feeLotAllocations,[{lotId:'historic',rawAmount:5n},{lotId:'terminal',rawAmount:7n}]);
 });
 
 test('ZCAT regression: historic routine fee inventory is included, not treated as unrelated wallet balance',()=>{

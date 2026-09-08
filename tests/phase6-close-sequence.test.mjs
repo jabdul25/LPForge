@@ -49,7 +49,7 @@ test('worker close sequence snapshots → drains → claims → unwinds only att
   assert.match(worker,/LPFORGE_METEORA_CLAIM_NOTHING_TO_CLAIM/);
   assert.match(worker,/closeChildPlan\(input\.plan, unwindTransactionId\)/,'a primary unwind retry is a distinct durable child');
   assert.match(worker,/closeUnwindRetryCount/,'expired no-effect primary unwind retries retain their durable generation');
-  assert.match(worker,/tokenXAfter > tokenXBefore \? tokenXAfter - tokenXBefore : 0n/,'only position-attributable inventory may be unwound');
+  assert.match(worker,/tokenXAfterRemove > tokenXBefore \? tokenXAfterRemove - tokenXBefore : 0n/,'only REMOVE-attributable inventory may be unwound before claim inventory is separately receipt-attributed');
   assert.match(worker,/tokenYAfter>tokenYBefore\?tokenYAfter-tokenYBefore:0n/,'the close ledger also records the position-attributable SOL-side withdrawal');
   assert.match(worker,/flowType:\s*["']SWAP_PROCEEDS["']/,'token-X close inventory is represented by its actual SOL-side Jupiter output, not a second marked token-X withdrawal');
   assert.match(worker,/source:\s*"CONFIRMED_TRANSACTION_ASSET_EFFECTS"/,'swap proceeds come from confirmed receipt/effect chain truth');
