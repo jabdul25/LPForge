@@ -40,6 +40,10 @@ async function processUpdate(c:CommandConfig,u:TelegramUpdate){
   const persist=async(status:'ACCEPTED'|'REJECTED'|'COMPLETED'|'FAILED',response:string,payload:Record<string,unknown>={})=>store.recordTelegramOperatorCommand({telegramUpdateId:BigInt(updateId),chatId:chat,...(operator?{operatorId:operator}:{}),command:parsed.name||'UNKNOWN',arguments:{args:parsed.args},receivedAt,status,response,payload});
   try{
     if(!accepted){await persist('REJECTED','Unauthorized Telegram operator command.',{authorization:'REJECTED'});return;}
+    // Persist the operator intent before any child row references this update.
+    // If the process restarts while it is ACCEPTED, polling replays it and the
+    // deterministic request/action identities make completion idempotent.
+    if(!await persist('ACCEPTED','Command accepted.',{authorization:'ALLOWLISTED'}))return;
     const actionId=`telegram:${updateId}`;
     const audit=async(action:string,why:string,targetType?:string,targetId?:string)=>store.insertPhase7OperatorAction({actionId,operatorId:operator,action,requestedAt:receivedAt,approvalId:'telegram-allowlist-v1',reason:why,...(targetType?{targetType}:{}),...(targetId?{targetId}:{}),beforeHash:'telegram-command',afterHash:'telegram-command',result:'APPLIED',payload:{telegramOperator:true,telegramUpdateId:updateId,chatId:chat}});
     let response='';

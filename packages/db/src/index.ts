@@ -4915,11 +4915,14 @@ return 'APPLIED';
       );
     },
     async recordTelegramOperatorCommand(v) {
-      const r=await db.query(`INSERT INTO operations.telegram_operator_commands(telegram_update_id,chat_id,operator_id,command,arguments,received_at,status,response,payload) VALUES($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9::jsonb) ON CONFLICT(telegram_update_id) DO NOTHING RETURNING telegram_update_id`,[v.telegramUpdateId.toString(),v.chatId,v.operatorId??null,v.command,json(v.arguments),v.receivedAt,v.status,v.response??null,json(v.payload)]);
+      const r=await db.query(`INSERT INTO operations.telegram_operator_commands(telegram_update_id,chat_id,operator_id,command,arguments,received_at,status,response,payload) VALUES($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9::jsonb) ON CONFLICT(telegram_update_id) DO UPDATE SET status=EXCLUDED.status,response=EXCLUDED.response,payload=operations.telegram_operator_commands.payload||EXCLUDED.payload,updated_at=now() WHERE operations.telegram_operator_commands.status='ACCEPTED' AND EXCLUDED.status IN ('ACCEPTED','COMPLETED','FAILED') RETURNING telegram_update_id`,[v.telegramUpdateId.toString(),v.chatId,v.operatorId??null,v.command,json(v.arguments),v.receivedAt,v.status,v.response??null,json(v.payload)]);
       return r.rows.length===1;
     },
     async loadLatestTelegramOperatorUpdateId() {
-      const r=await db.query(`SELECT max(telegram_update_id)::text AS id FROM operations.telegram_operator_commands`);
+      // An ACCEPTED command may have survived a process restart before its
+      // durable side effect or terminal response. Leave it in Telegram's
+      // replay range; the command/request IDs make that replay idempotent.
+      const r=await db.query(`SELECT max(telegram_update_id)::text AS id FROM operations.telegram_operator_commands WHERE status<>'ACCEPTED'`);
       return r.rows[0]?.id===null||r.rows[0]?.id===undefined?undefined:BigInt(String(r.rows[0].id));
     },
     async upsertTelegramOperatorPoolBlock(v) {

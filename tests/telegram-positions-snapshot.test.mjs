@@ -58,8 +58,12 @@ test('formatter remains bounded and presentation-only',async()=>{
 });
 test('telegram operator uses the bounded DB summary reader for /positions',async()=>{
   const source=await readFile('apps/telegram-operator/src/main.ts','utf8');
+  const db=await readFile('packages/db/src/index.ts','utf8');
   assert.match(source,/parsed\.name==='\/positions'\)\{const max=maxOpenPositions\(\);response=formatTelegramPositionSummaries\(\{positions:await store\.loadTelegramOperatorPositionSummaries\(\)/);
   assert.match(source,/parsed\.name==='\/positions'\?'Unable to load position snapshot right now\.'/);
   assert.match(source,/resolveTelegramPositionAddress\(\{target,positions\}\)/);
   assert.match(source,/close <position number\|all>/);
+  assert.match(source,/await persist\('ACCEPTED','Command accepted\.'/);
+  assert.match(db,/telegram_operator_commands\.status='ACCEPTED' AND EXCLUDED\.status IN \('ACCEPTED','COMPLETED','FAILED'\)/);
+  assert.match(db,/FROM operations\.telegram_operator_commands WHERE status<>'ACCEPTED'/);
 });
