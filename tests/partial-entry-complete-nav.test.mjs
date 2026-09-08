@@ -20,6 +20,12 @@ test('partial multi-chunk construction never becomes a fully constructed OPEN',(
   assert.equal(complete.fullyConstructed,true);assert.equal(complete.partial,false);
 });
 
+test('a finalized failed OPEN child is landed terminal evidence, never proven-not-landed',()=>{
+  const planned=[{transactionId:'chunk-1',sequence:1,kind:'METEORA_OPEN'},{transactionId:'chunk-2',sequence:2,kind:'METEORA_OPEN_CHUNK'}];
+  const result=assessOpenChunkConstruction({planned,dispositions:[{transactionId:'chunk-1',disposition:'CONFIRMED'},{transactionId:'chunk-2',disposition:'CONFIRMED_FAILED'}]});
+  assert.equal(result.fullyConstructed,false);assert.equal(result.partial,true);assert.ok(result.reasonCodes.includes('P6_OPEN_PARTIAL_CONSTRUCTION'));
+});
+
 test('complete managed NAV includes attributed wallet inventory and prevents the incident-shaped false emergency stop',()=>{
   const lpOnly=economics(undefined),complete=economics(1_000_000);
   assert.equal(lpOnly.evidenceState,'AVAILABLE');assert.equal(complete.evidenceState,'AVAILABLE');

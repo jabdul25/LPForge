@@ -53,6 +53,7 @@
     "canary:capabilities": "node --enable-source-maps .build/apps/canary/src/main.js capabilities",
     "phase6:fixture": "node --enable-source-maps .build/apps/canary/src/main.js fixture-evaluate",
     "verify:postgres:phase6": "node scripts/verify-phase6-postgres.mjs",
+    "verify:postgres:p6-journal": "node scripts/verify-p6-journal-postgres.mjs",
     "verify:phase7": "node scripts/verify-phase7-boundary.mjs",
     "production": "node --enable-source-maps .build/apps/production/src/main.js start",
     "production:fixture": "node --enable-source-maps .build/apps/production/src/main.js fixture-once",

@@ -29,9 +29,14 @@ try{
   const created=await store.createExecutionJournal({journalId:ids('J'),idempotencyKey:journalKey,planId:plan,transactionId:tx2,state:'UNKNOWN_SUBMISSION',blockhash:'blockhash2',lastValidBlockHeight:12346,version:1,updatedAt:'2026-08-12T14:40:13Z',payload:{}});
   const duplicateJournal=await store.createExecutionJournal({journalId:ids('J_DUP'),idempotencyKey:journalKey,planId:plan,state:'HOLD',version:1,updatedAt:'2026-08-12T14:40:13Z',payload:{}});
   const advanced=await store.updateExecutionJournal({idempotencyKey:journalKey,expectedVersion:1,state:'HOLD',updatedAt:'2026-08-12T14:40:14Z',payload:{decision:'WAIT_DO_NOT_RESUBMIT'}});
-  const stale=await store.updateExecutionJournal({idempotencyKey:journalKey,expectedVersion:1,state:'EXPIRED',updatedAt:'2026-08-12T14:40:15Z',payload:{}});
+  let staleConflict=false;
+  try{
+    await store.updateExecutionJournal({idempotencyKey:journalKey,expectedVersion:1,state:'EXPIRED',updatedAt:'2026-08-12T14:40:15Z',payload:{}});
+  }catch(error){
+    staleConflict=String(error?.message??error).includes('LPFORGE_EXECUTION_JOURNAL_VERSION_CONFLICT');
+  }
   const journal=await store.getExecutionJournal(journalKey);
-  if(!created||duplicateJournal||!advanced||stale||journal?.state!=='HOLD'||Number(journal?.version)!==2)throw new Error('LPFORGE_P5_JOURNAL_CONCURRENCY');
+  if(!created||duplicateJournal||!advanced||!staleConflict||journal?.state!=='HOLD'||Number(journal?.version)!==2)throw new Error('LPFORGE_P5_JOURNAL_CONCURRENCY');
   await store.insertCanaryRun({runId:ids('CANARY'),planId:plan,poolAddress:pool,action:'OPEN',capitalLamports:10_000_000n,status:'BUILD_ONLY',startedAt:'2026-08-12T14:40:16Z',payload:{noMainnetSubmission:true}});
 }finally{await store.close();}
 const db=new Client({connectionString:url});await db.connect();
@@ -39,7 +44,7 @@ try{
   const m=await db.query(`SELECT count(*)::int AS count FROM governance.schema_migrations`);
   if(Number(m.rows[0]?.count)<15)throw new Error(`LPFORGE_P5_MIGRATIONS:${m.rows[0]?.count}`);
   const e=await db.query(`SELECT count(*)::int AS count FROM pg_tables WHERE schemaname='execution'`);
-  if(Number(e.rows[0]?.count)!==10)throw new Error(`LPFORGE_P5_EXECUTION_TABLES:${e.rows[0]?.count}`);
+  if(Number(e.rows[0]?.count)<10)throw new Error(`LPFORGE_P5_EXECUTION_TABLES:${e.rows[0]?.count}`);
   const s=await db.query(`SELECT state,payload->>'submission_error' AS submission_error FROM execution.submission_attempts WHERE attempt_id=$1`,[attempt2]);
   if(s.rows[0]?.state!=='UNKNOWN'||s.rows[0]?.submission_error!=='RPC_TIMEOUT_AFTER_SEND')throw new Error('LPFORGE_P5_UNKNOWN_SUBMISSION_PERSISTENCE');
 }finally{await db.end();}

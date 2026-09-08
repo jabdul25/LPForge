@@ -44,7 +44,7 @@ test('a proven-expired CLOSE claim retains confirmed removal and rebuilds only t
   assert.match(source,/P6_CLOSE_CLAIM_EXPIRED_NO_CHAIN_EFFECT/);
   assert.match(source,/P6_CLOSE_CLAIM_REBUILD_READY/);
   assert.match(source,/closeClaimRetryCount/);
-  assert.match(source,/claimBaseTransactionId.*:retry-\$\{claimRetryCount\}/s,'claim retry must use a new durable child identity');
+  assert.match(source,/function closeClaimChildTransactionId[\s\S]*retryCount===0\?base:`\$\{base\}:retry-\$\{retryCount\}`/,'claim retry must use a new durable child identity');
   assert.match(source,/confirmedRemoves\.some\(value=>!value\)/,'claim rebuild requires every remove receipt');
 });
 

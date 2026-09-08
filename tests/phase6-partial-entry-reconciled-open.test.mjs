@@ -64,6 +64,6 @@ test('confirmed funding uses fresh post-funding simulation authority and cannot 
   const postFundingSimulation = worker.indexOf('const simulatedAt = new Date().toISOString(),', funding);
   assert.ok(funding >= 0 && postFundingSimulation > funding, 'a confirmed funding signature must be tracked before post-funding work');
   assert.match(worker, /P6_CONFIRMED_FUNDING_PARTIAL_ENTRY/);
-  assert.match(worker, /if\(submittedAny\|\|fundingSubmitted\)/, 'chunked opens must also preserve confirmed funding as a partial economic effect');
+  assert.match(worker, /if\(submittedAny\|\|submissionStatusUnknown\|\|fundingSubmitted\)/, 'chunked opens must also preserve confirmed funding as a partial economic effect');
   assert.match(worker, /simulatedAt,\n        input\.config\.riskPermitTtlMs/);
 });

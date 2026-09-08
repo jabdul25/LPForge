@@ -1,7 +1,7 @@
 // LPFORGE_PHASE6_MAINNET_MODULE
 import {assertPhase6Authority,type Phase6Authority,type Phase6CanaryTicket} from '../../phase6-contracts/src/index.js';
 import {signMainnetCanaryWithAuxiliaries,type MainnetSignerBackend,type AuxiliaryMainnetSignerBackend,type MainnetSignableEnvelope} from '../../phase6-mainnet-signer/src/index.js';
-import {submitSignedTransaction,type BlockhashLease,type SubmissionLedger,type SubmissionTransport} from '../../execution-submission/src/index.js';
+import {SubmissionStatusUnknownError,submitSignedTransaction,type BlockhashLease,type SubmissionLedger,type SubmissionTransport} from '../../execution-submission/src/index.js';
 import type {ExecutionAuthority} from '../../execution-contracts/src/index.js';import type {ExecutionRiskDecision} from '../../execution-risk/src/index.js';
 export interface SerializableMainnetEnvelope extends MainnetSignableEnvelope {serializeSigned():Uint8Array;}
 export interface CanaryOpenResult {status:'SUBMITTED';ticketId:string;transactionId:string;signature:string;submittedAt:string;signerBackendId:string;}
@@ -12,7 +12,7 @@ export interface CanaryJournalCallbacks {
   /** sendRawTransaction may have reached the RPC even when its response is
    * lost. The caller must persist UNKNOWN_SUBMISSION and recover by ledger /
    * chain lookup, never retry blindly. */
-  onSubmissionUnknown?: (value:{transactionId:string;submittedAt:string;error:string})=>Promise<void>;
+  onSubmissionUnknown?: (value:{transactionId:string;submittedAt:string;error:string;signature?:string})=>Promise<void>;
   /** Runs after local signing but before the signed bytes reach any network
    * transport. A failure here is a deterministic pre-submission abort, not an
    * unknown submission. */
@@ -26,7 +26,15 @@ async function signThenSubmit(input:{authority:Phase6Authority;ticket:Phase6Cana
   await input.beforeSubmit?.({transactionId:input.transactionId,submittedAt:input.submittedAt});
   let record;
   try{record=await submitSignedTransaction({authority:phase5Authority(input.authority),riskDecision:input.phase5RiskDecision,transactionId:input.transactionId,idempotencyKey:input.idempotencyKey,attempt:1,raw:input.envelope.serializeSigned(),lease:input.lease,ledger:input.ledger,transport:input.transport,submittedAt:input.submittedAt});}
-  catch(error){await input.onSubmissionUnknown?.({transactionId:input.transactionId,submittedAt:input.submittedAt,error:error instanceof Error?error.message:String(error)});throw error;}
+  catch(error){
+    const reason=error instanceof Error?error.message:String(error);
+    // Authority, callback and duplicate-attempt failures occur before this
+    // invocation can create a new ambiguous network effect.  Only the
+    // submission module's explicit status-unknown result crosses the
+    // no-blind-resend recovery boundary.
+    if(error instanceof SubmissionStatusUnknownError)await input.onSubmissionUnknown?.({transactionId:input.transactionId,submittedAt:input.submittedAt,error:reason,...(error.signature?{signature:error.signature}:{})});
+    throw error;
+  }
   return{status:'SUBMITTED',ticketId:input.ticket.ticketId,transactionId:input.transactionId,signature:record.signature,submittedAt:input.submittedAt,signerBackendId};
 }
 export async function executeMainnetCanaryOpen(input:{authority:Phase6Authority;ticket:Phase6CanaryTicket;transactionId:string;idempotencyKey:string;requiredSignerAddresses:string[];backend:MainnetSignerBackend;auxiliaryBackends?:AuxiliaryMainnetSignerBackend[];envelope:SerializableMainnetEnvelope;phase5RiskDecision:ExecutionRiskDecision;lease:BlockhashLease;ledger:SubmissionLedger;transport:SubmissionTransport;submittedAt:string}&CanaryJournalCallbacks):Promise<CanaryOpenResult>{assertPhase6Authority(input.authority,['MAINNET_CANARY_OPEN'],input.submittedAt);if(input.ticket.action!=='OPEN')throw new Error('LPFORGE_P6_OPEN_TICKET_ACTION');if(input.authority.ticketId!==input.ticket.ticketId)throw new Error('LPFORGE_P6_OPEN_TICKET_MISMATCH');return signThenSubmit(input);}

@@ -579,6 +579,7 @@ export type OpenChunkDisposition =
   | "SIGNED"
   | "SUBMITTED"
   | "CONFIRMED"
+  | "CONFIRMED_FAILED"
   | "UNKNOWN_SUBMISSION"
   | "PROVEN_NOT_LANDED"
   | "FAILED_PRE_SIGN"
@@ -598,6 +599,7 @@ export type PlanCashflowType =
   | "ENTRY_FUNDING_SOL_OUT"
   | "ENTRY_FUNDING_X_IN"
   | "FUNDING_TX_COST"
+  | "EXECUTION_TX_COST"
   | "RECOVERY_UNWIND_X_OUT"
   | "RECOVERY_SOL_IN"
   | "RECOVERY_TX_COST";
@@ -647,6 +649,19 @@ export interface PositionLifecycle {
 }
 export type LifecycleChildTransactionState="CONFIRMED"|"FAILED_FINAL"|"PROVEN_NOT_LANDED"|"SUBMITTED"|"UNKNOWN"|"RECOVERY_PENDING"|"CONFIRMATION_PENDING";
 export interface LifecycleChildTransaction {transactionId:string;signature?:string;state:LifecycleChildTransactionState;planId?:string;planRole?:"ENTRY"|"MANAGEMENT"|"CLOSE"|"RECOVERY";kind?:string;}
+
+/** Translate persistence states into settlement effect states.  In
+ * particular, a deliberately skipped child is proven no-effect; it is never
+ * a confirmed economic receipt. */
+export function normalizeLifecycleChildTransactionState(state:string):LifecycleChildTransactionState{
+  return state==='CONFIRMED'||state==='FINALIZED'?"CONFIRMED"
+    :state==='SKIPPED_NO_EFFECT'||state==='PROVEN_NOT_LANDED'||state==='EXPIRED'?"PROVEN_NOT_LANDED"
+    :state==='FAILED'?"FAILED_FINAL"
+    :state==='UNKNOWN'?"UNKNOWN"
+    :state==='SUBMITTED'||state==='SENT'||state==='PROCESSED'?"SUBMITTED"
+    :state==='PREPARED'?"CONFIRMATION_PENDING"
+    :"RECOVERY_PENDING";
+}
 export interface LifecycleSettlementCashflow {cashflowId:string;flowType:string;lamports?:bigint;tokenMint?:string;tokenAmountRaw?:string;planId?:string;payload?:Record<string,unknown>;}
 export interface LifecycleSettlementInput {
   lifecycle:PositionLifecycle;
@@ -697,6 +712,21 @@ export function assessLifecycleSettlement(input:LifecycleSettlementInput):Lifecy
   if(!input.reconciliationClean)reasons.push("SETTLEMENT_RECONCILIATION_REQUIRED");
   if(!input.reservationClean)reasons.push("SETTLEMENT_RESERVATION_PENDING");
   reasons.push(...assertLifecycleTransactionsTerminal(input.transactions));
+  // A finalized failed child landed and paid a network fee even though its
+  // protocol action did not succeed.  Do not permit terminal settlement to
+  // erase that receipt: the exact transaction/signature-bound TX_COST must be
+  // durable first.  Expired PROVEN_NOT_LANDED children intentionally do not
+  // require a cost receipt.
+  for(const transaction of input.transactions.filter(tx=>tx.state==='FAILED_FINAL')){
+    if(!transaction.signature){reasons.push(`SETTLEMENT_FAILED_TX_RECEIPT_IDENTITY_MISSING:${transaction.transactionId}`);continue;}
+    const fee=input.cashflows.some(cashflow=>
+      cashflow.flowType==='TX_COST'&&
+      cashflow.planId===transaction.planId&&
+      cashflow.payload?.transactionId===transaction.transactionId&&
+      cashflow.payload?.signature===transaction.signature
+    );
+    if(!fee)reasons.push(`SETTLEMENT_FAILED_TX_COST_RECEIPT_MISSING:${transaction.transactionId}`);
+  }
   for(const lot of input.inventoryLots){
     if(lot.status==="DUST_RETAINED"){
       const dust=lot.payload.dustDisposition;
@@ -1405,7 +1435,7 @@ export interface Phase1Store {
   loadPendingPositionManagementDecisionAuditCompactions(limit?:number):Promise<string[]>;
   compactPositionManagementDecisionAudit(value:{positionAddress:string;at:string}):Promise<{compacted:boolean}>;
   upsertCloseFeeAttributionSnapshot(value:{closePlanId:string;positionAddress:string;poolAddress:string;ownerAddress:string;observedSlot?:bigint;observedAt:string;observedBlockTime?:string;commitment:string;tokenXMint:string;tokenYMint:string;tokenXDecimals?:number;tokenYDecimals?:number;preCloseFeeXRaw:bigint;preCloseFeeYRaw:bigint;preCloseRewardOneRaw:bigint;preCloseRewardTwoRaw:bigint}):Promise<void>;
-  finalizeCloseFeeAttribution(value:{closePlanId:string;positionAddress:string;removeSignature:string;claimSignature?:string;terminalSettlementId:string;at:string}):Promise<{status:'COMPLETE'|'PARTIAL'|'UNAVAILABLE';reasonCodes:string[]}>;
+  finalizeCloseFeeAttribution(value:{closePlanId:string;positionAddress:string;removeSignature:string;claimSignatures?:string[];terminalSettlementId:string;at:string}):Promise<{status:'COMPLETE'|'PARTIAL'|'UNAVAILABLE';reasonCodes:string[]}>;
 
   createLiveSolSettledLearningOutcome(value:{positionAddress:string;at:string}):Promise<{created:boolean;outcome?:LiveLearningOutcome;reasonCodes:string[]}>;
   createLiveEntryAbortedLearningOutcome(value:{planId:string;at:string}):Promise<{created:boolean;outcome?:LiveLearningOutcome;reasonCodes:string[]}>;
@@ -1493,6 +1523,10 @@ export interface Phase1Store {
     blockhash: string;
     lastValidBlockHeight: number;
     preparedAt: string;
+    /** Deterministic first signature extracted from signed Solana wire bytes.
+     * It is stored before transport so recovery can query that exact identity
+     * even if the RPC response is lost. */
+    signature?: string;
     payload: Record<string, unknown>;
   }): Promise<"PREPARED" | "DUPLICATE">;
   markSubmissionSent(
@@ -1504,6 +1538,7 @@ export interface Phase1Store {
     attemptId: string,
     at: string,
     error: string,
+    signature?: string,
   ): Promise<void>;
   /** A signature was observed absent after its blockhash expired.  This is a
    * terminal no-effect recovery result, never permission to resend it. */
@@ -1571,6 +1606,10 @@ export interface Phase1Store {
   updateExecutionJournal(value: {
     idempotencyKey: string;
     expectedVersion: number;
+    /** The current child recovery cursor.  Supplying a different transaction
+     * replaces (and may clear) the prior child's signature atomically. */
+    transactionId?: string;
+    clearTransactionIdentity?: boolean;
     state: ExecutionJournalState;
     signature?: string;
     blockhash?: string;
@@ -3462,8 +3501,20 @@ return 'APPLIED';
       );
     },
     async insertExecutionIntent(v) {
-      await db.query(
-        `INSERT INTO execution.intents(intent_id,idempotency_key,action,pool_address,owner_address,position_address,thesis_id,observed_at,expires_at,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb) ON CONFLICT(intent_id) DO NOTHING`,
+      const result=await db.query(
+        `INSERT INTO execution.intents(intent_id,idempotency_key,action,pool_address,owner_address,position_address,thesis_id,observed_at,expires_at,payload)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)
+         ON CONFLICT(intent_id) DO UPDATE SET intent_id=execution.intents.intent_id
+         WHERE execution.intents.idempotency_key=EXCLUDED.idempotency_key
+           AND execution.intents.action=EXCLUDED.action
+           AND execution.intents.pool_address=EXCLUDED.pool_address
+           AND execution.intents.owner_address=EXCLUDED.owner_address
+           AND execution.intents.position_address IS NOT DISTINCT FROM EXCLUDED.position_address
+           AND execution.intents.thesis_id=EXCLUDED.thesis_id
+           AND execution.intents.observed_at=EXCLUDED.observed_at
+           AND execution.intents.expires_at=EXCLUDED.expires_at
+           AND execution.intents.payload=EXCLUDED.payload
+         RETURNING intent_id`,
         [
           v.intentId,
           v.idempotencyKey,
@@ -3477,41 +3528,65 @@ return 'APPLIED';
           json(v.payload),
         ],
       );
+      if(result.rows.length!==1)throw new Error("LPFORGE_EXECUTION_INTENT_IDENTITY_CONFLICT");
     },
     async insertTransactionPlan(v) {
-      await db.query(
-        `INSERT INTO execution.transaction_plans(plan_id,intent_id,cluster,state,created_at,expires_at,payload) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb) ON CONFLICT(plan_id) DO NOTHING`,
-        [
-          v.planId,
-          v.intentId,
-          v.cluster,
-          v.state,
-          v.createdAt,
-          v.expiresAt,
-          json(v.payload),
-        ],
-      );
-      for (const step of v.steps)
-        await db.query(
-          `INSERT INTO execution.transaction_steps(transaction_id,plan_id,sequence,kind,state,required_signers,metadata) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb) ON CONFLICT(transaction_id) DO NOTHING`,
-          [
-            step.transactionId,
-            v.planId,
-            step.sequence,
-            step.kind,
-            step.state,
-            json(step.requiredSignerAddresses),
-            json(step.metadata),
-          ],
+      await db.query("BEGIN");
+      try{
+        const plan=await db.query(
+          `INSERT INTO execution.transaction_plans(plan_id,intent_id,cluster,state,created_at,expires_at,payload)
+           VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)
+           ON CONFLICT(plan_id) DO UPDATE SET plan_id=execution.transaction_plans.plan_id
+           WHERE execution.transaction_plans.intent_id=EXCLUDED.intent_id
+             AND execution.transaction_plans.cluster=EXCLUDED.cluster
+             AND execution.transaction_plans.state=EXCLUDED.state
+             AND execution.transaction_plans.created_at=EXCLUDED.created_at
+             AND execution.transaction_plans.expires_at=EXCLUDED.expires_at
+             AND execution.transaction_plans.payload=EXCLUDED.payload
+           RETURNING plan_id`,
+          [v.planId,v.intentId,v.cluster,v.state,v.createdAt,v.expiresAt,json(v.payload)],
         );
+        if(plan.rows.length!==1)throw new Error("LPFORGE_EXECUTION_PLAN_IDENTITY_CONFLICT");
+        for (const step of v.steps){
+          const inserted=await db.query(
+            `INSERT INTO execution.transaction_steps(transaction_id,plan_id,sequence,kind,state,required_signers,metadata)
+             VALUES($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb)
+             ON CONFLICT(transaction_id) DO UPDATE SET transaction_id=execution.transaction_steps.transaction_id
+             WHERE execution.transaction_steps.plan_id=EXCLUDED.plan_id
+               AND execution.transaction_steps.sequence=EXCLUDED.sequence
+               AND execution.transaction_steps.kind=EXCLUDED.kind
+               AND execution.transaction_steps.state=EXCLUDED.state
+               AND execution.transaction_steps.required_signers=EXCLUDED.required_signers
+               AND execution.transaction_steps.metadata=EXCLUDED.metadata
+             RETURNING transaction_id`,
+            [step.transactionId,v.planId,step.sequence,step.kind,step.state,json(step.requiredSignerAddresses),json(step.metadata)],
+          );
+          if(inserted.rows.length!==1)throw new Error("LPFORGE_EXECUTION_STEP_IDENTITY_CONFLICT");
+        }
+        await db.query("COMMIT");
+      }catch(error){
+        try{await db.query("ROLLBACK");}catch{}
+        throw error;
+      }
     },
     async ensureExecutionTransactionStep(v) {
-      await db.query(
+      const result=await db.query(
         `INSERT INTO execution.transaction_steps(transaction_id,plan_id,sequence,kind,state,required_signers,metadata)
          SELECT $1,$2,COALESCE((SELECT MAX(sequence)+1 FROM execution.transaction_steps WHERE plan_id=$2),1),$3,$4,$5::jsonb,$6::jsonb
          ON CONFLICT(transaction_id) DO UPDATE
          SET required_signers=EXCLUDED.required_signers,
-             metadata=execution.transaction_steps.metadata||EXCLUDED.metadata`,
+             metadata=execution.transaction_steps.metadata||EXCLUDED.metadata
+         WHERE execution.transaction_steps.plan_id=EXCLUDED.plan_id
+           AND execution.transaction_steps.kind=EXCLUDED.kind
+           AND (execution.transaction_steps.required_signers='[]'::jsonb
+                OR execution.transaction_steps.required_signers=EXCLUDED.required_signers)
+           AND NOT EXISTS (
+             SELECT 1
+             FROM jsonb_each(execution.transaction_steps.metadata) existing(key,value)
+             JOIN jsonb_each(EXCLUDED.metadata) incoming(key,value) USING(key)
+             WHERE existing.value IS DISTINCT FROM incoming.value
+           )
+         RETURNING transaction_id`,
         [
           v.transactionId,
           v.planId,
@@ -3521,8 +3596,17 @@ return 'APPLIED';
           json(v.metadata),
         ],
       );
+      if(result.rows.length!==1)
+        throw new Error("LPFORGE_EXECUTION_STEP_IDENTITY_CONFLICT");
     },
     async claimNextAutonomousPlan(now) {
+      // Plan selection, state transition, and its audit event are one
+      // serialized transaction.  SKIP LOCKED alone protects a plan row, but
+      // two workers could otherwise claim different plans for the same
+      // position from the same MVCC snapshot during a restart overlap.
+      await db.query("BEGIN");
+      try {
+      await db.query("SELECT pg_advisory_xact_lock(hashtext($1))",["lpforge:execution-plan-claim:v1"]);
       // An expired recommendation is no longer a valid expression of the market
       // thesis that created it.  Finalize it before looking for work so it cannot
       // remain an apparently queued plan (or be confused with a retryable plan)
@@ -3555,7 +3639,7 @@ return 'APPLIED';
         [now],
       );
       const plan = claimed.rows[0];
-      if (!plan) return undefined;
+      if (!plan) { await db.query("COMMIT"); return undefined; }
       await db.query(
         `INSERT INTO execution.plan_state_events(plan_id,prior_state,next_state,observed_at,reason_codes,payload) VALUES($1,'PLANNED','CLAIMED',$2,'[]'::jsonb,'{}'::jsonb)`,
         [String(plan.plan_id), now],
@@ -3566,7 +3650,12 @@ return 'APPLIED';
       );
       const row = detail.rows[0];
       if (!row) throw new Error("LPFORGE_P6_AUTONOMOUS_PLAN_DETAIL_MISSING");
+      await db.query("COMMIT");
       return autonomousPlanFromRow(row);
+      } catch(error) {
+        try { await db.query("ROLLBACK"); } catch {}
+        throw error;
+      }
     },
     async reserveExecutionCapital(v) {
       const tx=db;
@@ -3685,10 +3774,13 @@ return 'APPLIED';
       };
     },
     async transitionAutonomousPlan(v) {
+      await db.query("BEGIN");
+      try {
       const prior = await db.query(
-        `WITH current AS (SELECT state FROM execution.transaction_plans WHERE plan_id=$1),updated AS (UPDATE execution.transaction_plans SET state=$2,payload=payload||jsonb_build_object('autonomous_dispatch_updated_at',$3::text,'autonomous_dispatch',COALESCE(payload->'autonomous_dispatch','{}'::jsonb)||$4::jsonb) WHERE plan_id=$1 RETURNING plan_id) SELECT state FROM current JOIN updated ON true`,
+        `WITH current AS (SELECT state FROM execution.transaction_plans WHERE plan_id=$1),updated AS (UPDATE execution.transaction_plans SET state=$2,payload=payload||jsonb_build_object('autonomous_dispatch_updated_at',$3::text,'autonomous_dispatch',COALESCE(payload->'autonomous_dispatch','{}'::jsonb)||$4::jsonb) WHERE plan_id=$1 AND (state NOT IN ('RECONCILED','COMPLETED','EXPIRED') OR state=$2) RETURNING plan_id) SELECT state FROM current JOIN updated ON true`,
         [v.planId, v.state, v.at, json(v.payload)],
       );
+      if(prior.rows.length!==1)throw new Error("LPFORGE_EXECUTION_PLAN_MISSING_AT_TRANSITION");
       await db.query(
         `INSERT INTO execution.plan_state_events(plan_id,prior_state,next_state,observed_at,reason_codes,payload) VALUES($1,$2,$3,$4,$5::jsonb,$6::jsonb)`,
         [
@@ -3713,12 +3805,19 @@ return 'APPLIED';
           `UPDATE execution.execution_journal SET state=$2,updated_at=$3,payload=payload||jsonb_build_object('terminalPlanState',$4::text,'terminalizedAt',$3::timestamptz) WHERE plan_id=$1 AND state IN ('PLAN_CREATED','BUILT','SIMULATED','APPROVED','SIGNING','SIGNED','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILIATION_REQUIRED')`,
           [v.planId, terminalJournalState, v.at, v.state],
         );
+      await db.query("COMMIT");
+      } catch(error) {
+        try { await db.query("ROLLBACK"); } catch {}
+        throw error;
+      }
     },
     async resumePreSubmissionClosePlan(v) {
       // This is intentionally narrower than a generic retry.  It revives only
       // a CLOSE-family plan whose previous attempt stopped before any child
       // signature. Its signed plan expiry is restored from the immutable
       // intent instead of being extended: expiry participates in the HMAC.
+      await db.query("BEGIN");
+      try {
       const prior=await db.query(
         `WITH current AS (
            SELECT state FROM execution.transaction_plans
@@ -3733,7 +3832,7 @@ return 'APPLIED';
          ) SELECT current.state FROM current JOIN updated ON true`,
         [v.planId,v.at,json(v.payload)],
       );
-      if(!prior.rows[0])return false;
+      if(!prior.rows[0]){await db.query("COMMIT");return false;}
       await db.query(
         `INSERT INTO execution.plan_state_events(plan_id,prior_state,next_state,observed_at,reason_codes,payload)
          VALUES($1,$2,'PLANNED',$3,$4::jsonb,$5::jsonb)`,
@@ -3749,12 +3848,24 @@ return 'APPLIED';
            AND payload->>'terminalPlanState'='BLOCKED'`,
         [v.planId,v.at],
       );
+      await db.query("COMMIT");
       return true;
+      } catch(error) {
+        try { await db.query("ROLLBACK"); } catch {}
+        throw error;
+      }
     },
     async completeAutonomousPlan(v) {
-      await db.query(
-        `UPDATE execution.transaction_plans SET state=$2,payload=payload||jsonb_build_object('autonomous_dispatch_completed_at',$3::text,'autonomous_dispatch',COALESCE(payload->'autonomous_dispatch','{}'::jsonb)||$4::jsonb) WHERE plan_id=$1`,
+      await db.query("BEGIN");
+      try {
+      const prior=await db.query(
+        `WITH current AS (SELECT state FROM execution.transaction_plans WHERE plan_id=$1),updated AS (UPDATE execution.transaction_plans SET state=$2,payload=payload||jsonb_build_object('autonomous_dispatch_completed_at',$3::text,'autonomous_dispatch',COALESCE(payload->'autonomous_dispatch','{}'::jsonb)||$4::jsonb) WHERE plan_id=$1 AND (state NOT IN ('RECONCILED','COMPLETED','EXPIRED') OR state=$2) RETURNING plan_id) SELECT state FROM current JOIN updated ON true`,
         [v.planId, v.state, v.at, json(v.payload)],
+      );
+      if(prior.rows.length!==1)throw new Error("LPFORGE_EXECUTION_PLAN_MISSING_OR_TERMINAL_CONFLICT_AT_COMPLETION");
+      await db.query(
+        `INSERT INTO execution.plan_state_events(plan_id,prior_state,next_state,observed_at,reason_codes,payload) VALUES($1,$2,$3,$4,'[]'::jsonb,$5::jsonb)`,
+        [v.planId,String(prior.rows[0]!.state),v.state,v.at,json(v.payload)],
       );
       const terminalJournalState =
         v.state === "BLOCKED" || v.state === "FAILED"
@@ -3767,10 +3878,17 @@ return 'APPLIED';
           `UPDATE execution.execution_journal SET state=$2,updated_at=$3::timestamptz,payload=payload||jsonb_build_object('terminalPlanState',$4::text,'terminalizedAt',$3::text) WHERE plan_id=$1 AND state IN ('PLAN_CREATED','BUILT','SIMULATED','APPROVED','SIGNING','SIGNED','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILIATION_REQUIRED')`,
           [v.planId, terminalJournalState, v.at, v.state],
         );
+      await db.query("COMMIT");
+      } catch(error) {
+        try { await db.query("ROLLBACK"); } catch {}
+        throw error;
+      }
     },
     async upsertOwnedPosition(v) {
-      await db.query(
-        `INSERT INTO execution.owned_positions(lpforge_position_id,pool_address,position_address,owner_address,strategy,orientation,lower_bin_id,upper_bin_id,active_bin_at_entry,initial_capital_lamports,entry_plan_id,entry_signature,entry_slot,entered_at,lifecycle_state,last_plan_id,reconciliation_status,last_reconciled_at,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb) ON CONFLICT(lpforge_position_id) DO UPDATE SET lifecycle_state=EXCLUDED.lifecycle_state,last_plan_id=COALESCE(EXCLUDED.last_plan_id,execution.owned_positions.last_plan_id),reconciliation_status=EXCLUDED.reconciliation_status,entry_signature=COALESCE(EXCLUDED.entry_signature,execution.owned_positions.entry_signature),entry_slot=COALESCE(EXCLUDED.entry_slot,execution.owned_positions.entry_slot),last_reconciled_at=EXCLUDED.last_reconciled_at,payload=EXCLUDED.payload`,
+      await db.query("BEGIN");
+      try {
+      const owned=await db.query(
+        `INSERT INTO execution.owned_positions(lpforge_position_id,pool_address,position_address,owner_address,strategy,orientation,lower_bin_id,upper_bin_id,active_bin_at_entry,initial_capital_lamports,entry_plan_id,entry_signature,entry_slot,entered_at,lifecycle_state,last_plan_id,reconciliation_status,last_reconciled_at,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb) ON CONFLICT(lpforge_position_id) DO UPDATE SET lifecycle_state=EXCLUDED.lifecycle_state,last_plan_id=COALESCE(EXCLUDED.last_plan_id,execution.owned_positions.last_plan_id),reconciliation_status=EXCLUDED.reconciliation_status,entry_signature=COALESCE(EXCLUDED.entry_signature,execution.owned_positions.entry_signature),entry_slot=COALESCE(EXCLUDED.entry_slot,execution.owned_positions.entry_slot),last_reconciled_at=EXCLUDED.last_reconciled_at,payload=EXCLUDED.payload WHERE execution.owned_positions.position_address=EXCLUDED.position_address AND execution.owned_positions.pool_address=EXCLUDED.pool_address AND execution.owned_positions.owner_address=EXCLUDED.owner_address AND execution.owned_positions.strategy=EXCLUDED.strategy AND execution.owned_positions.orientation=EXCLUDED.orientation AND execution.owned_positions.lower_bin_id=EXCLUDED.lower_bin_id AND execution.owned_positions.upper_bin_id=EXCLUDED.upper_bin_id AND execution.owned_positions.initial_capital_lamports=EXCLUDED.initial_capital_lamports AND (execution.owned_positions.entry_plan_id IS NULL OR EXCLUDED.entry_plan_id IS NULL OR execution.owned_positions.entry_plan_id=EXCLUDED.entry_plan_id) AND (execution.owned_positions.lifecycle_state NOT IN ('CLOSED','SOL_SETTLED') OR execution.owned_positions.lifecycle_state=EXCLUDED.lifecycle_state) RETURNING lpforge_position_id`,
         [
           v.lpforgePositionId,
           v.poolAddress,
@@ -3793,9 +3911,16 @@ return 'APPLIED';
           json(v.payload),
         ],
       );
-      await db.query("INSERT INTO execution.position_lifecycles(lifecycle_id,position_address,entry_plan_id,owner_address,pool_address,status,created_at,payload) VALUES($1,$2,$3,$4,$5,$6,$7,'{}'::jsonb) ON CONFLICT(position_address) DO UPDATE SET entry_plan_id=COALESCE(execution.position_lifecycles.entry_plan_id,EXCLUDED.entry_plan_id)",[`lifecycle:${v.positionAddress}`,v.positionAddress,v.entryPlanId??null,v.ownerAddress,v.poolAddress,v.lifecycleState==='RECONCILIATION_REQUIRED'?'RECONCILIATION_REQUIRED':v.lifecycleState==='CLOSED'?'CLOSED':'OPEN',v.enteredAt]);
-      if(v.entryPlanId)await db.query("INSERT INTO execution.lifecycle_plan_links(lifecycle_id,plan_id,role,linked_at) VALUES($1,$2,'ENTRY',$3) ON CONFLICT DO NOTHING",[`lifecycle:${v.positionAddress}`,v.entryPlanId,v.enteredAt]);
-      if(v.entryPlanId){const lineage=await db.query("INSERT INTO research.lifecycle_prediction_lineage(lifecycle_id,entry_plan_id,thesis_id,recommendation_id,prediction_id,linked_at,payload) SELECT $1,p.plan_id,t.thesis_id,t.recommendation_id,t.recommendation_id,$3,jsonb_build_object('predictionAuthority','PHASE3_RECOMMENDATION') FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id JOIN research.lp_theses t ON t.thesis_id=i.thesis_id WHERE p.plan_id=$2 ON CONFLICT(lifecycle_id) DO NOTHING RETURNING lifecycle_id",[`lifecycle:${v.positionAddress}`,v.entryPlanId,v.enteredAt]);if(!lineage.rows[0]){const existing=await db.query("SELECT lifecycle_id FROM research.lifecycle_prediction_lineage WHERE lifecycle_id=$1",[`lifecycle:${v.positionAddress}`]);if(!existing.rows[0])throw new Error("LPFORGE_LIVE_OUTCOME_PREDICTION_LINEAGE_MISSING");}}
+      if(owned.rows.length!==1)throw new Error("LPFORGE_OWNED_POSITION_IDENTITY_OR_TERMINAL_STATE_CONFLICT");
+      const lifecycle=await db.query("INSERT INTO execution.position_lifecycles(lifecycle_id,position_address,entry_plan_id,owner_address,pool_address,status,created_at,payload) VALUES($1,$2,$3,$4,$5,$6,$7,'{}'::jsonb) ON CONFLICT(position_address) DO UPDATE SET entry_plan_id=COALESCE(execution.position_lifecycles.entry_plan_id,EXCLUDED.entry_plan_id) WHERE execution.position_lifecycles.owner_address=EXCLUDED.owner_address AND execution.position_lifecycles.pool_address=EXCLUDED.pool_address AND (execution.position_lifecycles.entry_plan_id IS NULL OR EXCLUDED.entry_plan_id IS NULL OR execution.position_lifecycles.entry_plan_id=EXCLUDED.entry_plan_id) AND (execution.position_lifecycles.status NOT IN ('CLOSED','SOL_SETTLED') OR execution.position_lifecycles.status=EXCLUDED.status) RETURNING lifecycle_id",[`lifecycle:${v.positionAddress}`,v.positionAddress,v.entryPlanId??null,v.ownerAddress,v.poolAddress,v.lifecycleState==='RECONCILIATION_REQUIRED'?'RECONCILIATION_REQUIRED':v.lifecycleState==='CLOSED'?'CLOSED':'OPEN',v.enteredAt]);
+      if(lifecycle.rows.length!==1)throw new Error("LPFORGE_POSITION_LIFECYCLE_IDENTITY_OR_TERMINAL_STATE_CONFLICT");
+      if(v.entryPlanId){const linked=await db.query("INSERT INTO execution.lifecycle_plan_links(lifecycle_id,plan_id,role,linked_at) VALUES($1,$2,'ENTRY',$3) ON CONFLICT(lifecycle_id,plan_id) DO UPDATE SET role=execution.lifecycle_plan_links.role WHERE execution.lifecycle_plan_links.role='ENTRY' RETURNING plan_id",[`lifecycle:${v.positionAddress}`,v.entryPlanId,v.enteredAt]);if(linked.rows.length!==1)throw new Error("LPFORGE_LIFECYCLE_ENTRY_PLAN_ROLE_CONFLICT");}
+      if(v.entryPlanId){const lineage=await db.query("INSERT INTO research.lifecycle_prediction_lineage(lifecycle_id,entry_plan_id,thesis_id,recommendation_id,prediction_id,linked_at,payload) SELECT $1,p.plan_id,t.thesis_id,t.recommendation_id,t.recommendation_id,$3,jsonb_build_object('predictionAuthority','PHASE3_RECOMMENDATION') FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id JOIN research.lp_theses t ON t.thesis_id=i.thesis_id WHERE p.plan_id=$2 ON CONFLICT(lifecycle_id) DO NOTHING RETURNING lifecycle_id",[`lifecycle:${v.positionAddress}`,v.entryPlanId,v.enteredAt]);if(!lineage.rows[0]){const existing=await db.query("SELECT lifecycle_id,entry_plan_id FROM research.lifecycle_prediction_lineage WHERE lifecycle_id=$1",[`lifecycle:${v.positionAddress}`]);if(!existing.rows[0])throw new Error("LPFORGE_LIVE_OUTCOME_PREDICTION_LINEAGE_MISSING");if(String(existing.rows[0].entry_plan_id)!==v.entryPlanId)throw new Error("LPFORGE_LIVE_OUTCOME_PREDICTION_LINEAGE_IDENTITY_CONFLICT");}}
+      await db.query("COMMIT");
+      } catch(error) {
+        try { await db.query("ROLLBACK"); } catch {}
+        throw error;
+      }
     },
     async insertPositionObservation(v) {
       await db.query(
@@ -3912,8 +4037,10 @@ return 'APPLIED';
       return r.rows.map(row=>({planId:String(row.plan_id),action:String(row.action) as AutonomousPlanAction,state:String(row.state),createdAt:toIsoTimestamp(row.created_at),expiresAt:toIsoTimestamp(row.expires_at)}));
     },
     async markOwnedPositionLifecycle(v) {
-      await db.query(
-        `UPDATE execution.owned_positions SET lifecycle_state=$2,reconciliation_status=$3,last_plan_id=COALESCE($4,last_plan_id),payload=payload||jsonb_build_object('lifecycle_updated_at',$5::text,'lifecycle',$6::jsonb) WHERE position_address=$1`,
+      await db.query("BEGIN");
+      try {
+      const owned=await db.query(
+        `UPDATE execution.owned_positions SET lifecycle_state=$2,reconciliation_status=$3,last_plan_id=COALESCE($4,last_plan_id),payload=payload||jsonb_build_object('lifecycle_updated_at',$5::text,'lifecycle',$6::jsonb) WHERE position_address=$1 RETURNING position_address`,
         [
           v.positionAddress,
           v.lifecycleState,
@@ -3923,8 +4050,14 @@ return 'APPLIED';
           json(v.payload),
         ],
       );
+      if(owned.rows.length!==1)throw new Error("LPFORGE_OWNED_POSITION_MISSING_AT_LIFECYCLE_TRANSITION");
       if(v.lifecycleState==='RECONCILIATION_REQUIRED')await db.query("UPDATE execution.position_lifecycles SET status='RECONCILIATION_REQUIRED' WHERE position_address=$1 AND status<>'SOL_SETTLED'",[v.positionAddress]);
       if(v.lifecycleState==='CLOSED')await db.query("UPDATE execution.position_lifecycles SET status='CLOSED' WHERE position_address=$1 AND status<>'SOL_SETTLED'",[v.positionAddress]);
+      await db.query("COMMIT");
+      } catch(error) {
+        try { await db.query("ROLLBACK"); } catch {}
+        throw error;
+      }
     },
     async adjustOwnedPositionCapital(v) {
       await db.query(
@@ -3932,19 +4065,28 @@ return 'APPLIED';
         [v.positionAddress, v.capitalLamports.toString(), v.at, json(v.payload)],
       );
     },
-    async insertPositionCashflow(v){await db.query("INSERT INTO execution.position_cashflows(cashflow_id,position_address,plan_id,flow_type,observed_at,lamports,token_mint,token_amount_raw,payload,lifecycle_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,(SELECT lifecycle_id FROM execution.position_lifecycles WHERE position_address=$2)) ON CONFLICT(cashflow_id) DO UPDATE SET lamports=EXCLUDED.lamports,token_mint=EXCLUDED.token_mint,token_amount_raw=EXCLUDED.token_amount_raw,payload=EXCLUDED.payload",[v.cashflowId,v.positionAddress,v.planId,v.flowType,v.observedAt,v.lamports?.toString()??null,v.tokenMint??null,v.tokenAmountRaw??null,json(v.payload)]);},
+    async insertPositionCashflow(v){const r=await db.query("INSERT INTO execution.position_cashflows(cashflow_id,position_address,plan_id,flow_type,observed_at,lamports,token_mint,token_amount_raw,payload,lifecycle_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,(SELECT lifecycle_id FROM execution.position_lifecycles WHERE position_address=$2)) ON CONFLICT(cashflow_id) DO UPDATE SET lamports=EXCLUDED.lamports,token_mint=COALESCE(EXCLUDED.token_mint,execution.position_cashflows.token_mint),token_amount_raw=EXCLUDED.token_amount_raw,payload=execution.position_cashflows.payload||EXCLUDED.payload WHERE execution.position_cashflows.position_address=EXCLUDED.position_address AND execution.position_cashflows.plan_id IS NOT DISTINCT FROM EXCLUDED.plan_id AND execution.position_cashflows.flow_type=EXCLUDED.flow_type AND (execution.position_cashflows.token_mint IS NULL OR EXCLUDED.token_mint IS NULL OR execution.position_cashflows.token_mint=EXCLUDED.token_mint) RETURNING cashflow_id",[v.cashflowId,v.positionAddress,v.planId,v.flowType,v.observedAt,v.lamports?.toString()??null,v.tokenMint??null,v.tokenAmountRaw??null,json(v.payload)]);if(r.rows.length!==1)throw new Error('LPFORGE_POSITION_CASHFLOW_IDENTITY_CONFLICT');},
     async loadPositionCashflows(positionAddress){const r=await db.query("SELECT flow_type,lamports,token_mint,token_amount_raw,payload FROM execution.position_cashflows WHERE position_address=$1 ORDER BY observed_at ASC,cashflow_id ASC",[positionAddress]);return r.rows.map(row=>({flowType:String(row.flow_type),...(row.lamports!==null&&row.lamports!==undefined?{lamports:BigInt(String(row.lamports))}:{}),...(row.token_mint?{tokenMint:String(row.token_mint)}:{}),...(row.token_amount_raw?{tokenAmountRaw:String(row.token_amount_raw)}:{}),...(row.payload&&typeof row.payload==='object'?{payload:row.payload as Record<string,unknown>}:{})}));},
     async insertPositionEntryBasis(v){await db.query("INSERT INTO execution.position_entry_basis_reconciliations(basis_id,position_address,entry_plan_id,classification_version,basis_state,requested_liquidity_capital_lamports,lp_position_principal_lamports,managed_economic_contribution_lamports,execution_cost_lamports,recoverable_rent_debits_lamports,recoverable_rent_refunds_lamports,unclassified_lamports,receipt_provenance,observed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14) ON CONFLICT(basis_id) DO NOTHING",[v.basisId,v.positionAddress,v.entryPlanId,v.classificationVersion,v.basisState,v.requestedLiquidityCapitalLamports.toString(),v.lpPositionPrincipalLamports?.toString()??null,v.managedEconomicContributionLamports?.toString()??null,v.executionCostLamports.toString(),v.recoverableRentDebitsLamports.toString(),v.recoverableRentRefundsLamports.toString(),v.unclassifiedLamports.toString(),json(v.receiptProvenance),v.observedAt]);},
     async loadLatestPositionEntryBasis(positionAddress){const r=await db.query("SELECT basis_id,position_address,entry_plan_id,classification_version,basis_state,requested_liquidity_capital_lamports,lp_position_principal_lamports,managed_economic_contribution_lamports,execution_cost_lamports,recoverable_rent_debits_lamports,recoverable_rent_refunds_lamports,unclassified_lamports,receipt_provenance,observed_at FROM execution.position_entry_basis_reconciliations WHERE position_address=$1 ORDER BY classification_version DESC,created_at DESC LIMIT 1",[positionAddress]),row=r.rows[0];if(!row)return undefined;return{basisId:String(row.basis_id),positionAddress:String(row.position_address),entryPlanId:String(row.entry_plan_id),classificationVersion:Number(row.classification_version),basisState:String(row.basis_state) as PositionEntryBasis['basisState'],requestedLiquidityCapitalLamports:BigInt(String(row.requested_liquidity_capital_lamports)),...(row.lp_position_principal_lamports===null?{}:{lpPositionPrincipalLamports:BigInt(String(row.lp_position_principal_lamports))}),...(row.managed_economic_contribution_lamports===null?{}:{managedEconomicContributionLamports:BigInt(String(row.managed_economic_contribution_lamports))}),executionCostLamports:BigInt(String(row.execution_cost_lamports)),recoverableRentDebitsLamports:BigInt(String(row.recoverable_rent_debits_lamports)),recoverableRentRefundsLamports:BigInt(String(row.recoverable_rent_refunds_lamports)),unclassifiedLamports:BigInt(String(row.unclassified_lamports)),receiptProvenance:(row.receipt_provenance??{}) as Record<string,unknown>,observedAt:toIsoTimestamp(row.observed_at)};},
     async ensurePositionLifecycle(v){
       const lifecycleId=`lifecycle:${v.positionAddress}`;
-      const r=await db.query("INSERT INTO execution.position_lifecycles(lifecycle_id,position_address,entry_plan_id,owner_address,pool_address,predecessor_lifecycle_id,status,created_at,payload) VALUES($1,$2,$3,$4,$5,$6,'OPEN',$7,'{}'::jsonb) ON CONFLICT(position_address) DO UPDATE SET entry_plan_id=COALESCE(execution.position_lifecycles.entry_plan_id,EXCLUDED.entry_plan_id),predecessor_lifecycle_id=COALESCE(execution.position_lifecycles.predecessor_lifecycle_id,EXCLUDED.predecessor_lifecycle_id) RETURNING lifecycle_id,position_address,entry_plan_id,owner_address,pool_address,predecessor_lifecycle_id,status",[lifecycleId,v.positionAddress,v.entryPlanId??null,v.ownerAddress,v.poolAddress,v.predecessorLifecycleId??null,v.at]);
-      if(v.entryPlanId)await db.query("INSERT INTO execution.lifecycle_plan_links(lifecycle_id,plan_id,role,linked_at) VALUES($1,$2,'ENTRY',$3) ON CONFLICT DO NOTHING",[lifecycleId,v.entryPlanId,v.at]);
+      await db.query("BEGIN");
+      try {
+      const r=await db.query("INSERT INTO execution.position_lifecycles(lifecycle_id,position_address,entry_plan_id,owner_address,pool_address,predecessor_lifecycle_id,status,created_at,payload) VALUES($1,$2,$3,$4,$5,$6,'OPEN',$7,'{}'::jsonb) ON CONFLICT(position_address) DO UPDATE SET entry_plan_id=COALESCE(execution.position_lifecycles.entry_plan_id,EXCLUDED.entry_plan_id),predecessor_lifecycle_id=COALESCE(execution.position_lifecycles.predecessor_lifecycle_id,EXCLUDED.predecessor_lifecycle_id) WHERE execution.position_lifecycles.owner_address=EXCLUDED.owner_address AND execution.position_lifecycles.pool_address=EXCLUDED.pool_address AND (execution.position_lifecycles.entry_plan_id IS NULL OR EXCLUDED.entry_plan_id IS NULL OR execution.position_lifecycles.entry_plan_id=EXCLUDED.entry_plan_id) AND (execution.position_lifecycles.predecessor_lifecycle_id IS NULL OR EXCLUDED.predecessor_lifecycle_id IS NULL OR execution.position_lifecycles.predecessor_lifecycle_id=EXCLUDED.predecessor_lifecycle_id) RETURNING lifecycle_id,position_address,entry_plan_id,owner_address,pool_address,predecessor_lifecycle_id,status",[lifecycleId,v.positionAddress,v.entryPlanId??null,v.ownerAddress,v.poolAddress,v.predecessorLifecycleId??null,v.at]);
+      if(r.rows.length!==1)throw new Error("LPFORGE_POSITION_LIFECYCLE_IDENTITY_CONFLICT");
+      if(v.entryPlanId){const linked=await db.query("INSERT INTO execution.lifecycle_plan_links(lifecycle_id,plan_id,role,linked_at) VALUES($1,$2,'ENTRY',$3) ON CONFLICT(lifecycle_id,plan_id) DO UPDATE SET role=execution.lifecycle_plan_links.role WHERE execution.lifecycle_plan_links.role='ENTRY' RETURNING plan_id",[lifecycleId,v.entryPlanId,v.at]);if(linked.rows.length!==1)throw new Error("LPFORGE_LIFECYCLE_ENTRY_PLAN_ROLE_CONFLICT");}
+      await db.query("COMMIT");
       const row=r.rows[0]!;return{lifecycleId:String(row.lifecycle_id),positionAddress:String(row.position_address),...(row.entry_plan_id?{entryPlanId:String(row.entry_plan_id)}:{}),ownerAddress:String(row.owner_address),poolAddress:String(row.pool_address),...(row.predecessor_lifecycle_id?{predecessorLifecycleId:String(row.predecessor_lifecycle_id)}:{}),status:String(row.status) as PositionLifecycle["status"]};
+      } catch(error) {
+        try { await db.query("ROLLBACK"); } catch {}
+        throw error;
+      }
     },
     async linkPositionLifecyclePlan(v){
       const r=await db.query("SELECT lifecycle_id FROM execution.position_lifecycles WHERE position_address=$1",[v.positionAddress]);if(!r.rows[0])throw new Error("LPFORGE_LIFECYCLE_MISSING");
-      await db.query("INSERT INTO execution.lifecycle_plan_links(lifecycle_id,plan_id,role,linked_at) VALUES($1,$2,$3,$4) ON CONFLICT(lifecycle_id,plan_id) DO NOTHING",[r.rows[0].lifecycle_id,v.planId,v.role,v.at]);
+      const linked=await db.query("INSERT INTO execution.lifecycle_plan_links(lifecycle_id,plan_id,role,linked_at) VALUES($1,$2,$3,$4) ON CONFLICT(lifecycle_id,plan_id) DO UPDATE SET role=execution.lifecycle_plan_links.role WHERE execution.lifecycle_plan_links.role=EXCLUDED.role RETURNING plan_id",[r.rows[0].lifecycle_id,v.planId,v.role,v.at]);
+      if(linked.rows.length!==1)throw new Error("LPFORGE_LIFECYCLE_PLAN_ROLE_CONFLICT");
     },
     async loadLifecycleSettlementInput(positionAddress){
       const lr=await db.query("SELECT lifecycle_id,position_address,entry_plan_id,owner_address,pool_address,predecessor_lifecycle_id,status FROM execution.position_lifecycles WHERE position_address=$1",[positionAddress]);if(!lr.rows[0])return undefined;const l=lr.rows[0];
@@ -3957,11 +4099,10 @@ return 'APPLIED';
         // as pending at final settlement would permanently strand an otherwise
         // fully reconciled close.  This is deliberately receipt-bound, rather
         // than inferring success from the plan state alone.
-        db.query("SELECT link.plan_id,link.role,s.transaction_id,s.kind,s.state AS step_state,(a.attempt_id IS NOT NULL) AS has_submission_attempt,COALESCE(a.signature,j.signature) AS signature,CASE WHEN s.kind='JUPITER_UNWIND' AND a.signature IS NULL AND ((p.payload #>> '{autonomous_dispatch,attributableTokenX}'='0' AND p.payload #>> '{autonomous_dispatch,attributableTokenY}'='0') OR (link.role='ENTRY' AND EXISTS(SELECT 1 FROM execution.transaction_steps opened JOIN execution.submission_attempts opened_attempt ON opened_attempt.transaction_id=opened.transaction_id JOIN execution.confirmations opened_confirmation ON opened_confirmation.attempt_id=opened_attempt.attempt_id AND opened_confirmation.status IN ('CONFIRMED','FINALIZED') WHERE opened.plan_id=p.plan_id AND opened.kind='METEORA_OPEN'))) THEN 'SKIPPED_NO_EFFECT' ELSE COALESCE(CASE WHEN a.state='EXPIRED' THEN 'EXPIRED' ELSE c.status END,CASE WHEN j.state IN ('CONFIRMED','RECONCILED') THEN 'CONFIRMED' WHEN j.state IN ('FAILED','EXPIRED') THEN j.state ELSE NULL END,a.state,CASE WHEN s.state IN ('CONFIRMED','COMPLETED') THEN 'CONFIRMED' ELSE s.state END) END state FROM execution.lifecycle_plan_links link JOIN execution.transaction_plans p ON p.plan_id=link.plan_id JOIN execution.transaction_steps s ON s.plan_id=link.plan_id LEFT JOIN LATERAL (SELECT attempt_id,signature,state FROM execution.submission_attempts WHERE transaction_id=s.transaction_id ORDER BY attempt DESC LIMIT 1) a ON true LEFT JOIN LATERAL (SELECT status FROM execution.confirmations WHERE attempt_id=a.attempt_id ORDER BY observed_at DESC LIMIT 1) c ON true LEFT JOIN LATERAL (SELECT state,signature FROM execution.execution_journal WHERE transaction_id=s.transaction_id ORDER BY updated_at DESC LIMIT 1) j ON true WHERE link.lifecycle_id=$1 ORDER BY s.sequence",[l.lifecycle_id]),
+        db.query("SELECT link.plan_id,link.role,s.transaction_id,s.kind,s.state AS step_state,(a.attempt_id IS NOT NULL) AS has_submission_attempt,COALESCE(a.signature,j.signature) AS signature,CASE WHEN a.attempt_id IS NULL AND s.state IN ('FAILED','EXPIRED') THEN 'SKIPPED_NO_EFFECT' WHEN s.kind='JUPITER_UNWIND' AND a.signature IS NULL AND ((p.payload #>> '{autonomous_dispatch,attributableTokenX}'='0' AND p.payload #>> '{autonomous_dispatch,attributableTokenY}'='0') OR (link.role='ENTRY' AND EXISTS(SELECT 1 FROM execution.transaction_steps opened JOIN execution.submission_attempts opened_attempt ON opened_attempt.transaction_id=opened.transaction_id JOIN execution.confirmations opened_confirmation ON opened_confirmation.attempt_id=opened_attempt.attempt_id AND opened_confirmation.status IN ('CONFIRMED','FINALIZED') WHERE opened.plan_id=p.plan_id AND opened.kind='METEORA_OPEN'))) THEN 'SKIPPED_NO_EFFECT' ELSE COALESCE(CASE WHEN a.state='EXPIRED' THEN 'EXPIRED' ELSE c.status END,CASE WHEN j.state IN ('CONFIRMED','RECONCILED') THEN 'CONFIRMED' WHEN j.state IN ('FAILED','EXPIRED') THEN j.state ELSE NULL END,a.state,CASE WHEN s.state IN ('CONFIRMED','COMPLETED') THEN 'CONFIRMED' ELSE s.state END) END state FROM execution.lifecycle_plan_links link JOIN execution.transaction_plans p ON p.plan_id=link.plan_id JOIN execution.transaction_steps s ON s.plan_id=link.plan_id LEFT JOIN LATERAL (SELECT attempt_id,signature,state FROM execution.submission_attempts WHERE transaction_id=s.transaction_id ORDER BY attempt DESC LIMIT 1) a ON true LEFT JOIN LATERAL (SELECT status FROM execution.confirmations WHERE attempt_id=a.attempt_id ORDER BY observed_at DESC LIMIT 1) c ON true LEFT JOIN LATERAL (SELECT state,signature FROM execution.execution_journal WHERE transaction_id=s.transaction_id ORDER BY updated_at DESC LIMIT 1) j ON true WHERE link.lifecycle_id=$1 ORDER BY s.sequence",[l.lifecycle_id]),
         db.query("SELECT NOT EXISTS(SELECT 1 FROM execution.owned_positions WHERE position_address=$1 AND lifecycle_state='RECONCILIATION_REQUIRED') AS reconciliation_clean,NOT EXISTS(SELECT 1 FROM execution.capital_reservations r JOIN execution.lifecycle_plan_links link ON link.plan_id=r.plan_id WHERE link.lifecycle_id=$2 AND r.state IN ('RESERVED','SUBMITTED')) AS reservation_clean",[positionAddress,l.lifecycle_id])
       ]);
-      const normalize=(state:string):LifecycleChildTransactionState=>state==='CONFIRMED'||state==='FINALIZED'||state==='SKIPPED_NO_EFFECT'?"CONFIRMED":state==='FAILED'||state==='EXPIRED'?"FAILED_FINAL":state==='PROVEN_NOT_LANDED'?"PROVEN_NOT_LANDED":state==='UNKNOWN'?"UNKNOWN":state==='SUBMITTED'||state==='SENT'||state==='PROCESSED'?"SUBMITTED":state==='PREPARED'?"CONFIRMATION_PENDING":"RECOVERY_PENDING";
-      return {lifecycle:{lifecycleId:String(l.lifecycle_id),positionAddress:String(l.position_address),...(l.entry_plan_id?{entryPlanId:String(l.entry_plan_id)}:{}),ownerAddress:String(l.owner_address),poolAddress:String(l.pool_address),...(l.predecessor_lifecycle_id?{predecessorLifecycleId:String(l.predecessor_lifecycle_id)}:{}),status:String(l.status) as PositionLifecycle["status"]},cashflows:cash.rows.map(row=>({cashflowId:String(row.cashflow_id),flowType:String(row.flow_type),...(row.plan_id?{planId:String(row.plan_id)}:{}),...(row.lamports===null?{}:{lamports:BigInt(String(row.lamports))}),...(row.token_mint?{tokenMint:String(row.token_mint)}:{}),...(row.token_amount_raw===null?{}:{tokenAmountRaw:String(row.token_amount_raw)}),...(row.payload&&typeof row.payload==='object'?{payload:row.payload as Record<string,unknown>}:{})})),inventoryLots:lots.rows.map(row=>({lotId:String(row.lot_id),positionAddress:String(row.position_address),planId:String(row.plan_id),ownerAddress:String(row.owner_address),poolAddress:String(row.pool_address),tokenMint:String(row.token_mint),tokenSide:String(row.token_side) as PositionInventoryLotSide,sourceEvent:String(row.source_event) as PositionInventoryLotSource,...(row.source_cashflow_id?{sourceCashflowId:String(row.source_cashflow_id)}:{}),rawAmount:BigInt(String(row.raw_amount)),remainingRawAmount:BigInt(String(row.remaining_raw_amount)),decimals:Number(row.decimals),acquiredAt:toIsoTimestamp(row.acquired_at),status:String(row.status) as PositionInventoryLotStatus,payload:(row.payload??{}) as Record<string,unknown>})),transactions:tx.rows.filter(row=>shouldIncludeLifecycleTransactionForSettlement({hasSubmissionAttempt:Boolean(row.has_submission_attempt),stepState:String(row.step_state)})).map(row=>({transactionId:String(row.transaction_id),...(row.signature?{signature:String(row.signature)}:{}),...(row.plan_id?{planId:String(row.plan_id)}:{}),...(row.role?{planRole:String(row.role) as "ENTRY"|"MANAGEMENT"|"CLOSE"|"RECOVERY"}:{}),...(row.kind?{kind:String(row.kind)}:{}),state:normalize(String(row.state))})),reconciliationClean:Boolean(res.rows[0]?.reconciliation_clean),reservationClean:Boolean(res.rows[0]?.reservation_clean)};
+      return {lifecycle:{lifecycleId:String(l.lifecycle_id),positionAddress:String(l.position_address),...(l.entry_plan_id?{entryPlanId:String(l.entry_plan_id)}:{}),ownerAddress:String(l.owner_address),poolAddress:String(l.pool_address),...(l.predecessor_lifecycle_id?{predecessorLifecycleId:String(l.predecessor_lifecycle_id)}:{}),status:String(l.status) as PositionLifecycle["status"]},cashflows:cash.rows.map(row=>({cashflowId:String(row.cashflow_id),flowType:String(row.flow_type),...(row.plan_id?{planId:String(row.plan_id)}:{}),...(row.lamports===null?{}:{lamports:BigInt(String(row.lamports))}),...(row.token_mint?{tokenMint:String(row.token_mint)}:{}),...(row.token_amount_raw===null?{}:{tokenAmountRaw:String(row.token_amount_raw)}),...(row.payload&&typeof row.payload==='object'?{payload:row.payload as Record<string,unknown>}:{})})),inventoryLots:lots.rows.map(row=>({lotId:String(row.lot_id),positionAddress:String(row.position_address),planId:String(row.plan_id),ownerAddress:String(row.owner_address),poolAddress:String(row.pool_address),tokenMint:String(row.token_mint),tokenSide:String(row.token_side) as PositionInventoryLotSide,sourceEvent:String(row.source_event) as PositionInventoryLotSource,...(row.source_cashflow_id?{sourceCashflowId:String(row.source_cashflow_id)}:{}),rawAmount:BigInt(String(row.raw_amount)),remainingRawAmount:BigInt(String(row.remaining_raw_amount)),decimals:Number(row.decimals),acquiredAt:toIsoTimestamp(row.acquired_at),status:String(row.status) as PositionInventoryLotStatus,payload:(row.payload??{}) as Record<string,unknown>})),transactions:tx.rows.filter(row=>shouldIncludeLifecycleTransactionForSettlement({hasSubmissionAttempt:Boolean(row.has_submission_attempt),stepState:String(row.step_state)})).map(row=>({transactionId:String(row.transaction_id),...(row.signature?{signature:String(row.signature)}:{}),...(row.plan_id?{planId:String(row.plan_id)}:{}),...(row.role?{planRole:String(row.role) as "ENTRY"|"MANAGEMENT"|"CLOSE"|"RECOVERY"}:{}),...(row.kind?{kind:String(row.kind)}:{}),state:normalizeLifecycleChildTransactionState(String(row.state))})),reconciliationClean:Boolean(res.rows[0]?.reconciliation_clean),reservationClean:Boolean(res.rows[0]?.reservation_clean)};
     },
     async persistLifecycleSolSettlement(v){
       if(!v.assessment.ready)throw new Error(`LPFORGE_SETTLEMENT_NOT_READY:${v.assessment.reasonCodes.join(',')}`);
@@ -3972,12 +4113,14 @@ return 'APPLIED';
         if(prior&&String(prior.evidence_hash)===evidenceHash){await db.query("COMMIT");return{lifecycleId:input.lifecycle.lifecycleId,settlementId:String(prior.settlement_id),created:false};}
         const version=prior?Number(prior.settlement_version)+1:1,settlementId=`settlement:${input.lifecycle.lifecycleId}:v${version}`;
         await db.query("INSERT INTO execution.lifecycle_sol_settlements(settlement_id,lifecycle_id,settlement_version,position_address,owner_address,pool_address,entry_plan_id,total_sol_in_lamports,total_sol_out_lamports,rent_locked_lamports,rent_recovered_lamports,net_rent_cost_lamports,realized_sol_pnl_lamports,cashflow_count,inventory_lot_count,child_transaction_count,position_checked_at,position_checked_slot,reconciliation_verified_at,source_commit,policy_hash,migration_head,build_id,evidence_hash,settled_at,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26::jsonb)",[settlementId,input.lifecycle.lifecycleId,version,input.lifecycle.positionAddress,input.lifecycle.ownerAddress,input.lifecycle.poolAddress,input.lifecycle.entryPlanId??null,assessment.totalSolInLamports.toString(),assessment.totalSolOutLamports.toString(),assessment.rentLockedLamports.toString(),assessment.rentRecoveredLamports.toString(),assessment.netRentCostLamports.toString(),assessment.realizedSolPnlLamports.toString(),input.cashflows.length,input.inventoryLots.length,input.transactions.length,input.positionCheckedAt,input.positionCheckedSlot?.toString()??null,v.at,v.sourceCommit??null,v.policyHash??null,v.migrationHead??null,v.buildId??null,evidenceHash,v.at,json({accountingConvention:'gross-sol-instruction-flows-v1',reasonCodes:assessment.reasonCodes,positionAbsence:{checkedAt:input.positionCheckedAt,slot:input.positionCheckedSlot?.toString()??null,commitment:'confirmed'},...(prior?{supersedesSettlementId:String(prior.settlement_id),supersedesSettlementVersion:Number(prior.settlement_version),supersessionReason:'ADDITIONAL_CONFIRMED_ATTRIBUTABLE_CASHFLOW'}:{})})]);
-        await db.query("UPDATE execution.position_lifecycles SET status='SOL_SETTLED',settled_at=$2 WHERE lifecycle_id=$1",[input.lifecycle.lifecycleId,v.at]);
+        const lifecycleUpdated=await db.query("UPDATE execution.position_lifecycles SET status='SOL_SETTLED',settled_at=$2 WHERE lifecycle_id=$1 AND position_address=$3 AND owner_address=$4 AND pool_address=$5 RETURNING lifecycle_id",[input.lifecycle.lifecycleId,v.at,input.lifecycle.positionAddress,input.lifecycle.ownerAddress,input.lifecycle.poolAddress]);
+        if(lifecycleUpdated.rows.length!==1)throw new Error("LPFORGE_SETTLEMENT_LIFECYCLE_IDENTITY_CONFLICT");
         // `payload.lifecycle` is an operational progress hint, not the lifecycle
         // authority.  Clear it atomically with the terminal columns so a prior
         // SETTLEMENT_BLOCKED hint cannot survive a successful, reconciled
         // SOL_SETTLED transition and mislead a later observer/recovery pass.
-        await db.query("UPDATE execution.owned_positions SET lifecycle_state='SOL_SETTLED',reconciliation_status='MATCH',payload=payload-'lifecycle' WHERE position_address=$1",[input.lifecycle.positionAddress]);
+        const ownedUpdated=await db.query("UPDATE execution.owned_positions SET lifecycle_state='SOL_SETTLED',reconciliation_status='MATCH',payload=payload-'lifecycle' WHERE position_address=$1 AND owner_address=$2 AND pool_address=$3 RETURNING position_address",[input.lifecycle.positionAddress,input.lifecycle.ownerAddress,input.lifecycle.poolAddress]);
+        if(ownedUpdated.rows.length!==1)throw new Error("LPFORGE_SETTLEMENT_OWNED_POSITION_IDENTITY_CONFLICT");
         await db.query("COMMIT");return{lifecycleId:input.lifecycle.lifecycleId,settlementId,created:true,...(prior?{superseded:true}:{})};
       }catch(error){try{await db.query("ROLLBACK");}catch{}throw error;}
     },
@@ -4010,11 +4153,11 @@ return 'APPLIED';
       if(!life.rows[0]||!settlement.rows[0])return{status:'UNAVAILABLE' as const,reasonCodes:['TERMINAL_SETTLEMENT_UNAVAILABLE']};
       const amount=(f:Record<string,unknown>)=>f.lamports!==null&&f.lamports!==undefined?BigInt(String(f.lamports)):f.token_mint===WSOL_MINT&&f.token_amount_raw!==null&&f.token_amount_raw!==undefined?BigInt(String(f.token_amount_raw)):0n;
       const rows=flows.rows,closeRows=rows.filter(flow=>String(flow.plan_id)===v.closePlanId),findRaw=(mint:string)=>closeRows.filter(flow=>String(flow.flow_type)==='CLOSE_WITHDRAWAL'&&String(flow.token_mint??'')===mint).reduce((n,flow)=>n+BigInt(String(flow.token_amount_raw??0)),0n),closeNative=closeRows.filter(flow=>String(flow.flow_type)==='CLOSE_WITHDRAWAL').reduce((n,flow)=>n+amount(flow),0n),swap=closeRows.filter(flow=>String(flow.flow_type)==='SWAP_PROCEEDS').reduce((n,flow)=>n+amount(flow),0n),claims=rows.filter(flow=>String(flow.flow_type)==='FEE_CLAIM').reduce((n,flow)=>n+amount(flow),0n),rewards=rows.filter(flow=>String(flow.flow_type)==='REWARD_CLAIM').reduce((n,flow)=>n+amount(flow),0n),txCosts=rows.filter(flow=>['TX_COST','SWAP_COST'].includes(String(flow.flow_type))).reduce((n,flow)=>n+amount(flow),0n),rentLocked=rows.filter(flow=>String(flow.flow_type)==='RENT_LOCK').reduce((n,flow)=>n+amount(flow),0n),rentRecovered=rows.filter(flow=>String(flow.flow_type)==='RENT_RECOVERY').reduce((n,flow)=>n+amount(flow),0n);
-      const terminalClaim=closeRows.some(flow=>String(flow.flow_type)==='FEE_CLAIM'&&v.claimSignature!==undefined&&typeof (flow.payload as Record<string,unknown>|null)?.signature==='string'&&String((flow.payload as Record<string,unknown>).signature)===v.claimSignature),preCloseFeeXRaw=BigInt(String(row.pre_close_fee_x_raw)),preCloseFeeYRaw=BigInt(String(row.pre_close_fee_y_raw)),claimedFeeXRaw=terminalClaim&&String(row.token_x_mint)===WSOL_MINT?preCloseFeeXRaw:0n,claimedFeeYRaw=terminalClaim&&String(row.token_y_mint)===WSOL_MINT?preCloseFeeYRaw:0n;
+      const claimSignatures=new Set(v.claimSignatures??[]),terminalClaim=closeRows.some(flow=>String(flow.flow_type)==='FEE_CLAIM'&&typeof (flow.payload as Record<string,unknown>|null)?.signature==='string'&&claimSignatures.has(String((flow.payload as Record<string,unknown>).signature))),preCloseFeeXRaw=BigInt(String(row.pre_close_fee_x_raw)),preCloseFeeYRaw=BigInt(String(row.pre_close_fee_y_raw)),claimedFeeXRaw=terminalClaim&&String(row.token_x_mint)===WSOL_MINT?preCloseFeeXRaw:0n,claimedFeeYRaw=terminalClaim&&String(row.token_y_mint)===WSOL_MINT?preCloseFeeYRaw:0n;
       const accounting=deriveCloseFeeAttributionAccounting({tokenXMint:String(row.token_x_mint),tokenYMint:String(row.token_y_mint),preCloseFeeXRaw,preCloseFeeYRaw,...(row.token_x_decimals===null?{}:{tokenXDecimals:Number(row.token_x_decimals)}),...(row.token_y_decimals===null?{}:{tokenYDecimals:Number(row.token_y_decimals)}),closeTokenXRaw:findRaw(String(row.token_x_mint)),closeTokenYRaw:findRaw(String(row.token_y_mint)),closeNativeLamports:closeNative,swapProceedsLamports:swap,explicitClaimLamports:claims,rewardLamports:rewards,initialCapitalLamports:BigInt(String(life.rows[0].initial_capital_lamports)),transactionCostLamports:txCosts,rentLockedLamports:rentLocked,rentRecoveredLamports:rentRecovered,realizedSolPnlLamports:BigInt(String(settlement.rows[0].realized_sol_pnl_lamports))});
       const reasons=[...accounting.reasonCodes,...(BigInt(String(row.pre_close_reward_one_raw))>0n||BigInt(String(row.pre_close_reward_two_raw))>0n?['REWARD_ATTRIBUTION_UNAVAILABLE']:[])],status: 'COMPLETE'|'PARTIAL'=reasons.length?'PARTIAL':accounting.status;
       const embeddedFeeXRaw=accounting.embeddedRemoveFeeXRaw-claimedFeeXRaw,embeddedFeeYRaw=accounting.embeddedRemoveFeeYRaw-claimedFeeYRaw;
-      await db.query("UPDATE execution.close_fee_attributions SET claimed_fee_x_raw=$2,claimed_fee_y_raw=$3,embedded_remove_fee_x_raw=$4,embedded_remove_fee_y_raw=$5,total_realized_fee_x_raw=$6,total_realized_fee_y_raw=$7,realized_lp_fee_value_lamports=$8,realized_rewards_value_lamports=$9,principal_returned_value_lamports=$10,inventory_unwind_result_lamports=$11,transaction_cost_lamports=$12,rent_recovered_lamports=$13,accounting_reconciliation_difference_lamports=$14,attribution_status=$15,reason_codes=$16::jsonb,remove_signature=$17,claim_signature=$18,terminal_settlement_id=$19,valuation_payload=$20::jsonb,finalized_at=$21 WHERE close_plan_id=$1",[v.closePlanId,claimedFeeXRaw.toString(),claimedFeeYRaw.toString(),embeddedFeeXRaw.toString(),embeddedFeeYRaw.toString(),accounting.embeddedRemoveFeeXRaw.toString(),accounting.embeddedRemoveFeeYRaw.toString(),accounting.realizedLpFeeValueLamports?.toString()??null,rewards.toString(),accounting.principalReturnedValueLamports?.toString()??null,accounting.inventoryUnwindResultLamports?.toString()??null,txCosts.toString(),rentRecovered.toString(),accounting.accountingReconciliationDifferenceLamports?.toString()??null,status,json([...new Set(reasons)].sort()),v.removeSignature,v.claimSignature??null,v.terminalSettlementId,json({valuationMethod:'WSOL_RAW_OR_CONFIRMED_UNWIND_PRO_RATA',terminalClaimObserved:terminalClaim,swapProceedsLamports:swap.toString(),closeTokenXRaw:findRaw(String(row.token_x_mint)).toString(),closeTokenYRaw:findRaw(String(row.token_y_mint)).toString()}),v.at]);
+      await db.query("UPDATE execution.close_fee_attributions SET claimed_fee_x_raw=$2,claimed_fee_y_raw=$3,embedded_remove_fee_x_raw=$4,embedded_remove_fee_y_raw=$5,total_realized_fee_x_raw=$6,total_realized_fee_y_raw=$7,realized_lp_fee_value_lamports=$8,realized_rewards_value_lamports=$9,principal_returned_value_lamports=$10,inventory_unwind_result_lamports=$11,transaction_cost_lamports=$12,rent_recovered_lamports=$13,accounting_reconciliation_difference_lamports=$14,attribution_status=$15,reason_codes=$16::jsonb,remove_signature=$17,claim_signature=$18,terminal_settlement_id=$19,valuation_payload=$20::jsonb,finalized_at=$21 WHERE close_plan_id=$1",[v.closePlanId,claimedFeeXRaw.toString(),claimedFeeYRaw.toString(),embeddedFeeXRaw.toString(),embeddedFeeYRaw.toString(),accounting.embeddedRemoveFeeXRaw.toString(),accounting.embeddedRemoveFeeYRaw.toString(),accounting.realizedLpFeeValueLamports?.toString()??null,rewards.toString(),accounting.principalReturnedValueLamports?.toString()??null,accounting.inventoryUnwindResultLamports?.toString()??null,txCosts.toString(),rentRecovered.toString(),accounting.accountingReconciliationDifferenceLamports?.toString()??null,status,json([...new Set(reasons)].sort()),v.removeSignature,v.claimSignatures?.[0]??null,v.terminalSettlementId,json({valuationMethod:'WSOL_RAW_OR_CONFIRMED_UNWIND_PRO_RATA',terminalClaimObserved:terminalClaim,terminalClaimSignatures:[...claimSignatures],swapProceedsLamports:swap.toString(),closeTokenXRaw:findRaw(String(row.token_x_mint)).toString(),closeTokenYRaw:findRaw(String(row.token_y_mint)).toString()}),v.at]);
       const closePlan=await db.query("SELECT payload FROM execution.transaction_plans WHERE plan_id=$1",[v.closePlanId]);
       const closePayload=(closePlan.rows[0]?.payload??{}) as Record<string,unknown>, metadata=(closePayload.metadata??{}) as Record<string,unknown>, managementReasons=Array.isArray(metadata.managementReasonCodes)?metadata.managementReasonCodes.map(String):[];
       const closeReason=managementReasons.find(code=>code.startsWith('POSITION_OOR_'))??managementReasons[0]??null;
@@ -4049,7 +4192,7 @@ return 'APPLIED';
       const row=r.rows[0];if(!row)return{created:false,reasonCodes:['LPFORGE_LIVE_ABORTED_OUTCOME_RECOVERY_OR_LINEAGE_MISSING']};
       const flows=await db.query("SELECT flow_type,lamports,token_mint,token_amount_raw,payload FROM execution.plan_cashflows WHERE plan_id=$1 ORDER BY observed_at,cashflow_id",[v.planId]);
       const amount=(flow:Record<string,unknown>)=>flow.lamports!==null&&flow.lamports!==undefined?BigInt(String(flow.lamports)):flow.token_mint===WSOL_MINT&&flow.token_amount_raw!==null&&flow.token_amount_raw!==undefined?BigInt(String(flow.token_amount_raw)):0n;
-      const ins=new Set(['RECOVERY_SOL_IN','SWAP_PROCEEDS']),outs=new Set(['ENTRY_FUNDING_SOL_OUT','FUNDING_TX_COST','RECOVERY_TX_COST','TX_COST','SWAP_COST']);
+      const ins=new Set(['RECOVERY_SOL_IN','SWAP_PROCEEDS']),outs=new Set(['ENTRY_FUNDING_SOL_OUT','FUNDING_TX_COST','EXECUTION_TX_COST','RECOVERY_TX_COST','TX_COST','SWAP_COST']);
       const totalIn=flows.rows.filter(flow=>ins.has(String(flow.flow_type))).reduce((n,flow)=>n+amount(flow),0n),totalOut=flows.rows.filter(flow=>outs.has(String(flow.flow_type))).reduce((n,flow)=>n+amount(flow),0n),pnl=totalIn-totalOut;
       const evidenceHash=await sha256Hex(canonicalJson({planId:v.planId,recoveryUpdatedAt:row.updated_at,predictionId:row.recommendation_id,flows:flows.rows.map(flow=>[flow.flow_type,flow.lamports,flow.token_mint,flow.token_amount_raw,flow.payload])}));
       const existing=await db.query("SELECT outcome_id,evidence_hash FROM research.live_learning_outcomes WHERE outcome_kind='LIVE_ENTRY_ABORTED_SOL_SETTLED' AND entry_plan_id=$1",[v.planId]);
@@ -4141,15 +4284,16 @@ return 'APPLIED';
       return r.rows.map(row=>({lotId:String(row.lot_id),positionAddress:String(row.position_address),planId:String(row.plan_id),ownerAddress:String(row.owner_address),poolAddress:String(row.pool_address),tokenMint:String(row.token_mint),tokenSide:String(row.token_side) as PositionInventoryLotSide,sourceEvent:String(row.source_event) as PositionInventoryLotSource,...(row.source_cashflow_id?{sourceCashflowId:String(row.source_cashflow_id)}:{}),rawAmount:BigInt(String(row.raw_amount)),remainingRawAmount:BigInt(String(row.remaining_raw_amount)),decimals:Number(row.decimals),acquiredAt:toIsoTimestamp(row.acquired_at),status:String(row.status) as PositionInventoryLotStatus,payload:(row.payload??{}) as Record<string,unknown>}));
     },
     async insertPlanCashflow(v){
-      await db.query("INSERT INTO execution.plan_cashflows(cashflow_id,plan_id,flow_type,observed_at,lamports,token_mint,token_amount_raw,transaction_signature,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) ON CONFLICT(cashflow_id) DO UPDATE SET lamports=EXCLUDED.lamports,token_mint=EXCLUDED.token_mint,token_amount_raw=EXCLUDED.token_amount_raw,transaction_signature=EXCLUDED.transaction_signature,payload=EXCLUDED.payload",[v.cashflowId,v.planId,v.flowType,v.observedAt,v.lamports?.toString()??null,v.tokenMint??null,v.tokenAmountRaw??null,v.transactionSignature??null,json(v.payload)]);
+      const r=await db.query("INSERT INTO execution.plan_cashflows(cashflow_id,plan_id,flow_type,observed_at,lamports,token_mint,token_amount_raw,transaction_signature,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) ON CONFLICT(cashflow_id) DO UPDATE SET lamports=EXCLUDED.lamports,token_mint=COALESCE(EXCLUDED.token_mint,execution.plan_cashflows.token_mint),token_amount_raw=EXCLUDED.token_amount_raw,transaction_signature=COALESCE(EXCLUDED.transaction_signature,execution.plan_cashflows.transaction_signature),payload=execution.plan_cashflows.payload||EXCLUDED.payload WHERE execution.plan_cashflows.plan_id=EXCLUDED.plan_id AND execution.plan_cashflows.flow_type=EXCLUDED.flow_type AND (execution.plan_cashflows.token_mint IS NULL OR EXCLUDED.token_mint IS NULL OR execution.plan_cashflows.token_mint=EXCLUDED.token_mint) AND (execution.plan_cashflows.transaction_signature IS NULL OR EXCLUDED.transaction_signature IS NULL OR execution.plan_cashflows.transaction_signature=EXCLUDED.transaction_signature) RETURNING cashflow_id",[v.cashflowId,v.planId,v.flowType,v.observedAt,v.lamports?.toString()??null,v.tokenMint??null,v.tokenAmountRaw??null,v.transactionSignature??null,json(v.payload)]);
+      if(r.rows.length!==1)throw new Error("LPFORGE_PLAN_CASHFLOW_IDENTITY_CONFLICT");
     },
     async loadPlanCashflows(planId){
       const r=await db.query("SELECT cashflow_id,plan_id,flow_type,observed_at,lamports,token_mint,token_amount_raw,transaction_signature,payload FROM execution.plan_cashflows WHERE plan_id=$1 ORDER BY observed_at,cashflow_id",[planId]);
       return r.rows.map(row=>({cashflowId:String(row.cashflow_id),planId:String(row.plan_id),flowType:String(row.flow_type) as PlanCashflowType,observedAt:toIsoTimestamp(row.observed_at),...(row.lamports===null?{}:{lamports:BigInt(String(row.lamports))}),...(row.token_mint?{tokenMint:String(row.token_mint)}:{}),...(row.token_amount_raw===null?{}:{tokenAmountRaw:String(row.token_amount_raw)}),...(row.transaction_signature?{transactionSignature:String(row.transaction_signature)}:{}),payload:(row.payload??{}) as Record<string,unknown>}));
     },
     async upsertPartialEntryRecovery(v) {
-      await db.query(
-        `INSERT INTO execution.partial_entry_recovery(plan_id,pool_address,owner_address,token_mint,funding_transaction_id,funding_signature,funded_at,paired_token_amount,intended_capital_lamports,intended_range,state,wallet_truth,payload,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12::jsonb,$13::jsonb,$14) ON CONFLICT(plan_id) DO UPDATE SET state=EXCLUDED.state,wallet_truth=EXCLUDED.wallet_truth,payload=EXCLUDED.payload,updated_at=EXCLUDED.updated_at`,
+      const result=await db.query(
+        `INSERT INTO execution.partial_entry_recovery(plan_id,pool_address,owner_address,token_mint,funding_transaction_id,funding_signature,funded_at,paired_token_amount,intended_capital_lamports,intended_range,state,wallet_truth,payload,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12::jsonb,$13::jsonb,$14) ON CONFLICT(plan_id) DO UPDATE SET state=EXCLUDED.state,wallet_truth=EXCLUDED.wallet_truth,payload=execution.partial_entry_recovery.payload||EXCLUDED.payload,updated_at=EXCLUDED.updated_at WHERE execution.partial_entry_recovery.pool_address=EXCLUDED.pool_address AND execution.partial_entry_recovery.owner_address=EXCLUDED.owner_address AND execution.partial_entry_recovery.token_mint=EXCLUDED.token_mint AND execution.partial_entry_recovery.funding_transaction_id=EXCLUDED.funding_transaction_id AND execution.partial_entry_recovery.funding_signature=EXCLUDED.funding_signature AND execution.partial_entry_recovery.funded_at=EXCLUDED.funded_at AND execution.partial_entry_recovery.paired_token_amount=EXCLUDED.paired_token_amount AND execution.partial_entry_recovery.intended_capital_lamports=EXCLUDED.intended_capital_lamports AND execution.partial_entry_recovery.intended_range=EXCLUDED.intended_range RETURNING plan_id`,
         [
           v.planId,
           v.poolAddress,
@@ -4167,6 +4311,7 @@ return 'APPLIED';
           v.updatedAt,
         ],
       );
+      if(result.rows.length!==1)throw new Error("LPFORGE_PARTIAL_ENTRY_RECOVERY_IDENTITY_CONFLICT");
     },
     async loadPartialEntryRecoveries() {
       const r = await db.query(
@@ -4210,12 +4355,21 @@ return 'APPLIED';
       return r.rows.length===1;
     },
     async upsertOpenChunkDisposition(v) {
-      await db.query(
+      const result=await db.query(
         `INSERT INTO execution.open_chunk_dispositions(plan_id,transaction_id,sequence,kind,disposition,signature,last_valid_block_height,observed_at,payload)
          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
-         ON CONFLICT(plan_id,transaction_id) DO UPDATE SET disposition=EXCLUDED.disposition,signature=COALESCE(EXCLUDED.signature,execution.open_chunk_dispositions.signature),last_valid_block_height=COALESCE(EXCLUDED.last_valid_block_height,execution.open_chunk_dispositions.last_valid_block_height),observed_at=EXCLUDED.observed_at,payload=execution.open_chunk_dispositions.payload||EXCLUDED.payload`,
+         ON CONFLICT(plan_id,transaction_id) DO UPDATE SET disposition=EXCLUDED.disposition,signature=COALESCE(EXCLUDED.signature,execution.open_chunk_dispositions.signature),last_valid_block_height=COALESCE(EXCLUDED.last_valid_block_height,execution.open_chunk_dispositions.last_valid_block_height),observed_at=EXCLUDED.observed_at,payload=execution.open_chunk_dispositions.payload||EXCLUDED.payload
+         WHERE execution.open_chunk_dispositions.sequence=EXCLUDED.sequence
+           AND execution.open_chunk_dispositions.kind=EXCLUDED.kind
+           AND (execution.open_chunk_dispositions.signature IS NULL
+                OR EXCLUDED.signature IS NULL
+                OR execution.open_chunk_dispositions.signature=EXCLUDED.signature)
+           AND (execution.open_chunk_dispositions.disposition NOT IN ('CONFIRMED','CONFIRMED_FAILED','PROVEN_NOT_LANDED')
+                OR execution.open_chunk_dispositions.disposition=EXCLUDED.disposition)
+         RETURNING transaction_id`,
         [v.planId,v.transactionId,v.sequence,v.kind,v.disposition,v.signature??null,v.lastValidBlockHeight?.toString()??null,v.observedAt,json(v.payload)],
       );
+      if(result.rows.length!==1)throw new Error("LPFORGE_OPEN_CHUNK_DISPOSITION_IDENTITY_OR_STATE_CONFLICT");
     },
     async loadOpenChunkDispositions(planId) {
       const r=await db.query("SELECT plan_id,transaction_id,sequence,kind,disposition,signature,last_valid_block_height,observed_at,payload FROM execution.open_chunk_dispositions WHERE plan_id=$1 ORDER BY sequence,transaction_id",[planId]);
@@ -4230,7 +4384,7 @@ return 'APPLIED';
     },
     async loadUnresolvedAutonomousPlans() {
       const r = await db.query(
-        `SELECT p.plan_id,p.intent_id,p.state,p.expires_at,p.payload AS plan_payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,COALESCE(i.position_address,(SELECT min(l.position_address) FROM execution.lifecycle_plan_links link JOIN execution.position_lifecycles l ON l.lifecycle_id=link.lifecycle_id WHERE link.plan_id=p.plan_id AND l.status='SOL_SETTLED' HAVING count(DISTINCT l.position_address)=1)) AS position_address,CASE WHEN i.position_address IS NOT NULL THEN 'DIRECT' WHEN (SELECT count(DISTINCT l.position_address) FROM execution.lifecycle_plan_links link JOIN execution.position_lifecycles l ON l.lifecycle_id=link.lifecycle_id WHERE link.plan_id=p.plan_id AND l.status='SOL_SETTLED')=1 THEN 'LIFECYCLE_SOL_SETTLED' END AS position_identity_source,EXISTS(SELECT 1 FROM execution.lifecycle_plan_links settled_link JOIN execution.position_lifecycles settled_lifecycle ON settled_lifecycle.lifecycle_id=settled_link.lifecycle_id WHERE settled_link.plan_id=p.plan_id AND settled_lifecycle.status='SOL_SETTLED' AND (i.position_address IS NULL OR settled_lifecycle.position_address=i.position_address)) AS position_lifecycle_settled,i.thesis_id,i.observed_at,i.payload AS intent_payload,COALESCE(json_agg(json_build_object('transactionId',s.transaction_id,'sequence',s.sequence,'kind',s.kind,'state',s.state,'requiredSignerAddresses',s.required_signers,'metadata',s.metadata) ORDER BY s.sequence) FILTER (WHERE s.transaction_id IS NOT NULL),'[]'::json) AS steps FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id LEFT JOIN execution.transaction_steps s ON s.plan_id=p.plan_id WHERE p.cluster='mainnet-beta' AND (p.state IN ('CLAIMED','DISPATCHING','BUILDING','BUILT','SIMULATING','SIMULATED','RISK_APPROVED','SIGNING','SIGNED','SUBMITTING','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILING','RECOVERING','RECONCILIATION_REQUIRED') OR (p.state='BLOCKED' AND i.action IN ('CLOSE','EMERGENCY_CLOSE') AND p.payload #>> '{autonomous_dispatch,preSubmissionResume}'='true') OR (p.state='FAILED' AND (EXISTS(SELECT 1 FROM execution.transaction_steps s JOIN execution.submission_attempts a ON a.transaction_id=s.transaction_id WHERE s.plan_id=p.plan_id AND a.state IN ('SENT','UNKNOWN')) OR p.payload->'autonomous_dispatch'->>'recovery'='CLOSE_PENDING_STAGE_EXPIRED_NO_CHAIN_EFFECT'))) GROUP BY p.plan_id,p.intent_id,p.state,p.expires_at,p.payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload ORDER BY p.created_at ASC`,
+        `SELECT p.plan_id,p.intent_id,p.state,p.expires_at,p.payload AS plan_payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,COALESCE(i.position_address,(SELECT min(l.position_address) FROM execution.lifecycle_plan_links link JOIN execution.position_lifecycles l ON l.lifecycle_id=link.lifecycle_id WHERE link.plan_id=p.plan_id AND l.status='SOL_SETTLED' HAVING count(DISTINCT l.position_address)=1)) AS position_address,CASE WHEN i.position_address IS NOT NULL THEN 'DIRECT' WHEN (SELECT count(DISTINCT l.position_address) FROM execution.lifecycle_plan_links link JOIN execution.position_lifecycles l ON l.lifecycle_id=link.lifecycle_id WHERE link.plan_id=p.plan_id AND l.status='SOL_SETTLED')=1 THEN 'LIFECYCLE_SOL_SETTLED' END AS position_identity_source,EXISTS(SELECT 1 FROM execution.lifecycle_plan_links settled_link JOIN execution.position_lifecycles settled_lifecycle ON settled_lifecycle.lifecycle_id=settled_link.lifecycle_id WHERE settled_link.plan_id=p.plan_id AND settled_lifecycle.status='SOL_SETTLED' AND (i.position_address IS NULL OR settled_lifecycle.position_address=i.position_address)) AS position_lifecycle_settled,i.thesis_id,i.observed_at,i.payload AS intent_payload,COALESCE(json_agg(json_build_object('transactionId',s.transaction_id,'sequence',s.sequence,'kind',s.kind,'state',s.state,'requiredSignerAddresses',s.required_signers,'metadata',s.metadata) ORDER BY s.sequence) FILTER (WHERE s.transaction_id IS NOT NULL),'[]'::json) AS steps FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id LEFT JOIN execution.transaction_steps s ON s.plan_id=p.plan_id WHERE p.cluster='mainnet-beta' AND (p.state IN ('CLAIMED','DISPATCHING','BUILDING','BUILT','SIMULATING','SIMULATED','RISK_APPROVED','SIGNING','SIGNED','SUBMITTING','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILING','RECOVERING','RECONCILIATION_REQUIRED') OR (p.state='BLOCKED' AND i.action IN ('CLOSE','EMERGENCY_CLOSE') AND p.payload #>> '{autonomous_dispatch,preSubmissionResume}'='true') OR (p.state='FAILED' AND (EXISTS(SELECT 1 FROM execution.transaction_steps failed_step JOIN execution.submission_attempts failed_attempt ON failed_attempt.transaction_id=failed_step.transaction_id WHERE failed_step.plan_id=p.plan_id AND failed_attempt.state IN ('SENT','UNKNOWN') AND NOT EXISTS(SELECT 1 FROM execution.confirmations terminal_confirmation WHERE terminal_confirmation.attempt_id=failed_attempt.attempt_id AND terminal_confirmation.status IN ('CONFIRMED','FINALIZED','FAILED','EXPIRED'))) OR p.payload->'autonomous_dispatch'->>'recovery'='CLOSE_PENDING_STAGE_EXPIRED_NO_CHAIN_EFFECT' OR p.payload #>> '{autonomous_dispatch,error}'='LPFORGE_EXECUTION_JOURNAL_INVALID_TRANSITION:CONFIRMED->SIGNING'))) GROUP BY p.plan_id,p.intent_id,p.state,p.expires_at,p.payload,i.idempotency_key,i.action,i.pool_address,i.owner_address,i.position_address,i.thesis_id,i.observed_at,i.payload ORDER BY p.created_at ASC`,
       );
       return r.rows.map(autonomousPlanFromRow);
     },
@@ -4265,7 +4419,7 @@ return 'APPLIED';
     },
     async prepareSubmissionAttempt(v) {
       const r = await db.query(
-        `INSERT INTO execution.submission_attempts(attempt_id,transaction_id,idempotency_key,attempt,state,signed_payload_fingerprint,blockhash,last_valid_block_height,prepared_at,payload) VALUES($1,$2,$3,$4,'PREPARED',$5,$6,$7,$8,$9::jsonb) ON CONFLICT(attempt_id) DO NOTHING RETURNING attempt_id`,
+        `INSERT INTO execution.submission_attempts(attempt_id,transaction_id,idempotency_key,attempt,state,signed_payload_fingerprint,blockhash,last_valid_block_height,prepared_at,signature,payload) VALUES($1,$2,$3,$4,'PREPARED',$5,$6,$7,$8,$9,$10::jsonb) ON CONFLICT(attempt_id) DO NOTHING RETURNING attempt_id`,
         [
           v.attemptId,
           v.transactionId,
@@ -4275,28 +4429,66 @@ return 'APPLIED';
           v.blockhash,
           v.lastValidBlockHeight,
           v.preparedAt,
+          v.signature ?? null,
           json(v.payload),
         ],
       );
-      return r.rows.length ? "PREPARED" : "DUPLICATE";
+      if(r.rows.length)return "PREPARED";
+      const existing=await db.query(
+        `SELECT attempt_id,transaction_id,idempotency_key,attempt,signed_payload_fingerprint,blockhash,last_valid_block_height,signature,payload
+         FROM execution.submission_attempts
+         WHERE attempt_id=$1 OR (idempotency_key=$2 AND attempt=$3)`,
+        [v.attemptId,v.idempotencyKey,v.attempt],
+      );
+      const row=existing.rows[0];
+      const payload=(row?.payload??{}) as Record<string,unknown>;
+      const incomingPayload=v.payload;
+      const overlappingPayloadConflict=Object.keys(payload).some(
+        key=>Object.prototype.hasOwnProperty.call(incomingPayload,key)
+          && canonicalJson(payload[key])!==canonicalJson(incomingPayload[key]),
+      );
+      if(existing.rows.length!==1
+        ||String(row!.attempt_id)!==v.attemptId
+        ||String(row!.transaction_id)!==v.transactionId
+        ||String(row!.idempotency_key)!==v.idempotencyKey
+        ||Number(row!.attempt)!==v.attempt
+        ||String(row!.signed_payload_fingerprint)!==v.signedPayloadFingerprint
+        ||String(row!.blockhash)!==v.blockhash
+        ||BigInt(String(row!.last_valid_block_height))!==BigInt(v.lastValidBlockHeight)
+        ||(row!.signature!==null&&row!.signature!==undefined&&v.signature!==undefined&&String(row!.signature)!==v.signature)
+        ||overlappingPayloadConflict)
+        throw new Error("LPFORGE_SUBMISSION_ATTEMPT_IDENTITY_CONFLICT");
+      return "DUPLICATE";
     },
     async markSubmissionSent(attemptId, signature, submittedAt) {
-      await db.query(
-        `UPDATE execution.submission_attempts SET state='SENT',signature=$2,submitted_at=$3 WHERE attempt_id=$1`,
+      const result=await db.query(
+        `UPDATE execution.submission_attempts SET state='SENT',signature=$2,submitted_at=COALESCE(submitted_at,$3)
+         WHERE attempt_id=$1
+           AND state IN ('PREPARED','SENT')
+           AND (signature IS NULL OR signature=$2)
+         RETURNING attempt_id`,
         [attemptId, signature, submittedAt],
       );
+      if(result.rows.length!==1)throw new Error("LPFORGE_SUBMISSION_ATTEMPT_MISSING_AT_SEND");
     },
-    async markSubmissionUnknown(attemptId, at, error) {
-      await db.query(
-        `UPDATE execution.submission_attempts SET state='UNKNOWN',submitted_at=COALESCE(submitted_at,$2),payload=payload||jsonb_build_object('submission_error',$3::text) WHERE attempt_id=$1`,
-        [attemptId, at, error],
+    async markSubmissionUnknown(attemptId, at, error, signature) {
+      const result=await db.query(
+        `UPDATE execution.submission_attempts
+         SET state='UNKNOWN',signature=COALESCE($4::text,signature),submitted_at=COALESCE(submitted_at,$2),payload=payload||jsonb_build_object('submission_error',$3::text)
+         WHERE attempt_id=$1
+           AND state IN ('PREPARED','SENT','UNKNOWN')
+           AND (signature IS NULL OR $4::text IS NULL OR signature=$4::text)
+         RETURNING attempt_id`,
+        [attemptId, at, error, signature ?? null],
       );
+      if(result.rows.length!==1)throw new Error("LPFORGE_SUBMISSION_ATTEMPT_MISSING_AT_UNKNOWN");
     },
     async markSubmissionExpired(signature, at, reason) {
-      await db.query(
-        `UPDATE execution.submission_attempts SET state='EXPIRED',payload=payload||jsonb_build_object('terminal_recovery_reason',$3::text,'terminal_recovered_at',$2::timestamptz) WHERE signature=$1 AND state IN ('PREPARED','SENT','UNKNOWN')`,
+      const result=await db.query(
+        `UPDATE execution.submission_attempts SET state='EXPIRED',payload=payload||jsonb_build_object('terminal_recovery_reason',$3::text,'terminal_recovered_at',$2::timestamptz) WHERE signature=$1 AND state IN ('PREPARED','SENT','UNKNOWN') RETURNING attempt_id`,
         [signature, at, reason],
       );
+      if(result.rows.length!==1)throw new Error("LPFORGE_SUBMISSION_ATTEMPT_MISSING_AT_EXPIRY");
     },
     async recoverNoEffectPreflightSubmissionAttempts(at) {
       const result=await db.query(
@@ -4343,7 +4535,10 @@ return 'APPLIED';
          FROM execution.submission_attempts a
          JOIN execution.confirmations c ON c.attempt_id=a.attempt_id
          WHERE a.transaction_id=$1
-           AND a.state='SENT'
+           -- The RPC can confirm exact signed bytes even if the worker died
+           -- before PREPARED became SENT, or before UNKNOWN was repaired.
+           -- Exact confirmation is stronger than the local attempt cursor.
+           AND a.state IN ('PREPARED','SENT','UNKNOWN')
            AND a.signature IS NOT NULL
            AND c.status IN ('CONFIRMED','FINALIZED')
          ORDER BY CASE c.status WHEN 'FINALIZED' THEN 0 ELSE 1 END,
@@ -4377,8 +4572,12 @@ return 'APPLIED';
       );
     },
     async insertExecutionReconciliation(v) {
-      await db.query(
-        `INSERT INTO execution.reconciliations(reconciliation_id,plan_id,observed_at,status,expected,actual,discrepancies,payload) VALUES($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb) ON CONFLICT(reconciliation_id) DO NOTHING`,
+      const result=await db.query(
+        `INSERT INTO execution.reconciliations(reconciliation_id,plan_id,observed_at,status,expected,actual,discrepancies,payload) VALUES($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb)
+         ON CONFLICT(reconciliation_id) DO UPDATE SET reconciliation_id=execution.reconciliations.reconciliation_id
+         WHERE execution.reconciliations.plan_id=EXCLUDED.plan_id
+           AND execution.reconciliations.status=EXCLUDED.status
+         RETURNING reconciliation_id`,
         [
           v.reconciliationId,
           v.planId,
@@ -4390,6 +4589,7 @@ return 'APPLIED';
           json(v.payload),
         ],
       );
+      if(result.rows.length!==1)throw new Error("LPFORGE_EXECUTION_RECONCILIATION_IDENTITY_CONFLICT");
     },
     async createExecutionJournal(v) {
       const r = await db.query(
@@ -4412,19 +4612,30 @@ return 'APPLIED';
     },
     async updateExecutionJournal(v) {
       const r = await db.query(
-        `UPDATE execution.execution_journal SET state=$3,signature=COALESCE($4,signature),blockhash=COALESCE($5,blockhash),last_valid_block_height=COALESCE($6,last_valid_block_height),version=version+1,updated_at=$7,payload=$8::jsonb WHERE idempotency_key=$1 AND version=$2 RETURNING journal_id`,
+        `UPDATE execution.execution_journal
+         SET transaction_id=CASE WHEN $10 THEN NULL ELSE COALESCE($3,transaction_id) END,
+             state=$4,
+             signature=CASE WHEN $10 THEN NULL WHEN $3 IS NOT NULL AND $3 IS DISTINCT FROM transaction_id THEN $5 ELSE COALESCE($5,signature) END,
+             blockhash=CASE WHEN $10 THEN NULL WHEN $3 IS NOT NULL AND $3 IS DISTINCT FROM transaction_id THEN $6 ELSE COALESCE($6,blockhash) END,
+             last_valid_block_height=CASE WHEN $10 THEN NULL WHEN $3 IS NOT NULL AND $3 IS DISTINCT FROM transaction_id THEN $7 ELSE COALESCE($7,last_valid_block_height) END,
+             version=version+1,updated_at=$8,payload=$9::jsonb
+         WHERE idempotency_key=$1 AND version=$2 RETURNING journal_id`,
         [
           v.idempotencyKey,
           v.expectedVersion,
+          v.transactionId ?? null,
           v.state,
           v.signature ?? null,
           v.blockhash ?? null,
           v.lastValidBlockHeight ?? null,
           v.updatedAt,
           json(v.payload),
+          Boolean(v.clearTransactionIdentity),
         ],
       );
-      return r.rows.length > 0;
+      if(r.rows.length!==1)
+        throw new Error("LPFORGE_EXECUTION_JOURNAL_VERSION_CONFLICT");
+      return true;
     },
     async getExecutionJournal(idempotencyKey) {
       const r = await db.query(
@@ -4444,9 +4655,8 @@ return 'APPLIED';
            FROM execution.execution_journal j
            LEFT JOIN LATERAL (
              SELECT a.state,a.signature
-             FROM execution.transaction_steps s
-             JOIN execution.submission_attempts a ON a.transaction_id=s.transaction_id
-             WHERE s.plan_id=j.plan_id
+             FROM execution.submission_attempts a
+             WHERE a.transaction_id=j.transaction_id
              ORDER BY COALESCE(a.submitted_at,a.prepared_at) DESC,a.attempt DESC
              LIMIT 1
            ) a ON true

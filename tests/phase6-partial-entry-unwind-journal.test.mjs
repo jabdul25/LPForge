@@ -31,5 +31,7 @@ test('partial-entry unwind persists its signature before confirmation and never 
 test('PostgreSQL store can create an idempotent recovery transaction step', () => {
   const store = fs.readFileSync('packages/db/src/index.ts', 'utf8');
   assert.match(store, /ensureExecutionTransactionStep/);
-  assert.match(store, /ON CONFLICT\(transaction_id\) DO NOTHING/);
+  assert.match(store, /ON CONFLICT\(transaction_id\) DO UPDATE/);
+  assert.match(store, /execution\.transaction_steps\.plan_id=EXCLUDED\.plan_id/);
+  assert.match(store, /LPFORGE_EXECUTION_STEP_IDENTITY_CONFLICT/);
 });

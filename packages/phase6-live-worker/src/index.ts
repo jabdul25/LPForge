@@ -286,7 +286,7 @@ export function assessOpenChunkConstruction(input:{planned:ReadonlyArray<{transa
   const byId=new Map(input.dispositions.map(row=>[row.transactionId,row.disposition]));
   const missing=economic.filter(step=>byId.get(step.transactionId)!=='CONFIRMED');
   if(missing.length===0)return{fullyConstructed:true,partial:false,reasonCodes:['P6_OPEN_ALL_ECONOMIC_CHUNKS_CONFIRMED']};
-  const terminal=missing.some(step=>['PROVEN_NOT_LANDED','FAILED_PRE_SIGN','EXPIRED_PRE_SUBMISSION'].includes(String(byId.get(step.transactionId))));
+  const terminal=missing.some(step=>['PROVEN_NOT_LANDED','CONFIRMED_FAILED','FAILED_PRE_SIGN','EXPIRED_PRE_SUBMISSION'].includes(String(byId.get(step.transactionId))));
   const unknown=missing.some(step=>['UNKNOWN_SUBMISSION','SUBMITTED','SIGNING','SIGNED','PENDING'].includes(String(byId.get(step.transactionId))));
   return{fullyConstructed:false,partial:terminal,reasonCodes:[terminal?'P6_OPEN_PARTIAL_CONSTRUCTION':'P6_OPEN_CHUNK_DISPOSITION_PENDING',...(unknown?['P6_OPEN_CHUNK_CHAIN_TRUTH_UNRESOLVED']:[]),...missing.map(step=>`P6_OPEN_CHUNK_NOT_CONFIRMED:${step.transactionId}`)]};
 }
@@ -434,6 +434,22 @@ export function assessExpiredNoEffectOpenRecovery(input:{
   if(input.chunkDispositions.some(disposition=>!["PROVEN_NOT_LANDED","FAILED_PRE_SIGN"].includes(disposition)))reasons.push("P6_NO_EFFECT_CHILD_DISPOSITION_NOT_PROVEN");
   return{terminal:reasons.length===0,reasonCodes:reasons};
 }
+/** A finalized program failure can retire an OPEN only when its exact receipt
+ * fee is the sole durable economic effect and no funding/position effect is
+ * possible. It is distinct from an expired attempt and is never resendable. */
+export function assessConfirmedFailedOpenRecovery(input:{confirmationStatus:string;economicEffect:'PRESENT'|'ABSENT'|'UNKNOWN';positionAbsenceProven:boolean;signatureStatusReadUnknown:boolean;hasFundingChild:boolean;partialEntryRecoveryPresent:boolean;planCashflowTypes:string[];chunkDispositions:string[]}):{terminal:boolean;reasonCodes:string[]}{
+  const reasons:string[]=[];
+  if(input.confirmationStatus!=='FAILED')reasons.push('P6_FAILED_OPEN_SIGNATURE_NOT_FAILED');
+  if(input.economicEffect!=='ABSENT')reasons.push('P6_FAILED_OPEN_PROTOCOL_EFFECT_NOT_ABSENT');
+  if(!input.positionAbsenceProven)reasons.push('P6_FAILED_OPEN_POSITION_ABSENCE_UNPROVEN');
+  if(input.signatureStatusReadUnknown)reasons.push('P6_FAILED_OPEN_SIGNATURE_STATUS_UNKNOWN');
+  if(input.hasFundingChild)reasons.push('P6_FAILED_OPEN_FUNDING_REQUIRES_PARTIAL_RECOVERY');
+  if(input.partialEntryRecoveryPresent)reasons.push('P6_FAILED_OPEN_PARTIAL_ENTRY_RECOVERY_PRESENT');
+  if(input.planCashflowTypes.length!==1||input.planCashflowTypes[0]!=='EXECUTION_TX_COST')reasons.push('P6_FAILED_OPEN_RECEIPT_COST_NOT_EXACT');
+  if(input.chunkDispositions.some(disposition=>!['CONFIRMED_FAILED','FAILED_PRE_SIGN'].includes(disposition)))reasons.push('P6_FAILED_OPEN_CHILD_EFFECT_NOT_TERMINAL');
+  if(!input.chunkDispositions.includes('CONFIRMED_FAILED'))reasons.push('P6_FAILED_OPEN_CHILD_RECEIPT_MISSING');
+  return{terminal:reasons.length===0,reasonCodes:reasons};
+}
 /** Loads the live authorities immediately before economic signing. Nothing in
  * this snapshot is a favorable default: an unavailable source fails closed. */
 export async function loadFreshExecutionSafetyFacts(input:{store:Pick<Phase1Store,'loadLatestPhase7ControlDecision'|'loadPhase7ControlDecision'|'loadPhase7PortfolioFacts'>;plan:AutonomousOpenPlan;config:Pick<LiveWorkerConfig,'rpcUrl'|'programId'|'maxOpenPositions'|'controlledCanary'>;connection?:Pick<Connection,'getLatestBlockhash'>;now?:string;phase7RuntimeId?:string;protocolCompatibility?:()=>Promise<boolean>}):Promise<FreshExecutionSafetyFacts>{
@@ -500,8 +516,8 @@ function ledger(store: Phase1Store): SubmissionLedger {
     prepare: (v) => store.prepareSubmissionAttempt(v),
     markSent: (attemptId, signature, submittedAt) =>
       store.markSubmissionSent(attemptId, signature, submittedAt),
-    markUnknown: (attemptId, at, error) =>
-      store.markSubmissionUnknown(attemptId, at, error),
+    markUnknown: (attemptId, at, error, signature) =>
+      store.markSubmissionUnknown(attemptId, at, error, signature),
     recordConfirmation: (v) =>
       store.insertExecutionConfirmation({
         attemptId: v.attemptId,
@@ -523,7 +539,7 @@ async function recordJournal(
 ) {
   const existing = await store.getExecutionJournal(plan.idempotencyKey);
   if (!existing) {
-    await store.createExecutionJournal({
+    const created = await store.createExecutionJournal({
       // A terminal workflow can have several independently signed children.
       // Their journals must never share a state machine: child 1 may be
       // CONFIRMED while child 2 is only about to be signed.
@@ -541,17 +557,47 @@ async function recordJournal(
       updatedAt: new Date().toISOString(),
       payload,
     });
+    if (created) return;
+    // Another worker may have won the insert between our read and create.
+    // Never continue toward signing with an unrecorded child cursor: reload
+    // the winner and perform the same optimistic transition below.
+    const raced = await store.getExecutionJournal(plan.idempotencyKey);
+    if (!raced)
+      throw new Error("LPFORGE_EXECUTION_JOURNAL_CREATE_CONFLICT_UNRESOLVED");
+    if(String(raced.planId)!==plan.planId)
+      throw new Error("LPFORGE_EXECUTION_JOURNAL_IDEMPOTENCY_IDENTITY_CONFLICT");
+    assertExecutionJournalTransition(String(raced.state) as ExecutionJournalState, state);
+    const updated = await store.updateExecutionJournal({
+      idempotencyKey: plan.idempotencyKey,
+      expectedVersion: Number(raced.version),
+      ...(typeof payload.transactionId === "string"
+        ? { transactionId: payload.transactionId }
+        : {}),
+      state,
+      ...(signature ? { signature } : {}),
+      updatedAt: new Date().toISOString(),
+      payload,
+    });
+    if (!updated)
+      throw new Error("LPFORGE_EXECUTION_JOURNAL_CONCURRENT_UPDATE");
     return;
   }
+  if(String(existing.planId)!==plan.planId)
+    throw new Error("LPFORGE_EXECUTION_JOURNAL_IDEMPOTENCY_IDENTITY_CONFLICT");
   assertExecutionJournalTransition(String(existing.state) as ExecutionJournalState, state);
-  await store.updateExecutionJournal({
+  const updated = await store.updateExecutionJournal({
     idempotencyKey: plan.idempotencyKey,
     expectedVersion: Number(existing.version),
+    ...(typeof payload.transactionId === "string"
+      ? { transactionId: payload.transactionId }
+      : {}),
     state,
     ...(signature ? { signature } : {}),
     updatedAt: new Date().toISOString(),
     payload,
   });
+  if (!updated)
+    throw new Error("LPFORGE_EXECUTION_JOURNAL_CONCURRENT_UPDATE");
 }
 function authority(
   level: "MAINNET_BUILD_SIMULATE" | "MAINNET_CANARY",
@@ -864,7 +910,7 @@ async function executeRequiredJupiterSwap(input: {
  * reconciliation-required state with its exact completed step/signature.
  */
 async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:AutonomousOpenPlan;signer:MainnetSignerBackend;config:LiveWorkerConfig;connection:Connection;pool:MeteoraOpenAddPoolLike;prepared:PreparedAutonomousOpen;fields:ReturnType<typeof planFields>;entryFundingMeasurement?:EntryFundingMeasurement}):Promise<LiveWorkerResult>{
-  let submittedAny=false,lastSignature='',confirmedEntrySlot:bigint|undefined,completedSteps:Array<{transactionId:string;kind:string;signature:string;estimatedFeeLamports:bigint}>=[],currentStep:{transactionId:string;sequence:number;kind:string;lastValidBlockHeight?:bigint;signature?:string;submitted:boolean}|undefined,confirmedLiquiditySolAssetOut=0n;
+  let submittedAny=false,submissionStatusUnknown=false,lastSignature='',confirmedEntrySlot:bigint|undefined,completedSteps:Array<{transactionId:string;kind:string;signature:string;estimatedFeeLamports:bigint}>=[],currentStep:{transactionId:string;sequence:number;kind:string;lastValidBlockHeight?:bigint;signature?:string;submitted:boolean}|undefined,confirmedLiquiditySolAssetOut=0n;
   try{
     for(const [stepIndex,step] of input.prepared.steps.entries()){
       currentStep={transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,submitted:false};
@@ -878,8 +924,30 @@ async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:Auto
       await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SIGNING',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata});
       const economicChunk=step.kind==='METEORA_OPEN'||step.kind==='METEORA_OPEN_CHUNK';
       await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'SIGNING',lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:submittedAt,payload:{chunked:true}});
-      const submitted=await executeMainnetCanaryOpen({authority:openAuthority,ticket:openTicket,transactionId:step.transactionId,idempotencyKey:`${input.plan.idempotencyKey}:${step.transactionId}`,requiredSignerAddresses:step.requiredSignerAddresses,backend:input.signer,auxiliaryBackends:auxiliaryPositionSignersForOpenStep(step,input.prepared.positionSigner),envelope:step.envelope,phase5RiskDecision:risk,lease:latest,ledger:ledger(input.store),transport:createWeb3SubmissionTransport(input.connection),submittedAt,beforeSubmit:async()=>{const finalSafety=await checkFreshOpenSubmissionSafety({store:input.store,plan:input.plan,config:input.config,permitExpiresAt:risk.expiresAt!});if(!finalSafety.approved)throw new Error("LPFORGE_P6_PRESUBMISSION_SAFETY_BLOCKED:"+finalSafety.reasonCodes.join(","));},onSigned:async({signerBackendId})=>{await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SIGNED',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata,signerBackendId});await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'SIGNED',lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true,signerBackendId}});},onSubmissionUnknown:async({error})=>{await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'UNKNOWN_SUBMISSION',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata,error});await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'UNKNOWN_SUBMISSION',lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true,error}});}});submittedAny=true;currentStep!.signature=submitted.signature;currentStep!.submitted=true;lastSignature=submitted.signature;await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SUBMITTED',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata},submitted.signature);await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'SUBMITTED',signature:submitted.signature,lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true}});
-      let confirmed=false;for(let attempt=0;attempt<input.config.confirmAttempts;attempt++){await new Promise(resolve=>setTimeout(resolve,input.config.confirmPollMs));const confirmation=await observeConfirmation({attemptId:`${step.transactionId}:attempt:1`,record:{transactionId:step.transactionId,signature:submitted.signature,submittedAt,blockhash:latest.blockhash,lastValidBlockHeight:latest.lastValidBlockHeight,attempt:1},transport:createWeb3SubmissionTransport(input.connection),ledger:ledger(input.store),observedAt:new Date().toISOString()});if(confirmation.status==='CONFIRMED'||confirmation.status==='FINALIZED'){confirmed=true;if(confirmation.slot!==undefined)confirmedEntrySlot=confirmation.slot;let economicSolAssetOut=0n;if(economicChunk){const receipt=await loadParsedConfirmedExecutionReceipt(input.connection,submitted.signature),receiptContribution=deriveReceiptBoundSolContribution({receipt,ownerAddress:input.plan.ownerAddress,...(receipt.staticAccountKeys[0]?{feePayerAddress:receipt.staticAccountKeys[0]}:{})});economicSolAssetOut=receiptContribution?.principalLamports??0n;confirmedLiquiditySolAssetOut+=economicSolAssetOut;}await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'CONFIRMED',signature:submitted.signature,lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true,confirmation:confirmation.status,economicSolAssetOutLamports:economicSolAssetOut.toString(),measurementSource:'CONFIRMED_RECEIPT_NET_OF_RENT'}});break;}if(confirmation.status==='FAILED'||confirmation.status==='EXPIRED'){await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'PROVEN_NOT_LANDED',signature:submitted.signature,lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true,confirmation:confirmation.status}});throw new Error(`LPFORGE_P6_CHUNK_CONFIRM_${confirmation.status}`);}}if(!confirmed)throw new Error('LPFORGE_P6_CHUNK_CONFIRMATION_PENDING');completedSteps.push({transactionId:step.transactionId,kind:step.kind,signature:submitted.signature,estimatedFeeLamports:fee.totalFeeLamports});
+      const submitted=await executeMainnetCanaryOpen({authority:openAuthority,ticket:openTicket,transactionId:step.transactionId,idempotencyKey:`${input.plan.idempotencyKey}:${step.transactionId}`,requiredSignerAddresses:step.requiredSignerAddresses,backend:input.signer,auxiliaryBackends:auxiliaryPositionSignersForOpenStep(step,input.prepared.positionSigner),envelope:step.envelope,phase5RiskDecision:risk,lease:latest,ledger:ledger(input.store),transport:createWeb3SubmissionTransport(input.connection),submittedAt,beforeSubmit:async()=>{const finalSafety=await checkFreshOpenSubmissionSafety({store:input.store,plan:input.plan,config:input.config,permitExpiresAt:risk.expiresAt!});if(!finalSafety.approved)throw new Error("LPFORGE_P6_PRESUBMISSION_SAFETY_BLOCKED:"+finalSafety.reasonCodes.join(","));},onSigned:async({signerBackendId})=>{await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SIGNED',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata,signerBackendId});await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'SIGNED',lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true,signerBackendId}});},onSubmissionUnknown:async({error,signature})=>{submissionStatusUnknown=true;if(signature){lastSignature=signature;currentStep!.signature=signature;}currentStep!.submitted=true;await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'UNKNOWN_SUBMISSION',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata,error},signature);await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'UNKNOWN_SUBMISSION',...(signature?{signature}:{}),lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true,error}});}});submittedAny=true;currentStep!.signature=submitted.signature;currentStep!.submitted=true;lastSignature=submitted.signature;await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SUBMITTED',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata},submitted.signature);await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'SUBMITTED',signature:submitted.signature,lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true}});
+      let confirmed=false;
+      for(let attempt=0;attempt<input.config.confirmAttempts;attempt++){
+        await new Promise(resolve=>setTimeout(resolve,input.config.confirmPollMs));
+        const confirmation=await observeConfirmation({attemptId:`${step.transactionId}:attempt:1`,record:{transactionId:step.transactionId,signature:submitted.signature,submittedAt,blockhash:latest.blockhash,lastValidBlockHeight:latest.lastValidBlockHeight,attempt:1},transport:createWeb3SubmissionTransport(input.connection),ledger:ledger(input.store),observedAt:new Date().toISOString()});
+        if(confirmation.status==='CONFIRMED'||confirmation.status==='FINALIZED'){
+          confirmed=true;if(confirmation.slot!==undefined)confirmedEntrySlot=confirmation.slot;
+          let economicSolAssetOut=0n;
+          if(economicChunk){const receipt=await loadParsedConfirmedExecutionReceipt(input.connection,submitted.signature),receiptContribution=deriveReceiptBoundSolContribution({receipt,ownerAddress:input.plan.ownerAddress,...(receipt.staticAccountKeys[0]?{feePayerAddress:receipt.staticAccountKeys[0]}:{})});economicSolAssetOut=receiptContribution?.principalLamports??0n;confirmedLiquiditySolAssetOut+=economicSolAssetOut;}
+          await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'CONFIRMED',signature:submitted.signature,lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true,confirmation:confirmation.status,economicSolAssetOutLamports:economicSolAssetOut.toString(),measurementSource:'CONFIRMED_RECEIPT_NET_OF_RENT'}});
+          break;
+        }
+        if(confirmation.status==='FAILED'||confirmation.status==='EXPIRED'){
+          if(confirmation.status==='FAILED'){
+            const actualFee=await confirmedTransactionFeeLamports(input.connection,submitted.signature);
+            if(actualFee===undefined)throw new Error('LPFORGE_P6_FAILED_OPEN_RECEIPT_UNAVAILABLE');
+            await input.store.insertPlanCashflow({cashflowId:`${input.plan.planId}:execution-tx-cost:${step.transactionId}`,planId:input.plan.planId,flowType:'EXECUTION_TX_COST',observedAt:new Date().toISOString(),lamports:actualFee,transactionSignature:submitted.signature,payload:{source:'CONFIRMED_FAILED_CHAIN_RECEIPT',transactionId:step.transactionId}});
+          }
+          await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:confirmation.status==='FAILED'?'CONFIRMED_FAILED':'PROVEN_NOT_LANDED',signature:submitted.signature,lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true,confirmation:confirmation.status,chainLanded:confirmation.status==='FAILED'}});
+          throw new Error(`LPFORGE_P6_CHUNK_CONFIRM_${confirmation.status}`);
+        }
+      }
+      if(!confirmed)throw new Error('LPFORGE_P6_CHUNK_CONFIRMATION_PENDING');
+      completedSteps.push({transactionId:step.transactionId,kind:step.kind,signature:submitted.signature,estimatedFeeLamports:fee.totalFeeLamports});
     }
     const construction=assessOpenChunkConstruction({planned:input.prepared.steps.map((step,index)=>({transactionId:step.transactionId,sequence:index+1,kind:step.kind})),dispositions:await input.store.loadOpenChunkDispositions(input.plan.planId)});if(!construction.fullyConstructed)throw new Error(`LPFORGE_P6_OPEN_CONSTRUCTION_INCOMPLETE:${construction.reasonCodes.join(',')}`);
     await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'CONFIRMED',{action:'OPEN',positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,lastSignature},lastSignature);
@@ -902,7 +970,7 @@ async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:Auto
     await supersedeProvisionalPartialEntryRecovery({store:input.store,plan:input.plan,positionAddress:input.prepared.positionSigner.publicKeyAddress,at:new Date().toISOString()});
     await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'RECONCILED',at:new Date().toISOString(),payload:{signature:lastSignature,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,entryBasisState:entryBasis.basisState,entryBasisId:`${input.plan.planId}:entry-basis:v1`}});
     return{status:'RECONCILED',planId:input.plan.planId,reasonCodes:[],transactionSubmitted:true,positionAddress:input.prepared.positionSigner.publicKeyAddress};
-  }catch(error){const reason=error instanceof Error?error.message:'LPFORGE_P6_CHUNKABLE_OPEN_UNKNOWN',fundingSubmitted=input.entryFundingMeasurement!==undefined,effectiveLastSignature=lastSignature||input.entryFundingMeasurement?.fundingSignature||'';if(currentStep&&!currentStep.submitted&&!reason.startsWith('LPFORGE_P6_PRESUBMISSION_SAFETY_BLOCKED:'))await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:currentStep.transactionId,sequence:currentStep.sequence,kind:currentStep.kind,disposition:'FAILED_PRE_SIGN',...(currentStep.lastValidBlockHeight!==undefined?{lastValidBlockHeight:currentStep.lastValidBlockHeight}:{}),observedAt:new Date().toISOString(),payload:{chunked:true,error:reason}});if(currentStep?.submitted&&currentStep.signature&&reason==='LPFORGE_P6_CHUNK_CONFIRMATION_PENDING')await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:currentStep.transactionId,sequence:currentStep.sequence,kind:currentStep.kind,disposition:'UNKNOWN_SUBMISSION',signature:currentStep.signature,...(currentStep.lastValidBlockHeight!==undefined?{lastValidBlockHeight:currentStep.lastValidBlockHeight}:{}),observedAt:new Date().toISOString(),payload:{chunked:true,error:reason}});if(submittedAny||fundingSubmitted){if(input.entryFundingMeasurement){await input.store.upsertPartialEntryRecovery({planId:input.plan.planId,poolAddress:input.plan.poolAddress,ownerAddress:input.plan.ownerAddress,tokenMint:input.entryFundingMeasurement.tokenMint,fundingTransactionId:input.plan.swapTransactionId??'P6_CHUNKABLE_OPEN',fundingSignature:input.entryFundingMeasurement.fundingSignature,fundedAt:new Date().toISOString(),pairedTokenAmount:input.entryFundingMeasurement.pairedTokenReceivedRaw.toString(),intendedCapitalLamports:input.fields.capital,intendedRange:{lowerBinId:input.fields.lower,upperBinId:input.fields.upper},state:'RECONCILIATION_REQUIRED',walletTruth:{refreshRequired:true,confirmedLiquiditySolAssetOutLamports:confirmedLiquiditySolAssetOut.toString(),entryFundingMeasurement:{tokenMint:input.entryFundingMeasurement.tokenMint,pairedTokenReceivedRaw:input.entryFundingMeasurement.pairedTokenReceivedRaw.toString(),pairedTokenRawBeforeFunding:input.entryFundingMeasurement.pairedTokenRawBeforeFunding.toString(),pairedTokenRawBeforeOpen:input.entryFundingMeasurement.pairedTokenRawBeforeOpen.toString(),fundingSignature:input.entryFundingMeasurement.fundingSignature}},payload:{partialEntry:true,reasonCodes:['P6_PARTIAL_OPEN_CHUNK_DISPOSITION_REQUIRED',...(fundingSubmitted?['P6_CONFIRMED_FUNDING_PARTIAL_ENTRY']:[]),reason],positionAddress:input.prepared.positionSigner.publicKeyAddress},updatedAt:new Date().toISOString()});}await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'RECONCILIATION_REQUIRED',{action:'OPEN',chunked:true,error:reason,positionAddress:input.prepared.positionSigner.publicKeyAddress,lastSignature:effectiveLastSignature,postSubmission:true},effectiveLastSignature||undefined);await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECONCILIATION_REQUIRED',at:new Date().toISOString(),reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',...(fundingSubmitted?['P6_CONFIRMED_FUNDING_PARTIAL_ENTRY']:[]),reason],payload:{stage:'CHUNKABLE_OPEN',error:reason,positionAddress:input.prepared.positionSigner.publicKeyAddress,lastSignature:effectiveLastSignature,partialEntry:true}});return{status:'UNKNOWN',planId:input.plan.planId,reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',...(fundingSubmitted?['P6_CONFIRMED_FUNDING_PARTIAL_ENTRY']:[]),reason],transactionSubmitted:true};}if(reason.startsWith('LPFORGE_P6_PRESUBMISSION_SAFETY_BLOCKED:'))await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'FAILED',{action:'OPEN',stage:'PRESUBMISSION_SAFETY',error:reason,chunked:true,positionAddress:input.prepared.positionSigner.publicKeyAddress});await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'BLOCKED',at:new Date().toISOString(),payload:{stage:'CHUNKABLE_OPEN',error:reason}});return{status:'BLOCKED',planId:input.plan.planId,reasonCodes:[reason],transactionSubmitted:false};}
+  }catch(error){const reason=error instanceof Error?error.message:'LPFORGE_P6_CHUNKABLE_OPEN_UNKNOWN',fundingSubmitted=input.entryFundingMeasurement!==undefined,effectiveLastSignature=lastSignature||input.entryFundingMeasurement?.fundingSignature||'';if(currentStep&&!currentStep.submitted&&!reason.startsWith('LPFORGE_P6_PRESUBMISSION_SAFETY_BLOCKED:'))await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:currentStep.transactionId,sequence:currentStep.sequence,kind:currentStep.kind,disposition:'FAILED_PRE_SIGN',...(currentStep.lastValidBlockHeight!==undefined?{lastValidBlockHeight:currentStep.lastValidBlockHeight}:{}),observedAt:new Date().toISOString(),payload:{chunked:true,error:reason}});if(currentStep?.submitted&&currentStep.signature&&reason==='LPFORGE_P6_CHUNK_CONFIRMATION_PENDING')await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:currentStep.transactionId,sequence:currentStep.sequence,kind:currentStep.kind,disposition:'UNKNOWN_SUBMISSION',signature:currentStep.signature,...(currentStep.lastValidBlockHeight!==undefined?{lastValidBlockHeight:currentStep.lastValidBlockHeight}:{}),observedAt:new Date().toISOString(),payload:{chunked:true,error:reason}});if(submittedAny||submissionStatusUnknown||fundingSubmitted){if(input.entryFundingMeasurement){await input.store.upsertPartialEntryRecovery({planId:input.plan.planId,poolAddress:input.plan.poolAddress,ownerAddress:input.plan.ownerAddress,tokenMint:input.entryFundingMeasurement.tokenMint,fundingTransactionId:input.plan.swapTransactionId??'P6_CHUNKABLE_OPEN',fundingSignature:input.entryFundingMeasurement.fundingSignature,fundedAt:new Date().toISOString(),pairedTokenAmount:input.entryFundingMeasurement.pairedTokenReceivedRaw.toString(),intendedCapitalLamports:input.fields.capital,intendedRange:{lowerBinId:input.fields.lower,upperBinId:input.fields.upper},state:'RECONCILIATION_REQUIRED',walletTruth:{refreshRequired:true,confirmedLiquiditySolAssetOutLamports:confirmedLiquiditySolAssetOut.toString(),entryFundingMeasurement:{tokenMint:input.entryFundingMeasurement.tokenMint,pairedTokenReceivedRaw:input.entryFundingMeasurement.pairedTokenReceivedRaw.toString(),pairedTokenRawBeforeFunding:input.entryFundingMeasurement.pairedTokenRawBeforeFunding.toString(),pairedTokenRawBeforeOpen:input.entryFundingMeasurement.pairedTokenRawBeforeOpen.toString(),fundingSignature:input.entryFundingMeasurement.fundingSignature}},payload:{partialEntry:true,reasonCodes:['P6_PARTIAL_OPEN_CHUNK_DISPOSITION_REQUIRED',...(fundingSubmitted?['P6_CONFIRMED_FUNDING_PARTIAL_ENTRY']:[]),reason],positionAddress:input.prepared.positionSigner.publicKeyAddress},updatedAt:new Date().toISOString()});}await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'RECONCILIATION_REQUIRED',{action:'OPEN',chunked:true,error:reason,positionAddress:input.prepared.positionSigner.publicKeyAddress,lastSignature:effectiveLastSignature,postSubmission:true},effectiveLastSignature||undefined);await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECONCILIATION_REQUIRED',at:new Date().toISOString(),reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',...(fundingSubmitted?['P6_CONFIRMED_FUNDING_PARTIAL_ENTRY']:[]),reason],payload:{stage:'CHUNKABLE_OPEN',error:reason,positionAddress:input.prepared.positionSigner.publicKeyAddress,lastSignature:effectiveLastSignature,partialEntry:true}});return{status:'UNKNOWN',planId:input.plan.planId,reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',...(fundingSubmitted?['P6_CONFIRMED_FUNDING_PARTIAL_ENTRY']:[]),reason],transactionSubmitted:true};}if(reason.startsWith('LPFORGE_P6_PRESUBMISSION_SAFETY_BLOCKED:'))await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'FAILED',{action:'OPEN',stage:'PRESUBMISSION_SAFETY',error:reason,chunked:true,positionAddress:input.prepared.positionSigner.publicKeyAddress});await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'BLOCKED',at:new Date().toISOString(),payload:{stage:'CHUNKABLE_OPEN',error:reason}});return{status:'BLOCKED',planId:input.plan.planId,reasonCodes:[reason],transactionSubmitted:false};}
 }
 /** Executes one already-claimed plan. A caller must claim from storage before calling this function. */
 export async function executeAutonomousOpen(input: {
@@ -919,6 +987,7 @@ export async function executeAutonomousOpen(input: {
   // A signature that has left the wallet means the position may exist on-chain
   // even if post-submit bookkeeping fails; recovery must adopt, never resend.
   let submittedAny = false,
+    submissionStatusUnknown = false,
     lastSignature = "",
     openPositionAddress = "",
     entryFundingMeasurement:EntryFundingMeasurement|undefined;
@@ -1157,8 +1226,10 @@ export async function executeAutonomousOpen(input: {
             signerBackendId,
           },
         ),
-      onSubmissionUnknown: async ({ error }) =>
-        recordJournal(
+      onSubmissionUnknown: async ({ error,signature }) => {
+        submissionStatusUnknown=true;
+        if(signature)lastSignature=signature;
+        await recordJournal(
           input.store,
           input.plan as unknown as AutonomousPlan,
           "UNKNOWN_SUBMISSION",
@@ -1168,7 +1239,9 @@ export async function executeAutonomousOpen(input: {
             generatedPositionAddress: openPositionAddress,
             error,
           },
-        ),
+          signature,
+        );
+      },
     });
     submittedAny = true;
     lastSignature = submitted.signature;
@@ -1309,6 +1382,11 @@ export async function executeAutonomousOpen(input: {
         confirmation.status === "FAILED" ||
         confirmation.status === "EXPIRED"
       ) {
+        if(confirmation.status==="FAILED"){
+          const actualFee=await confirmedTransactionFeeLamports(connection,submitted.signature);
+          if(actualFee===undefined)throw new Error("LPFORGE_P6_FAILED_OPEN_RECEIPT_UNAVAILABLE");
+          await input.store.insertPlanCashflow({cashflowId:`${input.plan.planId}:execution-tx-cost:${input.plan.transactionId}`,planId:input.plan.planId,flowType:"EXECUTION_TX_COST",observedAt:new Date().toISOString(),lamports:actualFee,transactionSignature:submitted.signature,payload:{source:"CONFIRMED_FAILED_CHAIN_RECEIPT",transactionId:input.plan.transactionId}});
+        }
         await recordJournal(
           input.store,
           input.plan as unknown as AutonomousPlan,
@@ -1346,7 +1424,7 @@ export async function executeAutonomousOpen(input: {
   } catch (error) {
     const reason =
       error instanceof Error ? error.message : "LPFORGE_P6_AUTONOMOUS_UNKNOWN";
-    if (submittedAny) {
+    if (submittedAny||submissionStatusUnknown) {
       const confirmedFundingPartial = entryFundingMeasurement !== undefined;
       // One-shot opens get the same post-submit parity as the chunkable path:
       // never FAILED after a signature left the wallet, never resent blindly.
@@ -2274,6 +2352,15 @@ async function confirmedTransactionFeeLamports(connection:Connection,signature:s
   const receipt=await loadConfirmedExecutionReceipt(connection,signature);
   return receipt.state==='CONFIRMED_SUCCESS'||receipt.state==='CONFIRMED_FAILURE'?receipt.feeLamports:undefined;
 }
+/** A finalized failed Solana transaction has no successful protocol effect,
+ * but it did land and consume a fee. Recovery must persist that exact receipt
+ * before it retires or replaces the child; it must never call it expired. */
+async function persistConfirmedFailedTransactionCost(input:{store:Pick<Phase1Store,'insertPositionCashflow'>;connection:Connection;plan:AutonomousPlan;positionAddress:string;signature:string;transactionId:string;observedAt:string}):Promise<boolean>{
+  const receipt=await loadConfirmedExecutionReceipt(input.connection,input.signature);
+  if(receipt.state!=='CONFIRMED_FAILURE'||receipt.feeLamports===undefined)return false;
+  await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:tx-cost:${input.transactionId}`,positionAddress:input.positionAddress,planId:input.plan.planId,flowType:'TX_COST',observedAt:input.observedAt,lamports:receipt.feeLamports,payload:{source:'CONFIRMED_FAILED_CHAIN_RECEIPT',signature:input.signature,transactionId:input.transactionId,chainLanded:true,protocolEffect:'FAILED'}});
+  return true;
+}
 /** Claim recovery is deliberately action-scoped.  An expired signature whose
  * status was read successfully and whose blockhash is past validity has no
  * chain effect; it must retire that CLAIM without authorizing a replacement.
@@ -2281,7 +2368,8 @@ async function confirmedTransactionFeeLamports(connection:Connection,signature:s
 export function assessExpiredClaimRecovery(input:{signaturePresent:boolean;signatureStatusReadUnknown:boolean;confirmationStatus:"PROCESSED"|"CONFIRMED"|"FINALIZED"|"EXPIRED"|"FAILED"|"UNKNOWN"}){
   if(!input.signaturePresent)return{terminal:false,reasonCodes:['P6_CLAIM_RECOVERY_SIGNATURE_MISSING']};
   if(input.signatureStatusReadUnknown)return{terminal:false,reasonCodes:['P6_CLAIM_RECOVERY_SIGNATURE_STATUS_UNKNOWN']};
-  if(input.confirmationStatus==='EXPIRED'||input.confirmationStatus==='FAILED')return{terminal:true,reasonCodes:['P6_CLAIM_EXPIRED_NO_CHAIN_EFFECT']};
+  if(input.confirmationStatus==='EXPIRED')return{terminal:true,terminalKind:'EXPIRED_NO_EFFECT' as const,reasonCodes:['P6_CLAIM_EXPIRED_NO_CHAIN_EFFECT']};
+  if(input.confirmationStatus==='FAILED')return{terminal:true,terminalKind:'CONFIRMED_FAILED' as const,reasonCodes:['P6_CLAIM_FAILED_CONFIRMED_NO_PROTOCOL_EFFECT']};
   return{terminal:false,reasonCodes:['P6_CLAIM_RECOVERY_CHAIN_EFFECT_UNRESOLVED']};
 }
 /**
@@ -2409,9 +2497,10 @@ export async function reconcileTerminalSettlementChainEffects(input:{connection:
   // receipt.  Reconciliation must therefore cover every CLOSE-plan child in
   // the same lifecycle, not only the plan that happened to finalize it.
   const allTerminalTransactions=input.settlementInput.transactions.filter(tx=>tx.planRole==='CLOSE');
-  // `FAILED_FINAL`/`PROVEN_NOT_LANDED` are durable no-effect attempts. They
-  // remain in settlement evidence, but are not economic receipts and must not
-  // be treated as a missing cashflow once an isolated successor has completed.
+  // `FAILED_FINAL`/`PROVEN_NOT_LANDED` are durable terminal protocol-action
+  // dispositions. A finalized FAILED transaction can still consume its
+  // transaction fee, while PROVEN_NOT_LANDED has no chain effect. Neither is
+  // a confirmed successful protocol receipt.
   const terminalTransactions=allTerminalTransactions.filter(tx=>tx.state==='CONFIRMED');
   for(const transaction of allTerminalTransactions)
     if(transaction.state!=='CONFIRMED'&&transaction.state!=='FAILED_FINAL'&&transaction.state!=='PROVEN_NOT_LANDED')
@@ -2556,7 +2645,7 @@ async function executeMeteoraMutation(input: {
   // From this point onward a submission may have reached the cluster.  A
   // later local/database/reconciliation error must never rewrite that fact as
   // FAILED/transactionSubmitted=false.
-  let submissionAttempted=false;
+  let submissionAttempted=false,submissionStatusUnknown=false;
   try {
     if (input.signer.publicKeyAddress !== input.plan.ownerAddress)
       throw new Error("LPFORGE_P6_OWNER_SIGNER_PLAN_MISMATCH");
@@ -2760,13 +2849,15 @@ async function executeMeteoraMutation(input: {
       submittedAt: signedAt,
       onSigned: async ({ signerBackendId }: { signerBackendId: string }) =>
         recordJournal(input.store,input.plan,"SIGNED",{action:input.action,transactionId,signerBackendId}),
-      onSubmissionUnknown: async ({ error }: { error: string }) =>
-        recordJournal(input.store,input.plan,"UNKNOWN_SUBMISSION",{action:input.action,transactionId,error}),
+      onSubmissionUnknown: async ({ error,signature }: { error: string;signature?:string }) => {
+        submissionStatusUnknown=true;
+        await recordJournal(input.store,input.plan,"UNKNOWN_SUBMISSION",{action:input.action,transactionId,error},signature);
+      },
     };
-    submissionAttempted=true;
     const submitted = open
       ? await executeMainnetCanaryClose(submitInput)
       : await executeMainnetCanaryManage(submitInput);
+    submissionAttempted=true;
     await recordJournal(
       input.store,
       input.plan,
@@ -2931,7 +3022,7 @@ async function executeMeteoraMutation(input: {
   } catch (error) {
     const reason =
       error instanceof Error ? error.message : "LPFORGE_P6_MUTATION_UNKNOWN";
-    if(submissionAttempted){
+    if(submissionAttempted||submissionStatusUnknown){
       await recordJournal(input.store,input.plan,"RECONCILIATION_REQUIRED",{action:input.action,error:reason,postSubmission:true});
       await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:"RECONCILIATION_REQUIRED",at:new Date().toISOString(),reasonCodes:["P6_MUTATION_POST_SUBMISSION_RECONCILIATION_REQUIRED"],payload:{action:input.action,error:reason,submissionAttempted:true}});
       return{status:"UNKNOWN",planId:input.plan.planId,reasonCodes:["P6_MUTATION_POST_SUBMISSION_RECONCILIATION_REQUIRED",reason],transactionSubmitted:true};
@@ -3236,6 +3327,50 @@ export function selectCanonicalAccountCloseOnlySuccessor<T extends {planId:strin
   return ordered[0]?{canonical:ordered[0],duplicates:ordered.slice(1)}:{duplicates:[]};
 }
 
+/** An account-close recovery descendant is authoritative only when every
+ * independently persisted binding names the same predecessor and economic
+ * subject.  Plan-id spelling is deliberately irrelevant. */
+export function isExactAccountCloseOnlySuccessor(input:{parent:AutonomousPlan;successor:AutonomousPlan}):boolean{
+  const parent=input.parent,successor=input.successor,
+    provenance=(successor.planPayload.provenance??{}) as Record<string,unknown>,
+    dispatch=closeSettlementDispatch(successor),
+    recoverySteps=successor.steps.filter(step=>step.metadata.accountCloseOnly===true),
+    generations=[dispatch.accountCloseOnlyRecoveryGeneration,...recoverySteps.map(step=>step.metadata.recoveryGeneration)].map(Number);
+  return successor.action==='CLOSE'&&
+    successor.positionAddress===parent.positionAddress&&
+    successor.poolAddress===parent.poolAddress&&
+    successor.ownerAddress===parent.ownerAddress&&
+    successor.intentPayload.accountCloseOnly===true&&
+    successor.intentPayload.predecessorPlanId===parent.planId&&
+    provenance.predecessorPlanId===parent.planId&&
+    provenance.terminalRecovery===true&&
+    dispatch.accountCloseOnly===true&&
+    dispatch.terminalRootClosePlanId===parent.planId&&
+    recoverySteps.length===1&&
+    recoverySteps[0]!.metadata.predecessorPlanId===parent.planId&&
+    generations.length===2&&generations.every(value=>Number.isSafeInteger(value)&&value>=1)&&
+    generations[0]===generations[1];
+}
+
+/** Resolve one terminal child effect from the exact transaction identities
+ * persisted by the parent dispatch.  Expired/no-effect predecessors outside
+ * that identity set cannot poison a confirmed retry, and unrelated lifecycle
+ * children cannot satisfy it. */
+export function canonicalTerminalActionEffect(input:{
+  transactions:readonly LifecycleChildTransaction[];
+  planId:string;
+  transactionIds:readonly string[];
+  required?:boolean;
+}):TerminalActionEffectState{
+  const ids=[...new Set(input.transactionIds.filter(Boolean))];
+  if(ids.length===0)return input.required===true?'UNKNOWN_EFFECT':'NOT_REQUIRED';
+  for(const transactionId of ids){
+    const rows=input.transactions.filter(row=>row.planId===input.planId&&row.transactionId===transactionId);
+    if(rows.length!==1||rows[0]!.state!=='CONFIRMED'||typeof rows[0]!.signature!=='string')return 'UNKNOWN_EFFECT';
+  }
+  return 'CONFIRMED_EFFECT';
+}
+
 function isAccountCloseOnlyPlan(plan:AutonomousPlan):boolean{
   return closeSettlementDispatch(plan).accountCloseOnly===true;
 }
@@ -3285,6 +3420,24 @@ function closeSettlementPending(plan: AutonomousPlan): {
     : undefined;
 }
 
+function closePendingTransactionId(plan:AutonomousPlan,pending:NonNullable<ReturnType<typeof closeSettlementPending>>):string|undefined{
+  const dispatch=closeSettlementDispatch(plan),strings=(value:unknown):string[]=>Array.isArray(value)?value.filter((item):item is string=>typeof item==='string'):[];
+  if(pending.stage==='CLOSE_REMOVE_SUBMITTED'){
+    const ids=strings(dispatch.removeChildTransactionIds).length?strings(dispatch.removeChildTransactionIds):strings(dispatch.removeTransactionIds),index=Number(dispatch.removeChildIndex);
+    return Number.isInteger(index)&&index>=0?ids[index]:typeof dispatch.removeTransactionId==='string'?dispatch.removeTransactionId:undefined;
+  }
+  if(pending.stage==='CLOSE_CLAIM_SUBMITTED'){
+    const ids=strings(dispatch.claimTransactionIds),index=Number(dispatch.claimChildIndex);
+    return Number.isInteger(index)&&index>=0?ids[index]:typeof dispatch.claimTransactionId==='string'?dispatch.claimTransactionId:undefined;
+  }
+  if(pending.stage==='CLOSE_UNWIND_SUBMITTED')return typeof dispatch.unwindTransactionId==='string'?dispatch.unwindTransactionId:undefined;
+  if(pending.stage==='CLOSE_OPEN_RESIDUAL_UNWIND_SUBMITTED')return typeof dispatch.recoveredOpenResidualUnwindTransactionId==='string'?dispatch.recoveredOpenResidualUnwindTransactionId:undefined;
+  // The pending stage must name the exact durable child. Falling back to the
+  // first close-shaped step can bind recovery to the wrong child after a
+  // retry/restart and is therefore intentionally fail-closed.
+  return typeof dispatch.transactionId==='string'?dispatch.transactionId:undefined;
+}
+
 type DurableCloseRemoveChild = {
   transactionId:string;
   index:number;
@@ -3297,6 +3450,30 @@ function closeRemoveChildTransactionId(parentTransactionId:string,index:number,r
   // A blockhash-expired child is never resent under its original durable
   // identity.  A proven no-effect retry owns a new ledger/journal identity.
   return retryCount===0?base:`${base}:retry-${retryCount}`;
+}
+
+function closeClaimChildTransactionId(parentTransactionId:string,index:number,retryCount=0):string{
+  const claimBase=`${parentTransactionId}:claim`,base=index===0?claimBase:`${claimBase}:child-${index}`;
+  return retryCount===0?base:`${base}:retry-${retryCount}`;
+}
+
+export function advanceConfirmedCloseChild(input:{
+  kind:'REMOVE'|'CLAIM';
+  transactionIds:readonly string[];
+  confirmedTransactionIds:readonly string[];
+  pendingChildIndex:number;
+}):{valid:boolean;stage:CloseSettlementStage;confirmedTransactionIds:string[];reasonCode?:string}{
+  const ids=[...input.transactionIds],index=input.pendingChildIndex;
+  if(ids.length===0||!Number.isInteger(index)||index<0||index>=ids.length)
+    return{valid:false,stage:input.kind==='REMOVE'?'CLOSE_INVENTORY_SNAPSHOTTED':'CLOSE_LIQUIDITY_REMOVED',confirmedTransactionIds:[...input.confirmedTransactionIds],reasonCode:`P6_CLOSE_${input.kind}_RECOVERY_CHILD_IDENTITY_INVALID`};
+  const confirmed=new Set(input.confirmedTransactionIds.filter(id=>ids.includes(id)));
+  // Sequential execution is an invariant: a recovered child cannot leap over
+  // an unconfirmed predecessor merely because its own signature landed.
+  if(ids.slice(0,index).some(id=>!confirmed.has(id)))
+    return{valid:false,stage:input.kind==='REMOVE'?'CLOSE_INVENTORY_SNAPSHOTTED':'CLOSE_LIQUIDITY_REMOVED',confirmedTransactionIds:[...confirmed],reasonCode:`P6_CLOSE_${input.kind}_RECOVERY_ORDER_INVALID`};
+  confirmed.add(ids[index]!);
+  const complete=ids.every(id=>confirmed.has(id));
+  return{valid:true,stage:complete?(input.kind==='REMOVE'?'CLOSE_LIQUIDITY_REMOVED':'CLOSE_CLAIMS_SETTLED'):(input.kind==='REMOVE'?'CLOSE_INVENTORY_SNAPSHOTTED':'CLOSE_LIQUIDITY_REMOVED'),confirmedTransactionIds:ids.filter(id=>confirmed.has(id))};
 }
 
 function closeChildPlan(plan:AutonomousPlan,transactionId:string):AutonomousPlan{
@@ -3837,11 +4014,7 @@ async function executeCloseSettlement(input: {
 
   if (stage === "CLOSE_LIQUIDITY_REMOVED") {
     const claimRetryRaw=Number(dispatch.closeClaimRetryCount??0),
-      claimRetryCount=Number.isSafeInteger(claimRetryRaw)&&claimRetryRaw>=0?claimRetryRaw:0,
-      claimBaseTransactionId=`${closeStep.transactionId}:claim`,
-      claimTransactionId=claimRetryCount===0
-        ? claimBaseTransactionId
-        : `${claimBaseTransactionId}:retry-${claimRetryCount}`;
+      claimRetryCount=Number.isSafeInteger(claimRetryRaw)&&claimRetryRaw>=0?claimRetryRaw:0;
     let claimBuilt: BuiltMeteoraTransaction[] | undefined;
     try {
       claimBuilt = await buildClaimTransactions(input.pool, {
@@ -3856,46 +4029,40 @@ async function executeCloseSettlement(input: {
         throw error;
     }
     if (claimBuilt) {
-      if (claimBuilt.length !== 1)
-        throw new Error("LPFORGE_P6_MULTI_TRANSACTION_CLAIM_UNSUPPORTED");
-      const transactionId=claimTransactionId;
-      await input.store.ensureExecutionTransactionStep({
-        planId: input.plan.planId,
-        transactionId,
-        kind: "METEORA_CLAIM",
-        state: "PLANNED",
-        requiredSignerAddresses: [input.plan.ownerAddress],
-        metadata: {
-          stage: "CLOSE_CLAIM_RESIDUAL",
-          parentTransactionId: closeStep.transactionId,
-        },
-      });
-      claimBuilt[0]!.metadata.transactionId = transactionId;
-      const claimed = await executeMeteoraMutation({
-        ...input,
-        plan: closeChildPlan(input.plan, transactionId),
-        built: claimBuilt[0]!,
-        action: closeAction,
-        deferCompletion: true,
-        afterSubmit: async ({ signature }) => persist("CLOSE_LIQUIDITY_REMOVED", {
-          tokenXBefore: tokenXBefore!.toString(),
-          tokenYBefore: tokenYBefore!.toString(),
-          claimTransactionId:transactionId,
-          closeClaimRetryCount:claimRetryCount,
-          pendingStage: "CLOSE_CLAIM_SUBMITTED",
-          pendingSignature: signature,
-        }),
-        afterConfirmed: async ({signature}) => {
-          const receipt=await persistConfirmedClaimReceipt({store:input.store,connection,plan:input.plan,positionAddress:input.positionAddress,signature,transactionId,observedAt:new Date().toISOString(),source:"CONFIRMED_TERMINAL_CLAIM_RECEIPT"});
-          if(!receipt.ok)throw new Error(receipt.reasonCodes.join(","));
-        },
-      });
-      if (claimed.status !== "RECONCILED") return incomplete(claimed.reasonCodes, "CLOSE_CLAIM_PENDING");
+      if(claimBuilt.length===0)throw new Error("LPFORGE_P6_CLOSE_CLAIM_CONSTRUCTION_EMPTY");
+      const claimIds=claimBuilt.map((_,index)=>closeClaimChildTransactionId(closeStep.transactionId,index,claimRetryCount)),
+        priorConfirmed=new Set(Array.isArray(dispatch.claimChildrenConfirmed)?dispatch.claimChildrenConfirmed.filter((value):value is string=>typeof value==='string'&&claimIds.includes(value)):[]);
+      for(const [index,built] of claimBuilt.entries()){
+        const transactionId=claimIds[index]!,constructionFingerprint=closeRemoveConstructionFingerprint(built),previous=input.plan.steps.find(step=>step.transactionId===transactionId),previousFingerprint=previous?.metadata.closeClaimConstructionFingerprint;
+        if(typeof previousFingerprint==='string'&&previousFingerprint!==constructionFingerprint)throw new Error("LPFORGE_P6_CLOSE_CLAIM_CHILD_CONSTRUCTION_MISMATCH");
+        built.metadata={...built.metadata,transactionId,stage:"CLOSE_CLAIM_RESIDUAL",parentTransactionId:closeStep.transactionId,closeClaimChildIndex:index,closeClaimChildCount:claimBuilt.length,closeClaimRetryCount:claimRetryCount,closeClaimConstructionFingerprint:constructionFingerprint,parentPlanId:input.plan.planId,positionAddress:input.positionAddress,poolAddress:input.plan.poolAddress,ownerAddress:input.plan.ownerAddress};
+        await input.store.ensureExecutionTransactionStep({planId:input.plan.planId,transactionId,kind:"METEORA_CLAIM",state:"PLANNED",requiredSignerAddresses:built.requiredSignerAddresses,metadata:built.metadata});
+      }
+      const persistedClaimCount=Number(dispatch.claimChildCount??claimBuilt.length);
+      if(!Number.isInteger(persistedClaimCount)||persistedClaimCount!==claimBuilt.length)throw new Error("LPFORGE_P6_CLOSE_CLAIM_CHILD_CONSTRUCTION_MISMATCH");
+      for(const [index,built] of claimBuilt.entries()){
+        const transactionId=claimIds[index]!;
+        if(priorConfirmed.has(transactionId)){
+          if(!await input.store.loadConfirmedSubmissionByTransactionId(transactionId))throw new Error("LPFORGE_P6_CLOSE_CLAIM_CHILD_CONFIRMATION_MISSING");
+          continue;
+        }
+        const claimed=await executeMeteoraMutation({
+          ...input,plan:closeChildPlan(input.plan,transactionId),built,action:closeAction,deferCompletion:true,
+          afterSubmit:async({signature})=>persist("CLOSE_LIQUIDITY_REMOVED",{tokenXBefore:tokenXBefore!.toString(),tokenYBefore:tokenYBefore!.toString(),claimTransactionId:transactionId,claimTransactionIds:claimIds,claimChildCount:claimBuilt!.length,claimChildrenConfirmed:[...priorConfirmed],claimChildIndex:index,closeClaimRetryCount:claimRetryCount,pendingStage:"CLOSE_CLAIM_SUBMITTED",pendingSignature:signature}),
+          afterConfirmed:async({signature})=>{const receipt=await persistConfirmedClaimReceipt({store:input.store,connection,plan:input.plan,positionAddress:input.positionAddress,signature,transactionId,observedAt:new Date().toISOString(),source:"CONFIRMED_TERMINAL_CLAIM_RECEIPT"});if(!receipt.ok)throw new Error(receipt.reasonCodes.join(","));},
+        });
+        if(claimed.status!=="RECONCILED")return incomplete(claimed.reasonCodes,"CLOSE_CLAIM_PENDING");
+        priorConfirmed.add(transactionId);
+        await persist("CLOSE_LIQUIDITY_REMOVED",{tokenXBefore:tokenXBefore!.toString(),tokenYBefore:tokenYBefore!.toString(),claimTransactionId:transactionId,claimTransactionIds:claimIds,claimChildCount:claimBuilt.length,claimChildrenConfirmed:[...priorConfirmed],lastConfirmedClaimChild:index,closeClaimRetryCount:claimRetryCount});
+      }
     }
     await persist("CLOSE_CLAIMS_SETTLED", {
       tokenXBefore: tokenXBefore.toString(),
       tokenYBefore: tokenYBefore.toString(),
-      claimTransactionId:claimBuilt?claimTransactionId:undefined,
+      claimTransactionId:claimBuilt?closeClaimChildTransactionId(closeStep.transactionId,claimBuilt.length-1,claimRetryCount):undefined,
+      claimTransactionIds:claimBuilt?claimBuilt.map((_,index)=>closeClaimChildTransactionId(closeStep.transactionId,index,claimRetryCount)):undefined,
+      claimChildCount:claimBuilt?.length,
+      claimChildrenConfirmed:claimBuilt?claimBuilt.map((_,index)=>closeClaimChildTransactionId(closeStep.transactionId,index,claimRetryCount)):undefined,
       closeClaimRetryCount:claimBuilt?claimRetryCount:undefined,
       claimTransactionSkipped: !claimBuilt,
     });
@@ -4299,10 +4466,12 @@ async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:Au
     return{ready:false,reasonCodes:assessment.reasonCodes};
   }
   const persisted=await input.store.persistLifecycleSolSettlement({assessment,input:{...settlementInput,positionAbsent:true,positionCheckedAt,positionCheckedSlot},...(process.env.LPFORGE_SOURCE_COMMIT?{sourceCommit:process.env.LPFORGE_SOURCE_COMMIT}:{}),...(process.env.LPFORGE_P7_POLICY_HASH?{policyHash:process.env.LPFORGE_P7_POLICY_HASH}:{}),migrationHead:"M0067_terminal_fee_claim_settlement_reconciliation.sql",...(process.env.LPFORGE_BUILD_ID?{buildId:process.env.LPFORGE_BUILD_ID}:{}),at});
-  const claimSignature=settlementInput.transactions.find(transaction=>transaction.planRole==='CLOSE'&&transaction.transactionId.endsWith(':claim'))?.signature,
-    rootClosePlanId=typeof dispatch.terminalRootClosePlanId==='string'?dispatch.terminalRootClosePlanId:input.plan.planId;
+  const rootClosePlanId=typeof dispatch.terminalRootClosePlanId==='string'?dispatch.terminalRootClosePlanId:input.plan.planId,
+    claimSignatures=confirmedTerminalClaimTransactions(settlementInput.transactions)
+      .filter(transaction=>transaction.planId===rootClosePlanId)
+      .flatMap(transaction=>transaction.signature?[transaction.signature]:[]);
   if(!primaryRemoveSignature)return{ready:false,reasonCodes:["SETTLEMENT_REMOVE_RECEIPT_MISSING"]};
-  await input.store.finalizeCloseFeeAttribution({closePlanId:rootClosePlanId,positionAddress:input.positionAddress,removeSignature:primaryRemoveSignature,...(claimSignature===undefined?{}:{claimSignature}),terminalSettlementId:persisted.settlementId,at});
+  await input.store.finalizeCloseFeeAttribution({closePlanId:rootClosePlanId,positionAddress:input.positionAddress,removeSignature:primaryRemoveSignature,...(claimSignatures.length===0?{}:{claimSignatures}),terminalSettlementId:persisted.settlementId,at});
   await input.store.compactPositionManagementDecisionAudit({positionAddress:input.positionAddress,at});
   // Existing research outcomes are immutable. A settlement supersession fixes
   // the accounting authority without mutating or duplicating V3 evidence.
@@ -4324,8 +4493,8 @@ async function executeAccountCloseOnlyRecovery(input:{
   store:Phase1Store; plan:AutonomousPlan; signer:MainnetSignerBackend; config:LiveWorkerConfig;
   pool:MeteoraOpenAddPoolLike & MeteoraRemoveClaimPoolLike; positionAddress:string;
 }):Promise<LiveWorkerResult>{
-  const closeStep=input.plan.steps.find(step=>step.kind==='METEORA_CLOSE');
-  if(!closeStep||input.plan.steps.some(step=>step.kind!=='METEORA_CLOSE'))throw new Error('LPFORGE_ACCOUNT_CLOSE_ONLY_STEP_INVALID');
+  const closeSteps=input.plan.steps.filter(step=>step.kind==='METEORA_CLOSE'),closeStep=closeSteps[0];
+  if(!closeStep||closeSteps.length!==1||input.plan.steps.length!==1)throw new Error('LPFORGE_ACCOUNT_CLOSE_ONLY_STEP_INVALID');
   const connection=createGovernedConnection({rpcUrl:input.config.rpcUrl,priority:'P0_EXECUTION_CRITICAL'}),at=new Date().toISOString();
   let account;
   try{account=await connection.getAccountInfo(new PublicKey(input.positionAddress),'confirmed');}catch{
@@ -4515,8 +4684,13 @@ async function createAccountCloseOnlySuccessor(input:{store:Phase1Store;plan:Aut
   // The failed parent remains recoverable only until one successor exists.
   // Repeated ticks and restarts must converge on that successor, never fan
   // out into several account-close transactions.
-  const activeSuccessors=(await input.store.loadActiveAutonomousPlansForPosition(input.positionAddress))
-    .filter(plan=>plan.action==='CLOSE'&&plan.planId.startsWith(`${input.plan.planId}:account-close-only:`)),selected=selectCanonicalAccountCloseOnlySuccessor(activeSuccessors);
+  const activePlans=await input.store.loadActiveAutonomousPlansForPosition(input.positionAddress),activeSuccessors=[] as typeof activePlans;
+  for(const candidate of activePlans){
+    if(candidate.action!=='CLOSE')continue;
+    const successor=await input.store.loadAutonomousPlan(candidate.planId);
+    if(successor&&isExactAccountCloseOnlySuccessor({parent:input.plan,successor}))activeSuccessors.push(candidate);
+  }
+  const selected=selectCanonicalAccountCloseOnlySuccessor(activeSuccessors);
   if(selected.canonical){
     const canonical=selected.canonical;
     for(const duplicate of selected.duplicates){
@@ -4526,12 +4700,14 @@ async function createAccountCloseOnlySuccessor(input:{store:Phase1Store;plan:Aut
   }
   const dispatch=closeSettlementDispatch(input.plan),settlement=await input.store.loadLifecycleSettlementInput(input.positionAddress);
   if(!settlement)return{created:false,reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_LIFECYCLE_MISSING']};
-  const closeTransactions=settlement.transactions.filter(transaction=>transaction.planRole==='CLOSE'),stateFor=(kind:string):TerminalActionEffectState=>{
-    const rows=closeTransactions.filter(transaction=>transaction.kind===kind);
-    if(rows.length===0)return 'NOT_REQUIRED';
-    return rows.every(row=>row.state==='CONFIRMED'&&Boolean(row.signature))?'CONFIRMED_EFFECT':'UNKNOWN_EFFECT';
-  },lots=await input.store.loadPositionInventoryLots(input.positionAddress),check=assessAccountCloseOnlyRecovery({
-    priorAccountClose:'EXPIRED_NO_EFFECT',remove:stateFor('METEORA_REMOVE'),claim:dispatch.claimTransactionSkipped===true?'NOT_REQUIRED':stateFor('METEORA_CLAIM'),primaryUnwind:stateFor('JUPITER_UNWIND'),residualUnwind:stateFor('JUPITER_UNWIND'),positionExists:input.positionTruth.exists===true?true:input.positionTruth.exists===false?false:'UNKNOWN',totalXAmount:BigInt(String(input.positionTruth.totalXAmount??'0')),totalYAmount:BigInt(String(input.positionTruth.totalYAmount??'0')),feeX:BigInt(String(input.positionTruth.feeX??'0')),feeY:BigInt(String(input.positionTruth.feeY??'0')),rewardOne:BigInt(String(input.positionTruth.rewardOne??'0')),rewardTwo:BigInt(String(input.positionTruth.rewardTwo??'0')),unresolvedInventoryLots:lots.filter(lot=>lot.remainingRawAmount>0n).length,
+  const stringList=(value:unknown):string[]=>Array.isArray(value)?value.filter((item):item is string=>typeof item==='string'):[],
+    removeIds=stringList(dispatch.removeTransactionIds).length>0?stringList(dispatch.removeTransactionIds):stringList(dispatch.removeChildTransactionIds),
+    claimIds=stringList(dispatch.claimTransactionIds).length>0?stringList(dispatch.claimTransactionIds):typeof dispatch.claimTransactionId==='string'?[dispatch.claimTransactionId]:[],
+    primaryUnwindIds=typeof dispatch.unwindTransactionId==='string'?[dispatch.unwindTransactionId]:[],
+    residualUnwindIds=typeof dispatch.recoveredOpenResidualUnwindTransactionId==='string'?[dispatch.recoveredOpenResidualUnwindTransactionId]:[],
+    effect=(transactionIds:string[],required=false)=>canonicalTerminalActionEffect({transactions:settlement.transactions,planId:input.plan.planId,transactionIds,required}),
+    lots=await input.store.loadPositionInventoryLots(input.positionAddress),check=assessAccountCloseOnlyRecovery({
+    priorAccountClose:'EXPIRED_NO_EFFECT',remove:effect(removeIds,true),claim:dispatch.claimTransactionSkipped===true?'NOT_REQUIRED':effect(claimIds,true),primaryUnwind:effect(primaryUnwindIds),residualUnwind:effect(residualUnwindIds),positionExists:input.positionTruth.exists===true?true:input.positionTruth.exists===false?false:'UNKNOWN',totalXAmount:BigInt(String(input.positionTruth.totalXAmount??'0')),totalYAmount:BigInt(String(input.positionTruth.totalYAmount??'0')),feeX:BigInt(String(input.positionTruth.feeX??'0')),feeY:BigInt(String(input.positionTruth.feeY??'0')),rewardOne:BigInt(String(input.positionTruth.rewardOne??'0')),rewardTwo:BigInt(String(input.positionTruth.rewardTwo??'0')),unresolvedInventoryLots:lots.filter(lot=>lot.remainingRawAmount>0n).length,
   });
   if(!check.eligible)return{created:false,reasonCodes:check.reasonCodes};
   const priorGeneration=Number(dispatch.accountCloseOnlyRecoveryGeneration??0),generation=Number.isInteger(priorGeneration)&&priorGeneration>=0?priorGeneration+1:1,id=accountCloseOnlySuccessorIdentity({planId:input.plan.planId,generation}),capitalLamports=String((input.plan.planPayload.intent as Record<string,unknown>|undefined)?.capitalLamports??'');
@@ -4540,7 +4716,7 @@ async function createAccountCloseOnlySuccessor(input:{store:Phase1Store;plan:Aut
   const secret=process.env.LPFORGE_PLAN_PROVENANCE_SECRET;
   if(secret){provenance.hmac=computePlanProvenanceHmac({producer:'LPFORGE_PRODUCTION',schemaVersion:1,intentId:id.intentId,poolAddress:input.plan.poolAddress,observedAt:input.now,action:'CLOSE',ownerAddress:input.plan.ownerAddress,positionAddress:input.positionAddress,expiresAt,immutablePlan:{intentPayload,planIntent,steps:steps.map(step=>({transactionId:step.transactionId,sequence:step.sequence,kind:step.kind,requiredSignerAddresses:[...step.requiredSignerAddresses],metadata:step.metadata}))},phase7Control:(provenance.phase7Control??null) as Record<string,unknown>|null},secret);}
   await input.store.insertExecutionIntent({intentId:id.intentId,idempotencyKey:id.idempotencyKey,action:'CLOSE',poolAddress:input.plan.poolAddress,ownerAddress:input.plan.ownerAddress,positionAddress:input.positionAddress,thesisId:input.plan.thesisId,observedAt:input.now,expiresAt,payload:intentPayload});
-  await input.store.insertTransactionPlan({planId:id.planId,intentId:id.intentId,cluster:'mainnet-beta',state:'PLANNED',createdAt:input.now,expiresAt,payload:{reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_SUCCESSOR'],authority:'AUTONOMOUS_TERMINAL_RECOVERY',provenance,immutablePlanVersion:1,intent:planIntent,autonomous_dispatch:{accountCloseOnly:true,terminalRootClosePlanId:input.plan.planId,accountCloseOnlyRecoveryGeneration:generation,stage:'ACCOUNT_CLOSE_ONLY_READY',removeTransactionId:dispatch.removeTransactionId,unwindTransactionId:dispatch.unwindTransactionId,recoveredOpenResidualUnwindTransactionId:dispatch.recoveredOpenResidualUnwindTransactionId,claimTransactionSkipped:dispatch.claimTransactionSkipped===true,closeSettlementIncomplete:true}},steps});
+  await input.store.insertTransactionPlan({planId:id.planId,intentId:id.intentId,cluster:'mainnet-beta',state:'PLANNED',createdAt:input.now,expiresAt,payload:{reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_SUCCESSOR'],authority:'AUTONOMOUS_TERMINAL_RECOVERY',provenance,immutablePlanVersion:1,intent:planIntent,autonomous_dispatch:{accountCloseOnly:true,terminalRootClosePlanId:input.plan.planId,accountCloseOnlyRecoveryGeneration:generation,stage:'ACCOUNT_CLOSE_ONLY_READY',removeTransactionId:dispatch.removeTransactionId,removeTransactionIds:removeIds,removeChildTransactionIds:removeIds,removeChildCount:removeIds.length,removeChildrenConfirmed:removeIds,claimTransactionId:claimIds.at(-1),claimTransactionIds:claimIds,unwindTransactionId:dispatch.unwindTransactionId,recoveredOpenResidualUnwindTransactionId:dispatch.recoveredOpenResidualUnwindTransactionId,claimTransactionSkipped:dispatch.claimTransactionSkipped===true,closeSettlementIncomplete:true}},steps});
   await input.store.markOwnedPositionLifecycle({positionAddress:input.positionAddress,lifecycleState:'RECONCILIATION_REQUIRED',reconciliationStatus:'TERMINALIZATION_DEBT',lastPlanId:id.planId,at:input.now,payload:{stage:'ACCOUNT_CLOSE_ONLY_SUCCESSOR_PLANNED',terminalizationDebt:true,predecessorPlanId:input.plan.planId,successorPlanId:id.planId,reasonCodes:['P6_TERMINALIZATION_DEBT_ACCOUNT_CLOSE_ONLY']}});
   await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'FAILED',at:input.now,payload:{action:input.plan.action,recovery:'ACCOUNT_CLOSE_ONLY_SUCCESSOR_CREATED',accountCloseOnlySuccessorPlanId:id.planId,accountCloseOnlyRecoveryGeneration:generation,pendingStage:'CLOSE_POSITION_SUBMITTED'}});
   return{created:true,planId:id.planId,reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_SUCCESSOR_CREATED','P6_TERMINALIZATION_DEBT_ACCOUNT_CLOSE_ONLY']};
@@ -4845,8 +5021,13 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         positionExists: positionTruth.exists === true,
       })
     ) {
-      const unwindStep = plan.steps.find((step) => step.kind === "JUPITER_UNWIND"),
-        dispatch = closeSettlementDispatch(plan),
+      const dispatch = closeSettlementDispatch(plan),
+        unwindTransactionId = typeof dispatch.unwindTransactionId === "string"
+          ? dispatch.unwindTransactionId
+          : undefined,
+        unwindStep = unwindTransactionId
+          ? plan.steps.find((step) => step.transactionId === unwindTransactionId && step.kind === "JUPITER_UNWIND")
+          : undefined,
         inputMint = typeof dispatch.tokenXMint === "string" ? dispatch.tokenXMint : undefined,
         inputAmountRaw = closeSettlementAmount(dispatch.attributableTokenX);
       const confirmedUnwind = unwindStep
@@ -5001,10 +5182,17 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       typeof closeSettlementDispatch(plan).recoveredOpenResidualUnwindSignature==="string"&&
       positionTruth.exists===true;
     if(expiredResidualJournalRehydrate){
+      const dispatch=closeSettlementDispatch(plan),recoveredId=typeof dispatch.recoveredOpenResidualUnwindTransactionId==='string'?dispatch.recoveredOpenResidualUnwindTransactionId:undefined,recoveredSignature=typeof dispatch.recoveredOpenResidualUnwindSignature==='string'?dispatch.recoveredOpenResidualUnwindSignature:undefined;
+      if(!recoveredId||!recoveredSignature){
+        results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:['P6_CLOSE_RESIDUAL_JOURNAL_REHYDRATE_IDENTITY_MISSING']});
+        continue;
+      }
       await input.store.updateExecutionJournal({
         idempotencyKey:plan.idempotencyKey,
         expectedVersion:journal.version,
+        transactionId:recoveredId,
         state:"CONFIRMED",
+        signature:recoveredSignature,
         updatedAt:input.now,
         payload:{...journal.payload,recovery:"CLOSE_RECOVERED_OPEN_RESIDUAL_PARENT_JOURNAL_REHYDRATED"},
       });
@@ -5023,6 +5211,18 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     if (closePending) {
       const settled = confirmationStatus === "CONFIRMED" || confirmationStatus === "FINALIZED";
       if (!settled) {
+        // FAILED means the signed transaction landed and the program rejected
+        // it.  Before any successor/retry decision, bind the exact pending
+        // child to its submission row and persist the paid network fee.
+        if(confirmationStatus==='FAILED'){
+          const failedTransactionId=closePendingTransactionId(plan,closePending),failedAttempt=failedTransactionId?await input.store.loadSubmissionAttemptByTransactionId(failedTransactionId):undefined;
+          const failedReceiptProven=Boolean(connection&&recoveryPositionAddress&&failedTransactionId&&failedAttempt?.signature===closePending.signature&&await persistConfirmedFailedTransactionCost({store:input.store,connection:connection!,plan,positionAddress:recoveryPositionAddress!,signature:closePending.signature,transactionId:failedTransactionId!,observedAt:input.now}));
+          if(!failedReceiptProven){
+            await input.store.transitionAutonomousPlan({planId:plan.planId,state:'RECONCILIATION_REQUIRED',at:input.now,reasonCodes:['P6_CLOSE_FAILED_RECEIPT_PROOF_REQUIRED'],payload:{pendingStage:closePending.stage,pendingSignature:closePending.signature,expectedTransactionId:failedTransactionId??null}});
+            results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:['P6_CLOSE_FAILED_RECEIPT_PROOF_REQUIRED']});
+            continue;
+          }
+        }
         // The first REMOVE child has no predecessor effect to preserve.  Once
         // its exact signature is proven expired and PositionV2 is still the
         // exact bound open position, rebuild the complete removal sequence
@@ -5083,6 +5283,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
             // remains immutable in its child ledger; PLAN_CREATED simply
             // represents the next safe parent boundary.
             state:'PLAN_CREATED',
+            clearTransactionIdentity:true,
             updatedAt:input.now,
             payload:{
               ...journal.payload,
@@ -5139,12 +5340,13 @@ export async function recoverUnfinishedAutonomousPlans(input: {
           pendingStage:closePending.stage,
           confirmedRemoveChildCount:pendingClaimConfirmedRemoveCount,
           requiredRemoveChildCount:pendingClaimRequiredRemoveCount,
-        })){
+          })){
           const dispatch=closeSettlementDispatch(plan),
-            claimSteps=plan.steps.filter(step=>step.kind==='METEORA_CLAIM'),
-            pendingClaimTransactionId=typeof dispatch.claimTransactionId==='string'
-              ? dispatch.claimTransactionId
-              : claimSteps.at(-1)?.transactionId,
+            claimTransactionIds=Array.isArray(dispatch.claimTransactionIds)?dispatch.claimTransactionIds.filter((value):value is string=>typeof value==='string'):[],
+            pendingClaimIndex=Number(dispatch.claimChildIndex),
+            pendingClaimTransactionId=Number.isInteger(pendingClaimIndex)&&pendingClaimIndex>=0
+              ? claimTransactionIds[pendingClaimIndex]
+              : typeof dispatch.claimTransactionId==='string'?dispatch.claimTransactionId:undefined,
             removeChildIds=pendingClaimRemoveIds.length>0
               ? pendingClaimRemoveIds
               : plan.steps.filter(step=>step.kind==='METEORA_REMOVE').map(step=>step.transactionId),
@@ -5165,11 +5367,17 @@ export async function recoverUnfinishedAutonomousPlans(input: {
             continue;
           }
           await input.store.markSubmissionExpired(closePending.signature,input.now,'P6_CLOSE_CLAIM_EXPIRED_NO_CHAIN_EFFECT');
+          const lastConfirmedRemoveId=removeChildIds.at(-1),lastConfirmedRemove=confirmedRemoves.at(-1);
+          if(!lastConfirmedRemoveId||!lastConfirmedRemove){
+            results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:['P6_CLOSE_CLAIM_REBUILD_CONFIRMED_PREDECESSOR_MISSING']});
+            continue;
+          }
           await input.store.updateExecutionJournal({
             idempotencyKey:plan.idempotencyKey,
             expectedVersion:journal.version,
+            transactionId:lastConfirmedRemoveId,
             state:'CONFIRMED',
-            signature:confirmedRemoves[0]!.signature,
+            signature:lastConfirmedRemove.signature,
             updatedAt:input.now,
             payload:{
               ...journal.payload,
@@ -5189,6 +5397,11 @@ export async function recoverUnfinishedAutonomousPlans(input: {
               pendingStage:null,
               pendingSignature:null,
               closeClaimRetryCount:nextRetry,
+              claimTransactionId:null,
+              claimTransactionIds:[],
+              claimChildCount:null,
+              claimChildrenConfirmed:[],
+              claimChildIndex:null,
               expiredClaimSignature:closePending.signature,
               expiredClaimTransactionId:pendingClaimTransactionId,
             },
@@ -5214,7 +5427,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
             nextRetry=priorRetry+1,
             originalUnwindTransactionId=typeof dispatch.unwindTransactionId==='string'
               ? dispatch.unwindTransactionId
-              : plan.steps.find(step=>step.kind==='JUPITER_UNWIND')?.transactionId;
+              : undefined;
           if(!originalUnwindTransactionId){
             await input.store.transitionAutonomousPlan({
               planId:plan.planId,state:'RECONCILIATION_REQUIRED',at:input.now,
@@ -5229,13 +5442,22 @@ export async function recoverUnfinishedAutonomousPlans(input: {
             input.now,
             'P6_CLOSE_UNWIND_EXPIRED_NO_CHAIN_EFFECT',
           );
+          const predecessorIds=[
+            ...(Array.isArray(dispatch.claimTransactionIds)?dispatch.claimTransactionIds.filter((value):value is string=>typeof value==='string').reverse():[]),
+            ...(Array.isArray(dispatch.removeChildTransactionIds)?dispatch.removeChildTransactionIds.filter((value):value is string=>typeof value==='string').reverse():[]),
+          ];
+          let confirmedPredecessor:{transactionId:string;signature:string}|undefined;
+          for(const transactionId of predecessorIds){const confirmed=await input.store.loadConfirmedSubmissionByTransactionId(transactionId);if(confirmed){confirmedPredecessor={transactionId,signature:confirmed.signature};break;}}
+          if(!confirmedPredecessor){results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:['P6_CLOSE_UNWIND_REBUILD_CONFIRMED_PREDECESSOR_MISSING']});continue;}
           await input.store.updateExecutionJournal({
             idempotencyKey:plan.idempotencyKey,
             expectedVersion:journal.version,
             // A previous release may already have set the parent to FAILED.
             // Preserve that evidence in payload while restoring only the
             // parent’s last-confirmed boundary for this exact no-effect child.
+            transactionId:confirmedPredecessor.transactionId,
             state:'CONFIRMED',
+            signature:confirmedPredecessor.signature,
             updatedAt:input.now,
             payload:{
               ...journal.payload,
@@ -5292,13 +5514,23 @@ export async function recoverUnfinishedAutonomousPlans(input: {
             input.now,
             "P6_CLOSE_RECOVERED_OPEN_RESIDUAL_EXPIRED_NO_CHAIN_EFFECT",
           );
+          const predecessorIds=[
+            ...(typeof dispatch.unwindTransactionId==='string'?[dispatch.unwindTransactionId]:[]),
+            ...(Array.isArray(dispatch.claimTransactionIds)?dispatch.claimTransactionIds.filter((value):value is string=>typeof value==='string').reverse():[]),
+            ...(Array.isArray(dispatch.removeChildTransactionIds)?dispatch.removeChildTransactionIds.filter((value):value is string=>typeof value==='string').reverse():[]),
+          ];
+          let confirmedPredecessor:{transactionId:string;signature:string}|undefined;
+          for(const transactionId of predecessorIds){const confirmed=await input.store.loadConfirmedSubmissionByTransactionId(transactionId);if(confirmed){confirmedPredecessor={transactionId,signature:confirmed.signature};break;}}
+          if(!confirmedPredecessor){results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:['P6_CLOSE_RESIDUAL_REBUILD_CONFIRMED_PREDECESSOR_MISSING']});continue;}
           await input.store.updateExecutionJournal({
             idempotencyKey: plan.idempotencyKey,
             expectedVersion: journal.version,
             // The parent journal tracks the last confirmed close child. The
             // expired residual attempt is terminal only in its own submission
             // ledger; preserving CONFIRMED permits a fresh follow-up child.
+            transactionId:confirmedPredecessor.transactionId,
             state: "CONFIRMED",
+            signature:confirmedPredecessor.signature,
             updatedAt: input.now,
             payload: {
               ...journal.payload,
@@ -5339,8 +5571,10 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         // A durable lifecycle SOL_SETTLED link plus absence proves later settlement of
         // this exact PositionV2; retire the expired no-effect child only.
         if (!signatureStatusReadUnknown && (confirmationStatus === "EXPIRED" || confirmationStatus === "FAILED") && (plan.positionIdentitySource === "LIFECYCLE_SOL_SETTLED" || plan.positionLifecycleSettled === true) && positionTruth.exists === false && recoveryPositionAddress) {
-          const reason = "P6_CLOSE_PENDING_STAGE_EXPIRED_NO_CHAIN_EFFECT_POSITION_ABSENT";
-          await input.store.markSubmissionExpired(closePending.signature, input.now, reason);
+          const reason = confirmationStatus==='FAILED'
+            ? "P6_CLOSE_PENDING_STAGE_FAILED_CONFIRMED_POSITION_ALREADY_SETTLED"
+            : "P6_CLOSE_PENDING_STAGE_EXPIRED_NO_CHAIN_EFFECT_POSITION_ABSENT";
+          if(confirmationStatus==='EXPIRED')await input.store.markSubmissionExpired(closePending.signature, input.now, reason);
           await input.store.updateExecutionJournal({ idempotencyKey: plan.idempotencyKey, expectedVersion: journal.version, state: "FAILED", updatedAt: input.now, payload: { ...journal.payload, recovery: reason, confirmationStatus, pendingStage: closePending.stage, pendingSignature: closePending.signature, positionTruth } });
           await input.store.completeAutonomousPlan({ planId: plan.planId, state: "COMPLETED", at: input.now, payload: { action: plan.action, recovery: reason, pendingStage: closePending.stage, pendingSignature: closePending.signature, positionAddress: recoveryPositionAddress } });
           results.push({ planId: plan.planId, action: "MARK_RECONCILED", reasonCodes: [reason, closePending.stage] });
@@ -5357,21 +5591,28 @@ export async function recoverUnfinishedAutonomousPlans(input: {
           positionTruth.exists === true
         ) {
           if(closePending.stage==='CLOSE_POSITION_SUBMITTED'&&recoveryPositionAddress){
-            await input.store.markSubmissionExpired(closePending.signature,input.now,'P6_CLOSE_PENDING_STAGE_EXPIRED_NO_CHAIN_EFFECT');
+            if(confirmationStatus==='EXPIRED')await input.store.markSubmissionExpired(closePending.signature,input.now,'P6_CLOSE_PENDING_STAGE_EXPIRED_NO_CHAIN_EFFECT');
             // A close-account child can expire after REMOVE and CLAIM have
             // finalized but before a normal OPEN_RESIDUAL lot was included in
             // the unwind. Re-enter the durable close stage in that exact case:
             // it re-measures the receipt-backed lot and produces one normal
             // unwind, rather than creating an account-close-only successor
             // whose preconditions can never be met.
-            const removeStep=plan.steps.find(step=>step.kind==='METEORA_REMOVE'),claimStep=plan.steps.find(step=>step.kind==='METEORA_CLAIM'),unwindStep=plan.steps.find(step=>step.kind==='JUPITER_UNWIND'),
-              [removeConfirmed,claimConfirmed,unwindConfirmed]=await Promise.all([
-                removeStep?input.store.loadConfirmedSubmissionByTransactionId(removeStep.transactionId):Promise.resolve(undefined),
-                claimStep?input.store.loadConfirmedSubmissionByTransactionId(claimStep.transactionId):Promise.resolve(undefined),
-                unwindStep?input.store.loadConfirmedSubmissionByTransactionId(unwindStep.transactionId):Promise.resolve(undefined),
-              ]),dispatch=closeSettlementDispatch(plan),claimSkipped=dispatch.claimTransactionSkipped===true;
-            if(removeConfirmed&&(claimSkipped||claimConfirmed)&&!unwindConfirmed&&closeSettlementAmount(dispatch.attributableTokenX)===0n){
-              await input.store.updateExecutionJournal({idempotencyKey:plan.idempotencyKey,expectedVersion:journal.version,state:'CONFIRMED',signature:claimConfirmed?.signature??removeConfirmed.signature,updatedAt:input.now,payload:{...journal.payload,recovery:'P6_CLOSE_REHYDRATED_FOR_RECEIPT_BOUND_OPEN_RESIDUAL_UNWIND',transactionId:claimStep?.transactionId??removeStep!.transactionId,expiredAccountCloseSignature:closePending.signature}});
+            const dispatch=closeSettlementDispatch(plan),asIds=(value:unknown):string[]=>Array.isArray(value)?value.filter((item):item is string=>typeof item==='string'):[],
+              removeIds=asIds(dispatch.removeTransactionIds).length>0?asIds(dispatch.removeTransactionIds):asIds(dispatch.removeChildTransactionIds),
+              claimIds=asIds(dispatch.claimTransactionIds).length>0?asIds(dispatch.claimTransactionIds):typeof dispatch.claimTransactionId==='string'?[dispatch.claimTransactionId]:[],
+              unwindId=typeof dispatch.unwindTransactionId==='string'?dispatch.unwindTransactionId:undefined,
+              [removeConfirmations,claimConfirmations,unwindConfirmed]=await Promise.all([
+                Promise.all(removeIds.map(transactionId=>input.store.loadConfirmedSubmissionByTransactionId(transactionId))),
+                Promise.all(claimIds.map(transactionId=>input.store.loadConfirmedSubmissionByTransactionId(transactionId))),
+                unwindId?input.store.loadConfirmedSubmissionByTransactionId(unwindId):Promise.resolve(undefined),
+              ]),claimSkipped=dispatch.claimTransactionSkipped===true,
+              removesConfirmed=removeIds.length>0&&removeConfirmations.every(Boolean),
+              claimsConfirmed=claimIds.length>0&&claimConfirmations.every(Boolean),
+              lastConfirmedId=claimIds.at(-1)??removeIds.at(-1),
+              lastConfirmed=claimConfirmations.at(-1)??removeConfirmations.at(-1);
+            if(removesConfirmed&&(claimSkipped||claimsConfirmed)&&!unwindConfirmed&&lastConfirmedId&&lastConfirmed&&closeSettlementAmount(dispatch.attributableTokenX)===0n){
+              await input.store.updateExecutionJournal({idempotencyKey:plan.idempotencyKey,expectedVersion:journal.version,transactionId:lastConfirmedId,state:'CONFIRMED',signature:lastConfirmed.signature,updatedAt:input.now,payload:{...journal.payload,recovery:'P6_CLOSE_REHYDRATED_FOR_RECEIPT_BOUND_OPEN_RESIDUAL_UNWIND',transactionId:lastConfirmedId,expiredAccountCloseSignature:closePending.signature}});
               await input.store.transitionAutonomousPlan({planId:plan.planId,state:'RECONCILING',at:input.now,reasonCodes:['P6_CLOSE_REHYDRATED_FOR_RECEIPT_BOUND_OPEN_RESIDUAL_UNWIND'],payload:{stage:'CLOSE_CLAIMS_SETTLED',pendingStage:null,pendingSignature:null,closeSettlementIncomplete:true}});
               results.push({planId:plan.planId,action:'RESUME_CLOSE_SETTLEMENT',reasonCodes:['P6_CLOSE_REHYDRATED_FOR_RECEIPT_BOUND_OPEN_RESIDUAL_UNWIND']});
               continue;
@@ -5389,8 +5630,10 @@ export async function recoverUnfinishedAutonomousPlans(input: {
             results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:['P6_TERMINALIZATION_DEBT_ACCOUNT_CLOSE_ONLY_BLOCKED',...successor.reasonCodes]});
             continue;
           }
-          const reason = "P6_CLOSE_PENDING_STAGE_EXPIRED_NO_CHAIN_EFFECT";
-          await input.store.markSubmissionExpired(closePending.signature, input.now, reason);
+          const reason = confirmationStatus==='FAILED'
+            ? "P6_CLOSE_PENDING_STAGE_FAILED_CONFIRMED_NO_PROTOCOL_EFFECT"
+            : "P6_CLOSE_PENDING_STAGE_EXPIRED_NO_CHAIN_EFFECT";
+          if(confirmationStatus==='EXPIRED')await input.store.markSubmissionExpired(closePending.signature, input.now, reason);
           await input.store.updateExecutionJournal({
             idempotencyKey: plan.idempotencyKey,
             expectedVersion: journal.version,
@@ -5398,7 +5641,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
             updatedAt: input.now,
             payload: {
               ...journal.payload,
-              recovery: "CLOSE_PENDING_STAGE_EXPIRED",
+              recovery: confirmationStatus==='FAILED'?"CLOSE_PENDING_STAGE_FAILED_CONFIRMED":"CLOSE_PENDING_STAGE_EXPIRED",
               confirmationStatus,
               pendingStage: closePending.stage,
               pendingSignature: closePending.signature,
@@ -5411,7 +5654,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
             at: input.now,
             payload: {
               action: plan.action,
-              recovery: "CLOSE_PENDING_STAGE_EXPIRED_NO_CHAIN_EFFECT",
+              recovery: reason,
               pendingStage: closePending.stage,
               pendingSignature: closePending.signature,
             },
@@ -5491,21 +5734,31 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         results.push({ planId: plan.planId, action: "RESUME_CLOSE_SETTLEMENT", reasonCodes: [recovered?"P6_CLOSE_RECOVERED_OPEN_RESIDUAL_SETTLEMENT_RECOVERED":"P6_CLOSE_UNWIND_SETTLEMENT_RECOVERED"] });
         continue;
       }
-      const completedStage: Record<Exclude<CloseSettlementPendingStage, "CLOSE_UNWIND_SUBMITTED"|"CLOSE_OPEN_RESIDUAL_UNWIND_SUBMITTED">, CloseSettlementStage | undefined> = {
-        CLOSE_REMOVE_SUBMITTED: "CLOSE_LIQUIDITY_REMOVED",
-        CLOSE_CLAIM_SUBMITTED: "CLOSE_CLAIMS_SETTLED",
-        CLOSE_POSITION_SUBMITTED: undefined,
-      };
-      const next = completedStage[closePending.stage];
-      if (next) {
+      if(closePending.stage==='CLOSE_REMOVE_SUBMITTED'||closePending.stage==='CLOSE_CLAIM_SUBMITTED'){
+        const dispatch=closeSettlementDispatch(plan),remove=closePending.stage==='CLOSE_REMOVE_SUBMITTED',
+          idsRaw=remove?dispatch.removeChildTransactionIds:dispatch.claimTransactionIds,
+          idsFromArray=Array.isArray(idsRaw)?idsRaw.filter((value):value is string=>typeof value==='string'):[],
+          legacyId=remove?dispatch.removeTransactionId:dispatch.claimTransactionId,
+          ids=idsFromArray.length>0?idsFromArray:typeof legacyId==='string'?[legacyId]:[],
+          confirmedRaw=remove?dispatch.removeChildrenConfirmed:dispatch.claimChildrenConfirmed,
+          confirmed=Array.isArray(confirmedRaw)?confirmedRaw.filter((value):value is string=>typeof value==='string'):[],
+          indexRaw=Number(remove?dispatch.removeChildIndex:dispatch.claimChildIndex),index=Number.isInteger(indexRaw)?indexRaw:ids.length===1?0:Number.NaN,expectedId=Number.isInteger(index)?ids[index]:undefined,
+          exact=expectedId?await input.store.loadConfirmedSubmissionByTransactionId(expectedId):undefined,
+          advanced=advanceConfirmedCloseChild({kind:remove?'REMOVE':'CLAIM',transactionIds:ids,confirmedTransactionIds:confirmed,pendingChildIndex:index});
+        if(!expectedId||!exact||exact.signature!==closePending.signature||!advanced.valid){
+          const reason=advanced.reasonCode??`P6_CLOSE_${remove?'REMOVE':'CLAIM'}_RECOVERY_CONFIRMATION_IDENTITY_MISMATCH`;
+          await input.store.transitionAutonomousPlan({planId:plan.planId,state:'RECONCILIATION_REQUIRED',at:input.now,reasonCodes:[reason],payload:{pendingStage:closePending.stage,pendingSignature:closePending.signature,expectedTransactionId:expectedId??null}});
+          results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:[reason]});
+          continue;
+        }
         await input.store.transitionAutonomousPlan({
           planId: plan.planId,
           state: "RECONCILING",
           at: input.now,
           reasonCodes: ["P6_CLOSE_PENDING_STAGE_CONFIRMED", closePending.stage],
-          payload: { stage: next, pendingStage: null, pendingSignature: null },
+          payload: {stage:advanced.stage,pendingStage:null,pendingSignature:null,...(remove?{removeChildrenConfirmed:advanced.confirmedTransactionIds,lastConfirmedRemoveChild:index}:{claimChildrenConfirmed:advanced.confirmedTransactionIds,lastConfirmedClaimChild:index})},
         });
-        results.push({ planId: plan.planId, action: "RESUME_CLOSE_SETTLEMENT", reasonCodes: ["P6_CLOSE_PENDING_STAGE_CONFIRMED", next] });
+        results.push({ planId: plan.planId, action: "RESUME_CLOSE_SETTLEMENT", reasonCodes: ["P6_CLOSE_PENDING_STAGE_CONFIRMED", advanced.stage] });
         continue;
       }
       // The final account-close transaction is only economically complete
@@ -5559,10 +5812,18 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     if(plan.action==='CLAIM'&&(Boolean(recoverySignature)||journal.state==='SUBMITTED'||journal.state==='UNKNOWN_SUBMISSION'||journal.state==='SIGNED')){
       const claimRecovery=assessExpiredClaimRecovery({signaturePresent:Boolean(recoverySignature),signatureStatusReadUnknown,confirmationStatus});
       if(claimRecovery.terminal&&recoverySignature){
-        await input.store.markSubmissionExpired(recoverySignature,input.now,'P6_CLAIM_EXPIRED_NO_CHAIN_EFFECT');
-        await input.store.updateExecutionJournal({idempotencyKey:plan.idempotencyKey,expectedVersion:journal.version,state:'HOLD',updatedAt:input.now,payload:{...journal.payload,recovery:'CLAIM_NOT_EXECUTED',confirmationStatus,signature:recoverySignature,positionTruth}});
-        await input.store.insertExecutionReconciliation({reconciliationId:`${plan.planId}:claim-no-effect`,planId:plan.planId,observedAt:input.now,status:'MATCH',expected:{action:'CLAIM',signature:recoverySignature},actual:{confirmationStatus,claimEffect:'ABSENT',positionTruth},discrepancies:[],payload:{recovery:'CLAIM_NOT_EXECUTED',chainEffect:'NONE'}});
-        await input.store.transitionAutonomousPlan({planId:plan.planId,state:'EXPIRED',at:input.now,reasonCodes:claimRecovery.reasonCodes,payload:{recovery:'CLAIM_NOT_EXECUTED',confirmationStatus,signature:recoverySignature,chainEffect:'NONE'}});
+        const failed=claimRecovery.terminalKind==='CONFIRMED_FAILED';
+        if(failed){
+          if(!connection||!recoveryPositionAddress||!journal.transactionId||!(await persistConfirmedFailedTransactionCost({store:input.store,connection,plan,positionAddress:recoveryPositionAddress,signature:recoverySignature,transactionId:journal.transactionId,observedAt:input.now}))) {
+            await input.store.transitionAutonomousPlan({planId:plan.planId,state:'RECONCILIATION_REQUIRED',at:input.now,reasonCodes:['P6_CLAIM_FAILED_RECEIPT_PROOF_REQUIRED'],payload:{confirmationStatus,signature:recoverySignature,transactionId:journal.transactionId??null}});
+            results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:['P6_CLAIM_FAILED_RECEIPT_PROOF_REQUIRED']});
+            continue;
+          }
+        }else await input.store.markSubmissionExpired(recoverySignature,input.now,'P6_CLAIM_EXPIRED_NO_CHAIN_EFFECT');
+        const terminalState=failed?'FAILED':'EXPIRED',recovery=failed?'CLAIM_FAILED_CONFIRMED':'CLAIM_NOT_EXECUTED';
+        await input.store.updateExecutionJournal({idempotencyKey:plan.idempotencyKey,expectedVersion:journal.version,state:failed?'FAILED':'HOLD',updatedAt:input.now,payload:{...journal.payload,recovery,confirmationStatus,signature:recoverySignature,positionTruth}});
+        await input.store.insertExecutionReconciliation({reconciliationId:`${plan.planId}:claim-no-effect`,planId:plan.planId,observedAt:input.now,status:'MATCH',expected:{action:'CLAIM',signature:recoverySignature},actual:{confirmationStatus,claimEffect:'ABSENT',transactionFeeEffect:failed?'PRESENT':'ABSENT',positionTruth},discrepancies:[],payload:{recovery,chainEffect:failed?'FAILED_RECEIPT_ONLY':'NONE'}});
+        await input.store.transitionAutonomousPlan({planId:plan.planId,state:terminalState,at:input.now,reasonCodes:claimRecovery.reasonCodes,payload:{recovery,confirmationStatus,signature:recoverySignature,chainEffect:failed?'FAILED_RECEIPT_ONLY':'NONE'}});
         await input.store.releaseExecutionCapital(plan.planId,input.now,claimRecovery.reasonCodes);
         results.push({planId:plan.planId,action:'RETURN_EXISTING_PLAN',reasonCodes:claimRecovery.reasonCodes});
         continue;
@@ -5608,7 +5869,8 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       terminalDispatch.error==='LPFORGE_DUPLICATE_SUBMISSION_ATTEMPT'&&
       recoveryPositionAddress
     ){
-      const unwindStep=plan.steps.find(step=>step.kind==='JUPITER_UNWIND'),
+      const unwindTransactionId=typeof terminalDispatch.unwindTransactionId==='string'?terminalDispatch.unwindTransactionId:undefined,
+        unwindStep=unwindTransactionId?plan.steps.find(step=>step.transactionId===unwindTransactionId&&step.kind==='JUPITER_UNWIND'):undefined,
         unwindConfirmed=unwindStep?await input.store.loadConfirmedSubmissionByTransactionId(unwindStep.transactionId):undefined;
       if(unwindConfirmed){
         const successor=await createAccountCloseOnlySuccessor({store:input.store,plan,positionAddress:recoveryPositionAddress,positionTruth,now:input.now});
@@ -5748,11 +6010,29 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     // plan is terminalized and its reservation released; it is never replayed.
     if(plan.action==="OPEN"){
       const noEffectStore=input.store as Partial<Pick<Phase1Store,"loadPartialEntryRecovery"|"loadPlanCashflows"|"loadOpenChunkDispositions">>;
-      const [partialEntryRecovery,planCashflows,chunkDispositions]=await Promise.all([
+      const [partialEntryRecovery,initialPlanCashflows,initialChunkDispositions]=await Promise.all([
         noEffectStore.loadPartialEntryRecovery?.(plan.planId),
         noEffectStore.loadPlanCashflows?.(plan.planId)??[],
         noEffectStore.loadOpenChunkDispositions?.(plan.planId)??[],
       ]);
+      let planCashflows=initialPlanCashflows,chunkDispositions=initialChunkDispositions;
+      if(confirmationStatus==='FAILED'&&effectiveRecoverySignature&&journal.transactionId&&connection){
+        const step=plan.steps.find(candidate=>candidate.transactionId===journal.transactionId),receipt=await loadConfirmedExecutionReceipt(connection,effectiveRecoverySignature);
+        if(step&&receipt.state==='CONFIRMED_FAILURE'&&receipt.feeLamports!==undefined){
+          await input.store.insertPlanCashflow({cashflowId:`${plan.planId}:execution-tx-cost:${journal.transactionId}`,planId:plan.planId,flowType:'EXECUTION_TX_COST',observedAt:input.now,lamports:receipt.feeLamports,transactionSignature:effectiveRecoverySignature,payload:{source:'CONFIRMED_FAILED_CHAIN_RECEIPT_RECOVERY',transactionId:journal.transactionId}});
+          if(step.kind==='METEORA_OPEN'||step.kind==='METEORA_OPEN_CHUNK')await input.store.upsertOpenChunkDisposition({planId:plan.planId,transactionId:step.transactionId,sequence:step.sequence,kind:step.kind,disposition:'CONFIRMED_FAILED',signature:effectiveRecoverySignature,observedAt:input.now,payload:{confirmation:'FAILED',chainLanded:true,recovered:true}});
+          planCashflows=await input.store.loadPlanCashflows(plan.planId);chunkDispositions=await input.store.loadOpenChunkDispositions(plan.planId);
+        }
+      }
+      const failedNoProtocolEffect=assessConfirmedFailedOpenRecovery({confirmationStatus,economicEffect,positionAbsenceProven:positionTruth.absenceProven===true,signatureStatusReadUnknown,hasFundingChild:plan.steps.some(step=>step.kind==='JUPITER_SWAP'),partialEntryRecoveryPresent:partialEntryRecovery!==undefined,planCashflowTypes:planCashflows.map(flow=>flow.flowType),chunkDispositions:chunkDispositions.map(child=>child.disposition)});
+      if(failedNoProtocolEffect.terminal){
+        await input.store.insertExecutionReconciliation({reconciliationId:`${plan.planId}:open-failed-receipt-only`,planId:plan.planId,observedAt:input.now,status:'MATCH',expected:{action:'OPEN',owner:plan.ownerAddress,pool:plan.poolAddress,signature:effectiveRecoverySignature},actual:{confirmationStatus:'FAILED',protocolEffect:'ABSENT',transactionFeeEffect:'PRESENT',positionTruth},discrepancies:[],payload:{recovery:'OPEN_FAILED_CONFIRMED_NO_PROTOCOL_EFFECT',chainEffect:'FAILED_RECEIPT_ONLY'}});
+        await input.store.updateExecutionJournal({idempotencyKey:plan.idempotencyKey,expectedVersion:journal.version,state:'RECONCILED',updatedAt:input.now,payload:{...journal.payload,recovery:'OPEN_FAILED_CONFIRMED_NO_PROTOCOL_EFFECT',signature:effectiveRecoverySignature,positionTruth}});
+        await input.store.transitionAutonomousPlan({planId:plan.planId,state:'FAILED',at:input.now,reasonCodes:['P6_OPEN_FAILED_CONFIRMED_NO_PROTOCOL_EFFECT'],payload:{recovery:'OPEN_FAILED_CONFIRMED_NO_PROTOCOL_EFFECT',signature:effectiveRecoverySignature,chainEffect:'FAILED_RECEIPT_ONLY'}});
+        await input.store.releaseExecutionCapital(plan.planId,input.now,['P6_OPEN_FAILED_CONFIRMED_NO_PROTOCOL_EFFECT']);
+        results.push({planId:plan.planId,action:'RETURN_EXISTING_PLAN',reasonCodes:['P6_OPEN_FAILED_CONFIRMED_NO_PROTOCOL_EFFECT']});
+        continue;
+      }
       const noEffect=assessExpiredNoEffectOpenRecovery({
         confirmationStatus,
         economicEffect,

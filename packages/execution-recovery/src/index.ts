@@ -72,7 +72,10 @@ export function determineRecoveryAction(f:RecoveryFacts):RecoveryAction{
     if(f.confirmationStatus==='PROCESSED'||f.confirmationStatus==='CONFIRMED'||f.confirmationStatus==='FINALIZED')return'RECONCILE_FIRST';
     const expired=j.lastValidBlockHeight!==undefined&&f.currentBlockHeight>j.lastValidBlockHeight;
     if(!expired)return'WAIT_DO_NOT_RESUBMIT';
-    if(f.economicEffect==='ABSENT'&&(f.confirmationStatus==='UNKNOWN'||f.confirmationStatus==='EXPIRED'||f.confirmationStatus==='FAILED'))return'REBUILD_WITH_NEW_BLOCKHASH';
+    // FAILED is a landed receipt (and therefore at least a transaction-fee
+    // effect), never an expired/no-effect attempt. Action-specific recovery
+    // must account for that receipt before creating any distinct retry child.
+    if(f.economicEffect==='ABSENT'&&(f.confirmationStatus==='UNKNOWN'||f.confirmationStatus==='EXPIRED'))return'REBUILD_WITH_NEW_BLOCKHASH';
     return'HOLD_FOR_OPERATOR';
   }
   if(j.state==='FAILED'||j.state==='HOLD')return'HOLD_FOR_OPERATOR';if(j.state==='CONFIRMED')return'RECONCILE_FIRST';return'RETURN_EXISTING_PLAN';
