@@ -43,6 +43,24 @@ test('production launchers never load release-local environment files', () => {
   }
 });
 
+test('execution launcher gives the central execution authority config precedence over stale PM2 values', () => {
+  const launcher = readFileSync('scripts/start-lpforge-service.sh', 'utf8');
+  const execution = launcher.slice(launcher.indexOf('  execution)'), launcher.indexOf('  telegram-operator)'));
+  for (const variable of [
+    'LIVE_SIGNING',
+    'LPFORGE_LIVE_EXECUTION',
+    'LPFORGE_MAINNET_CANARY',
+    'LPFORGE_MAINNET_CANARY_CAMPAIGN_ID',
+    'LPFORGE_P6_PRIVATE_KEY',
+    'LPFORGE_P6_PRIVATE_WRITE_RPC_URL',
+    'LPFORGE_P6_SIGNER_BACKEND_ID',
+    'LPFORGE_P6_SIGNER_MODE',
+    'LPFORGE_P6_SIGNER_PUBLIC_KEY',
+  ]) assert.match(execution, new RegExp(`unset[\\s\\S]*${variable}`));
+  assert.match(execution, /env_args=\(--env-file="\$execution_env" --env-file="\$LPFORGE_RUNTIME_ENV_SOURCE"\)/);
+  assert.doesNotMatch(execution, /unset[\s\S]*LPFORGE_EXECUTION_POLICY_PATH/);
+});
+
 test('release integrity rejects release-local runtime environments', () => {
   const text = readFileSync('scripts/verify-release-integrity.sh', 'utf8');
   assert.match(text, /\.env must not be present in release/);

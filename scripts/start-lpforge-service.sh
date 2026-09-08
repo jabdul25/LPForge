@@ -37,8 +37,23 @@ case "$service" in
   execution)
     execution_env="$LPFORGE_RUNTIME_EXECUTION_ENV_SOURCE"
     [[ -r "$execution_env" ]] || { echo 'LPFORGE_EXECUTION_ENV_REQUIRED' >&2; exit 1; }
+    # Execution authority is deliberately defined by the central
+    # .env.execution file. Node does not overwrite inherited environment
+    # values when loading --env-file, and PM2 retains its daemon environment
+    # across release replacement. Clear only execution-owned values before
+    # loading the execution file first, so a stale base/PM2 false value cannot
+    # silently disable a configured live executor (or mask signer rotation).
+    # The canonical policy path is intentionally not cleared: runtime-config-
+    # paths.sh has already bound it to the central policy authority.
+    unset LIVE_SIGNING LPFORGE_LIVE_SIGNING LPFORGE_LIVE_EXECUTION \
+      LPFORGE_MAINNET_CANARY LPFORGE_MAINNET_CANARY_CAMPAIGN_ID \
+      LPFORGE_P6_PRIVATE_KEY LPFORGE_P6_PRIVATE_WRITE_RPC_URL \
+      LPFORGE_P6_SIGNER_BACKEND_ID LPFORGE_P6_SIGNER_MODE \
+      LPFORGE_P6_SIGNER_PUBLIC_KEY
     export LPFORGE_RPC_ROLE=EXECUTION
-    env_args+=(--env-file="$execution_env")
+    # First file wins for Node --env-file variables. The base runtime file
+    # remains available for shared non-execution configuration only.
+    env_args=(--env-file="$execution_env" --env-file="$LPFORGE_RUNTIME_ENV_SOURCE")
     target='.build/apps/execution/src/main.js'
     ;;
   telegram-operator)
