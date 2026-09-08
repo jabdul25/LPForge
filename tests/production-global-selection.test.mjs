@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {classifyProductionPoolCandidate,deriveProductionPoolHistory,fairProductionPoolOrder,selectProductionGlobalWinner} from '../.build/packages/production-global-selection/src/index.js';
+import {classifyProductionPoolCandidate,derivePoolReentryCooldown,deriveProductionPoolHistory,fairProductionPoolOrder,selectProductionGlobalWinner} from '../.build/packages/production-global-selection/src/index.js';
 
 const cutoff='2026-08-31T20:00:00.000Z',started='2026-08-31T19:58:00.000Z';
+const reentryPolicy={policyVersion:'pool-reentry-cooldown-v1',normalProfitCloseCooldownMinutes:120,discretionaryLossCooldownMinutes:240,hardStopCooldownMinutes:480,oorTokenRiskCooldownMinutes:720,emergencyCooldownMinutes:720,twoLossesWindowHours:24,twoLossesCooldownMinutes:1440,threeLossesWindowHours:168,threeLossesCooldownMinutes:4320};
 const outcome=(x={})=>({lifecycleId:'hve',poolAddress:'EsR3',settledAt:'2026-08-31T19:00:00.000Z',realizedNetLamports:-1_925_242n,realizedReturnFraction:-.064174733,closeReason:'OOR_TOKEN_EXPOSURE',oorDirection:'BELOW_MIN',inventoryClassification:'OOR_TOKEN_EXPOSURE',grossFeesLamports:924_642n,...x});
-const candidate=(pool,ev,opts={})=>classifyProductionPoolCandidate({cycleStartedAt:started,decisionCutoff:cutoff,candidate:{poolAddress:pool,operationalState:'ENTRY_READY',recommendationId:`r-${pool}`,thesisId:`t-${pool}`,candidateId:`c-${pool}`,decisionAt:'2026-08-31T19:59:00.000Z',expiresAt:'2026-08-31T20:04:00.000Z',phase3State:'ENTRY_READY',phase4State:'ENTRY_READY',capitalValue:.03,horizonMinutes:60,riskAdjustedExpectedNetEv:ev,history:deriveProductionPoolHistory({poolAddress:pool,asOf:cutoff,outcomes:opts.outcomes??[]}),...opts}});
+const candidate=(pool,ev,opts={})=>{const outcomes=opts.outcomes??[];return classifyProductionPoolCandidate({cycleStartedAt:started,decisionCutoff:cutoff,outcomes,reentryPolicy,candidate:{poolAddress:pool,operationalState:'ENTRY_READY',recommendationId:`r-${pool}`,thesisId:`t-${pool}`,candidateId:`c-${pool}`,decisionAt:'2026-08-31T19:59:00.000Z',expiresAt:'2026-08-31T20:04:00.000Z',phase3State:'ENTRY_READY',phase4State:'ENTRY_READY',capitalValue:.03,horizonMinutes:60,riskAdjustedExpectedNetEv:ev,history:deriveProductionPoolHistory({poolAddress:pool,asOf:cutoff,outcomes}),...opts}});};
 
 test('one best Candidate-Primary result per pool is globally ranked by comparable risk-adjusted net EV',()=>{
   const r=selectProductionGlobalWinner({decisionCutoff:cutoff,candidates:[candidate('A',.0001),candidate('B',.0003),candidate('C',.0002)]});
@@ -48,9 +49,24 @@ test('authoritative corrected settlements are visible only after settlement and 
   const hve=outcome(),history=deriveProductionPoolHistory({poolAddress:'EsR3',asOf:cutoff,outcomes:[hve,outcome({lifecycleId:'future',settledAt:'2026-08-31T20:01:00.000Z'}),outcome({lifecycleId:'other',poolAddress:'other',realizedNetLamports:320_468n})]});
   assert.deepEqual(history.sourceLifecycleIds,['hve']);assert.equal(history.lastRealizedNetLamports,-1_925_242n);assert.equal(history.recentTokenRiskCloseCount,1);assert.equal(deriveProductionPoolHistory({poolAddress:'other',asOf:cutoff,outcomes:[hve]}).entriesToday,0);
 });
-test('same-pool re-entry requires a post-settlement candidate but does not permanently ban the pool',()=>{
+test('same-pool re-entry requires fresh post-settlement evidence and waits for the configured cooldown',()=>{
   const hve=outcome({settledAt:'2026-08-31T19:59:00.000Z'});const stale=candidate('EsR3',.5,{decisionAt:hve.settledAt,outcomes:[hve]});assert.equal(stale.state,'EXCLUDED_REENTRY_EVIDENCE');
-  const fresh=candidate('EsR3',.5,{decisionAt:'2026-08-31T19:59:30.000Z',outcomes:[hve]});const r=selectProductionGlobalWinner({decisionCutoff:cutoff,candidates:[fresh,candidate('other',.1)]});assert.equal(r.winner?.poolAddress,'EsR3');
+  const fresh=candidate('EsR3',.5,{decisionAt:'2026-08-31T19:59:30.000Z',outcomes:[hve]});assert.equal(fresh.state,'EXCLUDED_REENTRY_EVIDENCE');assert.ok(fresh.reasonCodes.includes('GLOBAL_SAME_POOL_REENTRY_COOLDOWN_ACTIVE'));
+  const expiredCooldown=outcome({settledAt:'2026-08-31T06:00:00.000Z'}),eligible=candidate('EsR3',.5,{decisionAt:'2026-08-31T19:59:30.000Z',outcomes:[expiredCooldown]});const r=selectProductionGlobalWinner({decisionCutoff:cutoff,candidates:[eligible,candidate('other',.1)]});assert.equal(r.winner?.poolAddress,'EsR3');
+});
+test('calibrated re-entry cooldowns are exact, pool-scoped, and auditable',()=>{
+  const normal=outcome({poolAddress:'P',lifecycleId:'profit',settledAt:'2026-08-31T19:00:00.000Z',realizedNetLamports:1n,closeReason:'EXIT_PROFIT_GIVEBACK_LIMIT',inventoryClassification:undefined}),hard=outcome({poolAddress:'P',lifecycleId:'hard',settledAt:'2026-08-31T19:30:00.000Z',closeReason:'EXIT_HARD_POSITION_STOP_LOSS',inventoryClassification:undefined}),emergency=outcome({poolAddress:'P',lifecycleId:'emergency',settledAt:'2026-08-31T19:40:00.000Z',closeReason:'EXIT_LIQUIDITY_COLLAPSE',inventoryClassification:undefined});
+  assert.equal(derivePoolReentryCooldown({asOf:cutoff,poolAddress:'P',outcomes:[normal],policy:reentryPolicy})?.cooldownUntil,'2026-08-31T21:00:00.000Z');
+  assert.equal(derivePoolReentryCooldown({asOf:cutoff,poolAddress:'P',outcomes:[hard],policy:reentryPolicy})?.cooldownUntil,'2026-09-01T03:30:00.000Z');
+  const c=derivePoolReentryCooldown({asOf:cutoff,poolAddress:'P',outcomes:[emergency],policy:reentryPolicy});assert.equal(c?.trigger,'EMERGENCY');assert.equal(c?.cooldownUntil,'2026-09-01T07:40:00.000Z');assert.equal(c?.triggeringLifecycleId,'emergency');
+});
+test('two and three losing settlements escalate cooldowns without reusing old entry evidence',()=>{
+  const losses=[outcome({poolAddress:'P',lifecycleId:'l1',settledAt:'2026-08-31T18:00:00.000Z',closeReason:'EXIT_PROFIT_GIVEBACK_LIMIT'}),outcome({poolAddress:'P',lifecycleId:'l2',settledAt:'2026-08-31T19:00:00.000Z',closeReason:'EXIT_PROFIT_GIVEBACK_LIMIT'})];
+  const two=derivePoolReentryCooldown({asOf:cutoff,poolAddress:'P',outcomes:losses,policy:reentryPolicy});assert.equal(two?.trigger,'LOSS_STREAK_2_IN_24H');assert.equal(two?.cooldownUntil,'2026-09-01T19:00:00.000Z');assert.equal(two?.lossesInWindow,2);
+  const three=derivePoolReentryCooldown({asOf:cutoff,poolAddress:'P',outcomes:[...losses,outcome({poolAddress:'P',lifecycleId:'l3',settledAt:'2026-08-31T19:30:00.000Z',closeReason:'EXIT_PROFIT_GIVEBACK_LIMIT'})],policy:reentryPolicy});assert.equal(three?.trigger,'LOSS_STREAK_3_IN_7D');assert.equal(three?.cooldownUntil,'2026-09-03T19:30:00.000Z');assert.equal(three?.lossesInWindow,3);
+});
+test('missing re-entry policy fails closed for new entries rather than supplying hidden durations',()=>{
+  const h=deriveProductionPoolHistory({poolAddress:'P',asOf:cutoff,outcomes:[]}),r=classifyProductionPoolCandidate({cycleStartedAt:started,decisionCutoff:cutoff,candidate:{poolAddress:'P',operationalState:'ENTRY_READY',candidateId:'p',phase3State:'ENTRY_READY',phase4State:'ENTRY_READY',capitalValue:.03,horizonMinutes:60,riskAdjustedExpectedNetEv:.1,decisionAt:'2026-08-31T19:59:00.000Z',history:h}});assert.equal(r.state,'NO_VALID_CANDIDATE');assert.ok(r.reasonCodes.includes('GLOBAL_POOL_REENTRY_POLICY_MISSING'));
 });
 test('fair scheduler is deterministic, rotates, and has no duplicate pool starvation',()=>{
   const pools=['C','A','B','A'],one=fairProductionPoolOrder(pools,'cycle-1'),again=fairProductionPoolOrder(pools,'cycle-1'),two=fairProductionPoolOrder(pools,'cycle-2');assert.deepEqual(one,again);assert.equal(new Set(one).size,3);assert.equal(one.length,3);assert.equal(two.length,3);

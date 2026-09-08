@@ -37,6 +37,18 @@
   "feeClaim": {
     "minimumClaimValueUsd": 0.50
   },
+  "poolReentry": {
+    "policyVersion": "pool-reentry-cooldown-v1",
+    "normalProfitCloseCooldownMinutes": 120,
+    "discretionaryLossCooldownMinutes": 240,
+    "hardStopCooldownMinutes": 480,
+    "oorTokenRiskCooldownMinutes": 720,
+    "emergencyCooldownMinutes": 720,
+    "twoLossesWindowHours": 24,
+    "twoLossesCooldownMinutes": 1440,
+    "threeLossesWindowHours": 168,
+    "threeLossesCooldownMinutes": 4320
+  },
   "settlement": {
     "residualDustThresholdUsd": 0.10
   },
