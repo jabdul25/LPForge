@@ -57,7 +57,7 @@ test('execution launcher gives the central execution authority config precedence
     'LPFORGE_P6_SIGNER_MODE',
     'LPFORGE_P6_SIGNER_PUBLIC_KEY',
   ]) assert.match(execution, new RegExp(`unset[\\s\\S]*${variable}`));
-  assert.match(execution, /env_args=\(--env-file="\$execution_env" --env-file="\$LPFORGE_RUNTIME_ENV_SOURCE"\)/);
+  assert.match(execution, /env_args=\(--env-file="\$LPFORGE_RUNTIME_ENV_SOURCE" --env-file="\$execution_env"\)/);
   assert.doesNotMatch(execution, /unset[\s\S]*LPFORGE_EXECUTION_POLICY_PATH/);
 });
 

@@ -51,9 +51,10 @@ case "$service" in
       LPFORGE_P6_SIGNER_BACKEND_ID LPFORGE_P6_SIGNER_MODE \
       LPFORGE_P6_SIGNER_PUBLIC_KEY
     export LPFORGE_RPC_ROLE=EXECUTION
-    # First file wins for Node --env-file variables. The base runtime file
-    # remains available for shared non-execution configuration only.
-    env_args=(--env-file="$execution_env" --env-file="$LPFORGE_RUNTIME_ENV_SOURCE")
+    # Node applies later env files as overrides. Load the shared runtime file
+    # first, then let the execution authority file override only its explicit
+    # execution settings.
+    env_args=(--env-file="$LPFORGE_RUNTIME_ENV_SOURCE" --env-file="$execution_env")
     target='.build/apps/execution/src/main.js'
     ;;
   telegram-operator)
