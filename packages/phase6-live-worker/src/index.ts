@@ -3565,6 +3565,10 @@ export function canResumePreSubmissionClose(value:{
   positionPool:string|undefined;
   planOwner:string;
   planPool:string;
+  /** The original close workflow was persisted completely, but no child has
+   * crossed a network boundary.  This permits an unsnapshotted pre-build
+   * failure to restart its *same* parent close plan. */
+  hasCanonicalCloseWorkflow:boolean;
   removeChildrenHaveSignatures:boolean;
 }):boolean{
   return (value.action==="CLOSE"||value.action==="EMERGENCY_CLOSE")&&
@@ -3575,6 +3579,11 @@ export function canResumePreSubmissionClose(value:{
     // The preSubmissionResume marker was written before that claim, so this
     // remains an exact, durable no-signature continuation—not a BLOCKED retry.
     (value.stage==="CLOSE_INVENTORY_SNAPSHOTTED"||
+      // A transport/read failure can occur after the parent journal is
+      // created but before the first inventory snapshot is durable.  It is
+      // recoverable only for the standard, fully persisted close workflow;
+      // an arbitrary no-stage reconciliation-required plan never qualifies.
+      (value.stage===undefined&&value.hasCanonicalCloseWorkflow)||
       (value.blockedPreSubmissionResume===true&&value.stage==="CLAIM_GUARD"&&
         (value.planState==="BLOCKED"||value.planState==="RECONCILIATION_REQUIRED")&&
         value.journalState==="FAILED"))&&
@@ -4672,6 +4681,15 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     // here solely so the exact unsigned legacy recovery can prove why the
     // parent journal was terminalized before any network boundary.
     const recoveryCloseStage=closeStage??(typeof closeDispatch.stage==="string"?closeDispatch.stage:undefined);
+    // Store rows always carry steps; tolerate lean recovery-test/read-model
+    // fixtures without them so absence remains non-resumable rather than
+    // becoming a recovery exception.
+    const closeSteps=plan.steps??[];
+    const hasCanonicalCloseWorkflow=closeSteps.length>0&&
+      closeSteps.every(step=>step.state==="PLANNED")&&
+      closeSteps.some(step=>step.kind==="METEORA_REMOVE")&&
+      closeSteps.some(step=>step.kind==="JUPITER_UNWIND")&&
+      closeSteps.some(step=>step.kind==="METEORA_CLOSE");
     const preSubmissionCloseCandidate=canResumePreSubmissionClose({
       action:plan.action,planState:plan.state,stage:recoveryCloseStage,
       blockedPreSubmissionResume:closeDispatch.preSubmissionResume===true,
@@ -4680,6 +4698,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       positionOwner:typeof positionTruth.owner==="string"?positionTruth.owner:undefined,
       positionPool:typeof positionTruth.pool==="string"?positionTruth.pool:undefined,
       planOwner:plan.ownerAddress,planPool:plan.poolAddress,
+      hasCanonicalCloseWorkflow,
       // Submission ledgers are read below before mutation; this first pass
       // simply prevents any broad class of unresolved plans from entering it.
       removeChildrenHaveSignatures:false,
@@ -4695,6 +4714,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         positionOwner:typeof positionTruth.owner==="string"?positionTruth.owner:undefined,
         positionPool:typeof positionTruth.pool==="string"?positionTruth.pool:undefined,
         planOwner:plan.ownerAddress,planPool:plan.poolAddress,
+        hasCanonicalCloseWorkflow,
         removeChildrenHaveSignatures:submissions.some(Boolean),
       })){
         await input.store.transitionAutonomousPlan({
@@ -4705,18 +4725,22 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         results.push({planId:plan.planId,action:"HOLD_FOR_OPERATOR",reasonCodes:["P6_CLOSE_MULTI_REMOVE_PRE_SUBMISSION_SIGNATURE_CONFLICT"]});
         continue;
       }
+      // A failure before the snapshot has no snapshot values to resume from.
+      // Preserve that distinction so executeAutonomousPlan takes a fresh
+      // position-local snapshot after the same parent plan is re-claimed.
+      const resumePayload:Record<string,unknown>={
+        priorError:typeof closeDispatch.error==="string"?closeDispatch.error:null,
+        preSubmissionResume:true,
+        positionAddress:recoveryPositionAddress,
+        pendingStage:null,
+        pendingSignature:null,
+      };
+      if(recoveryCloseStage!==undefined)resumePayload.stage="CLOSE_INVENTORY_SNAPSHOTTED";
       const resumed=await input.store.resumePreSubmissionClosePlan({
         planId:plan.planId,
         at:input.now,
         reasonCodes:["P6_CLOSE_MULTI_REMOVE_PRE_SUBMISSION_RESUME_READY"],
-        payload:{
-          stage:"CLOSE_INVENTORY_SNAPSHOTTED",
-          priorError:typeof closeDispatch.error==="string"?closeDispatch.error:null,
-          preSubmissionResume:true,
-          positionAddress:recoveryPositionAddress,
-          pendingStage:null,
-          pendingSignature:null,
-        },
+        payload:resumePayload,
       });
       results.push({
         planId:plan.planId,

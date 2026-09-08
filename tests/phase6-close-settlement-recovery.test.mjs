@@ -14,7 +14,8 @@ test('only an exact unsigned OPEN/MATCH close snapshot may resume multi-remove c
     stage: 'CLOSE_INVENTORY_SNAPSHOTTED', hasPendingChild: false,
     journalState: 'PLAN_CREATED', hasJournalSignature: false,
     positionExists: true, positionOwner: 'owner', positionPool: 'pool',
-    planOwner: 'owner', planPool: 'pool', removeChildrenHaveSignatures: false,
+    planOwner: 'owner', planPool: 'pool', hasCanonicalCloseWorkflow: true,
+    removeChildrenHaveSignatures: false,
   };
   assert.equal(canResumePreSubmissionClose(base), true);
   for (const incompatible of [
@@ -33,6 +34,21 @@ test('only an exact unsigned OPEN/MATCH close snapshot may resume multi-remove c
   assert.equal(canResumePreSubmissionClose({...base, planState: 'RECONCILIATION_REQUIRED', stage: 'CLAIM_GUARD', journalState: 'PLAN_CREATED', blockedPreSubmissionResume: true}), false);
 });
 
+test('an exact unsnapshotted protective close resumes only when its complete unsigned workflow is durable', () => {
+  const base = {
+    action: 'CLOSE', planState: 'RECONCILIATION_REQUIRED', stage: undefined,
+    hasPendingChild: false, journalState: 'PLAN_CREATED', hasJournalSignature: false,
+    positionExists: true, positionOwner: 'owner', positionPool: 'pool',
+    planOwner: 'owner', planPool: 'pool', hasCanonicalCloseWorkflow: true,
+    removeChildrenHaveSignatures: false,
+  };
+  assert.equal(canResumePreSubmissionClose(base), true);
+  assert.equal(canResumePreSubmissionClose({...base, hasCanonicalCloseWorkflow: false}), false);
+  assert.equal(canResumePreSubmissionClose({...base, removeChildrenHaveSignatures: true}), false);
+  assert.equal(canResumePreSubmissionClose({...base, hasJournalSignature: true}), false);
+  assert.equal(canResumePreSubmissionClose({...base, positionPool: 'other'}), false);
+});
+
 test('multi-remove close construction persists all children and fingerprints before any child dispatch', async () => {
   const source = await import('node:fs/promises').then(fs => fs.readFile('packages/phase6-live-worker/src/index.ts', 'utf8'));
   const db = await import('node:fs/promises').then(fs => fs.readFile('packages/db/src/index.ts', 'utf8'));
@@ -43,6 +59,8 @@ test('multi-remove close construction persists all children and fingerprints bef
   assert.match(source, /P6_CLOSE_REMOVE_CHILD_CONSTRUCTION_MISMATCH/);
   assert.match(source, /P6_CLOSE_MULTI_REMOVE_PRE_SUBMISSION_RESUME_READY/);
   assert.match(source, /const recoveryCloseStage=closeStage\?\?/);
+  assert.match(source, /value\.stage===undefined&&value\.hasCanonicalCloseWorkflow/);
+  assert.match(source, /if\(recoveryCloseStage!==undefined\)resumePayload\.stage/);
   assert.match(db, /async resumePreSubmissionClosePlan/);
 });
 
