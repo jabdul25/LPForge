@@ -32,6 +32,14 @@ export function shortenTelegramPositionAddress(value:unknown):string{
  */
 export function resolveTelegramPositionAddress(input:{target:string;positions:readonly TelegramPositionSummary[]}):string{
   const target=input.target.trim();
+  // /positions numbers the same entered-at ordered live-position list.  An
+  // ordinal is resolved immediately to its canonical address and is never
+  // persisted as an execution identifier.
+  if(/^[1-9]\d*$/.test(target)){
+    const ordinal=Number(target);
+    if(Number.isSafeInteger(ordinal)&&ordinal<=input.positions.length)return String(input.positions[ordinal-1]!.position_address);
+    throw new Error('LPFORGE_TELEGRAM_LIVE_POSITION_NOT_FOUND');
+  }
   const exact=input.positions.filter(position=>String(position.position_address??'')===target);
   if(exact.length===1)return String(exact[0]!.position_address);
   if(exact.length>1)throw new Error('LPFORGE_TELEGRAM_LIVE_POSITION_AMBIGUOUS');

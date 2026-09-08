@@ -15,7 +15,11 @@ const position={
 test('telegram positions reports no live positions without external dependencies',()=>{
   assert.equal(formatTelegramPositionSummaries({positions:[]}), 'No live LPForge positions.');
 });
-test('telegram close resolution accepts only an exact canonical address or the exact displayed alias',()=>{
+test('telegram close resolution accepts the displayed ordinal, canonical address, or exact displayed alias',()=>{
+  const second={...position,position_address:'7t477abcdefghijkmnopqrstuvwxyz123456789fHYs'};
+  assert.equal(resolveTelegramPositionAddress({target:'1',positions:[position,second]}),position.position_address);
+  assert.equal(resolveTelegramPositionAddress({target:'2',positions:[position,second]}),second.position_address);
+  assert.throws(()=>resolveTelegramPositionAddress({target:'3',positions:[position,second]}),/LPFORGE_TELEGRAM_LIVE_POSITION_NOT_FOUND/);
   assert.equal(resolveTelegramPositionAddress({target:position.position_address,positions:[position]}),position.position_address);
   assert.equal(resolveTelegramPositionAddress({target:'5odbT7…jT2X',positions:[position]}),position.position_address);
   assert.throws(()=>resolveTelegramPositionAddress({target:'5odbT7',positions:[position]}),/LPFORGE_TELEGRAM_LIVE_POSITION_NOT_FOUND/);
@@ -57,5 +61,5 @@ test('telegram operator uses the bounded DB summary reader for /positions',async
   assert.match(source,/parsed\.name==='\/positions'\)\{const max=maxOpenPositions\(\);response=formatTelegramPositionSummaries\(\{positions:await store\.loadTelegramOperatorPositionSummaries\(\)/);
   assert.match(source,/parsed\.name==='\/positions'\?'Unable to load position snapshot right now\.'/);
   assert.match(source,/resolveTelegramPositionAddress\(\{target,positions\}\)/);
-  assert.match(source,/exact \/positions alias/);
+  assert.match(source,/close <position number\|all>/);
 });
