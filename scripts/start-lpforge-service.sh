@@ -16,7 +16,15 @@ case "$service" in
     # inherited malformed P7 baseline must not mask the canonical central
     # runtime value. These three variables are defined solely by .env for the
     # Production control runtime.
-    unset LPFORGE_P7_DRIFT_BASELINE_JSON LPFORGE_P7_INSTANCE_ID LPFORGE_P7_RUNTIME_ID
+    # P7 authority and its approval envelope are central .env authority.
+    # Clear every authority-bearing inherited PM2 value before Node loads it.
+    unset LPFORGE_P7_DRIFT_BASELINE_JSON LPFORGE_P7_INSTANCE_ID LPFORGE_P7_RUNTIME_ID \
+      LPFORGE_P7_MODE LPFORGE_P7_PRODUCTION_AUTHORITY LPFORGE_P7_SCALING_MODE \
+      LPFORGE_P7_AUTOMATIC_POLICY_PROMOTION LPFORGE_BOUNDED_UNATTENDED_PRODUCTION \
+      LPFORGE_P7_AUTHORITY_TTL_MS LPFORGE_P7_APPROVAL_ID \
+      LPFORGE_P7_APPROVAL_ACTION LPFORGE_P7_APPROVED_BY \
+      LPFORGE_P7_APPROVAL_ISSUED_AT LPFORGE_P7_APPROVAL_EXPIRES_AT \
+      LPFORGE_P7_APPROVAL_REASON
     export LPFORGE_RPC_ROLE=PRODUCTION
     target='.build/apps/production/src/main.js'
     ;;

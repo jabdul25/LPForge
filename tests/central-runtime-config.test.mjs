@@ -70,6 +70,19 @@ test('execution launcher gives the central execution authority config precedence
   assert.doesNotMatch(execution, /unset[\s\S]*LPFORGE_EXECUTION_POLICY_PATH/);
 });
 
+test('production launcher clears the complete central P7 authority envelope before loading .env', () => {
+  const launcher = readFileSync('scripts/start-lpforge-service.sh', 'utf8');
+  const production = launcher.slice(launcher.indexOf('  production)'), launcher.indexOf('  discovery)'));
+  for (const variable of [
+    'LPFORGE_P7_MODE', 'LPFORGE_P7_PRODUCTION_AUTHORITY',
+    'LPFORGE_P7_SCALING_MODE', 'LPFORGE_P7_AUTOMATIC_POLICY_PROMOTION',
+    'LPFORGE_BOUNDED_UNATTENDED_PRODUCTION', 'LPFORGE_P7_AUTHORITY_TTL_MS',
+    'LPFORGE_P7_APPROVAL_ID', 'LPFORGE_P7_APPROVAL_ACTION',
+    'LPFORGE_P7_APPROVED_BY', 'LPFORGE_P7_APPROVAL_ISSUED_AT',
+    'LPFORGE_P7_APPROVAL_EXPIRES_AT', 'LPFORGE_P7_APPROVAL_REASON',
+  ]) assert.match(production, new RegExp(`unset[\\s\\S]*${variable}`));
+});
+
 test('release integrity rejects release-local runtime environments', () => {
   const text = readFileSync('scripts/verify-release-integrity.sh', 'utf8');
   assert.match(text, /\.env must not be present in release/);
