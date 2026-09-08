@@ -3651,7 +3651,7 @@ export function isPreSubmissionAccountCloseRetryStepRecovery(value:{
   positionExists:boolean;
 }):boolean{
   const dispatch=closeSettlementDispatch(value.plan),retryRaw=Number(dispatch.closeAccountRetryCount??0),retry=Number.isSafeInteger(retryRaw)&&retryRaw>0?retryRaw:undefined,
-    closeStep=value.plan.steps.find(step=>step.kind==='METEORA_CLOSE'),expectedTransactionId=retry!==undefined&&closeStep?`${closeStep.transactionId}:retry-${retry}`:undefined;
+    closeStep=(value.plan.steps??[]).find(step=>step.kind==='METEORA_CLOSE'),expectedTransactionId=retry!==undefined&&closeStep?`${closeStep.transactionId}:retry-${retry}`:undefined;
   return (value.plan.action==='CLOSE'||value.plan.action==='EMERGENCY_CLOSE')&&
     value.plan.state==='RECONCILIATION_REQUIRED'&&
     value.journal.state==='FAILED'&&
