@@ -66,7 +66,7 @@ test('execution launcher gives the central execution authority config precedence
     'LPFORGE_OPERATOR_OWNER_ADDRESS',
   ]) assert.match(execution, new RegExp(`unset[\\s\\S]*${variable}`));
   assert.match(execution, /env_args=\(--env-file="\$LPFORGE_RUNTIME_ENV_SOURCE" --env-file="\$execution_env"\)/);
-  assert.match(execution, /unset[\s\S]*LPFORGE_EXECUTION_POLICY_PATH/);
+  assert.doesNotMatch(execution, /unset[\s\S]*LPFORGE_EXECUTION_POLICY_PATH/);
 });
 
 test('release integrity rejects release-local runtime environments', () => {
