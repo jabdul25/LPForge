@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {readFile} from 'node:fs/promises';
-import {formatTelegramPositionSummaries,shortenTelegramPositionAddress} from '../.build/packages/telegram-operator-format/src/index.js';
+import {formatTelegramPositionSummaries,resolveTelegramPositionAddress,shortenTelegramPositionAddress} from '../.build/packages/telegram-operator-format/src/index.js';
 
 const now=Date.parse('2026-09-07T05:00:00.000Z');
 const position={
@@ -14,6 +14,12 @@ const position={
 
 test('telegram positions reports no live positions without external dependencies',()=>{
   assert.equal(formatTelegramPositionSummaries({positions:[]}), 'No live LPForge positions.');
+});
+test('telegram close resolution accepts only an exact canonical address or the exact displayed alias',()=>{
+  assert.equal(resolveTelegramPositionAddress({target:position.position_address,positions:[position]}),position.position_address);
+  assert.equal(resolveTelegramPositionAddress({target:'5odbT7…jT2X',positions:[position]}),position.position_address);
+  assert.throws(()=>resolveTelegramPositionAddress({target:'5odbT7',positions:[position]}),/LPFORGE_TELEGRAM_LIVE_POSITION_NOT_FOUND/);
+  assert.throws(()=>resolveTelegramPositionAddress({target:'5odbT7…jT2X',positions:[position,{...position}]}),/LPFORGE_TELEGRAM_LIVE_POSITION_AMBIGUOUS/);
 });
 test('telegram positions renders a fresh canonical marked snapshot without inventing SOL MTM',()=>{
   const rendered=formatTelegramPositionSummaries({positions:[position],maxOpenPositions:2,nowMs:now});
@@ -50,4 +56,6 @@ test('telegram operator uses the bounded DB summary reader for /positions',async
   const source=await readFile('apps/telegram-operator/src/main.ts','utf8');
   assert.match(source,/parsed\.name==='\/positions'\)\{const max=maxOpenPositions\(\);response=formatTelegramPositionSummaries\(\{positions:await store\.loadTelegramOperatorPositionSummaries\(\)/);
   assert.match(source,/parsed\.name==='\/positions'\?'Unable to load position snapshot right now\.'/);
+  assert.match(source,/resolveTelegramPositionAddress\(\{target,positions\}\)/);
+  assert.match(source,/exact \/positions alias/);
 });

@@ -24,6 +24,23 @@ export function shortenTelegramPositionAddress(value:unknown):string{
   return address.length>12?`${address.slice(0,6)}…${address.slice(-4)}`:address;
 }
 
+/**
+ * Resolves only an exact canonical address or the exact display alias emitted
+ * by /positions.  A Telegram close request remains an operator intent: the
+ * position manager still revalidates ownership, chain truth, authority, and
+ * idempotency before it can construct a plan.
+ */
+export function resolveTelegramPositionAddress(input:{target:string;positions:readonly TelegramPositionSummary[]}):string{
+  const target=input.target.trim();
+  const exact=input.positions.filter(position=>String(position.position_address??'')===target);
+  if(exact.length===1)return String(exact[0]!.position_address);
+  if(exact.length>1)throw new Error('LPFORGE_TELEGRAM_LIVE_POSITION_AMBIGUOUS');
+  const alias=input.positions.filter(position=>shortenTelegramPositionAddress(position.position_address)===target);
+  if(alias.length===1)return String(alias[0]!.position_address);
+  if(alias.length>1)throw new Error('LPFORGE_TELEGRAM_LIVE_POSITION_AMBIGUOUS');
+  throw new Error('LPFORGE_TELEGRAM_LIVE_POSITION_NOT_FOUND');
+}
+
 function sol(value:unknown):string|undefined{
   const n=number(value);if(n===undefined)return undefined;
   return `${(n/LAMPORTS_PER_SOL).toFixed(6)} SOL`;
