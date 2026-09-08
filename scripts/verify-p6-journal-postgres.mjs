@@ -3,6 +3,10 @@ import {Client} from 'pg';
 
 const url=process.env.DATABASE_URL;
 if(!url)throw new Error('DATABASE_URL required');
+// This verifier deliberately creates collision/recovery fixtures.  It is for
+// the disposable PostgreSQL CI service only, never the production database.
+if(process.env.LPFORGE_P6_JOURNAL_PG_VERIFY_ALLOW_MUTATION!=="true")
+  throw new Error('LPFORGE_P6_JOURNAL_PG_VERIFY_ALLOW_MUTATION=true required');
 const suffix=process.env.LPFORGE_P6_JOURNAL_PG_VERIFY_SUFFIX??String(process.pid);
 const id=(value)=>`${value}_${suffix}`;
 const t0='2026-09-08T12:00:00.000Z';

@@ -28,3 +28,5 @@ jobs:
       - run: pnpm db:migrate
       - run: pnpm db:migrate
       - run: pnpm verify:postgres:p6-journal
+        env:
+          LPFORGE_P6_JOURNAL_PG_VERIFY_ALLOW_MUTATION: "true"
