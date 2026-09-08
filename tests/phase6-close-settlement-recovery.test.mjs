@@ -4,6 +4,7 @@ import {
   canonicalizeTerminalSettlementCashflows,
   canResumePreSubmissionClose,
   isReceiptBoundCombinedCloseClaimDisposition,
+  isPreSubmissionAccountCloseRetryStepRecovery,
   isLegacySequentialCloseJournalRecovery,
   mutationRiskPlanExpiry,
   selectReceiptBoundFeeClaimResidual,
@@ -68,6 +69,21 @@ test('a fresh account-close retry materializes its child step before the simulat
   assert.match(close,/transactionId:closeAccountTransactionId/);
   assert.match(close,/kind:"METEORA_CLOSE"/);
   assert.ok(close.indexOf('ensureExecutionTransactionStep')<close.indexOf('executeMeteoraMutation'),'the retry step exists before simulation/signing');
+});
+
+test('only the exact unsigned account-close retry FK failure may rehydrate to the confirmed unwind', () => {
+  const plan = {
+    action:'CLOSE', state:'RECONCILIATION_REQUIRED', steps:[{kind:'METEORA_CLOSE',transactionId:'close'}],
+    planPayload:{autonomous_dispatch:{stage:'CLOSE_POSITION_PENDING',closeAccountRetryCount:1,transactionId:'close:retry-1',unwindTransactionId:'unwind',error:'insert or update on table "simulations" violates foreign key constraint "simulations_transaction_id_fkey"'}},
+  };
+  const journal={state:'FAILED'};
+  assert.equal(isPreSubmissionAccountCloseRetryStepRecovery({plan,journal,positionExists:true}),true);
+  for(const value of [
+    {positionExists:false},
+    {journal:{state:'CONFIRMED'}},
+    {plan:{...plan,planPayload:{autonomous_dispatch:{...plan.planPayload.autonomous_dispatch,error:'other'}}}},
+    {plan:{...plan,planPayload:{autonomous_dispatch:{...plan.planPayload.autonomous_dispatch,transactionId:'close:retry-2'}}}},
+  ]) assert.equal(isPreSubmissionAccountCloseRetryStepRecovery({plan,journal,positionExists:true,...value}),false);
 });
 
 test('only an exact unsigned OPEN/MATCH close snapshot may resume multi-remove construction', () => {

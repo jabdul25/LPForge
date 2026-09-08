@@ -3638,6 +3638,29 @@ export function isLegacySequentialCloseJournalRecovery(value: {
   );
 }
 
+/**
+ * A release before retry children were materialized tried to simulate a fresh
+ * account-close identity without first inserting its transaction step.  The
+ * database FK correctly rejected that attempt before signing.  This narrow
+ * compatibility predicate reopens only that proven no-effect boundary so the
+ * current worker can create the missing step and resume the final close.
+ */
+export function isPreSubmissionAccountCloseRetryStepRecovery(value:{
+  plan:AutonomousPlan;
+  journal:ExecutionJournal;
+  positionExists:boolean;
+}):boolean{
+  const dispatch=closeSettlementDispatch(value.plan),retryRaw=Number(dispatch.closeAccountRetryCount??0),retry=Number.isSafeInteger(retryRaw)&&retryRaw>0?retryRaw:undefined,
+    closeStep=value.plan.steps.find(step=>step.kind==='METEORA_CLOSE'),expectedTransactionId=retry!==undefined&&closeStep?`${closeStep.transactionId}:retry-${retry}`:undefined;
+  return (value.plan.action==='CLOSE'||value.plan.action==='EMERGENCY_CLOSE')&&
+    value.plan.state==='RECONCILIATION_REQUIRED'&&
+    value.journal.state==='FAILED'&&
+    value.positionExists&&
+    dispatch.stage==='CLOSE_POSITION_PENDING'&&
+    dispatch.error==='insert or update on table "simulations" violates foreign key constraint "simulations_transaction_id_fkey"'&&
+    dispatch.transactionId===expectedTransactionId;
+}
+
 /** Only a proven expired residual child may receive a fresh recovery attempt. */
 export function shouldRebuildExpiredResidualUnwind(input:{
   signatureStatusReadUnknown:boolean;
@@ -6154,6 +6177,42 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:["P6_CLOSE_ACCOUNT_RETRY_SUCCESSOR_BLOCKED",...successor.reasonCodes]});
         continue;
       }
+    }
+    // Compatibility for the one deterministic no-effect failure where an
+    // expired account-close successor reached simulation before its child
+    // transaction-step row existed. Require the exact retry identity, the
+    // exact FK error, no submission row for that retry, and an independently
+    // confirmed primary unwind before permitting a fresh final-close build.
+    if(isPreSubmissionAccountCloseRetryStepRecovery({plan,journal,positionExists:positionTruth.exists===true})&&recoveryPositionAddress){
+      const dispatch=closeSettlementDispatch(plan),retryTransactionId=typeof dispatch.transactionId==='string'?dispatch.transactionId:undefined,
+        unwindTransactionId=typeof dispatch.unwindTransactionId==='string'?dispatch.unwindTransactionId:undefined,
+        unwindConfirmed=unwindTransactionId?await input.store.loadConfirmedSubmissionByTransactionId(unwindTransactionId):undefined,
+        retrySubmission=retryTransactionId?await input.store.loadSubmissionAttemptByTransactionId(retryTransactionId):undefined;
+      if(unwindConfirmed&&!retrySubmission){
+        await input.store.updateExecutionJournal({
+          idempotencyKey:plan.idempotencyKey,
+          expectedVersion:journal.version,
+          transactionId:unwindTransactionId!,
+          state:'CONFIRMED',
+          signature:unwindConfirmed.signature,
+          updatedAt:input.now,
+          payload:{...journal.payload,recovery:'P6_CLOSE_ACCOUNT_RETRY_STEP_PRE_SUBMISSION_REHYDRATED',priorJournalState:journal.state,failedRetryTransactionId:retryTransactionId},
+        });
+        await input.store.transitionAutonomousPlan({
+          planId:plan.planId,state:'RECONCILING',at:input.now,
+          reasonCodes:['P6_CLOSE_ACCOUNT_RETRY_STEP_PRE_SUBMISSION_REHYDRATED'],
+          payload:{stage:'CLOSE_INVENTORY_UNWOUND',pendingStage:null,pendingSignature:null,error:null,failedRetryTransactionId:retryTransactionId},
+        });
+        results.push({planId:plan.planId,action:'RESUME_CLOSE_SETTLEMENT',reasonCodes:['P6_CLOSE_ACCOUNT_RETRY_STEP_PRE_SUBMISSION_REHYDRATED']});
+        continue;
+      }
+      await input.store.transitionAutonomousPlan({
+        planId:plan.planId,state:'RECONCILIATION_REQUIRED',at:input.now,
+        reasonCodes:['P6_CLOSE_ACCOUNT_RETRY_STEP_RECOVERY_PROOF_MISSING'],
+        payload:{stage:'CLOSE_POSITION_PENDING',retryTransactionId:retryTransactionId??null,unwindTransactionId:unwindTransactionId??null,retrySubmissionPresent:Boolean(retrySubmission)},
+      });
+      results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:['P6_CLOSE_ACCOUNT_RETRY_STEP_RECOVERY_PROOF_MISSING']});
+      continue;
     }
     const action = determineRecoveryAction({
       journal,
