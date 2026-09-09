@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {loadPhase7TelegramConfig,phase7AlertFingerprint,phase7AlertTopic,renderPhase7TelegramAlert,Phase7TelegramDeliveryError} from '../.build/packages/phase7-alerting/src/index.js';
+import {loadPhase7TelegramConfig,operatorReasonSummary,phase7AlertFingerprint,phase7AlertTopic,renderPhase7TelegramAlert,Phase7TelegramDeliveryError} from '../.build/packages/phase7-alerting/src/index.js';
 
 test('terminal close transition awaits the durable Telegram outbox but contains delivery failures', async () => {
   const source = await import('node:fs/promises').then(fs => fs.readFile('apps/operator/src/main.ts', 'utf8'));
@@ -28,3 +28,10 @@ test('settlement wording distinguishes fully realized from cash-only facts suppl
 });
 test('delivery error carries bounded retry semantics including Telegram retry_after',()=>{const e=new Phase7TelegramDeliveryError(true,120000,'LPFORGE_TELEGRAM_HTTP_429');assert.equal(e.retryable,true);assert.equal(e.retryAfterMs,120000);});
 test('Telegram render is bounded to Telegram message length',()=>{assert.ok(renderPhase7TelegramAlert({...base,entityId:'p',message:'x'.repeat(10000)}).length<=4096);});
+test('Telegram renders plain-language operator reasons instead of raw internal codes',()=>{
+  const rendered=renderPhase7TelegramAlert({...base,entityId:'p',reasonCodes:['EXEC_GLOBAL_KILL_SWITCH','P6_CLAIM_P7_CONTROL_STALE','P6_WALLET_SWEEP_INTERVAL_NOT_DUE']});
+  assert.match(rendered,/Why: Safety status was briefly out of date\./);
+  assert.doesNotMatch(rendered,/EXEC_GLOBAL_KILL_SWITCH|P6_CLAIM_P7_CONTROL_STALE|P6_WALLET_SWEEP_INTERVAL_NOT_DUE/);
+  assert.match(rendered,/Reference: POSITION_OOR_STARTED/);
+  assert.deepEqual(operatorReasonSummary(['LPFORGE_P6_SWAP_RISK_BLOCKED:EXEC_GLOBAL_KILL_SWITCH,P6_CLAIM_P7_CONTROL_STALE']),['Safety status was briefly out of date.']);
+});

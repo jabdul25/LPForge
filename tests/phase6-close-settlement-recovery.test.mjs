@@ -262,7 +262,7 @@ test('a transient recovery RPC failure at execution startup does not terminate t
   const source = await import('node:fs/promises').then(fs => fs.readFile('apps/execution/src/main.ts', 'utf8'));
   const startup = source.slice(source.indexOf('const startupAt=new Date().toISOString();'), source.indexOf('for (;;) {', source.indexOf('const startupAt=new Date().toISOString();')));
   assert.match(startup,/P6_EXECUTION_DAEMON_START_FAILURE/);
-  assert.match(startup,/will retry\. No blind resend is permitted/);
+  assert.match(startup,/will retry safely and will not send a duplicate transaction/);
   assert.doesNotMatch(startup,/P6_EXECUTION_START_FAILURE'\]\}\);throw error/);
 });
 
