@@ -219,13 +219,13 @@ function workerConfig() {
       : {}),
   };
 }
-async function dispatchOne() {
+async function dispatchOne(options?: { protectiveOnly?: boolean }) {
   const current = assertLaunchable(),
     databaseUrl = process.env.DATABASE_URL ?? "",
     store = await createPostgresStore(databaseUrl),
     campaignId=controlledCanaryCampaignId();
   try {
-    const plan = await store.claimNextAutonomousPlan(new Date().toISOString());
+    const plan = await store.claimNextAutonomousPlan(new Date().toISOString(), options);
     if (!plan)
       return {
         service: "lpforge-execution",
@@ -503,7 +503,7 @@ async function start() {
   try{console.log(json({...assertLaunchable(),status:"RECOVERY_BEFORE_AUTONOMOUS_DISPATCH",recovery:await recoverOnce()}));if(executionTelegramConfig.notifyStartup)await safeExecutionTelegramAlert({severity:'INFO',code:'P6_EXECUTION_DAEMON_START',title:'Execution service ready',message:'LPForge is ready to handle autonomous plans. Every entry remains subject to live safety and portfolio checks.\nAction needed: none.',runtimeId:'lpforge-execution',observedAt:startupAt});}catch(error){console.error(error);await safeExecutionTelegramAlert({severity:'CRITICAL',code:'P6_EXECUTION_DAEMON_START_FAILURE',title:'Execution recovery is temporarily unavailable',message:'LPForge could not finish its startup recovery check. It will retry safely and will not send a duplicate transaction.\nAction needed: none right now.',runtimeId:'lpforge-execution',observedAt:startupAt,reasonCodes:['P6_EXECUTION_START_FAILURE']});}
   for (;;) {
     const observedAt=new Date().toISOString();
-    try{const recovery = await recoverOnce();if (recovery.partial.length || recovery.plans.length || (!('skipped' in recovery.walletSweep) && recovery.walletSweep.adopted>0)){const result={service:'lpforge-execution',status:'RECOVERY_PENDING',recovery,observedAt};console.log(json(result));await safeExecutionTelegramAlert({severity:'WARNING',code:'P6_EXECUTION_RECOVERY_PENDING',title:'Recovery in progress',message:'LPForge is safely finishing or verifying earlier work. New entries are paused until this is complete; existing positions and protective closes continue.\nAction needed: none right now.',runtimeId:'lpforge-execution',observedAt,reasonCodes:[...recovery.partial.flatMap(x=>x.reasonCodes),...recovery.plans.flatMap(x=>x.reasonCodes),...recovery.walletSweep.reasonCodes].slice(0,12)});}else{const result=await dispatchOne();console.log(json({...result,observedAt}));await alertExecutionResult(result,observedAt);}await observeExecutionRpcQuotaFromRuntime(true,observedAt);}catch(error){console.error(error);await safeExecutionTelegramAlert({severity:'CRITICAL',code:'P6_EXECUTION_CYCLE_EXCEPTION',title:'Execution check needs a safe retry',message:'LPForge could not complete this execution check. It will verify any affected work before trying again and will not send a duplicate transaction.\nAction needed: none right now.',runtimeId:'lpforge-execution',observedAt,reasonCodes:['P6_EXECUTION_CYCLE_EXCEPTION']});}
+    try{const recovery = await recoverOnce();if (recovery.partial.length || recovery.plans.length || (!('skipped' in recovery.walletSweep) && recovery.walletSweep.adopted>0)){const protective=await dispatchOne({protectiveOnly:true});const result={service:'lpforge-execution',status:'RECOVERY_PENDING',recovery,protective,observedAt};console.log(json(result));await safeExecutionTelegramAlert({severity:'WARNING',code:'P6_EXECUTION_RECOVERY_PENDING',title:'Recovery in progress',message:'LPForge is safely finishing or verifying earlier work. New entries are paused until this is complete; existing positions and protective closes continue.\nAction needed: none right now.',runtimeId:'lpforge-execution',observedAt,reasonCodes:[...recovery.partial.flatMap(x=>x.reasonCodes),...recovery.plans.flatMap(x=>x.reasonCodes),...recovery.walletSweep.reasonCodes].slice(0,12)});}else{const result=await dispatchOne();console.log(json({...result,observedAt}));await alertExecutionResult(result,observedAt);}await observeExecutionRpcQuotaFromRuntime(true,observedAt);}catch(error){console.error(error);await safeExecutionTelegramAlert({severity:'CRITICAL',code:'P6_EXECUTION_CYCLE_EXCEPTION',title:'Execution check needs a safe retry',message:'LPForge could not complete this execution check. It will verify any affected work before trying again and will not send a duplicate transaction.\nAction needed: none right now.',runtimeId:'lpforge-execution',observedAt,reasonCodes:['P6_EXECUTION_CYCLE_EXCEPTION']});}
     await new Promise((resolve) => setTimeout(resolve, interval));
   }
 }
