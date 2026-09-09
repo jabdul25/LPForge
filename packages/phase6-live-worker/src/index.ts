@@ -503,14 +503,32 @@ export function assessConfirmedFailedOpenRecovery(input:{confirmationStatus:stri
 }
 /** Loads the live authorities immediately before economic signing. Nothing in
  * this snapshot is a favorable default: an unavailable source fails closed. */
-export async function loadFreshExecutionSafetyFacts(input:{store:Pick<Phase1Store,'loadLatestPhase7ControlDecision'|'loadPhase7ControlDecision'|'loadPhase7PortfolioFacts'>;plan:AutonomousOpenPlan;config:Pick<LiveWorkerConfig,'rpcUrl'|'programId'|'maxOpenPositions'|'controlledCanary'>;connection?:Pick<Connection,'getLatestBlockhash'>;now?:string;phase7RuntimeId?:string;protocolCompatibility?:()=>Promise<boolean>}):Promise<FreshExecutionSafetyFacts>{
+/**
+ * P7 controls have a hard 60-second validity limit.  A control refresh can
+ * legitimately commit just after P6 reads the preceding record, so a stale-
+ * only result receives one short, pre-sign re-read.  This never extends the
+ * control TTL or authorizes a stale/revoked control: the second read must
+ * independently pass the same canonical validation.
+ */
+const P7_STALE_CONTROL_RELOAD_DELAY_MS=1_500;
+export async function loadFreshExecutionSafetyFacts(input:{store:Pick<Phase1Store,'loadLatestPhase7ControlDecision'|'loadPhase7ControlDecision'|'loadPhase7PortfolioFacts'>;plan:AutonomousOpenPlan;config:Pick<LiveWorkerConfig,'rpcUrl'|'programId'|'maxOpenPositions'|'controlledCanary'>;connection?:Pick<Connection,'getLatestBlockhash'>;now?:string;phase7RuntimeId?:string;protocolCompatibility?:()=>Promise<boolean>;staleControlReloadDelayMs?:number}):Promise<FreshExecutionSafetyFacts>{
   const now=input.now??new Date().toISOString(),reasons:string[]=[],runtimeId=input.phase7RuntimeId??(process.env.LPFORGE_P7_RUNTIME_ID??'lpforge-production').trim(),provenance=planRecord(input.plan.planPayload.provenance),binding=planRecord(provenance.phase7Control),boundDecisionId=String(binding.decisionId??'');
   let portfolio:Awaited<ReturnType<Phase1Store['loadPhase7PortfolioFacts']>>|undefined,current;
   try{
-    const [currentRow,boundRow,facts]=await Promise.all([input.store.loadLatestPhase7ControlDecision(runtimeId),boundDecisionId?input.store.loadPhase7ControlDecision(runtimeId,boundDecisionId):Promise.resolve(undefined),input.store.loadPhase7PortfolioFacts(input.plan.ownerAddress)]);
-    current=phase7ExecutionControlFromRow(currentRow);
-    const phase7Reasons=validateFreshOpenPhase7Safety({plan:input.plan as unknown as AutonomousPlan,current,bound:phase7ExecutionControlFromRow(boundRow),now,controlledCanary:controlledCanaryAuthorization(input.plan),maxConcurrentPositions:input.config.maxOpenPositions});
-    reasons.push(...phase7Reasons);portfolio=facts;
+    const readPhase7=async(at:string)=>{
+      const [currentRow,boundRow,facts]=await Promise.all([input.store.loadLatestPhase7ControlDecision(runtimeId),boundDecisionId?input.store.loadPhase7ControlDecision(runtimeId,boundDecisionId):Promise.resolve(undefined),input.store.loadPhase7PortfolioFacts(input.plan.ownerAddress)]);
+      const fresh=phase7ExecutionControlFromRow(currentRow),bound=phase7ExecutionControlFromRow(boundRow);
+      return{current:fresh,portfolio:facts,reasonCodes:validateFreshOpenPhase7Safety({plan:input.plan as unknown as AutonomousPlan,current:fresh,bound,now:at,controlledCanary:controlledCanaryAuthorization(input.plan),maxConcurrentPositions:input.config.maxOpenPositions})};
+    };
+    let phase7=await readPhase7(now);
+    if(phase7.reasonCodes.length===1&&phase7.reasonCodes[0]==='P6_CLAIM_P7_CONTROL_STALE'){
+      const delay=Math.max(0,Math.min(5_000,Math.floor(input.staleControlReloadDelayMs??P7_STALE_CONTROL_RELOAD_DELAY_MS)));
+      if(delay>0)await new Promise<void>(resolve=>setTimeout(resolve,delay));
+      // Tests provide `now` for deterministic control-age assertions.  A live
+      // worker must measure the re-read against real wall clock time.
+      phase7=await readPhase7(input.now??new Date().toISOString());
+    }
+    current=phase7.current;portfolio=phase7.portfolio;reasons.push(...phase7.reasonCodes);
   }catch{reasons.push('P6_FRESH_EXECUTION_SAFETY_P7_OR_PORTFOLIO_UNAVAILABLE');}
   const portfolioTruth=portfolio===undefined?undefined:assessFreshOpenPortfolioTruth({...portfolio,maxOpenPositions:input.config.maxOpenPositions});
   const portfolioClean=portfolioTruth?.clean===true;
