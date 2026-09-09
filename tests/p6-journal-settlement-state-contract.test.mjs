@@ -90,7 +90,7 @@ test('submission and open-child ledgers cannot regress terminal receipt truth',(
 
 test('autonomous plan claim is serialized and atomic across restart overlap',()=>{
   const source=fs.readFileSync('packages/db/src/index.ts','utf8');
-  const start=source.indexOf('async claimNextAutonomousPlan(now)');
+  const start=source.indexOf('async claimNextAutonomousPlan(now, options)');
   const end=source.indexOf('async reserveExecutionCapital',start);
   const claim=source.slice(start,end);
   assert.match(claim,/await db\.query\("BEGIN"\)/);
@@ -98,6 +98,7 @@ test('autonomous plan claim is serialized and atomic across restart overlap',()=
   assert.match(claim,/lpforge:execution-plan-claim:v1/);
   assert.match(claim,/await db\.query\("COMMIT"\)/);
   assert.match(claim,/await db\.query\("ROLLBACK"\)/);
+  assert.match(claim,/\$2::boolean=false OR i\.action IN \('CLOSE','EMERGENCY_CLOSE'\)/);
 });
 
 test('plan state, state-event audit, and terminal journal state commit atomically',()=>{
