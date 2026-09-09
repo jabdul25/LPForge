@@ -30,7 +30,7 @@ test('telegram positions renders a compact fresh LP-return snapshot without inve
   const rendered=formatTelegramPositionSummaries({positions:[position],maxOpenPositions:2,nowMs:now});
   assert.match(rendered,/📊 LPForge Positions — 1 open \/ 2 max/);assert.match(rendered,/5odbT7…jT2X/);assert.match(rendered,/EAf6sh…zpzZ/);
   assert.match(rendered,/🟢 In range · Open/);assert.match(rendered,/Current LP return: \+6\.00%/);
-  assert.match(rendered,/Fees earned: \+0\.000260 SOL/);assert.match(rendered,/Range: -1381 → -1347/);assert.match(rendered,/Current bin: -1352/);assert.match(rendered,/Updated: 18s ago/);
+  assert.match(rendered,/Fees earned: 0\.000260 SOL/);assert.match(rendered,/Range: -1381 → -1347/);assert.match(rendered,/Current bin: -1352/);assert.match(rendered,/Opened: 3h 24m ago/);assert.match(rendered,/Updated: 18s ago/);
   assert.doesNotMatch(rendered,/Economic MTM/);assert.doesNotMatch(rendered,/Capital:/);
 });
 test('telegram position detail keeps LP and economic accounting explicitly distinct',()=>{

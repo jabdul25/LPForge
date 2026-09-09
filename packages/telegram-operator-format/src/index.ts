@@ -66,8 +66,8 @@ function age(value:unknown,nowMs:number):string|undefined{
   const seconds=Math.floor((nowMs-at)/1000);
   if(seconds<60)return `${seconds}s ago`;
   const minutes=Math.floor(seconds/60);if(minutes<60)return `${minutes}m ago`;
-  const hours=Math.floor(minutes/60);if(hours<24)return `${hours}h ${minutes%60}m`;
-  return `${Math.floor(hours/24)}d ${hours%24}h`;
+  const hours=Math.floor(minutes/60);if(hours<24)return `${hours}h ${minutes%60}m ago`;
+  return `${Math.floor(hours/24)}d ${hours%24}h ago`;
 }
 function chainFresh(summary:TelegramPositionSummary):boolean{return summary.observation_stale_data!==true&&summary.chain_truth_fresh!==false;}
 function range(summary:TelegramPositionSummary):string{
@@ -106,7 +106,8 @@ function compactOne(summary:TelegramPositionSummary,index:number,nowMs:number):s
   ];
   const lpReturn=lpValuationAvailable(summary)?signedPercent(summary.lp_net_return_fraction):undefined;
   lines.push(`Current LP return: ${lpReturn??'unavailable'}`);
-  lines.push(`Fees earned: ${canonicalFee(summary)??'unavailable'}`);
+  const fees=chainFresh(summary)?sol(summary.fee_value_lamports):undefined;
+  lines.push(`Fees earned: ${fees??'unavailable'}`);
   lines.push(`Range: ${text(summary.lower_bin_id)} → ${text(summary.upper_bin_id)}`);
   lines.push(`Current bin: ${active===null||active===undefined?'unavailable':String(active)}`);
   if(opened)lines.push(`Opened: ${opened}`);
