@@ -69,6 +69,7 @@ test('the claim guard verifies the stamp fail-closed once the secret is configur
   const src=fs.readFileSync(claimGuard,'utf8');
   assert.ok(src.includes('P6_CLAIM_PROVENANCE_HMAC_MISSING')&&src.includes('P6_CLAIM_PROVENANCE_HMAC_INVALID'),'missing and invalid stamps get distinct reason codes');
   assert.ok(src.includes('input.provenanceSecret'),'verification only runs when the secret is provided');
+  assert.match(src,/if \(riskIncreasing && input\.provenanceSecret\)/,'entry provenance HMAC cannot block a protective close');
   assert.ok(src.includes('positionAddress: p.positionAddress ?? null'),'the guard recomputes over the row it is about to authorize');
   const policy={schemaVersion:1,policyId:'p',status:'ENABLED',approvalTtlMs:15000,minDevnetConfirmedRuns:1,maxActionsPerDay:2,maxOpenPositions:2,pools:[{address:'POOL',maxCapitalLamports:20_000_000n,maxOpenPositions:1}],productionAdmission:{enabled:true,eligibleTiers:['A'],maxCandidates:1,maxCandidateAgeMs:900000,maxCapitalLamports:20_000_000n,maxOpenPositions:1}};
   const control={decisionId:'control-1',cycleKey:'cycle-1',authorityMode:'PRODUCTION',healthStatus:'HEALTHY',driftStatus:'WATCH',safetyMode:'NORMAL',newEconomicActionAllowed:true,observedAt:'2026-08-13T00:04:30.000Z'};
