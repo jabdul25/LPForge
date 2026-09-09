@@ -1259,7 +1259,7 @@ export interface Phase1Store {
     requiredSignerAddresses: string[];
     metadata: Record<string, unknown>;
   }): Promise<void>;
-  claimNextAutonomousPlan(now: string): Promise<AutonomousPlan | undefined>;
+  claimNextAutonomousPlan(now: string, options?: { protectiveOnly?: boolean }): Promise<AutonomousPlan | undefined>;
   reserveExecutionCapital(value:ExecutionCapitalReservationRequest):Promise<ExecutionCapitalReservationResult>;
   releaseExecutionCapital(planId:string,at:string,reasonCodes:string[]):Promise<void>;
   markExecutionCapitalSubmitted(planId:string,at:string):Promise<void>;
@@ -3628,7 +3628,7 @@ return 'APPLIED';
       if(result.rows.length!==1)
         throw new Error("LPFORGE_EXECUTION_STEP_IDENTITY_CONFLICT");
     },
-    async claimNextAutonomousPlan(now) {
+    async claimNextAutonomousPlan(now, options) {
       // Plan selection, state transition, and its audit event are one
       // serialized transaction.  SKIP LOCKED alone protects a plan row, but
       // two workers could otherwise claim different plans for the same
@@ -3664,8 +3664,8 @@ return 'APPLIED';
         [now],
       );
       const claimed = await db.query(
-        `WITH candidate AS (SELECT p.plan_id FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id WHERE p.cluster='mainnet-beta' AND p.state='PLANNED' AND (p.expires_at>$1::timestamptz OR (i.action IN ('CLOSE','EMERGENCY_CLOSE') AND p.payload #>> '{autonomous_dispatch,preSubmissionResume}'='true')) AND i.action IN ('OPEN','ADD','CLAIM','REDUCE','RESHAPE','REBALANCE','CLOSE','EMERGENCY_CLOSE') AND NOT EXISTS (SELECT 1 FROM execution.transaction_plans pending JOIN execution.intents pi ON pi.intent_id=pending.intent_id WHERE pending.plan_id<>p.plan_id AND pending.cluster='mainnet-beta' AND pending.state IN ('CLAIMED','DISPATCHING','BUILDING','BUILT','SIMULATING','SIMULATED','RISK_APPROVED','SIGNING','SIGNED','SUBMITTING','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILING') AND ((i.position_address IS NOT NULL AND pi.position_address=i.position_address) OR (i.action='OPEN' AND pi.action='OPEN' AND pi.pool_address=i.pool_address AND pi.owner_address=i.owner_address))) ORDER BY CASE i.action WHEN 'EMERGENCY_CLOSE' THEN 1 WHEN 'CLOSE' THEN 2 WHEN 'REDUCE' THEN 3 WHEN 'RESHAPE' THEN 4 WHEN 'REBALANCE' THEN 5 WHEN 'CLAIM' THEN 6 WHEN 'ADD' THEN 7 ELSE 8 END,p.created_at FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE execution.transaction_plans p SET state='CLAIMED',payload=p.payload||jsonb_build_object('autonomous_dispatch_claimed_at',$1::text) FROM candidate c WHERE p.plan_id=c.plan_id RETURNING p.plan_id,p.intent_id,p.expires_at,p.payload`,
-        [now],
+        `WITH candidate AS (SELECT p.plan_id FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id WHERE p.cluster='mainnet-beta' AND p.state='PLANNED' AND (p.expires_at>$1::timestamptz OR (i.action IN ('CLOSE','EMERGENCY_CLOSE') AND p.payload #>> '{autonomous_dispatch,preSubmissionResume}'='true')) AND i.action IN ('OPEN','ADD','CLAIM','REDUCE','RESHAPE','REBALANCE','CLOSE','EMERGENCY_CLOSE') AND ($2::boolean=false OR i.action IN ('CLOSE','EMERGENCY_CLOSE')) AND NOT EXISTS (SELECT 1 FROM execution.transaction_plans pending JOIN execution.intents pi ON pi.intent_id=pending.intent_id WHERE pending.plan_id<>p.plan_id AND pending.cluster='mainnet-beta' AND pending.state IN ('CLAIMED','DISPATCHING','BUILDING','BUILT','SIMULATING','SIMULATED','RISK_APPROVED','SIGNING','SIGNED','SUBMITTING','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILING') AND ((i.position_address IS NOT NULL AND pi.position_address=i.position_address) OR (i.action='OPEN' AND pi.action='OPEN' AND pi.pool_address=i.pool_address AND pi.owner_address=i.owner_address))) ORDER BY CASE i.action WHEN 'EMERGENCY_CLOSE' THEN 1 WHEN 'CLOSE' THEN 2 WHEN 'REDUCE' THEN 3 WHEN 'RESHAPE' THEN 4 WHEN 'REBALANCE' THEN 5 WHEN 'CLAIM' THEN 6 WHEN 'ADD' THEN 7 ELSE 8 END,p.created_at FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE execution.transaction_plans p SET state='CLAIMED',payload=p.payload||jsonb_build_object('autonomous_dispatch_claimed_at',$1::text) FROM candidate c WHERE p.plan_id=c.plan_id RETURNING p.plan_id,p.intent_id,p.expires_at,p.payload`,
+        [now, options?.protectiveOnly === true],
       );
       const plan = claimed.rows[0];
       if (!plan) { await db.query("COMMIT"); return undefined; }
@@ -5582,7 +5582,7 @@ export function createMemoryStore(): Phase1Store {
     async insertExecutionIntent() {},
     async insertTransactionPlan() {},
     async ensureExecutionTransactionStep() {},
-    async claimNextAutonomousPlan() {
+    async claimNextAutonomousPlan(_now, _options) {
       return undefined;
     },
     async reserveExecutionCapital() { return {approved:true,reasonCodes:['P6_CAPITAL_RESERVED'],deployedLamports:0n,reservedLamports:0n,availableLamports:0n}; },
