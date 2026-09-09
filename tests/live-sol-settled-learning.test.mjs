@@ -35,6 +35,16 @@ test('Gap 10: immutable outcome schema prevents duplicates, mutation, and keeps 
   assert.match(sql,/live_learning_outcomes_kind_entry_plan_uq/);assert.match(sql,/prevent_live_learning_outcome_mutation/);
   assert.match(sql,/UNIQUE\(entry_plan_id\)/);
 });
+test('receipt-backed settlement corrections supersede, rather than rewrite, learned outcomes',()=>{
+  const migration=fs.readFileSync('packages/db/migrations/M0078_live_learning_outcome_settlement_supersession.sql','utf8');
+  const source=fs.readFileSync('packages/db/src/index.ts','utf8');
+  assert.match(migration,/DROP CONSTRAINT IF EXISTS live_learning_outcomes_lifecycle_id_key/);
+  assert.match(migration,/live_learning_outcome_supersessions/);
+  assert.match(migration,/UNIQUE\(predecessor_outcome_id\)/);
+  assert.match(source,/ORDER BY settlement\.settlement_version DESC LIMIT 1/);
+  assert.match(source,/LATEST_RECEIPT_BACKED_SETTLEMENT/);
+  assert.match(source,/LEFT JOIN research\.live_learning_outcome_supersessions/);
+});
 test('Gap 10: fee and management evidence comes from lifecycle cashflows and linked plans',()=>{
   const source=fs.readFileSync('packages/db/src/index.ts','utf8');
   assert.match(source,/\['FEE_CLAIM','REWARD_CLAIM'\]/);assert.match(source,/lifecycle_plan_links/);
