@@ -123,16 +123,18 @@ export function deriveTransactionAssetEffects(receipt:ConfirmedExecutionReceipt,
     const before=receipt.preBalancesLamports[index]!,after=receipt.postBalancesLamports[index]!,address=receipt.resolvedAccountKeys[index]!;
     const created=before===0n&&after>0n,closed=before>0n&&after===0n;
     if(!created&&!closed)continue;
-    const ata=associatedAddresses.has(address)||instructionTouches(instructions,index,ownerIndex,context.ownerAddress,"CREATE",[ASSOCIATED_TOKEN_PROGRAM_ID]);
+    const ownerPostTokenAccount=receipt.postTokenBalances.some(row=>row.accountIndex===index&&row.owner===context.ownerAddress),
+      inferredJupiterTokenAccount=created&&hasJupiter&&ownerPostTokenAccount&&tokenAccountIndices.has(index),
+      ata=associatedAddresses.has(address)||instructionTouches(instructions,index,ownerIndex,context.ownerAddress,"CREATE",[ASSOCIATED_TOKEN_PROGRAM_ID]);
     // A user-owned token account which is closed in this receipt returns its
     // rent to the owner. It can be an earlier temporary WSOL account (and need
     // not have been created by the same Jupiter route), so recognition must
     // not depend on a route-program allowlist.
-    const temporary=temporaryAddresses.has(address)||(!ata&&(hasJupiter&&(instructionTouches(instructions,index,ownerIndex,context.ownerAddress,"CREATE")||instructionTouches(instructions,index,ownerIndex,context.ownerAddress,"CLOSE"))||(closed&&tokenAccountIndices.has(index)&&instructionTouches(instructions,index,ownerIndex,context.ownerAddress,"CLOSE"))));
+    const temporary=temporaryAddresses.has(address)||(!ata&&(inferredJupiterTokenAccount||(hasJupiter&&(instructionTouches(instructions,index,ownerIndex,context.ownerAddress,"CREATE")||instructionTouches(instructions,index,ownerIndex,context.ownerAddress,"CLOSE"))||(closed&&tokenAccountIndices.has(index)&&instructionTouches(instructions,index,ownerIndex,context.ownerAddress,"CLOSE")))));
     const position=context.positionAddress===address;
     const lifecycleInstruction=instructionTouches(instructions,index,ownerIndex,context.ownerAddress,created?"CREATE":"CLOSE");
-    if(!lifecycleInstruction){partialLifecycle=true;continue;}
-    if(created){const classification=position?"POSITION_RENT_LOCK":ata?"ATA_RENT_DEBIT":temporary?"TEMP_ACCOUNT_RENT_DEBIT":"UNCLASSIFIED",effect=native(classification,receipt,index,after,["account-created","instruction-lifecycle"]);if(classification==="UNCLASSIFIED")base.unclassifiedNativeEffects.push(effect);else{base.rentDebits.push(effect);accountedNative-=after;}}
+    if(!lifecycleInstruction&&!inferredJupiterTokenAccount){partialLifecycle=true;continue;}
+    if(created){const classification=position?"POSITION_RENT_LOCK":ata?"ATA_RENT_DEBIT":temporary?"TEMP_ACCOUNT_RENT_DEBIT":"UNCLASSIFIED",effect=native(classification,receipt,index,after,["account-created",...(lifecycleInstruction?["instruction-lifecycle"]:["owner-token-account-route-inference"])]);if(classification==="UNCLASSIFIED")base.unclassifiedNativeEffects.push(effect);else{base.rentDebits.push(effect);accountedNative-=after;}}
     if(closed){const classification=position?"POSITION_RENT_RECOVERY":ata?"ATA_RENT_REFUND":temporary?"TEMP_ACCOUNT_RENT_REFUND":"UNCLASSIFIED",effect=native(classification,receipt,index,before,["account-closed","instruction-lifecycle"]);if(classification==="UNCLASSIFIED")base.unclassifiedNativeEffects.push(effect);else if(classification==="POSITION_RENT_RECOVERY"){base.positionRentRecoveryEffects.push(effect);base.positionRentRecoveryLamports+=before;accountedNative+=before;}else{base.rentRefunds.push(effect);accountedNative+=before;}}
   }
   const before=tokenMap(receipt.preTokenBalances),after=tokenMap(receipt.postTokenBalances),keys=new Set([...before.keys(),...after.keys()]);
