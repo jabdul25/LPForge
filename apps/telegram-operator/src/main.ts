@@ -6,7 +6,7 @@ import {loadPhase1Config,resolveLiveExecutionPolicyPath} from '../../../packages
 import {createPostgresStore} from '../../../packages/db/src/index.js';
 import {loadDeploymentPolicyFile} from '../../../packages/deployment-policy/src/index.js';
 import {loadPhase7TelegramConfig} from '../../../packages/phase7-alerting/src/index.js';
-import {formatTelegramPositionSummaries,resolveTelegramPositionAddress} from '../../../packages/telegram-operator-format/src/index.js';
+import {formatTelegramPositionDetail,formatTelegramPositionSummaries,resolveTelegramPositionAddress} from '../../../packages/telegram-operator-format/src/index.js';
 
 const enabled=(v:string|undefined)=>['1','true','yes','on'].includes(String(v??'').toLowerCase());
 const sleep=(ms:number)=>new Promise(resolve=>setTimeout(resolve,ms));
@@ -47,11 +47,22 @@ async function processUpdate(c:CommandConfig,u:TelegramUpdate){
     const actionId=`telegram:${updateId}`;
     const audit=async(action:string,why:string,targetType?:string,targetId?:string)=>store.insertPhase7OperatorAction({actionId,operatorId:operator,action,requestedAt:receivedAt,approvalId:'telegram-allowlist-v1',reason:why,...(targetType?{targetType}:{}),...(targetId?{targetId}:{}),beforeHash:'telegram-command',afterHash:'telegram-command',result:'APPLIED',payload:{telegramOperator:true,telegramUpdateId:updateId,chatId:chat}});
     let response='';
-    if(['/help','/start'].includes(parsed.name))response='LPForge commands:\n/status — P7 and portfolio summary\n/positions — live positions\n/pause [reason] — stop new entries only\n/resume — restore normal entry eligibility subject to P7/P6\n/stop [reason] — freeze entries and discretionary writes; protective close/recovery/settlement continue\n/blacklist <pool> [reason]\n/unblacklist <pool>\n/close <position number|all> [reason]\nTelegram cannot open positions.';
+    if(['/help','/start'].includes(parsed.name))response='LPForge commands:\n/status — P7 and portfolio summary\n/positions — quick live-position view\n/position <number> — detailed position accounting\n/pause [reason] — stop new entries only\n/resume — restore normal entry eligibility subject to P7/P6\n/stop [reason] — freeze entries and discretionary writes; protective close/recovery/settlement continue\n/blacklist <pool> [reason]\n/unblacklist <pool>\n/close <position number|all> [reason]\nTelegram cannot open positions.';
     else if(parsed.name==='/status'){
       const [control,positions,blocks]=await Promise.all([store.loadLatestPhase7ControlDecision((process.env.LPFORGE_P7_RUNTIME_ID??'lpforge-production').trim()),store.loadTelegramOperatorOpenPositions(),store.loadActiveTelegramOperatorPoolBlocks()]);
       response=`LPForge status\nP7: ${control?`${String(control.authority_mode)} / ${String(control.health_status)} / ${String(control.drift_status)} / ${String(control.safety_mode)}`:'unavailable'}\nNew economic action: ${control?.new_economic_action_allowed===true?'YES':'NO'}\nOpen positions: ${positions.length}\nPool blacklist: ${blocks.length?blocks.join(', '):'none'}`;
     } else if(parsed.name==='/positions'){const max=maxOpenPositions();response=formatTelegramPositionSummaries({positions:await store.loadTelegramOperatorPositionSummaries(),...(max===undefined?{}:{maxOpenPositions:max})});}
+    else if(parsed.name==='/position'){
+      const target=parsed.args[0]??'';
+      if(!target)response='Usage: /position <number>. Use /positions to see the current numbering.';
+      else {
+        const positions=await store.loadTelegramOperatorPositionSummaries();
+        const address=resolveTelegramPositionAddress({target,positions});
+        const index=positions.findIndex(position=>String(position.position_address)===address);
+        if(index<0)throw new Error('LPFORGE_TELEGRAM_LIVE_POSITION_NOT_FOUND');
+        response=formatTelegramPositionDetail({position:positions[index]!,index:index+1});
+      }
+    }
     else if(parsed.name==='/pause'||parsed.name==='/stop'){
       const stop=parsed.name==='/stop',incidentId=stop?'telegram:stop':'telegram:pause',why=reason(parsed.args);
       await store.upsertPhase7IncidentState({incidentId,incidentType:'MANUAL_EMERGENCY',severity:stop?'CRITICAL':'WARNING',status:'OPEN',openedAt:receivedAt,observedAt:receivedAt,reasonCodes:[stop?'P7_TELEGRAM_OPERATOR_STOP':'P7_TELEGRAM_OPERATOR_PAUSE'],payload:{telegramOperator:true,operatorId:operator,reason:why,semantics:stop?'ENTRIES_AND_DISCRETIONARY_WRITES_PAUSED_PROTECTIVE_CLOSE_RECOVERY_SETTLEMENT_ALLOWED':'NEW_ENTRIES_PAUSED_PROTECTIVE_MANAGEMENT_RECOVERY_SETTLEMENT_ALLOWED'}});
@@ -64,7 +75,7 @@ async function processUpdate(c:CommandConfig,u:TelegramUpdate){
       const target=parsed.args[0]??'';const positions=await store.loadTelegramOperatorOpenPositions();const targets=target==='all'?positions.map(p=>String(p.position_address)):[resolveTelegramPositionAddress({target,positions})];let queued=0;for(const positionAddress of targets){if(await store.createTelegramOperatorCloseRequest({requestId:id('telegram-close',`${updateId}:${positionAddress}`),positionAddress,operatorId:operator,requestedAt:receivedAt,reason:reason(parsed.args.slice(1)),sourceUpdateId:BigInt(updateId),payload:{telegramOperator:true,requestType:'CLOSE'}}))queued++;}await audit('REQUEST_CLOSE',reason(parsed.args.slice(1)),'POSITION',target);response=`Canonical close request${targets.length===1?'':'s'} accepted: ${queued}/${targets.length}. The position manager will revalidate ownership, live truth, protective authority, and idempotency before it creates a close plan. No direct Telegram transaction was sent.`;
     } else {response='Unsupported command. Send /help.';}
     await persist('COMPLETED',response,{authorization:'ALLOWLISTED'});await reply(c,response);
-  }catch(error){const response=parsed.name==='/positions'?'Unable to load position snapshot right now.':`Command not applied: ${error instanceof Error?error.message:'LPFORGE_TELEGRAM_COMMAND_FAILED'}`;try{await persist('FAILED',response);}catch{}await reply(c,response);
+  }catch(error){const response=['/positions','/position'].includes(parsed.name)?'Unable to load position snapshot right now.':`Command not applied: ${error instanceof Error?error.message:'LPFORGE_TELEGRAM_COMMAND_FAILED'}`;try{await persist('FAILED',response);}catch{}await reply(c,response);
   }finally{await store.close();}
 }
 async function cycle(c:CommandConfig){const cfg=loadPhase1Config(),store=await createPostgresStore(cfg.databaseUrl);let offset:bigint|undefined;try{const latest=await store.loadLatestTelegramOperatorUpdateId();offset=latest===undefined?undefined:latest+1n;}finally{await store.close();}const body:Record<string,unknown>={timeout:25,allowed_updates:['message']};if(offset!==undefined)body.offset=offset.toString();const result=await telegram(c,'getUpdates',body),updates=Array.isArray(result.result)?result.result as TelegramUpdate[]:[];for(const update of updates)await processUpdate(c,update);}

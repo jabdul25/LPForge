@@ -88,12 +88,37 @@ function canonicalFee(summary:TelegramPositionSummary):string|undefined{
   const fee=sol(summary.fee_value_lamports);
   return fee===undefined?undefined:`+${fee}`;
 }
-function one(summary:TelegramPositionSummary,index:number,nowMs:number):string{
+function positionState(summary:TelegramPositionSummary):string{
+  const lifecycle=text(summary.lifecycle_state,'UNKNOWN').replaceAll('_',' ').toLowerCase();
+  const reconciliation=text(summary.reconciliation_status,'UNKNOWN').replaceAll('_',' ').toLowerCase();
+  const title=(value:string)=>value.replace(/\b\w/g,char=>char.toUpperCase());
+  return reconciliation==='match'?title(lifecycle):`${title(lifecycle)} / ${title(reconciliation)}`;
+}
+function compactOne(summary:TelegramPositionSummary,index:number,nowMs:number):string{
   const active=summary.last_active_bin_id??summary.observation_active_bin_id;
   const opened=age(summary.entered_at,nowMs);
-  const updated=age(summary.chain_observed_at??summary.latest_observed_at??summary.observation_observed_at??summary.valuation_observed_at,nowMs);
+  const updated=age(summary.lp_mtm_observed_at??summary.valuation_observed_at??summary.chain_observed_at??summary.latest_observed_at??summary.observation_observed_at,nowMs);
   const lines=[
     `${index}. ${shortenTelegramPositionAddress(summary.position_address)}`,
+    `Pool: ${shortenTelegramPositionAddress(summary.pool_address)}`,
+    `${range(summary).replace('IN RANGE','In range').replace('OUT OF RANGE','Out of range')} · ${positionState(summary)}`,
+    '',
+  ];
+  const lpReturn=lpValuationAvailable(summary)?signedPercent(summary.lp_net_return_fraction):undefined;
+  lines.push(`Current LP return: ${lpReturn??'unavailable'}`);
+  lines.push(`Fees earned: ${canonicalFee(summary)??'unavailable'}`);
+  lines.push(`Range: ${text(summary.lower_bin_id)} → ${text(summary.upper_bin_id)}`);
+  lines.push(`Current bin: ${active===null||active===undefined?'unavailable':String(active)}`);
+  if(opened)lines.push(`Opened: ${opened}`);
+  if(updated)lines.push(`Updated: ${updated}`);
+  return lines.join('\n');
+}
+function detailOne(summary:TelegramPositionSummary,index:number|undefined,nowMs:number):string{
+  const active=summary.last_active_bin_id??summary.observation_active_bin_id;
+  const opened=age(summary.entered_at,nowMs);
+  const updated=age(summary.lp_mtm_observed_at??summary.valuation_observed_at??summary.chain_observed_at??summary.latest_observed_at??summary.observation_observed_at,nowMs);
+  const lines=[
+    `${index===undefined?'Position':`${index}.`} ${shortenTelegramPositionAddress(summary.position_address)}`,
     `Pool: ${shortenTelegramPositionAddress(summary.pool_address)}`,
     `${text(summary.strategy)} · ${text(summary.orientation)}`,
     `${range(summary)} · ${text(summary.lifecycle_state)} / ${text(summary.reconciliation_status)}`,
@@ -124,15 +149,22 @@ function one(summary:TelegramPositionSummary,index:number,nowMs:number):string{
   return lines.join('\n');
 }
 
+/** Formats the detailed accounting view for one persisted live position. */
+export function formatTelegramPositionDetail(input:{position:TelegramPositionSummary;index?:number;nowMs?:number}):string{
+  return detailOne(input.position,input.index,input.nowMs??Date.now());
+}
+
 /** Formats only canonical persisted facts.  `nowMs` is supplied for tests. */
 export function formatTelegramPositionSummaries(input:{positions:readonly TelegramPositionSummary[];maxOpenPositions?:number;nowMs?:number;maxLength?:number}):string{
   if(!input.positions.length)return 'No live LPForge positions.';
   const maxLength=Math.max(256,Math.min(4000,Math.floor(input.maxLength??3900)));
-  const header=`📊 LPForge Positions — ${input.positions.length}${Number.isInteger(input.maxOpenPositions)&&input.maxOpenPositions!>0?`/${input.maxOpenPositions}`:' open'}`;
+  const header=Number.isInteger(input.maxOpenPositions)&&input.maxOpenPositions!>0
+    ?`📊 LPForge Positions — ${input.positions.length} open / ${input.maxOpenPositions} max`
+    :`📊 LPForge Positions — ${input.positions.length} open`;
   const sections=[header];const nowMs=input.nowMs??Date.now();
   for(let i=0;i<input.positions.length;i++){
-    const next=one(input.positions[i]!,i+1,nowMs),candidate=[...sections,next].join('\n\n');
-    const omitted=`… ${input.positions.length-i} additional position${input.positions.length-i===1?'':'s'} omitted; use canonical operator controls for an exact position.`;
+    const next=compactOne(input.positions[i]!,i+1,nowMs),candidate=[...sections,next].join('\n\n');
+    const omitted=`… ${input.positions.length-i} additional position${input.positions.length-i===1?'':'s'} omitted; use /position <number> for details.`;
     // Reserve space for an explicit, non-truncating omission marker. Telegram
     // must never receive a slice through an otherwise complete position block.
     if(candidate.length>maxLength||i<input.positions.length-1&&candidate.length+2+omitted.length>maxLength){
