@@ -34,6 +34,7 @@ test('Telegram renders plain-language operator reasons instead of raw internal c
   assert.doesNotMatch(rendered,/EXEC_GLOBAL_KILL_SWITCH|P6_CLAIM_P7_CONTROL_STALE|P6_WALLET_SWEEP_INTERVAL_NOT_DUE/);
   assert.match(rendered,/Reference: POSITION_OOR_STARTED/);
   assert.deepEqual(operatorReasonSummary(['LPFORGE_P6_SWAP_RISK_BLOCKED:EXEC_GLOBAL_KILL_SWITCH,P6_CLAIM_P7_CONTROL_STALE']),['Safety status was briefly out of date.']);
+  assert.deepEqual(operatorReasonSummary(['LPFORGE_P6_SWAP_QUOTE_BLOCKED:P6_SWAP_QUOTE_MIN_OUTPUT_INSUFFICIENT']),['The current swap price could not safely buy enough of the paired token for this position.']);
 });
 test('RPC quota alert is durable, plain-language, and never exposes a provider URL',()=>{
   const observedAt='2026-09-09T12:00:00.000Z',last429At='2026-09-09T11:59:55.000Z';

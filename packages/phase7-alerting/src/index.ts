@@ -26,6 +26,10 @@ const operatorReason=(code:string):string|undefined=>{
   if(c.includes(','))return c.split(',').map(operatorReason).find(Boolean);
   if(c==='P6_CLAIM_P7_CONTROL_STALE')return 'Safety status was briefly out of date.';
   if(c.startsWith('P6_CLAIM_P7_'))return 'Current production safety checks did not permit a new entry.';
+  if(c.includes('P6_SWAP_QUOTE_MIN_OUTPUT_INSUFFICIENT')||c.includes('P6_PROTECTED_FUNDING_INFEASIBLE_WITHIN_EXACT_CAPITAL'))return 'The current swap price could not safely buy enough of the paired token for this position.';
+  if(c.includes('P6_SWAP_QUOTE_PRICE_IMPACT_EXCEEDED'))return 'The swap needed to fund this position would move the price too much.';
+  if(c.includes('P6_SWAP_QUOTE_INPUT_FEE_EXCEEDED'))return 'The swap fee needed to fund this position was too high.';
+  if(c.includes('P6_SWAP_QUOTE_UNAVAILABLE'))return 'A fresh swap price was unavailable, so LPForge skipped this entry safely.';
   if(c==='P6_CONFIRMATION_PENDING')return 'Chain confirmation is taking longer than usual.';
   if(c.includes('DISCOVERY_REGISTRY_NEWER_TERMINAL_DISQUALIFICATION'))return 'Newer market evidence made this pool ineligible for entry.';
   if(c.includes('DISCOVERY_REGISTRY'))return 'This pool was not eligible for a new entry.';
