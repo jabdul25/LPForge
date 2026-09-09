@@ -21,11 +21,24 @@ export type MeteoraDiscoveryTimeframe = '30m'|'1h'|'24h';
 /** Canonical Meteora discovery fields. Ratio values are percentage points. */
 export interface MeteoraDiscoveryPool { pool_address?:string; address?:string; tvl?:number; active_tvl?:number; fee_tvl_ratio?:number; fee_active_tvl_ratio?:number; fee?:number; fees?:number; volume?:number; swap_count?:number; dlmm_bin_step?:number; updated_at?:string|number; timestamp?:string|number; [key:string]:unknown; }
 export interface MeteoraDiscoveryPoolsPage { current_page?:number; page_size?:number; total?:number; pages?:number; total_pages?:number; data:MeteoraDiscoveryPool[]; }
+export interface MeteoraPositionPnlAmount { usd?:number|string; sol?:number|string; amount?:number|string; amountSol?:number|string; }
+export interface MeteoraPositionPnl {
+  positionAddress:string;
+  pnlUsd?:number|string;
+  pnlPctChange?:number|string;
+  pnlSol?:number|string;
+  pnlSolPctChange?:number|string;
+  allTimeDeposits?:{total?:MeteoraPositionPnlAmount};
+  allTimeWithdrawals?:{total?:MeteoraPositionPnlAmount};
+  allTimeFees?:{total?:MeteoraPositionPnlAmount};
+  unrealizedPnl?:{balances?:number|string;balancesSol?:number|string;unclaimedFeeTokenX?:MeteoraPositionPnlAmount;unclaimedFeeTokenY?:MeteoraPositionPnlAmount};
+}
 export interface MeteoraDataApi {
   listPools(page?: number, pageSize?: number, query?: string, options?: {sortBy?:string;filterBy?:string}): Promise<PoolsPage>;
   getPool(address: string): Promise<DataApiPool>;
   getOhlcv(address: string, params?: {timeframe?:MeteoraOhlcvTimeframe;startTime?:number;endTime?:number}): Promise<OhlcvResponse>;
   getHistoricalVolume(address:string,params?:{timeframe?:MeteoraOhlcvTimeframe;startTime?:number;endTime?:number}):Promise<HistoricalVolumeResponse>;
+  getOpenPositionPnl(poolAddress:string,ownerAddress:string):Promise<MeteoraPositionPnl[]>;
   listDiscoveryPools(page?:number,pageSize?:number,options?:{timeframe?:MeteoraDiscoveryTimeframe;sortBy?:string;filterBy?:string;category?:string}):Promise<MeteoraDiscoveryPoolsPage>;
 }
 
@@ -74,6 +87,12 @@ export function createMeteoraDataApi(opts: {baseUrl?:string;discoveryBaseUrl?:st
     async getHistoricalVolume(address,params={}) {
       const allowed=new Set<MeteoraOhlcvTimeframe>(['5m','30m','1h','2h','4h','12h','24h']); if(params.timeframe&&!allowed.has(params.timeframe))throw new Error('LPFORGE_DATA_API_VOLUME_TIMEFRAME');
       const obj=assertObject(await get(`/pools/${encodeURIComponent(address)}/volume/history`,{timeframe:params.timeframe,start_time:params.startTime,end_time:params.endTime}),'LPFORGE_DATA_API_SCHEMA:HISTORICAL_VOLUME'); if(!Array.isArray(obj.data))throw new Error('LPFORGE_DATA_API_SCHEMA:HISTORICAL_VOLUME_DATA'); return obj as unknown as HistoricalVolumeResponse;
+    },
+    async getOpenPositionPnl(poolAddress,ownerAddress) {
+      if(!poolAddress.trim()||!ownerAddress.trim())throw new Error('LPFORGE_DATA_API_POSITION_PNL_IDENTITY');
+      const obj=assertObject(await get(`/positions/${encodeURIComponent(poolAddress)}/pnl`,{user:ownerAddress,status:'open',pageSize:100,page:1}),'LPFORGE_DATA_API_SCHEMA:POSITION_PNL');
+      if(!Array.isArray(obj.positions))throw new Error('LPFORGE_DATA_API_SCHEMA:POSITION_PNL_DATA');
+      return obj.positions.filter((value):value is MeteoraPositionPnl=>Boolean(value)&&typeof value==='object'&&!Array.isArray(value)&&typeof (value as Record<string,unknown>).positionAddress==='string') as MeteoraPositionPnl[];
     },
     async listDiscoveryPools(page=1,pageSize=100,options={}) {
       if(!Number.isInteger(page)||page<1)throw new Error('LPFORGE_DISCOVERY_API_PAGE');

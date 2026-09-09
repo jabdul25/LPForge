@@ -1,5 +1,5 @@
 import { loadPhase1Config, resolveLiveExecutionPolicyPath } from "../../../packages/config/src/index.js";
-import { createMeteoraDataApi, type DataApiPool } from "../../../packages/data-api/src/index.js";
+import { createMeteoraDataApi, type DataApiPool, type MeteoraPositionPnl } from "../../../packages/data-api/src/index.js";
 import {
   createPostgresStore,
   type Phase1Store,
@@ -40,8 +40,10 @@ import {
   assessLiveExit,
   derivePositionEconomics,
   deriveLpPositionMarkToMarket,
+  deriveMeteoraComparableLpPositionMarkToMarket,
   loadLiveExitGovernorPolicy,
   type ExitHighWaterState,
+  type LpProfitHighWaterState,
   type MarketExitConfirmationState,
   type MarketExitEvidence,
 } from "../../../packages/live-exit-governor/src/index.js";
@@ -522,23 +524,45 @@ async function observeAndPlanOwnedPositions(input: {
     } catch {}
     let economics = { evidenceState: "UNAVAILABLE" as const, observedAt: input.observedAt, reasonCodes: ["EXIT_VALUATION_POOL_DATA_UNAVAILABLE"] },apiPool:DataApiPool|undefined;
     let cashflows:Awaited<ReturnType<Phase1Store['loadPositionCashflows']>>=[];
+    let meteoraPositionPnl: MeteoraPositionPnl | undefined;
     const attributedWalletInventory=await input.store.loadPositionInventoryLots(position.positionAddress);
     if (fact) {
       try {
-        const [loadedPool,loadedCashflows] = await Promise.all([input.api.getPool(position.poolAddress),input.store.loadPositionCashflows(position.positionAddress)]);
+        const [loadedPool,loadedCashflows] = await Promise.all([
+          input.api.getPool(position.poolAddress),
+          input.store.loadPositionCashflows(position.positionAddress),
+        ]);
         apiPool=loadedPool;
         cashflows=loadedCashflows;
         economics = derivePositionEconomics({position: fact, pool: apiPool, initialCapitalLamports: position.initialCapitalLamports, observedAt: input.observedAt,realizedFeeCashflows:cashflows,attributedWalletInventory:attributedWalletInventory.map(lot=>({tokenMint:lot.tokenMint,tokenAmountRaw:lot.remainingRawAmount.toString()})),...(position.managedEconomicContributionLamports!==undefined?{actualContributedLamports:position.managedEconomicContributionLamports}:{}),requireReceiptProvenContribution:position.entryBasisState!==undefined}) as typeof economics;
       } catch {}
+      // The reference PnL endpoint is an observability input for LP-local
+      // profit/trailing semantics.  Its availability must never suppress the
+      // independent chain/receipt valuation used by capital protection.
+      try {
+        const positionPnls=await input.api.getOpenPositionPnl(position.poolAddress,position.ownerAddress);
+        meteoraPositionPnl=positionPnls.find(value=>value.positionAddress===position.positionAddress);
+      } catch {}
     }
     const lpMtm=fact&&apiPool?deriveLpPositionMarkToMarket({position:fact,pool:apiPool,...(position.lpPositionPrincipalLamports===undefined?{}:{lpPositionPrincipalLamports:position.lpPositionPrincipalLamports}),realizedCashflows:cashflows,observedAt:input.observedAt}):undefined;
     const lpPositionMtmFresh=Boolean(lpMtm&&fact&&apiPool&&fact.stamp.source==='METEORA_SDK'&&Number.isFinite(Date.parse(fact.stamp.observedAt))&&Date.parse(fact.stamp.observedAt)>=Date.parse(input.observedAt));
+    const meteoraComparableLpMtm=deriveMeteoraComparableLpPositionMarkToMarket({...(meteoraPositionPnl?{positionPnl:meteoraPositionPnl}:{}),observedAt:input.observedAt});
+    const meteoraComparableLpMtmFresh=meteoraComparableLpMtm.evidenceState==='AVAILABLE';
     const lpMtmProvenance=apiPool?{scope:'LP_POSITION_MTM',valuationObservedAt:input.observedAt,positionSource:fact?.stamp.source??null,chainObservedAt:fact?.stamp.observedAt??null,chainSlot:fact?.stamp.chainSlot?.toString()??null,priceSource:'METEORA_DATA_API',poolAddress:apiPool.address,tokenX:apiPool.token_x?{address:apiPool.token_x.address,decimals:apiPool.token_x.decimals??null,priceUsd:apiPool.token_x.price??null}:null,tokenY:apiPool.token_y?{address:apiPool.token_y.address,decimals:apiPool.token_y.decimals??null,priceUsd:apiPool.token_y.price??null}:null}:undefined;
     const priorExitRow=await input.store.loadPositionExitState(position.lpforgePositionId);
     const priorHighWater:ExitHighWaterState|undefined=priorExitRow?{
       peakNetReturnFraction:Number(priorExitRow.peak_net_return_fraction??0),
       ...(priorExitRow.peak_economic_value_usd!==null&&priorExitRow.peak_economic_value_usd!==undefined?{peakEconomicValueUsd:Number(priorExitRow.peak_economic_value_usd)}:{}),
       peakObservedAt:String(priorExitRow.peak_observed_at??input.observedAt),
+    }:undefined;
+    const priorLpProfitHighWater:LpProfitHighWaterState|undefined=priorExitRow?{
+      ...(priorExitRow.lp_mtm_peak_return_fraction!==null&&priorExitRow.lp_mtm_peak_return_fraction!==undefined?{peakNetReturnFraction:Number(priorExitRow.lp_mtm_peak_return_fraction)}:{}),
+      ...(priorExitRow.lp_mtm_peak_value_usd!==null&&priorExitRow.lp_mtm_peak_value_usd!==undefined?{peakPositionValueUsd:Number(priorExitRow.lp_mtm_peak_value_usd)}:{}),
+      ...(priorExitRow.lp_mtm_peak_observed_at?{peakObservedAt:String(priorExitRow.lp_mtm_peak_observed_at)}:{}),
+      ...(priorExitRow.lp_mtm_pending_return_fraction!==null&&priorExitRow.lp_mtm_pending_return_fraction!==undefined?{pendingPeakNetReturnFraction:Number(priorExitRow.lp_mtm_pending_return_fraction)}:{}),
+      ...(priorExitRow.lp_mtm_pending_value_usd!==null&&priorExitRow.lp_mtm_pending_value_usd!==undefined?{pendingPeakPositionValueUsd:Number(priorExitRow.lp_mtm_pending_value_usd)}:{}),
+      ...(priorExitRow.lp_mtm_pending_observed_at?{pendingPeakObservedAt:String(priorExitRow.lp_mtm_pending_observed_at)}:{}),
+      pendingPeakConfirmations:Math.max(0,Math.floor(Number(priorExitRow.lp_mtm_pending_confirmations??0))),
     }:undefined;
     const current=input.currentResult?.poolAddress===position.poolAddress?input.currentResult:undefined;
     const regimeAssessment=current?.shadow?.regime;
@@ -575,7 +599,7 @@ async function observeAndPlanOwnedPositions(input: {
       ...(closeCostLamports!==undefined?{closeCost:Number(closeCostLamports)/1_000_000_000}:{}),
       ...(current?.risk?{riskDecision:current.risk.decision,riskReasonCodes:current.risk.reasonCodes}:{}),
       ...(typeof toxicity==="number"?{toxicityProbability:toxicity}:{}),liquidityCollapse:Number.isFinite(liquidityChange)&&liquidityChange<=-50,
-      marketEvidence,marketConfirmation,...(lpMtm?{lpPositionMtm:lpMtm,lpPositionMtmFresh}:{}),
+      marketEvidence,marketConfirmation,...(lpMtm?{lpPositionMtm:lpMtm,lpPositionMtmFresh}:{}),meteoraComparableLpMtm,meteoraComparableLpMtmFresh,...(priorLpProfitHighWater?{lpProfitHighWater:priorLpProfitHighWater}:{}),
       ...(position.enteredAt&&Number.isFinite(Date.parse(position.enteredAt))?{positionAgeMinutes:Math.max(0,(Date.parse(input.observedAt)-Date.parse(position.enteredAt))/60000)}:{}),
     });
     const claimExpectedValueLamports=fact&&apiPool?claimValueLamports({feeX:fact.feeX,feeY:fact.feeY,pool:apiPool}):undefined;
@@ -631,8 +655,21 @@ async function observeAndPlanOwnedPositions(input: {
       ...(exitDecision.economics.netReturnFraction!==undefined?{netReturnFraction:exitDecision.economics.netReturnFraction}:{}),
       peakNetReturnFraction:exitDecision.highWater.peakNetReturnFraction,
       ...(exitDecision.highWater.peakEconomicValueUsd!==undefined?{peakEconomicValueUsd:exitDecision.highWater.peakEconomicValueUsd}:{}),
+      lpMtmEvidenceState:meteoraComparableLpMtm.evidenceState,
+      ...(meteoraComparableLpMtm.entryPositionValueUsd!==undefined?{lpMtmEntryValueUsd:meteoraComparableLpMtm.entryPositionValueUsd}:{}),
+      ...(meteoraComparableLpMtm.currentPositionValueUsd!==undefined?{lpMtmCurrentValueUsd:meteoraComparableLpMtm.currentPositionValueUsd}:{}),
+      ...(meteoraComparableLpMtm.netPnlUsd!==undefined?{lpMtmNetPnlUsd:meteoraComparableLpMtm.netPnlUsd}:{}),
+      ...(meteoraComparableLpMtm.netReturnFraction!==undefined?{lpMtmNetReturnFraction:meteoraComparableLpMtm.netReturnFraction}:{}),
+      ...(meteoraComparableLpMtm.reportedNetReturnFraction!==undefined?{lpMtmReportedReturnFraction:meteoraComparableLpMtm.reportedNetReturnFraction}:{}),
+      ...(exitDecision.lpProfitHighWater?.peakNetReturnFraction!==undefined?{lpMtmPeakReturnFraction:exitDecision.lpProfitHighWater.peakNetReturnFraction}:{}),
+      ...(exitDecision.lpProfitHighWater?.peakPositionValueUsd!==undefined?{lpMtmPeakValueUsd:exitDecision.lpProfitHighWater.peakPositionValueUsd}:{}),
+      ...(exitDecision.lpProfitHighWater?.peakObservedAt!==undefined?{lpMtmPeakObservedAt:exitDecision.lpProfitHighWater.peakObservedAt}:{}),
+      ...(exitDecision.lpProfitHighWater?.pendingPeakNetReturnFraction!==undefined?{lpMtmPendingReturnFraction:exitDecision.lpProfitHighWater.pendingPeakNetReturnFraction}:{}),
+      ...(exitDecision.lpProfitHighWater?.pendingPeakPositionValueUsd!==undefined?{lpMtmPendingValueUsd:exitDecision.lpProfitHighWater.pendingPeakPositionValueUsd}:{}),
+      ...(exitDecision.lpProfitHighWater?.pendingPeakObservedAt!==undefined?{lpMtmPendingObservedAt:exitDecision.lpProfitHighWater.pendingPeakObservedAt}:{}),
+      lpMtmPendingConfirmations:exitDecision.lpProfitHighWater?.pendingPeakConfirmations??0,
       peakObservedAt:exitDecision.highWater.peakObservedAt,lastAction:exitDecision.action,reasonCodes:exitDecision.reasonCodes,
-      payload:{peakGivebackFraction:exitDecision.peakGivebackFraction,reasonFamily:exitDecision.reasonFamily,urgency:exitDecision.urgency,continuationEvLamports:continuation?.continuationEvLamports.toString()??null,expectedCloseCostLamports:closeCostLamports?.toString()??null,continuationCandidateId:continuation?.candidateId??null,geometryIdentity:continuation?.geometryIdentity??null,continuationConfirmationCount:confirmationCount,marketExitConfirmation:exitDecision.marketConfirmation,regime:regime??null,toxicity:toxicity??null,lpPositionMtm:lpMtm?{state:lpMtm.evidenceState,observedAt:lpMtm.observedAt,entryPositionValueUsd:lpMtm.entryPositionValueUsd??null,currentPositionValueUsd:lpMtm.currentPositionValueUsd??null,netPnlUsd:lpMtm.netPnlUsd??null,netReturnFraction:lpMtm.netReturnFraction??null,realizedFeeValueUsd:lpMtm.realizedFeeValueUsd??null,realizedWithdrawalValueUsd:lpMtm.realizedWithdrawalValueUsd??null,reasonCodes:lpMtm.reasonCodes,provenance:lpMtmProvenance??null}:null,managedEconomicMtmScope:'MANAGED_ECONOMIC_MTM'}
+      payload:{peakGivebackFraction:exitDecision.peakGivebackFraction,lpProfitGivebackFraction:exitDecision.lpProfitGivebackFraction??null,reasonFamily:exitDecision.reasonFamily,urgency:exitDecision.urgency,continuationEvLamports:continuation?.continuationEvLamports.toString()??null,expectedCloseCostLamports:closeCostLamports?.toString()??null,continuationCandidateId:continuation?.candidateId??null,geometryIdentity:continuation?.geometryIdentity??null,continuationConfirmationCount:confirmationCount,marketExitConfirmation:exitDecision.marketConfirmation,regime:regime??null,toxicity:toxicity??null,lpPositionMtm:lpMtm?{state:lpMtm.evidenceState,observedAt:lpMtm.observedAt,entryPositionValueUsd:lpMtm.entryPositionValueUsd??null,currentPositionValueUsd:lpMtm.currentPositionValueUsd??null,netPnlUsd:lpMtm.netPnlUsd??null,netReturnFraction:lpMtm.netReturnFraction??null,realizedFeeValueUsd:lpMtm.realizedFeeValueUsd??null,realizedWithdrawalValueUsd:lpMtm.realizedWithdrawalValueUsd??null,reasonCodes:lpMtm.reasonCodes,provenance:lpMtmProvenance??null}:null,meteoraComparableLpMtm:{state:meteoraComparableLpMtm.evidenceState,observedAt:meteoraComparableLpMtm.observedAt,entryPositionValueUsd:meteoraComparableLpMtm.entryPositionValueUsd??null,currentPositionValueUsd:meteoraComparableLpMtm.currentPositionValueUsd??null,netPnlUsd:meteoraComparableLpMtm.netPnlUsd??null,netReturnFraction:meteoraComparableLpMtm.netReturnFraction??null,reportedNetReturnFraction:meteoraComparableLpMtm.reportedNetReturnFraction??null,reasonCodes:meteoraComparableLpMtm.reasonCodes,source:'METEORA_POSITION_PNL_API'},managedEconomicMtmScope:'MANAGED_ECONOMIC_MTM'}
     });
     await input.store.insertPositionManagementDecisionAudit({lpforgePositionId:position.lpforgePositionId,positionAddress:position.positionAddress,observedAt:input.observedAt,activeBinId,lowerBinId:position.lowerBinId,upperBinId:position.upperBinId,...(continuation?{positionContinuationEvLamports:continuation.continuationEvLamports,forecastHorizonMinutes:continuation.forecastHorizonMinutes}:{}),...(current?.shadow?.recommendationId?{sourceDecisionId:current.shadow.recommendationId}:{}),...(continuation?{sourceEconomicsId:continuation.candidateId}:{}),...(continuation?.uncertainty!==undefined?{uncertainty:continuation.uncertainty}:{}),...(closeCostLamports!==undefined?{expectedCloseCostLamports:closeCostLamports}:{}),geometryIdentity:continuation?.geometryIdentity??`${position.positionAddress}:${position.strategy}:${position.orientation}:${position.lowerBinId}:${position.upperBinId}`,managementAction:decision.action,exitReasonFamily:exitDecision.reasonFamily,reasonCodes:exitDecision.reasonCodes,confirmationSequenceCount:confirmationCount,validContinuationEvidence:continuation!==undefined&&closeCostLamports!==undefined});
     const alertBase={entityType:'POSITION' as const,entityId:position.positionAddress,positionId:position.lpforgePositionId,positionAddress:position.positionAddress,poolAddress:position.poolAddress,observedAt:input.observedAt};
@@ -641,10 +678,11 @@ async function observeAndPlanOwnedPositions(input: {
       const code=reentered?'POSITION_RANGE_REENTERED':oor.state==='TRANSIENT_OOR'?'POSITION_OOR_STARTED':oor.state==='SUSTAINED_OOR'?'POSITION_OOR_SUSTAINED':oor.state==='OOR_ACTION_REQUIRED'?'POSITION_OOR_ACTION_REQUIRED':'POSITION_OOR_STALE_CAPITAL';
       queueLifecycleAlert({...alertBase,severity:reentered?'INFO':'WARNING',code,title:reentered?'Position back in range':oor.state==='TRANSIENT_OOR'?'Position moved outside its range':'Position range needs attention',message:reentered?'The current price returned to the position’s configured range. LPForge will continue normal monitoring.\nAction needed: none.':'LPForge detected that the current price is outside the position’s configured range. It is monitoring the position and will follow its existing risk rules.\nAction needed: none right now.',transitionKey:`${priorLifecycleState??'UNOBSERVED'}->${oor.state}`,reasonCodes:oor.reasonCodes,details:{Direction:oor.direction??'N/A',Status:oor.state,'LPForge action':oor.action,'Out of range':`${oor.continuousOorDurationSeconds}s`,'Active bin':activeBinId,Range:`${position.lowerBinId} → ${position.upperBinId}`,Inventory:oor.inventoryClassification}});
     }
-    const priorPeak=priorHighWater?.peakNetReturnFraction??0,currentReturn=exitDecision.economics.netReturnFraction;
-    if(exitPolicy.profitProtection.enabled&&priorPeak<exitPolicy.profitProtection.triggerFraction&&exitDecision.highWater.peakNetReturnFraction>=exitPolicy.profitProtection.triggerFraction)queueLifecycleAlert({...alertBase,severity:'INFO',code:'POSITION_PROFIT_PROTECTION_ARMED',title:'Profit protection armed',message:'The canonical high-water return crossed the configured profit-protection trigger.',transitionKey:'NOT_ARMED->ARMED',topic:'TRADES',details:{'Marked return':pct(currentReturn),'Peak return':pct(exitDecision.highWater.peakNetReturnFraction),'Trigger':pct(exitPolicy.profitProtection.triggerFraction),'Max giveback':pct(exitPolicy.profitProtection.maxGivebackFraction),'Retained floor':pct(exitPolicy.profitProtection.minRetainedProfitFraction),'Fees USD':exitDecision.economics.feesValueUsd??null,'Range':isOor?'OUT OF RANGE':'IN RANGE'}});
-    for(const milestone of telegramLifecycleConfig.returnMilestones)if(priorPeak<milestone&&exitDecision.highWater.peakNetReturnFraction>=milestone)queueLifecycleAlert({...alertBase,severity:'INFO',code:'POSITION_RETURN_MILESTONE',title:'Position return milestone reached',message:'Marked return crossed a configured Telegram-only milestone.',transitionKey:`RETURN<${milestone}->RETURN>=${milestone}`,topic:'TRADES',details:{Milestone:pct(milestone),'Marked return':pct(currentReturn),'Peak return':pct(exitDecision.highWater.peakNetReturnFraction),'Fees USD':exitDecision.economics.feesValueUsd??null}});
-    if((decision.action==='CLOSE'||decision.action==='EMERGENCY_CLOSE')&&priorExitRow?.last_action!==decision.action)await queueLifecycleAlert({...alertBase,severity:decision.action==='EMERGENCY_CLOSE'?'CRITICAL':'WARNING',code:decision.action==='EMERGENCY_CLOSE'?'POSITION_EMERGENCY_CLOSE_TRIGGERED':'POSITION_CLOSE_TRIGGERED',title:decision.action==='EMERGENCY_CLOSE'?'Emergency close requested':'Position close requested',message:'LPForge’s existing position-risk rules requested a close. This alert does not mean a transaction has been sent yet; execution will recheck live chain and safety facts first.\nAction needed: none right now.',transitionKey:`${priorExitRow?.last_action??'HOLD'}->${decision.action}`,topic:decision.action==='EMERGENCY_CLOSE'?'RISK':'TRADES',reasonCodes:decision.reasonCodes,details:{Trigger:exitDecision.reasonFamily,'Requested action':decision.action,Urgency:exitDecision.urgency,'Managed economic return':pct(currentReturn),'Peak managed return':pct(exitDecision.highWater.peakNetReturnFraction),'Peak giveback':pct(exitDecision.peakGivebackFraction),Range:isOor?'OUT OF RANGE':'IN RANGE'}});
+    const priorLpPeak=priorLpProfitHighWater?.peakNetReturnFraction??0,currentLpReturn=meteoraComparableLpMtm.netReturnFraction;
+    const confirmedLpPeak=exitDecision.lpProfitHighWater?.peakNetReturnFraction;
+    if(exitPolicy.profitProtection.enabled&&currentLpReturn!==undefined&&confirmedLpPeak!==undefined&&priorLpPeak<exitPolicy.profitProtection.triggerFraction&&confirmedLpPeak>=exitPolicy.profitProtection.triggerFraction)queueLifecycleAlert({...alertBase,severity:'INFO',code:'POSITION_PROFIT_PROTECTION_ARMED',title:'Profit protection armed',message:'The Meteora-comparable LP high-water return crossed the configured profit-protection trigger.',transitionKey:'NOT_ARMED->ARMED',topic:'TRADES',details:{'LP return':pct(currentLpReturn),'LP peak return':pct(confirmedLpPeak),'Trigger':pct(exitPolicy.profitProtection.triggerFraction),'Max giveback':pct(exitPolicy.profitProtection.maxGivebackFraction),'Retained floor':pct(exitPolicy.profitProtection.minRetainedProfitFraction),'Range':isOor?'OUT OF RANGE':'IN RANGE'}});
+    for(const milestone of telegramLifecycleConfig.returnMilestones)if(currentLpReturn!==undefined&&confirmedLpPeak!==undefined&&priorLpPeak<milestone&&confirmedLpPeak>=milestone)queueLifecycleAlert({...alertBase,severity:'INFO',code:'POSITION_RETURN_MILESTONE',title:'Position LP return milestone reached',message:'Meteora-comparable LP return crossed a configured Telegram-only milestone.',transitionKey:`LP_RETURN<${milestone}->LP_RETURN>=${milestone}`,topic:'TRADES',details:{Milestone:pct(milestone),'LP return':pct(currentLpReturn),'LP peak return':pct(confirmedLpPeak)}});
+    if((decision.action==='CLOSE'||decision.action==='EMERGENCY_CLOSE')&&priorExitRow?.last_action!==decision.action)await queueLifecycleAlert({...alertBase,severity:decision.action==='EMERGENCY_CLOSE'?'CRITICAL':'WARNING',code:decision.action==='EMERGENCY_CLOSE'?'POSITION_EMERGENCY_CLOSE_TRIGGERED':'POSITION_CLOSE_TRIGGERED',title:decision.action==='EMERGENCY_CLOSE'?'Emergency close requested':'Position close requested',message:'LPForge’s existing position-risk rules requested a close. This alert does not mean a transaction has been sent yet; execution will recheck live chain and safety facts first.\nAction needed: none right now.',transitionKey:`${priorExitRow?.last_action??'HOLD'}->${decision.action}`,topic:decision.action==='EMERGENCY_CLOSE'?'RISK':'TRADES',reasonCodes:decision.reasonCodes,details:{Trigger:exitDecision.reasonFamily,'Requested action':decision.action,Urgency:exitDecision.urgency,'LP return':pct(currentLpReturn),'LP peak return':pct(confirmedLpPeak),'LP peak giveback':pct(exitDecision.lpProfitGivebackFraction),Range:isOor?'OUT OF RANGE':'IN RANGE'}});
     const metrics=await persistFeeCompensationMetrics({store:input.store,position,observedAt:input.observedAt,activeBinId,...(fact?{fact}:{}),...(apiPool?{apiPool}:{}),economics,lots:attributedWalletInventory,...(continuation?{continuation:{continuationEvLamports:continuation.continuationEvLamports,...(continuation.uncertainty===undefined?{}:{uncertainty:continuation.uncertainty})}}:{}),...(current?{current}:{}),activePlans,managementAction:decision.action,source:'LPFORGE_PRODUCTION_OWNED_POSITION_MONITOR'});
     await input.store.insertPositionObservation({
       lpforgePositionId: position.lpforgePositionId,

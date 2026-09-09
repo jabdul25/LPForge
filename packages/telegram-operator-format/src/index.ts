@@ -106,6 +106,8 @@ function compactOne(summary:TelegramPositionSummary,index:number,nowMs:number):s
   ];
   const lpReturn=lpValuationAvailable(summary)?signedPercent(summary.lp_net_return_fraction):undefined;
   lines.push(`Current LP return: ${lpReturn??'unavailable'}`);
+  const lpPeak=lpValuationAvailable(summary)?signedPercent(summary.lp_peak_return_fraction):undefined;
+  if(lpPeak)lines.push(`Peak LP return: ${lpPeak}`);
   const fees=chainFresh(summary)?sol(summary.fee_value_lamports):undefined;
   lines.push(`Fees earned: ${fees??'unavailable'}`);
   lines.push(`Range: ${text(summary.lower_bin_id)} → ${text(summary.upper_bin_id)}`);
@@ -130,6 +132,8 @@ function detailOne(summary:TelegramPositionSummary,index:number|undefined,nowMs:
     const value=usd(summary.lp_current_position_value_usd),pnl=usd(summary.lp_net_pnl_usd,true),pct=signedPercent(summary.lp_net_return_fraction);
     lines.push(`LP Value: ${value??'unavailable'}`);
     lines.push(`LP MTM: ${pnl??'unavailable'}${pct?` (${pct})`:''}`);
+    const peak=signedPercent(summary.lp_peak_return_fraction);
+    if(peak)lines.push(`LP peak return: ${peak}`);
   }else lines.push('LP MTM: unavailable · entry basis pending');
   const managedBasis=sol(summary.managed_economic_contribution_lamports);
   if(managedBasis)lines.push(`Economic basis: ${managedBasis}`);

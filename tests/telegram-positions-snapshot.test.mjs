@@ -10,7 +10,7 @@ const position={
   initial_capital_lamports:'30000000',entered_at:'2026-09-07T01:36:00.000Z',lifecycle_state:'OPEN',reconciliation_status:'MATCH',
   observation_observed_at:'2026-09-07T04:59:42.000Z',chain_observed_at:'2026-09-07T04:59:42.000Z',observation_range_state:'IN_RANGE',observation_stale_data:false,
   valuation_observed_at:'2026-09-07T04:59:42.000Z',valuation_state:'AVAILABLE',current_economic_value_usd:'4.8142',net_pnl_usd:'0.2725',net_return_fraction:'0.0600',fee_value_lamports:'260000',
-  lp_mtm_observed_at:'2026-09-07T04:59:42.000Z',lp_mtm_state:'AVAILABLE',lp_current_position_value_usd:'4.8142',lp_net_pnl_usd:'0.2725',lp_net_return_fraction:'0.0600'
+  lp_mtm_observed_at:'2026-09-07T04:59:42.000Z',lp_mtm_state:'AVAILABLE',lp_current_position_value_usd:'4.8142',lp_net_pnl_usd:'0.2725',lp_net_return_fraction:'0.0600',lp_peak_return_fraction:'0.0721'
 };
 
 test('telegram positions reports no live positions without external dependencies',()=>{
@@ -29,14 +29,14 @@ test('telegram close resolution accepts the displayed ordinal, canonical address
 test('telegram positions renders a compact fresh LP-return snapshot without inventing accounting',()=>{
   const rendered=formatTelegramPositionSummaries({positions:[position],maxOpenPositions:2,nowMs:now});
   assert.match(rendered,/📊 LPForge Positions — 1 open \/ 2 max/);assert.match(rendered,/5odbT7…jT2X/);assert.match(rendered,/EAf6sh…zpzZ/);
-  assert.match(rendered,/🟢 In range · Open/);assert.match(rendered,/Current LP return: \+6\.00%/);
+  assert.match(rendered,/🟢 In range · Open/);assert.match(rendered,/Current LP return: \+6\.00%/);assert.match(rendered,/Peak LP return: \+7\.21%/);
   assert.match(rendered,/Fees earned: 0\.000260 SOL/);assert.match(rendered,/Range: -1381 → -1347/);assert.match(rendered,/Current bin: -1352/);assert.match(rendered,/Opened: 3h 24m ago/);assert.match(rendered,/Updated: 18s ago/);
   assert.doesNotMatch(rendered,/Economic MTM/);assert.doesNotMatch(rendered,/Capital:/);
 });
 test('telegram position detail keeps LP and economic accounting explicitly distinct',()=>{
   const rendered=formatTelegramPositionDetail({position,index:1,nowMs:now});
   assert.match(rendered,/BID_ASK · ONE_SIDED_Y/);assert.match(rendered,/Capital: 0\.030000 SOL/);
-  assert.match(rendered,/LP MTM: \+\$0\.2725 \(\+6\.00%\)/);assert.match(rendered,/Economic MTM: \+\$0\.2725 \(\+6\.00%\)/);
+  assert.match(rendered,/LP MTM: \+\$0\.2725 \(\+6\.00%\)/);assert.match(rendered,/LP peak return: \+7\.21%/);assert.match(rendered,/Economic MTM: \+\$0\.2725 \(\+6\.00%\)/);
 });
 test('telegram positions formats two independently valued positions and policy capacity',()=>{
   const second={...position,position_address:'7t477abcdefghijkmnopqrstuvwxyz123456789fHYs',pool_address:'PoolBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',orientation:'SKEWED_Y',net_pnl_usd:'-0.0078',net_return_fraction:'-0.0017'};

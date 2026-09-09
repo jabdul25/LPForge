@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import type { DataApiPool } from '../../data-api/src/index.js';
+import type { DataApiPool, MeteoraPositionPnl } from '../../data-api/src/index.js';
 import type { PositionV2Fact } from '../../domain/src/index.js';
 
 const WSOL_MINT='So11111111111111111111111111111111111111112';
@@ -41,10 +41,12 @@ export interface PositionEconomicsSnapshot {
   reasonCodes:string[];
 }
 /**
- * LP-local performance uses the same economic scope as a DLMM position UI:
+ * Receipt/chain LP-local performance uses LP-only economic scope:
  * position liquidity, unclaimed/claimed LP fees, and withdrawals, less the
  * immutable receipt-backed value deposited into PositionV2.  It deliberately
  * excludes execution cost, rent and position-attributable wallet inventory.
+ * It remains the capital-protection mark. Meteora-comparable UI/profit
+ * performance is intentionally derived separately below.
  */
 export interface LpPositionMarkToMarketSnapshot {
   evidenceState:ExitEvidenceState;
@@ -56,6 +58,31 @@ export interface LpPositionMarkToMarketSnapshot {
   realizedFeeValueUsd?:number;
   realizedWithdrawalValueUsd?:number;
   reasonCodes:string[];
+}
+/**
+ * Meteora-comparable LP performance.  This intentionally uses the exact
+ * deposit/withdrawal/fee scope exposed by Meteora's position PnL endpoint;
+ * it is separate from receipt-backed managed NAV and from the chain-only
+ * capital-loss mark.
+ */
+export interface MeteoraComparableLpPositionMarkToMarketSnapshot {
+  evidenceState:ExitEvidenceState;
+  observedAt:string;
+  entryPositionValueUsd?:number;
+  currentPositionValueUsd?:number;
+  netPnlUsd?:number;
+  netReturnFraction?:number;
+  reportedNetReturnFraction?:number;
+  reasonCodes:string[];
+}
+export interface LpProfitHighWaterState {
+  peakNetReturnFraction?:number;
+  peakPositionValueUsd?:number;
+  peakObservedAt?:string;
+  pendingPeakNetReturnFraction?:number;
+  pendingPeakPositionValueUsd?:number;
+  pendingPeakObservedAt?:string;
+  pendingPeakConfirmations:number;
 }
 /**
  * Wallet inventory is included only when a durable position inventory lot
@@ -89,8 +116,7 @@ export function derivePositionMarkToMarket(input:{position:PositionV2Fact;pool:D
  * LP-local performance intentionally excludes attributed wallet residuals,
  * realized cashflows, and execution cost.  The denominator is the
  * receipt-proven value deposited into PositionV2, expressed at the same SOL
- * mark as the current observation, so it is comparable to an LP UI mark and
- * never presented as settled PnL.
+ * mark as the current observation and is never presented as settled PnL.
  */
 export function deriveLpPositionMarkToMarket(input:{position:PositionV2Fact;pool:DataApiPool;lpPositionPrincipalLamports?:bigint;observedAt:string;realizedCashflows?:readonly RealizedPositionCashflow[]}):LpPositionMarkToMarketSnapshot{
   if(input.lpPositionPrincipalLamports===undefined||input.lpPositionPrincipalLamports<=0n)return{evidenceState:'UNAVAILABLE',observedAt:input.observedAt,reasonCodes:['LP_MTM_ENTRY_BASIS_UNPROVEN']};
@@ -109,6 +135,38 @@ export function deriveLpPositionMarkToMarket(input:{position:PositionV2Fact;pool
   const current=marked.currentPositionValueUsd+realized.feesUsd+realized.withdrawalsUsd;
   const net=current-entry;
   return{evidenceState:'AVAILABLE',observedAt:input.observedAt,entryPositionValueUsd:entry,currentPositionValueUsd:current,netPnlUsd:net,netReturnFraction:net/entry,realizedFeeValueUsd:realized.feesUsd,realizedWithdrawalValueUsd:realized.withdrawalsUsd,reasonCodes:['LP_POSITION_MARK_TO_MARKET','LP_POSITION_RECEIPT_BACKED_DEPOSIT']};
+}
+function apiNumber(value:unknown):number|undefined{
+  const n=typeof value==='number'?value:typeof value==='string'&&value.trim()!==''?Number(value):NaN;
+  return Number.isFinite(n)&&n>=0?n:undefined;
+}
+function apiFiniteNumber(value:unknown):number|undefined{
+  const n=typeof value==='number'?value:typeof value==='string'&&value.trim()!==''?Number(value):NaN;
+  return Number.isFinite(n)?n:undefined;
+}
+/** Derives, rather than trusts, Meteora's displayed LP PnL formula. */
+export function deriveMeteoraComparableLpPositionMarkToMarket(input:{positionPnl?:MeteoraPositionPnl;observedAt:string}):MeteoraComparableLpPositionMarkToMarketSnapshot{
+  const p=input.positionPnl;
+  if(!p)return{evidenceState:'UNAVAILABLE',observedAt:input.observedAt,reasonCodes:['LP_MTM_METEORA_POSITION_PNL_MISSING']};
+  const deposits=apiNumber(p.allTimeDeposits?.total?.usd),balances=apiNumber(p.unrealizedPnl?.balances),withdrawals=apiNumber(p.allTimeWithdrawals?.total?.usd),claimedFees=apiNumber(p.allTimeFees?.total?.usd),feeX=apiNumber(p.unrealizedPnl?.unclaimedFeeTokenX?.usd),feeY=apiNumber(p.unrealizedPnl?.unclaimedFeeTokenY?.usd);
+  if(deposits===undefined||deposits<=0||balances===undefined||withdrawals===undefined||claimedFees===undefined||feeX===undefined||feeY===undefined)return{evidenceState:'UNAVAILABLE',observedAt:input.observedAt,reasonCodes:['LP_MTM_METEORA_POSITION_PNL_INCOMPLETE']};
+  const current=balances+withdrawals+claimedFees+feeX+feeY,net=current-deposits,reported=apiFiniteNumber(p.pnlPctChange);
+  return{evidenceState:'AVAILABLE',observedAt:input.observedAt,entryPositionValueUsd:deposits,currentPositionValueUsd:current,netPnlUsd:net,netReturnFraction:net/deposits,...(reported===undefined?{}:{reportedNetReturnFraction:reported/100}),reasonCodes:['LP_POSITION_METEORA_COMPARABLE_MARK','LP_POSITION_METEORA_DEPOSIT_HISTORY']};
+}
+/**
+ * Meridian-style peak confirmation, made deterministic and durable by the
+ * caller's persisted state.  A transient single observation never raises the
+ * trailing high-water mark.
+ */
+export function confirmLpProfitHighWater(input:{prior?:LpProfitHighWaterState;current?:MeteoraComparableLpPositionMarkToMarketSnapshot;requiredConfirmations?:number}):LpProfitHighWaterState{
+  const prior=input.prior??{pendingPeakConfirmations:0},current=input.current,required=Math.max(1,Math.floor(input.requiredConfirmations??2));
+  if(current?.evidenceState!=='AVAILABLE'||!finite(current.netReturnFraction)||!finite(current.currentPositionValueUsd))return prior;
+  const peak=prior.peakNetReturnFraction;
+  if(peak!==undefined&&current.netReturnFraction<=peak){const {pendingPeakNetReturnFraction:_pendingReturn,pendingPeakPositionValueUsd:_pendingValue,pendingPeakObservedAt:_pendingAt,...retained}=prior;return{...retained,pendingPeakConfirmations:0};}
+  const sameOrHigherPending=prior.pendingPeakNetReturnFraction!==undefined&&current.netReturnFraction>=prior.pendingPeakNetReturnFraction;
+  const count=sameOrHigherPending?prior.pendingPeakConfirmations+1:1;
+  if(count<required)return{...prior,pendingPeakNetReturnFraction:current.netReturnFraction,pendingPeakPositionValueUsd:current.currentPositionValueUsd,pendingPeakObservedAt:current.observedAt,pendingPeakConfirmations:count};
+  return{peakNetReturnFraction:current.netReturnFraction,peakPositionValueUsd:current.currentPositionValueUsd,peakObservedAt:current.observedAt,pendingPeakConfirmations:0};
 }
 export interface ExitHighWaterState {peakNetReturnFraction:number;peakEconomicValueUsd?:number;peakObservedAt:string;}
 /**
@@ -145,6 +203,10 @@ export interface LiveExitGovernorInput {
   lpPositionMtm?:LpPositionMarkToMarketSnapshot;
   /** True only when the LP mark has current chain facts and durable provenance. */
   lpPositionMtmFresh?:boolean;
+  /** Fresh Meteora-comparable LP mark used only for profit/take-profit return semantics. */
+  meteoraComparableLpMtm?:MeteoraComparableLpPositionMarkToMarketSnapshot;
+  meteoraComparableLpMtmFresh?:boolean;
+  lpProfitHighWater?:LpProfitHighWaterState;
   /** Model/market evidence with source-family provenance, supplied by the live operator. */
   marketEvidence?:readonly MarketExitEvidence[];
   marketConfirmation?:MarketExitConfirmationState;
@@ -159,6 +221,8 @@ export interface LiveExitGovernorDecision {
   highWater:ExitHighWaterState;
   peakGivebackFraction:number|null;
   marketConfirmation:MarketExitConfirmationState;
+  lpProfitHighWater?:LpProfitHighWaterState;
+  lpProfitGivebackFraction?:number|null;
 }
 const clamp=(x:number,min=0,max=1)=>Math.max(min,Math.min(max,x));
 const finite=(x:unknown):x is number=>typeof x==='number'&&Number.isFinite(x);
@@ -275,8 +339,13 @@ function marketAuthority(input:LiveExitGovernorInput):{confirmed:boolean;pending
 }
 export function assessLiveExit(input:LiveExitGovernorInput):LiveExitGovernorDecision{
   const p=input.policy,e=input.economics,hw=nextHighWater(e,input.highWater),current=e.netReturnFraction,giveback=finite(current)?Math.max(0,hw.peakNetReturnFraction-current):null;
+  const comparable=input.meteoraComparableLpMtmFresh===true&&input.meteoraComparableLpMtm?.evidenceState==='AVAILABLE'?input.meteoraComparableLpMtm:undefined;
+  const lpProfitHighWater=confirmLpProfitHighWater({...(input.lpProfitHighWater?{prior:input.lpProfitHighWater}:{}),...(comparable?{current:comparable}:{})});
+  const lpProfitCurrent=comparable?.netReturnFraction;
+  const lpProfitPeak=lpProfitHighWater.peakNetReturnFraction;
+  const lpProfitGiveback=finite(lpProfitCurrent)&&finite(lpProfitPeak)?Math.max(0,lpProfitPeak-lpProfitCurrent):null;
   let authority=marketAuthority(input);
-  const out=(action:LiveExitAction,family:LiveExitGovernorDecision['reasonFamily'],codes:string[],urgency:number,reduceFraction=0):LiveExitGovernorDecision=>({action,reasonFamily:family,reasonCodes:[...new Set(codes)].sort(),urgency:clamp(urgency),reduceFraction,economics:e,highWater:hw,peakGivebackFraction:giveback,marketConfirmation:authority.confirmation});
+  const out=(action:LiveExitAction,family:LiveExitGovernorDecision['reasonFamily'],codes:string[],urgency:number,reduceFraction=0):LiveExitGovernorDecision=>({action,reasonFamily:family,reasonCodes:[...new Set(codes)].sort(),urgency:clamp(urgency),reduceFraction,economics:e,highWater:hw,peakGivebackFraction:giveback,marketConfirmation:authority.confirmation,lpProfitHighWater,lpProfitGivebackFraction:lpProfitGiveback});
   if(!p.enabled)return out('HOLD','NONE',['EXIT_GOVERNOR_DISABLED'],0);
   const tox=finite(input.toxicityProbability)?input.toxicityProbability:0;
   const lpReturn=input.lpPositionMtm?.netReturnFraction;
@@ -296,8 +365,8 @@ export function assessLiveExit(input:LiveExitGovernorInput):LiveExitGovernorDeci
   authority=governed;
   if(governed.confirmed)return out('CLOSE','EMERGENCY',governed.reasonCodes,.9,1);
   if(governed.pending)return out('HOLD','EMERGENCY',governed.reasonCodes,.35,0);
-  if(p.takeProfitFraction>0&&finite(current)&&current>=p.takeProfitFraction)return out('CLOSE','PROFIT_PROTECTION',['EXIT_TAKE_PROFIT_TARGET'],.88,1);
-  if(p.profitProtection.enabled&&finite(current)&&hw.peakNetReturnFraction>=p.profitProtection.triggerFraction&&giveback!==null&&giveback>=p.profitProtection.maxGivebackFraction&&current>=p.profitProtection.minRetainedProfitFraction)return out('CLOSE','PROFIT_PROTECTION',['EXIT_PROFIT_GIVEBACK_LIMIT'],.82,1);
+  if(p.takeProfitFraction>0&&finite(lpProfitCurrent)&&lpProfitCurrent>=p.takeProfitFraction)return out('CLOSE','PROFIT_PROTECTION',['EXIT_TAKE_PROFIT_TARGET'],.88,1);
+  if(p.profitProtection.enabled&&finite(lpProfitCurrent)&&finite(lpProfitPeak)&&lpProfitPeak>=p.profitProtection.triggerFraction&&lpProfitGiveback!==null&&lpProfitGiveback>=p.profitProtection.maxGivebackFraction&&lpProfitCurrent>=p.profitProtection.minRetainedProfitFraction)return out('CLOSE','PROFIT_PROTECTION',['EXIT_LP_POSITION_PROFIT_GIVEBACK_LIMIT'],.82,1);
   if(p.closeOnNonPositiveForwardEv&&finite(input.currentForwardEv)){if(input.forwardEvEvidenceAvailable===false)return out('HOLD','NONE',['EXIT_POSITION_CONTINUATION_EVIDENCE_UNAVAILABLE'],.1,0);if(!finite(input.closeCost))return out('HOLD','NONE',['EXIT_CLOSE_COST_UNAVAILABLE'],.1,0);const closeCost=Math.max(0,input.closeCost);if(input.currentForwardEv<=-closeCost){const confirmations=Math.max(0,Math.floor(input.forwardEvConfirmationCount??0));if(confirmations<2)return out('HOLD','FORWARD_EV',['EXIT_FORWARD_EV_CONFIRMATION_PENDING'],.1,0);return out('CLOSE','FORWARD_EV',['EXIT_FORWARD_EV_INFERIOR_TO_CLOSE'],.75,1);}}
   if(p.reduceOnRiskBlock&&input.riskDecision==='BLOCK')return out('REDUCE','RISK',['EXIT_REDUCE_RISK_BLOCK',...(input.riskReasonCodes??[])],.7,p.reduceFraction);
   if(p.maxHoldMinutes>0&&finite(input.positionAgeMinutes)&&input.positionAgeMinutes!>=p.maxHoldMinutes&&(!p.maxHoldRequiresNonPositiveForwardEv||(finite(input.currentForwardEv)&&input.currentForwardEv!<=0)))return out('CLOSE','TIME',['EXIT_MAX_HOLD_REACHED'],.6,1);
