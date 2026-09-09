@@ -214,7 +214,11 @@ export function validateClaimedPlan(input: {
   // Once the provenance secret is configured the plan must carry a valid
   // operator HMAC over the same identity fields the row asserts; before
   // that the guard stays backward compatible and verifies nothing.
-  if (input.provenanceSecret) {
+  // The operator provenance HMAC authenticates risk-increasing admission
+  // proofs. Protective CLOSE/EMERGENCY_CLOSE plans use their independently
+  // verified owned-position, P7 protective-authority and exact chain-truth
+  // bindings; requiring an entry-only stamp would strand capital on a close.
+  if (riskIncreasing && input.provenanceSecret) {
     const hmac = provenance.hmac;
     if (typeof hmac !== "string")
       reasons.push("P6_CLAIM_PROVENANCE_HMAC_MISSING");
