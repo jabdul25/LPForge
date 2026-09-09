@@ -31,6 +31,13 @@ test('P6 live execution accepts only local private-key owner signing and runs re
   assert.doesNotMatch(src,/createLocalKeypairFileSigner/);
 });
 
+test('an unrelated partial-entry recovery exception cannot strand an independently protective close',()=>{
+  const src=fs.readFileSync(new URL('../apps/execution/src/main.ts',import.meta.url),'utf8');
+  assert.match(src,/P6_PARTIAL_ENTRY_RECOVERY_EXCEPTION/);
+  assert.match(src,/partial-entry row remains durable recovery debt/);
+  assert.match(src,/dispatchOne\(\{protectiveOnly:true\}\)/);
+});
+
 test('P6 lifecycle persistence migration adds ownership, observations, partial entry recovery, and state events',()=>{
   const sql=fs.readFileSync(new URL('../packages/db/migrations/M0029_live_position_lifecycle.sql',import.meta.url),'utf8');
   for(const table of ['plan_state_events','owned_positions','position_observations','partial_entry_recovery'])assert.match(sql,new RegExp(`execution\\.${table}`));
