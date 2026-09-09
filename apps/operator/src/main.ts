@@ -484,6 +484,8 @@ async function observeAndPlanOwnedPositions(input: {
   currentResult?: OperationalCycleResult;
   allowRiskIncreasingPlans: boolean;
   allowProtectiveManagementPlans: boolean;
+  /** Recovery containment may run only terminal capital-protection closes. */
+  protectiveOnly?: boolean;
   swapQuoteProvider?: { quote(request:{inputMint:string;outputMint:string;inputAmount:bigint;requiredOutputAmount:bigint}):Promise<{status:string;quote?:{outAmount:bigint}}> };
 }) {
   if (!input.ownerAddress) return { observed: 0, planned: 0 };
@@ -739,9 +741,19 @@ async function observeAndPlanOwnedPositions(input: {
       ["RESHAPE", "REBALANCE"].includes(decision.action);
     const planAction = containmentTerminalClose ? "CLOSE" : decision.action;
     const planRiskIncreasing = ["ADD", "RESHAPE", "REBALANCE"].includes(planAction);
+    // Recovery must not strand an already-owned position, but it is not a
+    // general management lane: fee claims, reductions, reshapes and ordinary
+    // discretionary/time closes remain paused until recovery is clean.
+    const terminalProtectiveClose =
+      planAction === "EMERGENCY_CLOSE" ||
+      (planAction === "CLOSE" &&
+      (exitDecision.reasonFamily === "EMERGENCY" ||
+        decision.reasonCodes.includes("POSITION_OOR_TOKEN_RISK") ||
+        decision.reasonCodes.includes("POSITION_OOR_STALE_CAPITAL")));
     const managementPlanAllowed=managementContext.planAllowed||Boolean(telegramCloseRequest);
     if (
       decision.action === "HOLD" ||
+      (input.protectiveOnly && !terminalProtectiveClose) ||
       !managementPlanAllowed ||
       (planRiskIncreasing
         ? !input.allowRiskIncreasingPlans
@@ -1458,6 +1470,64 @@ async function observeOwnedPositionsOnce() {
     await store.close();
   }
 }
+/**
+ * The recovery lane must never make deployed capital invisible.  This command
+ * deliberately reuses the canonical position manager, but exposes only
+ * terminal protective CLOSE/EMERGENCY_CLOSE construction.  It cannot prepare
+ * entries, claims, reductions, reshapes, or rebalances.
+ */
+async function manageOwnedPositionsProtectiveOnce() {
+  const cfg = loadPhase1Config();
+  if (cfg.dataMode !== "LIVE_READ_ONLY")
+    throw new Error("LPFORGE_OPERATOR_REQUIRES_LIVE_READ_ONLY");
+  const log = new Logger("operator", cfg.logLevel);
+  const store = await createPostgresStore(cfg.databaseUrl);
+  try {
+    const runtimeId = (process.env.LPFORGE_P7_RUNTIME_ID ?? "lpforge-production").trim();
+    const control = await store.loadLatestPhase7ControlDecision(runtimeId);
+    const allowProtectiveManagementPlans = assessPostEntryAuthority({
+      ...(typeof control?.authority_mode === "string" ? { authorityMode: control.authority_mode } : {}),
+      ...(typeof control?.health_status === "string" ? { healthStatus: control.health_status } : {}),
+      ...(typeof control?.safety_mode === "string" ? { safetyMode: control.safety_mode } : {}),
+      newEconomicActionAllowed: false,
+      riskIncreasingPlanDispatchEnabled: false,
+      protectiveActionDispatchEnabled:
+        (process.env.LPFORGE_P7_PROTECTIVE_ACTION_DISPATCH_ENABLED ?? "true").toLowerCase() === "true",
+    }, "CLOSE").allowed;
+    const adapter = createMeteoraReadAdapter({
+      rpcUrl: cfg.solanaRpcHttpUrl,
+      cluster: cfg.cluster,
+      programId: cfg.programId,
+      expectedSdkVersion: cfg.expectedSdkVersion,
+      rpcTimeoutMs: cfg.rpcTimeoutMs,
+    });
+    const api = createMeteoraDataApi({
+      baseUrl: cfg.meteoraDataApiUrl,
+      maxRps: cfg.dataApiMaxRps,
+      timeoutMs: cfg.httpTimeoutMs,
+    });
+    const result = await observeAndPlanOwnedPositions({
+      store, adapter, api,
+      ...(process.env.LPFORGE_OPERATOR_OWNER_ADDRESS ? { ownerAddress: process.env.LPFORGE_OPERATOR_OWNER_ADDRESS } : {}),
+      observedAt: new Date().toISOString(), log,
+      allowRiskIncreasingPlans: false,
+      allowProtectiveManagementPlans,
+      protectiveOnly: true,
+    });
+    console.log(json({
+      event: "lpforge_operator_machine_summary",
+      operationalCycleComplete: true,
+      protectiveManagementOnly: true,
+      observedPositions: result.observed,
+      protectivePlansCreated: result.planned,
+      transactionsScanned: 0,
+      decodedSwapEvents: 0,
+      eventDecodeWarnings: 0,
+    }));
+  } finally {
+    await store.close();
+  }
+}
 async function liveRun() {
   const interval = Math.max(
     5000,
@@ -1484,6 +1554,10 @@ else if (cmd === "live-once") {
 }
 else if (cmd === "observe-owned-positions") {
   await observeOwnedPositionsOnce();
+  process.exit(0);
+}
+else if (cmd === "manage-owned-positions-protective") {
+  await manageOwnedPositionsProtectiveOnce();
   process.exit(0);
 }
 else if (cmd === "live-run") await liveRun();
