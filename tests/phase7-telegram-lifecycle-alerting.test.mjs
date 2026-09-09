@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {loadPhase7TelegramConfig,operatorReasonSummary,phase7AlertFingerprint,phase7AlertTopic,renderPhase7TelegramAlert,Phase7TelegramDeliveryError} from '../.build/packages/phase7-alerting/src/index.js';
+import {alertsForRpcQuotaPressure,loadPhase7TelegramConfig,operatorReasonSummary,phase7AlertFingerprint,phase7AlertTopic,renderPhase7TelegramAlert,RpcQuotaAlertObserver,Phase7TelegramDeliveryError} from '../.build/packages/phase7-alerting/src/index.js';
 
 test('terminal close transition awaits the durable Telegram outbox but contains delivery failures', async () => {
   const source = await import('node:fs/promises').then(fs => fs.readFile('apps/operator/src/main.ts', 'utf8'));
@@ -34,4 +34,16 @@ test('Telegram renders plain-language operator reasons instead of raw internal c
   assert.doesNotMatch(rendered,/EXEC_GLOBAL_KILL_SWITCH|P6_CLAIM_P7_CONTROL_STALE|P6_WALLET_SWEEP_INTERVAL_NOT_DUE/);
   assert.match(rendered,/Reference: POSITION_OOR_STARTED/);
   assert.deepEqual(operatorReasonSummary(['LPFORGE_P6_SWAP_RISK_BLOCKED:EXEC_GLOBAL_KILL_SWITCH,P6_CLAIM_P7_CONTROL_STALE']),['Safety status was briefly out of date.']);
+});
+test('RPC quota alert is durable, plain-language, and never exposes a provider URL',()=>{
+  const observedAt='2026-09-09T12:00:00.000Z',last429At='2026-09-09T11:59:55.000Z';
+  const [alert]=alertsForRpcQuotaPressure({lane:'EXECUTION',runtimeId:'lpforge-execution',providerKey:'a'.repeat(64),observedAt,successfulRead:false,state:{last_429_at:last429At,pressure_until:'2026-09-09T12:00:15.000Z',pressure_level:2}});
+  assert.equal(alert.code,'LPFORGE_RPC_USAGE_QUOTA_EXCEEDED');assert.equal(alert.severity,'WARNING');
+  const rendered=renderPhase7TelegramAlert(alert);assert.match(rendered,/RPC usage limit reached/);assert.match(rendered,/HTTP 429/);assert.doesNotMatch(rendered,/https?:\/\//i);assert.doesNotMatch(rendered,/aaaaaaaaaaaaaaaa/);
+});
+test('RPC quota observer emits recovery only after its own warning and a successful read',()=>{
+  const observer=new RpcQuotaAlertObserver(),providerKey='b'.repeat(64),warning=observer.alerts({lane:'DISCOVERY',runtimeId:'lpforge-discovery',providerKey,observedAt:'2026-09-09T12:00:00.000Z',successfulRead:false,state:{last_429_at:'2026-09-09T11:59:59.000Z',pressure_until:'2026-09-09T12:00:30.000Z'}});
+  assert.equal(warning[0]?.code,'LPFORGE_RPC_USAGE_QUOTA_EXCEEDED');
+  const recovery=observer.alerts({lane:'DISCOVERY',runtimeId:'lpforge-discovery',providerKey,observedAt:'2026-09-09T12:00:31.000Z',successfulRead:true,state:{last_429_at:'2026-09-09T11:59:59.000Z',pressure_until:'2026-09-09T12:00:30.000Z'}});
+  assert.equal(recovery[0]?.code,'LPFORGE_RPC_USAGE_QUOTA_RECOVERED');
 });

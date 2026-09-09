@@ -1863,6 +1863,9 @@ export interface Phase1Store {
     runtimeId: string,
     decisionId: string,
   ): Promise<Record<string, unknown> | undefined>;
+  loadRpcProviderBudgetState(
+    providerKey: string,
+  ): Promise<Record<string, unknown> | undefined>;
   insertPhase7EvidenceSnapshot(value: {
     snapshotId: string;
     runtimeId: string;
@@ -5160,6 +5163,13 @@ return 'APPLIED';
       );
       return r.rows[0];
     },
+    async loadRpcProviderBudgetState(providerKey) {
+      const r = await db.query(
+        `SELECT provider_key,pressure_until,pressure_level,last_429_at,updated_at FROM execution.rpc_provider_budget_state WHERE provider_key=$1 LIMIT 1`,
+        [providerKey],
+      );
+      return r.rows[0];
+    },
     async insertPhase7EvidenceSnapshot(v) {
       await db.query(
         `INSERT INTO operations.phase7_evidence_snapshots(snapshot_id,runtime_id,cycle_key,observed_at,implementation_status,operational_status,payload) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb) ON CONFLICT(snapshot_id) DO NOTHING`,
@@ -5728,6 +5738,9 @@ export function createMemoryStore(): Phase1Store {
       return undefined;
     },
     async loadPhase7ControlDecision() {
+      return undefined;
+    },
+    async loadRpcProviderBudgetState() {
       return undefined;
     },
     async insertPhase7EvidenceSnapshot() {},
