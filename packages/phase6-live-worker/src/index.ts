@@ -125,7 +125,7 @@ export interface LiveWorkerConfig {
   controlledCanary?: ControlledCanaryDeploymentPolicy;
 }
 export interface LiveWorkerResult {
-  status: "IDLE" | "BLOCKED" | "SUBMITTED" | "RECONCILED" | "UNKNOWN";
+  status: "IDLE" | "AWAITING_FRESH_P7_CONTROL" | "BLOCKED" | "SUBMITTED" | "RECONCILED" | "UNKNOWN";
   planId?: string;
   reasonCodes: string[];
   transactionSubmitted: boolean;
@@ -510,7 +510,26 @@ export function assessConfirmedFailedOpenRecovery(input:{confirmationStatus:stri
  * control TTL or authorizes a stale/revoked control: the second read must
  * independently pass the same canonical validation.
  */
-const P7_STALE_CONTROL_RELOAD_DELAY_MS=1_500;
+// P7 normally emits a fresh control record on its bounded daemon cadence.
+// Waiting through this small pre-sign window does not extend the 60-second
+// authority TTL: the re-read must still pass the same validation. It prevents
+// an otherwise healthy plan from losing a slot only because P6 arrived a
+// fraction of a cycle before P7 commits its next control record.
+const P7_STALE_CONTROL_RELOAD_DELAY_MS=5_000;
+/**
+ * A stale P7 control maps to EXEC_GLOBAL_KILL_SWITCH in the execution-risk
+ * layer. Treat that pair as one pre-sign freshness miss, but never collapse a
+ * real health, drift, portfolio, or market veto into a retryable condition.
+ */
+export function isStaleOnlyPreSignP7ControlBlock(reason:string|readonly string[]):boolean{
+  const raw:readonly string[]=typeof reason==='string'?(reason.split(':').at(-1)?.split(',')??[]):reason;
+  const codes=raw.map(code=>code.trim()).filter(Boolean);
+  return codes.includes('P6_CLAIM_P7_CONTROL_STALE')&&codes.every(code=>code==='P6_CLAIM_P7_CONTROL_STALE'||code==='EXEC_GLOBAL_KILL_SWITCH');
+}
+async function requeueUnsignedStaleControlOpen(input:{store:Phase1Store;plan:AutonomousOpenPlan;reason:string;stage:string}):Promise<LiveWorkerResult>{
+  await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'PLANNED',at:new Date().toISOString(),reasonCodes:['P6_CLAIM_P7_CONTROL_STALE_REQUEUED'],payload:{stage:input.stage,retryDisposition:'AWAIT_FRESH_P7_CONTROL',priorReason:input.reason,noChainEffect:true}});
+  return{status:'AWAITING_FRESH_P7_CONTROL',planId:input.plan.planId,reasonCodes:['P6_CLAIM_P7_CONTROL_STALE'],transactionSubmitted:false};
+}
 export async function loadFreshExecutionSafetyFacts(input:{store:Pick<Phase1Store,'loadLatestPhase7ControlDecision'|'loadPhase7ControlDecision'|'loadPhase7PortfolioFacts'>;plan:AutonomousOpenPlan;config:Pick<LiveWorkerConfig,'rpcUrl'|'programId'|'maxOpenPositions'|'controlledCanary'>;connection?:Pick<Connection,'getLatestBlockhash'>;now?:string;phase7RuntimeId?:string;protocolCompatibility?:()=>Promise<boolean>;staleControlReloadDelayMs?:number}):Promise<FreshExecutionSafetyFacts>{
   const now=input.now??new Date().toISOString(),reasons:string[]=[],runtimeId=input.phase7RuntimeId??(process.env.LPFORGE_P7_RUNTIME_ID??'lpforge-production').trim(),provenance=planRecord(input.plan.planPayload.provenance),binding=planRecord(provenance.phase7Control),boundDecisionId=String(binding.decisionId??'');
   let portfolio:Awaited<ReturnType<Phase1Store['loadPhase7PortfolioFacts']>>|undefined,current;
@@ -1280,6 +1299,7 @@ export async function executeAutonomousOpen(input: {
       });
     const risk = await governFreshOpenRisk({store:input.store,plan:input.plan,config:input.config,connection,simulation,costApproved:cost.approved,fields});
     if (risk.decision !== "APPROVE" || !risk.permitId || !risk.expiresAt) {
+      if(isStaleOnlyPreSignP7ControlBlock(risk.reasonCodes))return requeueUnsignedStaleControlOpen({store:input.store,plan:input.plan,reason:risk.reasonCodes.join(','),stage:'SIMULATE_RISK'});
       await input.store.completeAutonomousPlan({
         planId: input.plan.planId,
         state: "BLOCKED",
@@ -1607,6 +1627,7 @@ export async function executeAutonomousOpen(input: {
         transactionSubmitted: true,
       };
     }
+    if(!submittedAny&&!submissionStatusUnknown&&isStaleOnlyPreSignP7ControlBlock(reason))return requeueUnsignedStaleControlOpen({store:input.store,plan:input.plan,reason,stage:'PRE_SIGN_P7_REFRESH'});
     if (reason.startsWith("LPFORGE_P6_PRESUBMISSION_SAFETY_BLOCKED:"))
       await recordJournal(input.store,input.plan as unknown as AutonomousPlan,"FAILED",{action:"OPEN",stage:"PRESUBMISSION_SAFETY",error:reason,generatedPositionAddress:openPositionAddress});
     if (!reason.includes("LPFORGE_SUBMISSION_STATUS_UNKNOWN"))

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {loadFreshExecutionSafetyFacts,checkFreshOpenSubmissionSafety,assessFreshOpenPortfolioTruth} from '../.build/packages/phase6-live-worker/src/index.js';
+import {loadFreshExecutionSafetyFacts,checkFreshOpenSubmissionSafety,assessFreshOpenPortfolioTruth,isStaleOnlyPreSignP7ControlBlock} from '../.build/packages/phase6-live-worker/src/index.js';
 const now='2026-08-29T12:00:00.000Z';
 const plan={planId:'fresh-open',intentId:'intent',idempotencyKey:'idem',action:'OPEN',poolAddress:'pool',ownerAddress:'owner',thesisId:'thesis',observedAt:now,expiresAt:'2026-08-29T12:05:00.000Z',planPayload:{provenance:{phase7Control:{decisionId:'latest'}},intent:{capitalLamports:'30000000',candidateId:'candidate'}},intentPayload:{},steps:[]};
 const control=(overrides={})=>({decision_id:'latest',cycle_key:'cycle',authority_mode:'PRODUCTION',health_status:'HEALTHY',drift_status:'WATCH',safety_mode:'NORMAL',new_economic_action_allowed:true,observed_at:now,payload:{releaseIdentity:{valid:true},portfolio:{valid:true},activeIncidentIds:[],controlledCanaryRevokedApprovalIds:[]},...overrides});
@@ -22,5 +22,11 @@ test('a stale P7 control remains fail-closed when its bounded reload is still st
  const staleStore={async loadLatestPhase7ControlDecision(){reads++;return stale;},async loadPhase7ControlDecision(){return stale;},async loadPhase7PortfolioFacts(){return portfolio({pendingExecutionCount:1});}};
  const r=await loadFreshExecutionSafetyFacts({store:staleStore,plan,config,connection,now,protocolCompatibility:async()=>true,staleControlReloadDelayMs:0});
  assert.equal(reads,2);assert.equal(r.globalKillSwitch,true);assert.deepEqual(r.reasonCodes,['P6_CLAIM_P7_CONTROL_STALE']);
+});
+test('only the stale-control-derived global kill switch is eligible for unsigned requeue',()=>{
+ assert.equal(isStaleOnlyPreSignP7ControlBlock('LPFORGE_P6_SWAP_RISK_BLOCKED:EXEC_GLOBAL_KILL_SWITCH,P6_CLAIM_P7_CONTROL_STALE'),true);
+ assert.equal(isStaleOnlyPreSignP7ControlBlock(['EXEC_GLOBAL_KILL_SWITCH','P6_CLAIM_P7_CONTROL_STALE']),true);
+ assert.equal(isStaleOnlyPreSignP7ControlBlock(['EXEC_GLOBAL_KILL_SWITCH','P6_CLAIM_P7_CONTROL_STALE','P6_CLAIM_P7_HEALTH_NOT_HEALTHY']),false);
+ assert.equal(isStaleOnlyPreSignP7ControlBlock(['EXEC_GLOBAL_KILL_SWITCH']),false);
 });
 test('post-sign safety blocks a revoked or reconciled plan before transport',async()=>{const revoked=await checkFreshOpenSubmissionSafety({store:store(control({health_status:'CRITICAL'})),plan,config,permitExpiresAt:'2026-08-29T12:00:10.000Z',now});assert.equal(revoked.approved,false);assert.ok(revoked.reasonCodes.some(code=>code.includes('HEALTH_NOT_HEALTHY')));const reconciled=await checkFreshOpenSubmissionSafety({store:store(control(),portfolio({unresolvedReconciliationDebt:1})),plan,config,permitExpiresAt:'2026-08-29T12:00:10.000Z',now});assert.equal(reconciled.approved,false);assert.ok(reconciled.reasonCodes.includes('P6_PRESUBMISSION_RECONCILIATION_OR_PORTFOLIO_BLOCK'));});
