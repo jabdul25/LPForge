@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {derivePositionAttributedTerminalUnwind} from '../.build/packages/phase6-live-worker/src/index.js';
+import {derivePositionAttributedTerminalUnwind,parseDurableCloseLotAllocations} from '../.build/packages/phase6-live-worker/src/index.js';
 
 const positionAddress='position-zcat',tokenMint='zcat',closePlanId='close-plan';
 const lot=(lotId,rawAmount,overrides={})=>({lotId,positionAddress,planId:'claim-'+lotId,tokenMint,sourceEvent:'FEE_CLAIM',remainingRawAmount:BigInt(rawAmount),status:'OPEN',acquiredAt:`2026-09-05T00:00:0${lotId}Z`,...overrides});
@@ -42,4 +42,10 @@ test('entry funding residual is receipt-bound position inventory and is unwound 
 test('entry residual wallet shortfall fails closed and never infers unrelated inventory',()=>{
   const result=derivePositionAttributedTerminalUnwind({positionAddress,tokenMint,closePlanId,newlyWithdrawnRaw:0n,walletRawAfterClose:3975127n,lots:[lot('entry-residual',3975128,{sourceEvent:'OPEN_RESIDUAL',planId:'entry-plan'})]});
   assert.deepEqual(result,{ok:false,reasonCodes:['P6_CLOSE_POSITION_ATTRIBUTED_FEE_LOTS_WALLET_SHORTFALL']});
+});
+
+test('durable close lot allocations preserve exact receipt-bound lots across restart',()=>{
+  assert.deepEqual(parseDurableCloseLotAllocations([{lotId:'claim-x:lot',rawAmount:'6494363'}]),{ok:true,allocations:[{lotId:'claim-x:lot',rawAmount:6494363n}]});
+  assert.deepEqual(parseDurableCloseLotAllocations([{lotId:'claim-x:lot',rawAmount:'0'}]),{ok:false});
+  assert.deepEqual(parseDurableCloseLotAllocations([{lotId:'claim-x:lot',rawAmount:'7'},{lotId:'claim-x:lot',rawAmount:'1'}]),{ok:false});
 });

@@ -368,6 +368,25 @@ export function derivePositionAttributedTerminalUnwind(input:{
 }
 
 /**
+ * The close unwind is allowed to settle only the exact receipt-bound lots
+ * selected before its signature was submitted.  The dispatch payload is the
+ * restart boundary, so decode it once rather than recreating a synthetic
+ * close-x lot during recovery.
+ */
+export function parseDurableCloseLotAllocations(value:unknown):{ok:true;allocations:Array<{lotId:string;rawAmount:bigint}>}|{ok:false}{
+  if(value===undefined)return{ok:true,allocations:[]};
+  if(!Array.isArray(value))return{ok:false};
+  const allocations:Array<{lotId:string;rawAmount:bigint}>=[],seen=new Set<string>();
+  for(const rowValue of value){
+    if(!rowValue||typeof rowValue!=="object")return{ok:false};
+    const row=rowValue as Record<string,unknown>;
+    if(typeof row.lotId!=="string"||row.lotId.length===0||typeof row.rawAmount!=="string"||!/^([1-9][0-9]*)$/.test(row.rawAmount)||seen.has(row.lotId))return{ok:false};
+    try{allocations.push({lotId:row.lotId,rawAmount:BigInt(row.rawAmount)});seen.add(row.lotId);}catch{return{ok:false};}
+  }
+  return{ok:true,allocations};
+}
+
+/**
  * A final account-close child may expire after the normal close unwind has
  * already settled, while a receipt-backed fee claim remains in the owner
  * wallet.  That inventory is still position-attributable, but it is not safe
@@ -4293,7 +4312,12 @@ async function executeCloseSettlement(input: {
     stage = "CLOSE_CLAIMS_SETTLED";
   }
 
-  let attributableTokenX = closeSettlementAmount(dispatch.attributableTokenX),attributableTokenY=closeSettlementAmount(dispatch.attributableTokenY),attributableFeeLotAllocations:Array<{lotId:string;rawAmount:bigint}>=Array.isArray(dispatch.attributableFeeLotAllocations)?dispatch.attributableFeeLotAllocations.flatMap((value):Array<{lotId:string;rawAmount:bigint}>=>{if(!value||typeof value!=="object")return[];const row=value as Record<string,unknown>;if(typeof row.lotId!=="string"||typeof row.rawAmount!=="string")return[];try{const rawAmount=BigInt(row.rawAmount);return rawAmount>0n?[{lotId:row.lotId,rawAmount}]:[];}catch{return[];}}):[];
+  const persistedLotAllocations=parseDurableCloseLotAllocations(dispatch.attributableFeeLotAllocations);
+  if(!persistedLotAllocations.ok){
+    await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:"RECONCILIATION_REQUIRED",at:new Date().toISOString(),reasonCodes:["P6_CLOSE_POSITION_ATTRIBUTED_LOT_ALLOCATION_INVALID"],payload:{stage:"CLOSE_POSITION_ATTRIBUTED_FEE_INVENTORY"}});
+    return{status:"UNKNOWN",planId:input.plan.planId,reasonCodes:["P6_CLOSE_POSITION_ATTRIBUTED_LOT_ALLOCATION_INVALID"],transactionSubmitted:true};
+  }
+  let attributableTokenX = closeSettlementAmount(dispatch.attributableTokenX),attributableTokenY=closeSettlementAmount(dispatch.attributableTokenY),attributableFeeLotAllocations=persistedLotAllocations.allocations;
   if (stage === "CLOSE_CLAIMS_SETTLED") {
     const [tokenXAfter,tokenYAfter]=await Promise.all([readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenXMint}),readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:poolFact.tokenYMint})]);
     if(tokenXAfterRemove===undefined){
@@ -6050,7 +6074,13 @@ export async function recoverUnfinishedAutonomousPlans(input: {
           unwindTransactionId = recovered
             ? typeof dispatch.recoveredOpenResidualUnwindTransactionId === "string" ? dispatch.recoveredOpenResidualUnwindTransactionId : `${plan.planId}:recovered-open-residual-unwind`
             : typeof dispatch.unwindTransactionId === "string" ? dispatch.unwindTransactionId : `${plan.planId}:unwind`,
-          lotId = recovered && typeof dispatch.recoveredOpenResidualLotId === "string" ? dispatch.recoveredOpenResidualLotId : undefined;
+          lotId = recovered && typeof dispatch.recoveredOpenResidualLotId === "string" ? dispatch.recoveredOpenResidualLotId : undefined,
+          persistedLotAllocations=recovered?{ok:true as const,allocations:[] as Array<{lotId:string;rawAmount:bigint}>}:parseDurableCloseLotAllocations(dispatch.attributableFeeLotAllocations);
+        if(!persistedLotAllocations.ok){
+          await input.store.transitionAutonomousPlan({planId:plan.planId,state:"RECONCILIATION_REQUIRED",at:input.now,reasonCodes:["P6_CLOSE_POSITION_ATTRIBUTED_LOT_ALLOCATION_INVALID"],payload:{pendingStage:closePending.stage,pendingSignature:closePending.signature}});
+          results.push({planId:plan.planId,action:"HOLD_FOR_OPERATOR",reasonCodes:["P6_CLOSE_POSITION_ATTRIBUTED_LOT_ALLOCATION_INVALID"]});
+          continue;
+        }
         if (!connection || !recoveryPositionAddress || !inputMint || inputAmountRaw === undefined) {
           await input.store.transitionAutonomousPlan({
             planId: plan.planId,
@@ -6072,7 +6102,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
           inputMint,
           inputAmountRaw,
           observedAt: input.now,
-          ...(lotId?{lotId,settlementIdSuffix:"recovered-open-residual"}:{}),
+          ...(lotId?{lotId,settlementIdSuffix:"recovered-open-residual"}:persistedLotAllocations.allocations.length?{lotAllocations:persistedLotAllocations.allocations}:{}),
         });
         if (!settlement.ok) {
           await input.store.transitionAutonomousPlan({
