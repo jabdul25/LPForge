@@ -376,11 +376,27 @@ async function recoverOnce() {
       currentBlockHeight = await createGovernedConnection({rpcUrl:config.rpcUrl,priority:'P1_RECOVERY_CRITICAL'}).getBlockHeight("confirmed");
     const preflightNoEffectRecovered=await store.recoverNoEffectPreflightSubmissionAttempts(new Date().toISOString());
     await store.reconcileExecutionCapitalReservations(new Date().toISOString());
-    const partial = await recoverPartialEntryFunding({
-      store,
-      signer: signerFromEnvironment(),
-      config,
-    });
+    // A partial-entry row remains durable recovery debt until its own exact
+    // identity can be reconciled.  It must not, however, prevent recovery of
+    // an independently-owned protective CLOSE: that would strand a live
+    // position behind an unrelated, fail-closed partial-entry exception.
+    // Preserve the debt as a HOLD result; never clear it or retry an
+    // unproven economic action here.
+    let partial: Array<{ planId: string; action: "RESUME_OPEN" | "UNWIND_REQUIRED" | "HOLD"; reasonCodes: string[] }>;
+    try {
+      partial = await recoverPartialEntryFunding({
+        store,
+        signer: signerFromEnvironment(),
+        config,
+      });
+    } catch (error) {
+      console.error(error);
+      partial = [{
+        planId: "partial-entry-recovery",
+        action: "HOLD",
+        reasonCodes: ["P6_PARTIAL_ENTRY_RECOVERY_EXCEPTION"],
+      }];
+    }
     const plans = await recoverUnfinishedAutonomousPlans({
       store,
       currentBlockHeight,
