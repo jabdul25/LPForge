@@ -2338,7 +2338,11 @@ export async function recoverPartialEntryFunding(input: {
       results.push({ planId, action: "HOLD", reasonCodes: ["P6_PARTIAL_UNWIND_RECONCILED"] });
       continue;
     }
-    if (state !== "ENTRY_FUNDED_NOT_OPEN" && state !== "RESUME_OPEN") {
+    // UNWIND_REQUIRED means no unwind was submitted.  It is recoverable
+    // pre-submission work, so rebuild a fresh quote/transaction on later
+    // cycles instead of turning one transient simulation rejection into a
+    // permanent hold. UNWIND_SUBMITTED remains above and is never resent.
+    if (state !== "ENTRY_FUNDED_NOT_OPEN" && state !== "RESUME_OPEN" && state !== "UNWIND_REQUIRED") {
       results.push({
         planId,
         action: "HOLD",
