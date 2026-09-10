@@ -4327,7 +4327,14 @@ return 'APPLIED';
     },
     async upsertPartialEntryRecovery(v) {
       const result=await db.query(
-        `INSERT INTO execution.partial_entry_recovery(plan_id,pool_address,owner_address,token_mint,funding_transaction_id,funding_signature,funded_at,paired_token_amount,intended_capital_lamports,intended_range,state,wallet_truth,payload,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12::jsonb,$13::jsonb,$14) ON CONFLICT(plan_id) DO UPDATE SET state=EXCLUDED.state,wallet_truth=EXCLUDED.wallet_truth,payload=execution.partial_entry_recovery.payload||EXCLUDED.payload,updated_at=EXCLUDED.updated_at WHERE execution.partial_entry_recovery.pool_address=EXCLUDED.pool_address AND execution.partial_entry_recovery.owner_address=EXCLUDED.owner_address AND execution.partial_entry_recovery.token_mint=EXCLUDED.token_mint AND execution.partial_entry_recovery.funding_transaction_id=EXCLUDED.funding_transaction_id AND execution.partial_entry_recovery.funding_signature=EXCLUDED.funding_signature AND execution.partial_entry_recovery.funded_at=EXCLUDED.funded_at AND execution.partial_entry_recovery.paired_token_amount=EXCLUDED.paired_token_amount AND execution.partial_entry_recovery.intended_capital_lamports=EXCLUDED.intended_capital_lamports AND execution.partial_entry_recovery.intended_range=EXCLUDED.intended_range RETURNING plan_id`,
+        // The first insert establishes immutable funding provenance.  Later
+        // recovery passes may only advance mutable state after re-binding the
+        // row to its exact plan, owner, pool, mint and confirmed funding
+        // transaction/signature.  They must not re-assert derived range,
+        // amount, or timestamp representations: doing so made harmless
+        // recovery transitions depend on PostgreSQL/JS field-shape details
+        // and could strand unrelated protective management.
+        `INSERT INTO execution.partial_entry_recovery(plan_id,pool_address,owner_address,token_mint,funding_transaction_id,funding_signature,funded_at,paired_token_amount,intended_capital_lamports,intended_range,state,wallet_truth,payload,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12::jsonb,$13::jsonb,$14) ON CONFLICT(plan_id) DO UPDATE SET state=EXCLUDED.state,wallet_truth=EXCLUDED.wallet_truth,payload=execution.partial_entry_recovery.payload||EXCLUDED.payload,updated_at=EXCLUDED.updated_at WHERE execution.partial_entry_recovery.pool_address=EXCLUDED.pool_address AND execution.partial_entry_recovery.owner_address=EXCLUDED.owner_address AND execution.partial_entry_recovery.token_mint=EXCLUDED.token_mint AND execution.partial_entry_recovery.funding_transaction_id=EXCLUDED.funding_transaction_id AND execution.partial_entry_recovery.funding_signature=EXCLUDED.funding_signature RETURNING plan_id`,
         [
           v.planId,
           v.poolAddress,
