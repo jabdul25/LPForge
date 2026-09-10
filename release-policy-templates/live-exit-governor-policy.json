@@ -9,6 +9,25 @@
     "maxGivebackFraction": 0.05,
     "minRetainedProfitFraction": 0.02
   },
+  "profitRetention": {
+    "enabled": true,
+    "policyVersion": "profit-retention-ts5-oor-p4-v1",
+    "ts5": {
+      "enabled": true,
+      "mfeActivationFraction": 0.04,
+      "givebackFraction": 0.02,
+      "watchSeconds": 300,
+      "lowerRangeFraction": 0.3333333333333333,
+      "model": "EXPIRE_REARM",
+      "previousUsableMaxAgeSeconds": 300
+    },
+    "oorP4": {
+      "enabled": true,
+      "mfeActivationFraction": 0.02,
+      "requiresBelowMin": true,
+      "requiresTokenExposure": true
+    }
+  },
   "closeOnThesisInvalidated": true,
   "closeOnNonPositiveForwardEv": true,
   "reduceOnRiskBlock": true,

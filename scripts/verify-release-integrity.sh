@@ -73,6 +73,8 @@ manifest_pnpm="${manifest[6]}"
 manifest_lock="${manifest[7]}"
 [[ "$manifest_source" == "$REV" ]] || fail "manifest source identity mismatch"
 [[ "$manifest_policy" =~ ^[0-9a-f]{64}$ ]] || fail "manifest policy hash invalid"
+manifest_exit_policy=$(node -e 'const m=require(process.argv[1]);process.stdout.write(String(m.liveExitGovernorPolicyTemplateHash??""))' ./RELEASE_MANIFEST.json)
+[[ "$manifest_exit_policy" =~ ^[0-9a-f]{64}$ ]] || fail "manifest live exit policy hash invalid"
 node - "$manifest_policy" RELEASE_MANIFEST.json <<'NODE' || fail "runtime policy authority manifest mismatch"
 const fs=require('fs');const [expected,file]=process.argv.slice(2);const m=JSON.parse(fs.readFileSync(file,'utf8'));
 for(const key of ['releasePolicyTemplateHash','runtimeExpectedPolicyHash'])if(m[key]!==undefined&&m[key]!==expected)process.exit(1);
@@ -92,6 +94,12 @@ fi
 [[ -f "$policy" ]] || fail "canonical execution policy missing"
 actual_policy=$(sha256sum "$policy" | awk '{print $1}')
 [[ "$actual_policy" == "$manifest_policy" ]] || fail "policy hash mismatch"
+if [[ "${LPFORGE_RUNTIME_CONFIG_ENFORCED:-false}" == "true" ]]; then
+  exit_policy="$config_root/policy/live-exit-governor-policy.json"
+  [[ -f "$exit_policy" ]] || fail "canonical live exit policy missing"
+  actual_exit_policy=$(sha256sum "$exit_policy" | awk '{print $1}')
+  [[ "$actual_exit_policy" == "$manifest_exit_policy" ]] || fail "live exit policy hash mismatch"
+fi
 actual_lock=$(sha256sum pnpm-lock.yaml | awk '{print $1}')
 [[ "$actual_lock" == "$manifest_lock" ]] || fail "lockfile hash mismatch"
 mapfile -t migrations < <(find packages/db/migrations -maxdepth 1 -type f -printf '%f\n' | grep -E '^M[0-9]{4}_.+\.sql$' | sort)

@@ -1222,35 +1222,20 @@ export interface Phase1Store {
     openPositions: number;
     payload: Record<string, unknown>;
   }): Promise<void>;
-  insertExecutionIntent(value: {
-    intentId: string;
-    idempotencyKey: string;
-    action: string;
-    poolAddress?: string;
-    ownerAddress: string;
-    positionAddress?: string;
-    thesisId: string;
-    observedAt: string;
-    expiresAt: string;
-    payload: Record<string, unknown>;
-  }): Promise<void>;
-  insertTransactionPlan(value: {
-    planId: string;
-    intentId: string;
-    cluster: string;
-    state: string;
-    createdAt: string;
-    expiresAt: string;
-    payload: Record<string, unknown>;
-    steps: Array<{
-      transactionId: string;
-      sequence: number;
-      kind: string;
-      state: string;
-      requiredSignerAddresses: string[];
-      metadata: Record<string, unknown>;
-    }>;
-  }): Promise<void>;
+  insertExecutionIntent(value: ExecutionIntentPersistence): Promise<void>;
+  insertTransactionPlan(value: ExecutionPlanPersistence): Promise<void>;
+  /**
+   * The canonical serialization boundary for independently protective CLOSE
+   * actions. It owns the advisory lock, active-plan recheck, intent, plan,
+   * and steps in one physical PostgreSQL transaction.
+   */
+  persistProtectedClosePlan(value: {
+    positionAddress: string;
+    intent: ExecutionIntentPersistence;
+    plan: ExecutionPlanPersistence;
+    /** Persisted with the plan so a crash cannot strand a confirmed TS/P4 watch. */
+    profitRetentionTransition?: { lpforgePositionId: string; observedAt: string; watch: object };
+  }): Promise<boolean>;
   ensureExecutionTransactionStep(value: {
     planId: string;
     transactionId: string;
@@ -1396,6 +1381,10 @@ export interface Phase1Store {
   loadPhase7PortfolioRiskState(ownerAddress:string):Promise<Record<string,unknown>|undefined>;
   upsertPhase7PortfolioRiskState(value:{ownerAddress:string;dayStart:string;dailyStartEquityLamports:bigint;peakEquityLamports:bigint;currentEquityLamports:bigint;observedAt:string;valuationState:'RECONCILED'|'UNAVAILABLE';reasonCodes:string[];payload:Record<string,unknown>}):Promise<void>;
   loadPositionExitState(lpforgePositionId: string): Promise<Record<string, unknown> | null>;
+  /** Deterministic predecessor for an independently-protective managed mark.
+   * It is intentionally queried from the durable observation stream, never
+   * process memory, and excludes observations that were not safe to manage. */
+  loadPreviousUsableManagedEconomicObservation(value:{lpforgePositionId:string;beforeObservedAt:string;poolAddress:string}):Promise<{observedAt:string;managedReturnFraction:number;poolAddress:string}|null>;
   upsertPositionExitState(value: {
     lpforgePositionId:string; observedAt:string; evidenceState:string; initialCapitalUsd?:number; currentEconomicValueUsd?:number;
     netPnlUsd?:number; netReturnFraction?:number; peakNetReturnFraction:number; peakEconomicValueUsd?:number; peakObservedAt:string|Date;
@@ -1967,6 +1956,89 @@ async function newPgClient(url: string): Promise<PgClient> {
 }
 const json = (v: unknown) =>
   JSON.stringify(v, (_, x) => (typeof x === "bigint" ? x.toString() : x));
+
+/** The exact persistence contract shared by ordinary and serialized plan writes. */
+export interface ExecutionIntentPersistence {
+  intentId: string;
+  idempotencyKey: string;
+  action: string;
+  poolAddress?: string;
+  ownerAddress: string;
+  positionAddress?: string;
+  thesisId: string;
+  observedAt: string;
+  expiresAt: string;
+  payload: Record<string, unknown>;
+}
+export interface ExecutionPlanPersistence {
+  planId: string;
+  intentId: string;
+  cluster: string;
+  state: string;
+  createdAt: string;
+  expiresAt: string;
+  payload: Record<string, unknown>;
+  steps: Array<{
+    transactionId: string;
+    sequence: number;
+    kind: string;
+    state: string;
+    requiredSignerAddresses: string[];
+    metadata: Record<string, unknown>;
+  }>;
+}
+
+async function insertExecutionIntentWithClient(db: PgClient, v: ExecutionIntentPersistence): Promise<void> {
+  const result=await db.query(
+    `INSERT INTO execution.intents(intent_id,idempotency_key,action,pool_address,owner_address,position_address,thesis_id,observed_at,expires_at,payload)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)
+     ON CONFLICT(intent_id) DO UPDATE SET intent_id=execution.intents.intent_id
+     WHERE execution.intents.idempotency_key=EXCLUDED.idempotency_key
+       AND execution.intents.action=EXCLUDED.action
+       AND execution.intents.pool_address=EXCLUDED.pool_address
+       AND execution.intents.owner_address=EXCLUDED.owner_address
+       AND execution.intents.position_address IS NOT DISTINCT FROM EXCLUDED.position_address
+       AND execution.intents.thesis_id=EXCLUDED.thesis_id
+       AND execution.intents.observed_at=EXCLUDED.observed_at
+       AND execution.intents.expires_at=EXCLUDED.expires_at
+       AND execution.intents.payload=EXCLUDED.payload
+     RETURNING intent_id`,
+    [v.intentId,v.idempotencyKey,v.action,v.poolAddress ?? null,v.ownerAddress,v.positionAddress ?? null,v.thesisId,v.observedAt,v.expiresAt,json(v.payload)],
+  );
+  if(result.rows.length!==1)throw new Error("LPFORGE_EXECUTION_INTENT_IDENTITY_CONFLICT");
+}
+async function insertTransactionPlanWithClient(db: PgClient, v: ExecutionPlanPersistence): Promise<void> {
+  const plan=await db.query(
+    `INSERT INTO execution.transaction_plans(plan_id,intent_id,cluster,state,created_at,expires_at,payload)
+     VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)
+     ON CONFLICT(plan_id) DO UPDATE SET plan_id=execution.transaction_plans.plan_id
+     WHERE execution.transaction_plans.intent_id=EXCLUDED.intent_id
+       AND execution.transaction_plans.cluster=EXCLUDED.cluster
+       AND execution.transaction_plans.state=EXCLUDED.state
+       AND execution.transaction_plans.created_at=EXCLUDED.created_at
+       AND execution.transaction_plans.expires_at=EXCLUDED.expires_at
+       AND execution.transaction_plans.payload=EXCLUDED.payload
+     RETURNING plan_id`,
+    [v.planId,v.intentId,v.cluster,v.state,v.createdAt,v.expiresAt,json(v.payload)],
+  );
+  if(plan.rows.length!==1)throw new Error("LPFORGE_EXECUTION_PLAN_IDENTITY_CONFLICT");
+  for(const step of v.steps){
+    const inserted=await db.query(
+      `INSERT INTO execution.transaction_steps(transaction_id,plan_id,sequence,kind,state,required_signers,metadata)
+       VALUES($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb)
+       ON CONFLICT(transaction_id) DO UPDATE SET transaction_id=execution.transaction_steps.transaction_id
+       WHERE execution.transaction_steps.plan_id=EXCLUDED.plan_id
+         AND execution.transaction_steps.sequence=EXCLUDED.sequence
+         AND execution.transaction_steps.kind=EXCLUDED.kind
+         AND execution.transaction_steps.state=EXCLUDED.state
+         AND execution.transaction_steps.required_signers=EXCLUDED.required_signers
+         AND execution.transaction_steps.metadata=EXCLUDED.metadata
+       RETURNING transaction_id`,
+      [step.transactionId,v.planId,step.sequence,step.kind,step.state,json(step.requiredSignerAddresses),json(step.metadata)],
+    );
+    if(inserted.rows.length!==1)throw new Error("LPFORGE_EXECUTION_STEP_IDENTITY_CONFLICT");
+  }
+}
 
 /**
  * Canonical P7 operational debt view.  Historical plan-level UNKNOWN rows are
@@ -3530,70 +3602,54 @@ return 'APPLIED';
       );
     },
     async insertExecutionIntent(v) {
-      const result=await db.query(
-        `INSERT INTO execution.intents(intent_id,idempotency_key,action,pool_address,owner_address,position_address,thesis_id,observed_at,expires_at,payload)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)
-         ON CONFLICT(intent_id) DO UPDATE SET intent_id=execution.intents.intent_id
-         WHERE execution.intents.idempotency_key=EXCLUDED.idempotency_key
-           AND execution.intents.action=EXCLUDED.action
-           AND execution.intents.pool_address=EXCLUDED.pool_address
-           AND execution.intents.owner_address=EXCLUDED.owner_address
-           AND execution.intents.position_address IS NOT DISTINCT FROM EXCLUDED.position_address
-           AND execution.intents.thesis_id=EXCLUDED.thesis_id
-           AND execution.intents.observed_at=EXCLUDED.observed_at
-           AND execution.intents.expires_at=EXCLUDED.expires_at
-           AND execution.intents.payload=EXCLUDED.payload
-         RETURNING intent_id`,
-        [
-          v.intentId,
-          v.idempotencyKey,
-          v.action,
-          v.poolAddress ?? null,
-          v.ownerAddress,
-          v.positionAddress ?? null,
-          v.thesisId,
-          v.observedAt,
-          v.expiresAt,
-          json(v.payload),
-        ],
-      );
-      if(result.rows.length!==1)throw new Error("LPFORGE_EXECUTION_INTENT_IDENTITY_CONFLICT");
+      await insertExecutionIntentWithClient(db,v);
     },
     async insertTransactionPlan(v) {
       await db.query("BEGIN");
       try{
-        const plan=await db.query(
-          `INSERT INTO execution.transaction_plans(plan_id,intent_id,cluster,state,created_at,expires_at,payload)
-           VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)
-           ON CONFLICT(plan_id) DO UPDATE SET plan_id=execution.transaction_plans.plan_id
-           WHERE execution.transaction_plans.intent_id=EXCLUDED.intent_id
-             AND execution.transaction_plans.cluster=EXCLUDED.cluster
-             AND execution.transaction_plans.state=EXCLUDED.state
-             AND execution.transaction_plans.created_at=EXCLUDED.created_at
-             AND execution.transaction_plans.expires_at=EXCLUDED.expires_at
-             AND execution.transaction_plans.payload=EXCLUDED.payload
-           RETURNING plan_id`,
-          [v.planId,v.intentId,v.cluster,v.state,v.createdAt,v.expiresAt,json(v.payload)],
-        );
-        if(plan.rows.length!==1)throw new Error("LPFORGE_EXECUTION_PLAN_IDENTITY_CONFLICT");
-        for (const step of v.steps){
-          const inserted=await db.query(
-            `INSERT INTO execution.transaction_steps(transaction_id,plan_id,sequence,kind,state,required_signers,metadata)
-             VALUES($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb)
-             ON CONFLICT(transaction_id) DO UPDATE SET transaction_id=execution.transaction_steps.transaction_id
-             WHERE execution.transaction_steps.plan_id=EXCLUDED.plan_id
-               AND execution.transaction_steps.sequence=EXCLUDED.sequence
-               AND execution.transaction_steps.kind=EXCLUDED.kind
-               AND execution.transaction_steps.state=EXCLUDED.state
-               AND execution.transaction_steps.required_signers=EXCLUDED.required_signers
-               AND execution.transaction_steps.metadata=EXCLUDED.metadata
-             RETURNING transaction_id`,
-            [step.transactionId,v.planId,step.sequence,step.kind,step.state,json(step.requiredSignerAddresses),json(step.metadata)],
-          );
-          if(inserted.rows.length!==1)throw new Error("LPFORGE_EXECUTION_STEP_IDENTITY_CONFLICT");
-        }
+        await insertTransactionPlanWithClient(db,v);
         await db.query("COMMIT");
       }catch(error){
+        try{await db.query("ROLLBACK");}catch{}
+        throw error;
+      }
+    },
+    async persistProtectedClosePlan(v) {
+      if(!["CLOSE","EMERGENCY_CLOSE"].includes(v.intent.action)||v.intent.positionAddress!==v.positionAddress)throw new Error("LPFORGE_PROTECTED_CLOSE_IDENTITY_INVALID");
+      await db.query("BEGIN");
+      try {
+        // This lock is per canonical position only. It never serializes two
+        // unrelated live positions and survives process/machine boundaries.
+        await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",[`lpforge:protected-close:${v.positionAddress}`]);
+        await db.query("SELECT lpforge_position_id FROM execution.position_exit_state WHERE lpforge_position_id=(SELECT lpforge_position_id FROM execution.owned_positions WHERE position_address=$1 LIMIT 1) FOR UPDATE",[v.positionAddress]);
+        const active=await db.query(
+          `SELECT EXISTS(SELECT 1 FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id WHERE i.position_address=$1 AND p.cluster='mainnet-beta' AND p.state IN ('PLANNED','CLAIMED','DISPATCHING','BUILDING','BUILT','SIMULATING','SIMULATED','RISK_APPROVED','SIGNING','SIGNED','SUBMITTING','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILING','RECOVERING','RECONCILIATION_REQUIRED')) AS active`,
+          [v.positionAddress],
+        );
+        if(Boolean(active.rows[0]?.active)){
+          await db.query("COMMIT");
+          return false;
+        }
+        if(v.profitRetentionTransition){
+          const transition=await db.query(
+            `UPDATE execution.position_exit_state
+                SET observed_at=$2::timestamptz,
+                    payload=payload||jsonb_build_object('profitRetentionWatch',$3::jsonb),
+                    updated_at=$2::timestamptz
+              WHERE lpforge_position_id=$1
+                AND observed_at<=$2::timestamptz
+            RETURNING lpforge_position_id`,
+            [v.profitRetentionTransition.lpforgePositionId,v.profitRetentionTransition.observedAt,json(v.profitRetentionTransition.watch)],
+          );
+          // A missing/newer state is not a harmless race: never create a
+          // close from a stale observation whose watch cannot be committed.
+          if(transition.rows.length!==1){await db.query("COMMIT");return false;}
+        }
+        await insertExecutionIntentWithClient(db,v.intent);
+        await insertTransactionPlanWithClient(db,v.plan);
+        await db.query("COMMIT");
+        return true;
+      } catch(error) {
         try{await db.query("ROLLBACK");}catch{}
         throw error;
       }
@@ -4048,12 +4104,37 @@ return 'APPLIED';
       const r=await db.query(`SELECT * FROM execution.position_exit_state WHERE lpforge_position_id=$1`,[lpforgePositionId]);
       return (r.rows[0] as Record<string,unknown>|undefined)??null;
     },
+    async loadPreviousUsableManagedEconomicObservation(v) {
+      const r=await db.query(
+        `SELECT observed_at,
+                management_context #>> '{exitDecision,economics,netReturnFraction}' AS managed_return_fraction,
+                management_context ->> 'positionPoolAddress' AS pool_address
+           FROM execution.position_observations
+          WHERE lpforge_position_id=$1
+            AND observed_at<$2::timestamptz
+            AND reconciliation_debt=false
+            AND stale_data=false
+            AND range_state IN ('IN_RANGE','OUT_OF_RANGE')
+            AND active_bin_id IS NOT NULL
+            AND management_context #>> '{exitDecision,economics,evidenceState}'='AVAILABLE'
+            AND management_context ->> 'positionPoolAddress'=$3
+            AND COALESCE(jsonb_array_length(payload->'activePlans'),0)=0
+            AND COALESCE((management_context #>> '{exitDecision,economics,netReturnFraction}')::numeric, 'NaN'::numeric) BETWEEN -1.25 AND 2
+          ORDER BY observed_at DESC,id DESC LIMIT 1`,
+        [v.lpforgePositionId,v.beforeObservedAt,v.poolAddress],
+      );
+      const row=r.rows[0];
+      if(!row)return null;
+      const managedReturnFraction=Number(row.managed_return_fraction);
+      if(!Number.isFinite(managedReturnFraction))return null;
+      return{observedAt:toIsoTimestamp(row.observed_at),managedReturnFraction,poolAddress:String(row.pool_address)};
+    },
     async upsertPositionExitState(v) {
       // Exit governance can carry the high-water timestamp as a Date.  Normalize
       // it at the PostgreSQL boundary; Date#toString() is not a timestamptz value.
       const peakObservedAt=toIsoTimestamp(v.peakObservedAt);
       const lpPeakObservedAt=v.lpMtmPeakObservedAt?toIsoTimestamp(v.lpMtmPeakObservedAt):null,lpPendingObservedAt=v.lpMtmPendingObservedAt?toIsoTimestamp(v.lpMtmPendingObservedAt):null;
-      await db.query(`INSERT INTO execution.position_exit_state(lpforge_position_id,observed_at,evidence_state,initial_capital_usd,current_economic_value_usd,net_pnl_usd,net_return_fraction,peak_net_return_fraction,peak_economic_value_usd,peak_observed_at,last_action,last_reason_codes,payload,updated_at,lp_mtm_evidence_state,lp_mtm_entry_value_usd,lp_mtm_current_value_usd,lp_mtm_net_pnl_usd,lp_mtm_net_return_fraction,lp_mtm_reported_return_fraction,lp_mtm_peak_return_fraction,lp_mtm_peak_value_usd,lp_mtm_peak_observed_at,lp_mtm_pending_return_fraction,lp_mtm_pending_value_usd,lp_mtm_pending_observed_at,lp_mtm_pending_confirmations) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$2,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26) ON CONFLICT(lpforge_position_id) DO UPDATE SET observed_at=EXCLUDED.observed_at,evidence_state=EXCLUDED.evidence_state,initial_capital_usd=COALESCE(EXCLUDED.initial_capital_usd,execution.position_exit_state.initial_capital_usd),current_economic_value_usd=EXCLUDED.current_economic_value_usd,net_pnl_usd=EXCLUDED.net_pnl_usd,net_return_fraction=EXCLUDED.net_return_fraction,peak_net_return_fraction=GREATEST(execution.position_exit_state.peak_net_return_fraction,EXCLUDED.peak_net_return_fraction),peak_economic_value_usd=CASE WHEN EXCLUDED.peak_net_return_fraction>=execution.position_exit_state.peak_net_return_fraction THEN EXCLUDED.peak_economic_value_usd ELSE execution.position_exit_state.peak_economic_value_usd END,peak_observed_at=CASE WHEN EXCLUDED.peak_net_return_fraction>=execution.position_exit_state.peak_net_return_fraction THEN EXCLUDED.peak_observed_at ELSE execution.position_exit_state.peak_observed_at END,last_action=EXCLUDED.last_action,last_reason_codes=EXCLUDED.last_reason_codes,payload=EXCLUDED.payload,lp_mtm_evidence_state=EXCLUDED.lp_mtm_evidence_state,lp_mtm_entry_value_usd=EXCLUDED.lp_mtm_entry_value_usd,lp_mtm_current_value_usd=EXCLUDED.lp_mtm_current_value_usd,lp_mtm_net_pnl_usd=EXCLUDED.lp_mtm_net_pnl_usd,lp_mtm_net_return_fraction=EXCLUDED.lp_mtm_net_return_fraction,lp_mtm_reported_return_fraction=EXCLUDED.lp_mtm_reported_return_fraction,lp_mtm_peak_return_fraction=CASE WHEN EXCLUDED.lp_mtm_peak_return_fraction IS NOT NULL AND (execution.position_exit_state.lp_mtm_peak_return_fraction IS NULL OR EXCLUDED.lp_mtm_peak_return_fraction>=execution.position_exit_state.lp_mtm_peak_return_fraction) THEN EXCLUDED.lp_mtm_peak_return_fraction ELSE execution.position_exit_state.lp_mtm_peak_return_fraction END,lp_mtm_peak_value_usd=CASE WHEN EXCLUDED.lp_mtm_peak_return_fraction IS NOT NULL AND (execution.position_exit_state.lp_mtm_peak_return_fraction IS NULL OR EXCLUDED.lp_mtm_peak_return_fraction>=execution.position_exit_state.lp_mtm_peak_return_fraction) THEN EXCLUDED.lp_mtm_peak_value_usd ELSE execution.position_exit_state.lp_mtm_peak_value_usd END,lp_mtm_peak_observed_at=CASE WHEN EXCLUDED.lp_mtm_peak_return_fraction IS NOT NULL AND (execution.position_exit_state.lp_mtm_peak_return_fraction IS NULL OR EXCLUDED.lp_mtm_peak_return_fraction>=execution.position_exit_state.lp_mtm_peak_return_fraction) THEN EXCLUDED.lp_mtm_peak_observed_at ELSE execution.position_exit_state.lp_mtm_peak_observed_at END,lp_mtm_pending_return_fraction=EXCLUDED.lp_mtm_pending_return_fraction,lp_mtm_pending_value_usd=EXCLUDED.lp_mtm_pending_value_usd,lp_mtm_pending_observed_at=EXCLUDED.lp_mtm_pending_observed_at,lp_mtm_pending_confirmations=EXCLUDED.lp_mtm_pending_confirmations,updated_at=EXCLUDED.updated_at`,[v.lpforgePositionId,v.observedAt,v.evidenceState,v.initialCapitalUsd??null,v.currentEconomicValueUsd??null,v.netPnlUsd??null,v.netReturnFraction??null,v.peakNetReturnFraction,v.peakEconomicValueUsd??null,peakObservedAt,v.lastAction,json(v.reasonCodes),json(v.payload),v.lpMtmEvidenceState??null,v.lpMtmEntryValueUsd??null,v.lpMtmCurrentValueUsd??null,v.lpMtmNetPnlUsd??null,v.lpMtmNetReturnFraction??null,v.lpMtmReportedReturnFraction??null,v.lpMtmPeakReturnFraction??null,v.lpMtmPeakValueUsd??null,lpPeakObservedAt,v.lpMtmPendingReturnFraction??null,v.lpMtmPendingValueUsd??null,lpPendingObservedAt,v.lpMtmPendingConfirmations??0]);
+      await db.query(`INSERT INTO execution.position_exit_state(lpforge_position_id,observed_at,evidence_state,initial_capital_usd,current_economic_value_usd,net_pnl_usd,net_return_fraction,peak_net_return_fraction,peak_economic_value_usd,peak_observed_at,last_action,last_reason_codes,payload,updated_at,lp_mtm_evidence_state,lp_mtm_entry_value_usd,lp_mtm_current_value_usd,lp_mtm_net_pnl_usd,lp_mtm_net_return_fraction,lp_mtm_reported_return_fraction,lp_mtm_peak_return_fraction,lp_mtm_peak_value_usd,lp_mtm_peak_observed_at,lp_mtm_pending_return_fraction,lp_mtm_pending_value_usd,lp_mtm_pending_observed_at,lp_mtm_pending_confirmations) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$2,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26) ON CONFLICT(lpforge_position_id) DO UPDATE SET observed_at=EXCLUDED.observed_at,evidence_state=EXCLUDED.evidence_state,initial_capital_usd=COALESCE(EXCLUDED.initial_capital_usd,execution.position_exit_state.initial_capital_usd),current_economic_value_usd=EXCLUDED.current_economic_value_usd,net_pnl_usd=EXCLUDED.net_pnl_usd,net_return_fraction=EXCLUDED.net_return_fraction,peak_net_return_fraction=GREATEST(execution.position_exit_state.peak_net_return_fraction,EXCLUDED.peak_net_return_fraction),peak_economic_value_usd=CASE WHEN EXCLUDED.peak_net_return_fraction>=execution.position_exit_state.peak_net_return_fraction THEN EXCLUDED.peak_economic_value_usd ELSE execution.position_exit_state.peak_economic_value_usd END,peak_observed_at=CASE WHEN EXCLUDED.peak_net_return_fraction>=execution.position_exit_state.peak_net_return_fraction THEN EXCLUDED.peak_observed_at ELSE execution.position_exit_state.peak_observed_at END,last_action=EXCLUDED.last_action,last_reason_codes=EXCLUDED.last_reason_codes,payload=execution.position_exit_state.payload||EXCLUDED.payload,lp_mtm_evidence_state=EXCLUDED.lp_mtm_evidence_state,lp_mtm_entry_value_usd=EXCLUDED.lp_mtm_entry_value_usd,lp_mtm_current_value_usd=EXCLUDED.lp_mtm_current_value_usd,lp_mtm_net_pnl_usd=EXCLUDED.lp_mtm_net_pnl_usd,lp_mtm_net_return_fraction=EXCLUDED.lp_mtm_net_return_fraction,lp_mtm_reported_return_fraction=EXCLUDED.lp_mtm_reported_return_fraction,lp_mtm_peak_return_fraction=CASE WHEN EXCLUDED.lp_mtm_peak_return_fraction IS NOT NULL AND (execution.position_exit_state.lp_mtm_peak_return_fraction IS NULL OR EXCLUDED.lp_mtm_peak_return_fraction>=execution.position_exit_state.lp_mtm_peak_return_fraction) THEN EXCLUDED.lp_mtm_peak_return_fraction ELSE execution.position_exit_state.lp_mtm_peak_return_fraction END,lp_mtm_peak_value_usd=CASE WHEN EXCLUDED.lp_mtm_peak_return_fraction IS NOT NULL AND (execution.position_exit_state.lp_mtm_peak_return_fraction IS NULL OR EXCLUDED.lp_mtm_peak_return_fraction>=execution.position_exit_state.lp_mtm_peak_return_fraction) THEN EXCLUDED.lp_mtm_peak_value_usd ELSE execution.position_exit_state.lp_mtm_peak_value_usd END,lp_mtm_peak_observed_at=CASE WHEN EXCLUDED.lp_mtm_peak_return_fraction IS NOT NULL AND (execution.position_exit_state.lp_mtm_peak_return_fraction IS NULL OR EXCLUDED.lp_mtm_peak_return_fraction>=execution.position_exit_state.lp_mtm_peak_return_fraction) THEN EXCLUDED.lp_mtm_peak_observed_at ELSE execution.position_exit_state.lp_mtm_peak_observed_at END,lp_mtm_pending_return_fraction=EXCLUDED.lp_mtm_pending_return_fraction,lp_mtm_pending_value_usd=EXCLUDED.lp_mtm_pending_value_usd,lp_mtm_pending_observed_at=EXCLUDED.lp_mtm_pending_observed_at,lp_mtm_pending_confirmations=EXCLUDED.lp_mtm_pending_confirmations,updated_at=EXCLUDED.updated_at WHERE EXCLUDED.observed_at>=execution.position_exit_state.observed_at`,[v.lpforgePositionId,v.observedAt,v.evidenceState,v.initialCapitalUsd??null,v.currentEconomicValueUsd??null,v.netPnlUsd??null,v.netReturnFraction??null,v.peakNetReturnFraction,v.peakEconomicValueUsd??null,peakObservedAt,v.lastAction,json(v.reasonCodes),json(v.payload),v.lpMtmEvidenceState??null,v.lpMtmEntryValueUsd??null,v.lpMtmCurrentValueUsd??null,v.lpMtmNetPnlUsd??null,v.lpMtmNetReturnFraction??null,v.lpMtmReportedReturnFraction??null,v.lpMtmPeakReturnFraction??null,v.lpMtmPeakValueUsd??null,lpPeakObservedAt,v.lpMtmPendingReturnFraction??null,v.lpMtmPendingValueUsd??null,lpPendingObservedAt,v.lpMtmPendingConfirmations??0]);
     },
     async hasActiveAutonomousPlan(positionAddress) {
       const r = await db.query(
@@ -5606,6 +5687,7 @@ export function createMemoryStore(): Phase1Store {
     async insertPaperPortfolioSnapshot() {},
     async insertExecutionIntent() {},
     async insertTransactionPlan() {},
+    async persistProtectedClosePlan() { return true; },
     async ensureExecutionTransactionStep() {},
     async claimNextAutonomousPlan(_now, _options) {
       return undefined;
@@ -5641,6 +5723,7 @@ export function createMemoryStore(): Phase1Store {
     async loadPhase7PortfolioRiskState() { return undefined; },
     async upsertPhase7PortfolioRiskState() {},
     async loadPositionExitState() { return null; },
+    async loadPreviousUsableManagedEconomicObservation() { return null; },
     async upsertPositionExitState() {},
     async hasActiveAutonomousPlan() {
       return false;

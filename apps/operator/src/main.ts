@@ -41,6 +41,8 @@ import {
   derivePositionEconomics,
   deriveLpPositionMarkToMarket,
   deriveMeteoraComparableLpPositionMarkToMarket,
+  assessProfitRetentionProtection,
+  parseProfitRetentionWatch,
   loadLiveExitGovernorPolicy,
   type ExitHighWaterState,
   type LpProfitHighWaterState,
@@ -298,7 +300,8 @@ async function loadLiveOpenPlanCapacity(input: {
 async function persistTransactionPlan(
   store: Phase1Store,
   plan: TransactionPlan,
-) {
+  options?: { serializedProtectiveClose?: boolean; profitRetentionTransition?: { lpforgePositionId:string; observedAt:string; watch:object } },
+): Promise<boolean> {
   const deployment=loadDeploymentPolicyFile(resolveLiveExecutionPolicyPath());
   const boundedUnattended=process.env.LPFORGE_BOUNDED_UNATTENDED_PRODUCTION==='true';
   // The controlled-canary probe remains read-only; its policy-derived
@@ -338,7 +341,7 @@ async function persistTransactionPlan(
   // representation here; otherwise a source `undefined` is omitted from the
   // HMAC material and fails closed when the plan is read back from JSONB.
   const immutablePlan={intentPayload:plan.intent.payload,planIntent:Object.fromEntries(Object.entries({capitalLamports:plan.intent.capitalLamports?.toString(),candidateId:plan.intent.candidateId??null,lowerBinId:plan.intent.lowerBinId,upperBinId:plan.intent.upperBinId,activeBinId:plan.intent.activeBinId,binStep:plan.intent.binStep,strategy:plan.intent.strategy,maxPositionWidthBins:plan.transactions.find((step)=>step.kind==='METEORA_OPEN'||step.kind==='METEORA_POSITION_EXTEND')?.metadata.maxPositionWidthBins}).filter(([,value])=>value!==undefined)),steps:plan.transactions.map(step=>({transactionId:step.transactionId,sequence:step.sequence,kind:step.kind,requiredSignerAddresses:[...step.requiredSignerAddresses],metadata:step.metadata}))};
-  await store.insertExecutionIntent({
+  const intentPersistence={
     intentId: plan.intent.intentId,
     idempotencyKey: plan.intent.idempotencyKey,
     action: plan.intent.action,
@@ -351,8 +354,8 @@ async function persistTransactionPlan(
     observedAt: plan.intent.observedAt,
     expiresAt: plan.intent.expiresAt,
     payload: plan.intent.payload,
-  });
-  await store.insertTransactionPlan({
+  };
+  const planPersistence={
     planId: plan.planId,
     intentId: plan.intent.intentId,
     cluster: plan.cluster,
@@ -420,7 +423,14 @@ async function persistTransactionPlan(
       requiredSignerAddresses: t.requiredSignerAddresses,
       metadata: t.metadata,
     })),
-  });
+  };
+  if(options?.serializedProtectiveClose){
+    if(!plan.intent.positionAddress)throw new Error('LPFORGE_PROTECTED_CLOSE_POSITION_REQUIRED');
+    return store.persistProtectedClosePlan({positionAddress:plan.intent.positionAddress,intent:intentPersistence,plan:planPersistence,...(options.profitRetentionTransition?{profitRetentionTransition:options.profitRetentionTransition}:{})});
+  }
+  await store.insertExecutionIntent(intentPersistence);
+  await store.insertTransactionPlan(planPersistence);
+  return true;
 }
 function owned(row: Record<string, unknown>): OwnedLivePosition {
   const payload=(row.payload as Record<string, unknown>) ?? {};
@@ -539,8 +549,9 @@ async function observeAndPlanOwnedPositions(input: {
         cashflows=loadedCashflows;
         economics = derivePositionEconomics({position: fact, pool: apiPool, initialCapitalLamports: position.initialCapitalLamports, observedAt: input.observedAt,realizedFeeCashflows:cashflows,attributedWalletInventory:attributedWalletInventory.map(lot=>({tokenMint:lot.tokenMint,tokenAmountRaw:lot.remainingRawAmount.toString()})),...(position.managedEconomicContributionLamports!==undefined?{actualContributedLamports:position.managedEconomicContributionLamports}:{}),requireReceiptProvenContribution:position.entryBasisState!==undefined}) as typeof economics;
       } catch {}
-      // This exact-position endpoint supplies the sole numerical PnL control
-      // mark. Its absence cannot be replaced with a receipt/accounting mark.
+    // This exact-position endpoint remains the sole numerical control mark
+    // for the existing stop/take-profit authority. Its absence cannot be
+    // replaced by a receipt/accounting mark for those pre-existing rules.
       try {
         const positionPnls=await input.api.getOpenPositionPnl(position.poolAddress,position.ownerAddress);
         meteoraPositionPnl=positionPnls.find(value=>value.positionAddress===position.positionAddress);
@@ -595,7 +606,7 @@ async function observeAndPlanOwnedPositions(input: {
       const reasons=new Set(regimeAssessment?.reasonCodes??[]);
       marketEvidence.push({family:'REGIME_DIRECTIONAL',code:'EXIT_REGIME_FREEFALL',severe:true,quality:reasons.has('REGIME_DATA_INCOMPLETE')?'INCOMPLETE':reasons.has('REGIME_LOW_CONFIDENCE')?'LOW_CONFIDENCE':'TRUSTWORTHY'});
     }
-    const exitDecision=assessLiveExit({
+    let exitDecision=assessLiveExit({
       policy:exitPolicy,economics,...(priorHighWater?{highWater:priorHighWater}:{}),thesisStatus,
       ...(typeof currentForwardEv==="number"?{currentForwardEv,forwardEvEvidenceAvailable:true,forwardEvConfirmationCount:confirmationCount}:{}),
       ...(closeCostLamports!==undefined?{closeCost:Number(closeCostLamports)/1_000_000_000}:{}),
@@ -614,6 +625,35 @@ async function observeAndPlanOwnedPositions(input: {
     const storedOor=(await input.store.loadPositionOorLifecycleState(position.positionAddress))??await input.store.reconstructPositionOorLifecycleState(position.positionAddress);
     const priorOor=oorPrior(storedOor);
     const oor=assessOorLifecycle({policy:oorPolicy,...(priorOor?{prior:priorOor}:{}),observation:{observedAt:input.observedAt,rangeState:isOor?'OUT_OF_RANGE':'IN_RANGE',activeBinId,lowerBinId:position.lowerBinId,upperBinId:position.upperBinId,chainTruthFresh:Boolean(fact&&activeBinChainFresh),reconciliationClean:Boolean(fact)&&String(row.reconciliation_status??'MATCH')==='MATCH',noActiveManagementPlan:!activePlanForPosition,inventoryClassification,...(claimExpectedValueLamports===undefined?{}:{feeValueLamports:claimExpectedValueLamports})}});
+    // TS-5/OOR-P4 intentionally use the managed-economic high-water rather
+    // than the old Meteora-only numeric authority, but only after all current
+    // chain, identity, accounting and reconciliation facts have passed.  The
+    // prior mark is read from durable observations, never process memory.
+    const previousUsable=await input.store.loadPreviousUsableManagedEconomicObservation({lpforgePositionId:position.lpforgePositionId,beforeObservedAt:input.observedAt,poolAddress:position.poolAddress});
+    const previousAge=previousUsable?Date.parse(input.observedAt)-Date.parse(previousUsable.observedAt):Number.POSITIVE_INFINITY;
+    const currentFactAge=fact?.stamp.observedAt?Date.parse(input.observedAt)-Date.parse(fact.stamp.observedAt):Number.POSITIVE_INFINITY;
+    const profitRetention=assessProfitRetentionProtection({
+      policy:exitPolicy.profitRetention,
+      policyHash:await sha256Hex(canonicalJson(exitPolicy.profitRetention)),
+      priorWatch:parseProfitRetentionWatch(priorPayload.profitRetentionWatch),
+      observedAt:input.observedAt,economics,highWater:exitDecision.highWater,
+      currentFactsFresh:Boolean(fact&&activeBinChainFresh&&apiPool&&Number.isFinite(currentFactAge)&&currentFactAge>=0&&currentFactAge<=exitPolicy.profitRetention.ts5.previousUsableMaxAgeSeconds*1000),
+      reconciliationClean:Boolean(fact)&&String(row.reconciliation_status??'MATCH')==='MATCH',
+      noActiveManagementPlan:!activePlanForPosition,
+      positionTerminal:['CLOSED','SOL_SETTLED','ABORTED'].includes(String(row.lifecycle_state??'')),
+      poolAddress:position.poolAddress,
+      rangeState:!fact?'UNKNOWN':direction??'IN_RANGE',activeBinId,lowerBinId:fact?.lowerBinId,upperBinId:fact?.upperBinId,
+      inventoryClassification,
+      ...(previousUsable?{previousUsable:{...previousUsable,fresh:Number.isFinite(previousAge)&&previousAge>=0&&previousAge<=exitPolicy.profitRetention.ts5.previousUsableMaxAgeSeconds*1000}}:{}),
+    });
+    // These two exact protective reasons are deliberately evaluated after
+    // chain/reconciliation guards but before discretionary market HOLD can
+    // suppress them.  Existing emergency/hard-stop close precedence remains.
+    const profitRetentionConfirmed=profitRetention.kind==='TS5_PROTECTION_CONFIRMED'||profitRetention.kind==='OOR_P4_PROTECTION_CONFIRMED';
+    if(profitRetentionConfirmed){
+      const code=profitRetention.kind==='TS5_PROTECTION_CONFIRMED'?'PROFIT_RETENTION_TS5_CONFIRMED':'PROFIT_RETENTION_OOR_P4_CONFIRMED';
+      if(exitDecision.action!=='EMERGENCY_CLOSE')exitDecision={...exitDecision,action:'CLOSE',reasonFamily:'CAPITAL_PROTECTION',urgency:Math.max(exitDecision.urgency,.84),reasonCodes:[...new Set([...exitDecision.reasonCodes,code])].sort()};
+    }
     let priorFeeStart:bigint|undefined;
     try { if(priorOor?.rangeState==='OUT_OF_RANGE'&&storedOor?.fee_value_at_oor_start_lamports!==null&&storedOor?.fee_value_at_oor_start_lamports!==undefined) priorFeeStart=BigInt(String(storedOor.fee_value_at_oor_start_lamports)); } catch {}
     const feeAtOorStart=oor.state==='IN_RANGE'?undefined:(priorFeeStart??claimExpectedValueLamports);
@@ -646,10 +686,10 @@ async function observeAndPlanOwnedPositions(input: {
       ...(current ? { managementPoolAddress: current.poolAddress } : {}),
       action: decision.action,
       terminalProtectiveClose:
-        decision.action === "CLOSE" && exitDecision.reasonCodes.includes("EXIT_HARD_POSITION_STOP_LOSS"),
+        decision.action === "CLOSE" && (exitDecision.reasonCodes.includes("EXIT_HARD_POSITION_STOP_LOSS")||decision.reasonCodes.includes('PROFIT_RETENTION_TS5_CONFIRMED')||decision.reasonCodes.includes('PROFIT_RETENTION_OOR_P4_CONFIRMED')),
       oorLifecycleClose: decision.reasonCodes.includes("POSITION_OOR_STALE_CAPITAL") || decision.reasonCodes.includes("POSITION_OOR_TOKEN_RISK"),
     });
-    await input.store.upsertPositionExitState({
+    const exitStateUpdate={
       lpforgePositionId:position.lpforgePositionId,observedAt:input.observedAt,evidenceState:exitDecision.economics.evidenceState,
       ...(exitDecision.economics.initialCapitalUsd!==undefined?{initialCapitalUsd:exitDecision.economics.initialCapitalUsd}:{}),
       ...(exitDecision.economics.currentEconomicValueUsd!==undefined?{currentEconomicValueUsd:exitDecision.economics.currentEconomicValueUsd}:{}),
@@ -673,8 +713,12 @@ async function observeAndPlanOwnedPositions(input: {
       ...(exitDecision.lpProfitHighWater?.pendingPeakObservedAt!==undefined?{lpMtmPendingObservedAt:exitDecision.lpProfitHighWater.pendingPeakObservedAt}:{}),
       lpMtmPendingConfirmations:exitDecision.lpProfitHighWater?.pendingPeakConfirmations??0,
       peakObservedAt:exitDecision.highWater.peakObservedAt,lastAction:exitDecision.action,reasonCodes:exitDecision.reasonCodes,
-      payload:{peakGivebackFraction:exitDecision.peakGivebackFraction,lpProfitGivebackFraction:exitDecision.lpProfitGivebackFraction??null,reasonFamily:exitDecision.reasonFamily,urgency:exitDecision.urgency,continuationEvLamports:continuation?.continuationEvLamports.toString()??null,expectedCloseCostLamports:closeCostLamports?.toString()??null,continuationCandidateId:continuation?.candidateId??null,geometryIdentity:continuation?.geometryIdentity??null,continuationConfirmationCount:confirmationCount,marketExitConfirmation:exitDecision.marketConfirmation,regime:regime??null,toxicity:toxicity??null,receiptLpMtm:lpMtm?{state:lpMtm.evidenceState,observedAt:lpMtm.observedAt,entryPositionValueUsd:lpMtm.entryPositionValueUsd??null,currentPositionValueUsd:lpMtm.currentPositionValueUsd??null,netPnlUsd:lpMtm.netPnlUsd??null,netReturnFraction:lpMtm.netReturnFraction??null,realizedFeeValueUsd:lpMtm.realizedFeeValueUsd??null,realizedWithdrawalValueUsd:lpMtm.realizedWithdrawalValueUsd??null,reasonCodes:lpMtm.reasonCodes,provenance:lpMtmProvenance??null}:null,liveControlPnl:{state:liveControlPnl.evidenceState,observedAt:liveControlPnl.observedAt,fetchedAt:liveControlPnl.fetchedAt,source:liveControlPnl.source,scope:liveControlPnl.scope,positionAddress:liveControlPnl.positionAddress??null,depositsUsd:liveControlPnl.depositsUsd??null,balanceUsd:liveControlPnl.balanceUsd??null,withdrawalsUsd:liveControlPnl.withdrawalsUsd??null,claimedFeesUsd:liveControlPnl.claimedFeesUsd??null,unclaimedFeeXUsd:liveControlPnl.unclaimedFeeXUsd??null,unclaimedFeeYUsd:liveControlPnl.unclaimedFeeYUsd??null,currentPositionValueUsd:liveControlPnl.currentPositionValueUsd??null,netPnlUsd:liveControlPnl.netPnlUsd??null,netReturnFraction:liveControlPnl.netReturnFraction??null,reportedNetReturnFraction:liveControlPnl.reportedNetReturnFraction??null,reportedReturnDeltaFraction:liveControlPnl.reportedReturnDeltaFraction??null,reasonCodes:liveControlPnl.reasonCodes},managedEconomicMtmScope:'MANAGED_ECONOMIC_MTM'}
-    });
+      payload:{peakGivebackFraction:exitDecision.peakGivebackFraction,lpProfitGivebackFraction:exitDecision.lpProfitGivebackFraction??null,reasonFamily:exitDecision.reasonFamily,urgency:exitDecision.urgency,profitRetentionWatch:profitRetention.watch,profitRetentionAssessment:{kind:profitRetention.kind,reasonCodes:profitRetention.reasonCodes,rangeFraction:profitRetention.rangeFraction??null,policyVersion:exitPolicy.profitRetention.policyVersion},continuationEvLamports:continuation?.continuationEvLamports.toString()??null,expectedCloseCostLamports:closeCostLamports?.toString()??null,continuationCandidateId:continuation?.candidateId??null,geometryIdentity:continuation?.geometryIdentity??null,continuationConfirmationCount:confirmationCount,marketExitConfirmation:exitDecision.marketConfirmation,regime:regime??null,toxicity:toxicity??null,receiptLpMtm:lpMtm?{state:lpMtm.evidenceState,observedAt:lpMtm.observedAt,entryPositionValueUsd:lpMtm.entryPositionValueUsd??null,currentPositionValueUsd:lpMtm.currentPositionValueUsd??null,netPnlUsd:lpMtm.netPnlUsd??null,netReturnFraction:lpMtm.netReturnFraction??null,realizedFeeValueUsd:lpMtm.realizedFeeValueUsd??null,realizedWithdrawalValueUsd:lpMtm.realizedWithdrawalValueUsd??null,reasonCodes:lpMtm.reasonCodes,provenance:lpMtmProvenance??null}:null,liveControlPnl:{state:liveControlPnl.evidenceState,observedAt:liveControlPnl.observedAt,fetchedAt:liveControlPnl.fetchedAt,source:liveControlPnl.source,scope:liveControlPnl.scope,positionAddress:liveControlPnl.positionAddress??null,depositsUsd:liveControlPnl.depositsUsd??null,balanceUsd:liveControlPnl.balanceUsd??null,withdrawalsUsd:liveControlPnl.withdrawalsUsd??null,claimedFeesUsd:liveControlPnl.claimedFeesUsd??null,unclaimedFeeXUsd:liveControlPnl.unclaimedFeeXUsd??null,unclaimedFeeYUsd:liveControlPnl.unclaimedFeeYUsd??null,currentPositionValueUsd:liveControlPnl.currentPositionValueUsd??null,netPnlUsd:liveControlPnl.netPnlUsd??null,netReturnFraction:liveControlPnl.netReturnFraction??null,reportedNetReturnFraction:liveControlPnl.reportedNetReturnFraction??null,reportedReturnDeltaFraction:liveControlPnl.reportedReturnDeltaFraction??null,reasonCodes:liveControlPnl.reasonCodes},managedEconomicMtmScope:'MANAGED_ECONOMIC_MTM'}
+    };
+    // A confirmed TS/P4 watch is written by the same transaction that owns
+    // its close intent below.  Other observations retain the established
+    // eager high-water projection behavior.
+    if(!profitRetentionConfirmed)await input.store.upsertPositionExitState(exitStateUpdate);
     await input.store.insertPositionManagementDecisionAudit({lpforgePositionId:position.lpforgePositionId,positionAddress:position.positionAddress,observedAt:input.observedAt,activeBinId,lowerBinId:position.lowerBinId,upperBinId:position.upperBinId,...(continuation?{positionContinuationEvLamports:continuation.continuationEvLamports,forecastHorizonMinutes:continuation.forecastHorizonMinutes}:{}),...(current?.shadow?.recommendationId?{sourceDecisionId:current.shadow.recommendationId}:{}),...(continuation?{sourceEconomicsId:continuation.candidateId}:{}),...(continuation?.uncertainty!==undefined?{uncertainty:continuation.uncertainty}:{}),...(closeCostLamports!==undefined?{expectedCloseCostLamports:closeCostLamports}:{}),geometryIdentity:continuation?.geometryIdentity??`${position.positionAddress}:${position.strategy}:${position.orientation}:${position.lowerBinId}:${position.upperBinId}`,managementAction:decision.action,exitReasonFamily:exitDecision.reasonFamily,reasonCodes:exitDecision.reasonCodes,confirmationSequenceCount:confirmationCount,validContinuationEvidence:continuation!==undefined&&closeCostLamports!==undefined});
     const alertBase={entityType:'POSITION' as const,entityId:position.positionAddress,positionId:position.lpforgePositionId,positionAddress:position.positionAddress,poolAddress:position.poolAddress,observedAt:input.observedAt};
     // Live control PnL is the only numerical exit authority. Alert only on a
@@ -756,6 +800,9 @@ async function observeAndPlanOwnedPositions(input: {
       planAction === "EMERGENCY_CLOSE" ||
       (planAction === "CLOSE" &&
       (exitDecision.reasonFamily === "EMERGENCY" ||
+        exitDecision.reasonCodes.includes("EXIT_HARD_POSITION_STOP_LOSS") ||
+        decision.reasonCodes.includes('PROFIT_RETENTION_TS5_CONFIRMED') ||
+        decision.reasonCodes.includes('PROFIT_RETENTION_OOR_P4_CONFIRMED') ||
         decision.reasonCodes.includes("POSITION_OOR_TOKEN_RISK") ||
         decision.reasonCodes.includes("POSITION_OOR_STALE_CAPITAL")));
     const managementPlanAllowed=managementContext.planAllowed||Boolean(telegramCloseRequest);
@@ -819,7 +866,13 @@ async function observeAndPlanOwnedPositions(input: {
         exitGovernor: { reasonFamily: exitDecision.reasonFamily, reasonCodes: exitDecision.reasonCodes, economics: exitDecision.economics, highWater: exitDecision.highWater, peakGivebackFraction: exitDecision.peakGivebackFraction },
       },
     });
-    await persistTransactionPlan(input.store, plan);
+    const serializedProtectiveClose=terminalProtectiveClose&&['CLOSE','EMERGENCY_CLOSE'].includes(planAction);
+    const persisted=await persistTransactionPlan(input.store, plan,{serializedProtectiveClose,...(profitRetentionConfirmed?{profitRetentionTransition:{lpforgePositionId:position.lpforgePositionId,observedAt:input.observedAt,watch:profitRetention.watch}}:{})});
+    // The watch itself was already committed with a newly created protective
+    // intent. This full projection preserves all normal MFE/economics fields
+    // after that durability boundary; a crash before it cannot strand CLOSE.
+    if(profitRetentionConfirmed)await input.store.upsertPositionExitState(exitStateUpdate);
+    if(!persisted)continue;
     if(telegramCloseRequest)await input.store.markTelegramOperatorCloseRequest({requestId:String(telegramCloseRequest.request_id),status:'PLANNED',at:input.observedAt,planId:plan.planId,payload:{positionAddress:position.positionAddress,poolAddress:position.poolAddress,canonicalPlanCreated:true}});
     planned++;
   }

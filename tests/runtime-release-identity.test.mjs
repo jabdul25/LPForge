@@ -25,10 +25,11 @@ function checksum(root){
 }
 function manifestFor(root,overrides={}){
   const policyHash=hash(readFileSync(path.join(root,'release-policy-templates/live-execution-policy.json')));
+  const liveExitGovernorPolicyTemplateHash=hash(readFileSync(path.join(root,'release-policy-templates/live-exit-governor-policy.json')));
   const lockfileHash=hash(readFileSync(path.join(root,'pnpm-lock.yaml')));
   const migrationHead='M0001_bootstrap.sql';
   const runtimePnpmVersion=execFileSync('pnpm',['--version'],{cwd:root,encoding:'utf8'}).trim();
-  return {sourceCommit,policyHash,migrationCount:1,migrationHead,buildIdentity:hash(`${sourceCommit}\n${policyHash}\n${migrationHead}\n${lockfileHash}\n`),nodeVersion,pnpmVersion:runtimePnpmVersion,lockfileHash,...overrides};
+  return {sourceCommit,policyHash,liveExitGovernorPolicyTemplateHash,migrationCount:1,migrationHead,buildIdentity:hash(`${sourceCommit}\n${policyHash}\n${migrationHead}\n${lockfileHash}\n`),nodeVersion,pnpmVersion:runtimePnpmVersion,lockfileHash,...overrides};
 }
 function createFixture(t){
   const root=mkdtempSync(path.join(tmpdir(),'lpforge-runtime-identity-'));
@@ -37,6 +38,7 @@ function createFixture(t){
   write(root,'scripts/verify-runtime-release-identity.mjs',readFileSync(path.resolve('scripts/verify-runtime-release-identity.mjs')));
   write(root,'.build/runtime.js','immutable compiled output\n');
   write(root,'release-policy-templates/live-execution-policy.json','{"policy":"canonical"}\n');
+  write(root,'release-policy-templates/live-exit-governor-policy.json','{"policy":"canonical-exit"}\n');
   write(root,'pnpm-lock.yaml','lockfileVersion: 9.0\n');
   write(root,'packages/db/migrations/M0001_bootstrap.sql','select 1;\n');
   write(root,'SOURCE_REVISION.txt',`source_git_commit=${sourceCommit}\n`);

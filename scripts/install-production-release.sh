@@ -25,11 +25,18 @@ ln -s "$lpforge_home/node_modules" "$stage/node_modules"
 # replacing the single central runtime authority.
 template_policy="$stage/release-policy-templates/live-execution-policy.json"
 runtime_policy="$lpforge_home/policy/live-execution-policy.json"
+template_exit_policy="$stage/release-policy-templates/live-exit-governor-policy.json"
+runtime_exit_policy="$lpforge_home/policy/live-exit-governor-policy.json"
 [[ -f "$template_policy" ]] || { echo 'LPFORGE_RUNTIME_POLICY_TEMPLATE_MISSING' >&2; exit 1; }
+[[ -f "$template_exit_policy" ]] || { echo 'LPFORGE_RUNTIME_EXIT_POLICY_TEMPLATE_MISSING' >&2; exit 1; }
 expected_policy_hash="$(node -e "const m=require(process.argv[1]);const h=m.runtimeExpectedPolicyHash??m.policyHash;if(!/^[0-9a-f]{64}$/i.test(String(h??'')))process.exit(2);process.stdout.write(h)" "$stage/RELEASE_MANIFEST.json")"
 template_policy_hash="$(sha256sum "$template_policy" | awk '{print $1}')"
 [[ "$template_policy_hash" == "$expected_policy_hash" ]] || { echo 'LPFORGE_RUNTIME_POLICY_TEMPLATE_HASH_MISMATCH' >&2; exit 1; }
 node --input-type=module -e "const m=await import(process.argv[1]);m.loadDeploymentPolicyFile(process.argv[2]);" "$stage/.build/packages/deployment-policy/src/index.js" "$template_policy" || { echo 'LPFORGE_RUNTIME_POLICY_TEMPLATE_SCHEMA_INVALID' >&2; exit 1; }
+expected_exit_policy_hash="$(node -e "const m=require(process.argv[1]);const h=m.liveExitGovernorPolicyTemplateHash;if(!/^[0-9a-f]{64}$/i.test(String(h??'')))process.exit(2);process.stdout.write(h)" "$stage/RELEASE_MANIFEST.json")"
+template_exit_policy_hash="$(sha256sum "$template_exit_policy" | awk '{print $1}')"
+[[ "$template_exit_policy_hash" == "$expected_exit_policy_hash" ]] || { echo 'LPFORGE_RUNTIME_EXIT_POLICY_TEMPLATE_HASH_MISMATCH' >&2; exit 1; }
+node --input-type=module -e "const m=await import(process.argv[1]);m.loadLiveExitGovernorPolicy(process.argv[2]);" "$stage/.build/packages/live-exit-governor/src/index.js" "$template_exit_policy" || { echo 'LPFORGE_RUNTIME_EXIT_POLICY_TEMPLATE_SCHEMA_INVALID' >&2; exit 1; }
 mkdir -p "$lpforge_home/policy"
 policy_stage="$(mktemp "$lpforge_home/policy/.live-execution-policy.json.XXXXXX")"
 cleanup(){ rm -rf "$stage"; rm -f "${policy_stage:-}"; }
@@ -40,6 +47,15 @@ node --input-type=module -e "const m=await import(process.argv[1]);m.loadDeploym
 mv -f "$policy_stage" "$runtime_policy"
 unset policy_stage
 [[ "$(sha256sum "$runtime_policy" | awk '{print $1}')" == "$expected_policy_hash" ]] || { echo 'LPFORGE_RUNTIME_POLICY_PROMOTION_HASH_MISMATCH' >&2; exit 1; }
+exit_policy_stage="$(mktemp "$lpforge_home/policy/.live-exit-governor-policy.json.XXXXXX")"
+cleanup(){ rm -rf "$stage"; rm -f "${policy_stage:-}" "${exit_policy_stage:-}"; }
+trap cleanup EXIT
+install -m 0644 "$template_exit_policy" "$exit_policy_stage"
+node --input-type=module -e "const m=await import(process.argv[1]);m.loadLiveExitGovernorPolicy(process.argv[2]);" "$stage/.build/packages/live-exit-governor/src/index.js" "$exit_policy_stage" || { echo 'LPFORGE_RUNTIME_EXIT_POLICY_SCHEMA_INVALID' >&2; exit 1; }
+[[ "$(sha256sum "$exit_policy_stage" | awk '{print $1}')" == "$expected_exit_policy_hash" ]] || { echo 'LPFORGE_RUNTIME_EXIT_POLICY_HASH_MISMATCH' >&2; exit 1; }
+mv -f "$exit_policy_stage" "$runtime_exit_policy"
+unset exit_policy_stage
+[[ "$(sha256sum "$runtime_exit_policy" | awk '{print $1}')" == "$expected_exit_policy_hash" ]] || { echo 'LPFORGE_RUNTIME_EXIT_POLICY_PROMOTION_HASH_MISMATCH' >&2; exit 1; }
 LPFORGE_HOME="$lpforge_home" LPFORGE_RUNTIME_CONFIG_ENFORCED=true bash "$stage/scripts/verify-release-integrity.sh" "$stage"
 mv "$stage" "$target"
 trap - EXIT
