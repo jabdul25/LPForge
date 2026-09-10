@@ -74,6 +74,7 @@ test('an expired chunked OPEN can be reconciled only from its original children,
   assert.match(worker, /refreshTerminalOpenChunkTruth/);
   assert.match(worker, /P6_OPEN_CHUNK_EXPIRED_NO_CHAIN_EFFECT/);
   assert.match(worker, /reconcileRecoveredChunkedOpen/);
+  assert.match(worker, /refreshedDispositions/);
   assert.match(worker, /rebroadcastExactSignedTransaction/);
   assert.match(store, /async reconcileRecoveredChunkedOpenPlan\(v\)/);
   const start = store.indexOf('async reconcileRecoveredChunkedOpenPlan(v)');
@@ -82,5 +83,6 @@ test('an expired chunked OPEN can be reconciled only from its original children,
   assert.match(method, /String\(currentRow\.action\)!=='OPEN'/);
   assert.match(method, /\['EXPIRED','RECONCILIATION_REQUIRED'\]/);
   assert.match(method, /'CONFIRMED','PROVEN_NOT_LANDED','CONFIRMED_FAILED','FAILED_PRE_SIGN','EXPIRED_PRE_SUBMISSION'/);
+  assert.match(method, /updated_at=\$2::timestamptz/);
   assert.match(method, /chunks\.rows\.length<2\|\|confirmed<1\|\|unresolved>0/);
 });

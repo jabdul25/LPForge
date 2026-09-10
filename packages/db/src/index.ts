@@ -3987,7 +3987,9 @@ return 'APPLIED';
         if(chunks.rows.length<2||confirmed<1||unresolved>0)throw new Error('LPFORGE_RECOVERED_CHUNKED_OPEN_CHAIN_PROOF_INCOMPLETE');
         await db.query("UPDATE execution.transaction_plans SET state='RECONCILED',payload=payload||jsonb_build_object('autonomous_dispatch_completed_at',$2::text,'autonomous_dispatch',COALESCE(payload->'autonomous_dispatch','{}'::jsonb)||$3::jsonb) WHERE plan_id=$1",[v.planId,v.at,json(v.payload)]);
         await db.query("INSERT INTO execution.plan_state_events(plan_id,prior_state,next_state,observed_at,reason_codes,payload) VALUES($1,$2,'RECONCILED',$3,$4::jsonb,$5::jsonb)",[v.planId,String(currentRow.state),v.at,json(['P6_RECOVERED_CHUNKED_OPEN_RECONCILED']),json(v.payload)]);
-        await db.query("UPDATE execution.execution_journal SET state='RECONCILED',updated_at=$2,payload=payload||jsonb_build_object('terminalPlanState','RECONCILED','terminalizedAt',$2::text) WHERE plan_id=$1 AND state IN ('PLAN_CREATED','BUILT','SIMULATED','APPROVED','SIGNING','SIGNED','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILIATION_REQUIRED','EXPIRED')",[v.planId,v.at]);
+        // Cast the reused value explicitly in both contexts. PostgreSQL otherwise
+        // cannot infer whether $2 is text (for JSON provenance) or timestamptz.
+        await db.query("UPDATE execution.execution_journal SET state='RECONCILED',updated_at=$2::timestamptz,payload=payload||jsonb_build_object('terminalPlanState','RECONCILED','terminalizedAt',$2::text) WHERE plan_id=$1 AND state IN ('PLAN_CREATED','BUILT','SIMULATED','APPROVED','SIGNING','SIGNED','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILIATION_REQUIRED','EXPIRED')",[v.planId,v.at]);
         await db.query("COMMIT");
       }catch(error){
         try{await db.query("ROLLBACK");}catch{}

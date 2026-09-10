@@ -2474,14 +2474,14 @@ export async function recoverPartialEntryFunding(input: {
       continue;
     }
     if(plan?.action==='OPEN'&&construction&&!construction.fullyConstructed){
-      const dispositions=await refreshTerminalOpenChunkTruth({store:input.store,config:input.config,planId,dispositions:await input.store.loadOpenChunkDispositions(planId)}),refreshedConstruction=assessOpenChunkConstruction({planned:plannedChunks,dispositions}),terminal=assessTerminalPartialOpenRecovery({planned:plannedChunks,dispositions});
+      const refreshedDispositions=await refreshTerminalOpenChunkTruth({store:input.store,config:input.config,planId,dispositions:await input.store.loadOpenChunkDispositions(planId)}),refreshedConstruction=assessOpenChunkConstruction({planned:plannedChunks,dispositions:refreshedDispositions}),terminal=assessTerminalPartialOpenRecovery({planned:plannedChunks,dispositions:refreshedDispositions});
       if(refreshedConstruction.fullyConstructed){
-        const recovered=await reconcileRecoveredChunkedOpen({store:input.store,config:input.config,row,plan,dispositions,partial:false});
+        const recovered=await reconcileRecoveredChunkedOpen({store:input.store,config:input.config,row,plan,dispositions:refreshedDispositions,partial:false});
         results.push({planId,action:'HOLD',reasonCodes:recovered.reasonCodes});
         if(recovered.recovered)continue;
       }
       if(terminal.eligible){
-        const recovered=await reconcileRecoveredChunkedOpen({store:input.store,config:input.config,row,plan,dispositions,partial:true});
+        const recovered=await reconcileRecoveredChunkedOpen({store:input.store,config:input.config,row,plan,dispositions:refreshedDispositions,partial:true});
         results.push({planId,action:'HOLD',reasonCodes:recovered.reasonCodes});
         if(recovered.recovered)continue;
       }
