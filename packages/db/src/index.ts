@@ -5012,7 +5012,17 @@ return 'APPLIED';
           es.lp_mtm_net_pnl_usd AS lp_net_pnl_usd,
           es.lp_mtm_net_return_fraction AS lp_net_return_fraction,
           es.lp_mtm_peak_return_fraction AS lp_peak_return_fraction,
-          es.lp_mtm_peak_observed_at AS lp_peak_observed_at
+          es.lp_mtm_peak_observed_at AS lp_peak_observed_at,
+          es.lp_mtm_evidence_state AS live_control_pnl_state,
+          es.observed_at AS live_control_pnl_observed_at,
+          es.lp_mtm_current_value_usd AS live_control_current_value_usd,
+          es.lp_mtm_net_pnl_usd AS live_control_net_pnl_usd,
+          es.lp_mtm_net_return_fraction AS live_control_return_fraction,
+          es.lp_mtm_peak_return_fraction AS live_control_peak_return_fraction,
+          obs.payload->'receiptLpMtm'->>'state' AS receipt_lp_mtm_state,
+          (obs.payload->'receiptLpMtm'->>'netPnlUsd')::double precision AS receipt_lp_mtm_net_pnl_usd,
+          (obs.payload->'receiptLpMtm'->>'netReturnFraction')::double precision AS receipt_lp_mtm_return_fraction,
+          (obs.payload->'liveControlPnl'->>'reportedReturnDeltaFraction')::double precision AS live_control_reported_delta_fraction
         FROM execution.owned_positions p
         LEFT JOIN LATERAL (
           SELECT observed_at,active_bin_id,range_state,stale_data

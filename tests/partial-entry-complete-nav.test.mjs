@@ -36,10 +36,13 @@ test('complete managed NAV includes attributed wallet inventory and prevents the
   assert.equal(complete.walletInventoryValueUsd,1);
 });
 
-test('a hard-stop decision requires a receipt-backed LP-position loss, not only managed NAV',()=>{
+test('a numerical emergency stop requires the Meteora-compatible live control return, never receipt or managed NAV',()=>{
   const loss=derivePositionEconomics({position:{totalXAmount:'0',totalYAmount:'10000000',feeX:'0',feeY:'0',claimedFeeX:'0',claimedFeeY:'0'},pool,initialCapitalLamports:30_000_000n,actualContributedLamports:30_000_000n,observedAt:'2026-08-29T04:53:16.672Z',attributedWalletInventory:[{tokenMint:'POOL',tokenAmountRaw:'100000'}]});
   assert.equal(loss.evidenceState,'AVAILABLE');assert.ok((loss.netReturnFraction??0)<=-.20);
-  const decision=assessLiveExit({policy,economics:loss,lpPositionMtm:{evidenceState:'AVAILABLE',observedAt:loss.observedAt,netReturnFraction:-.21,reasonCodes:['LP_POSITION_MARK_TO_MARKET']},lpPositionMtmFresh:true});assert.equal(decision.action,'EMERGENCY_CLOSE');assert.ok(decision.reasonCodes.includes('EXIT_EMERGENCY_STOP_LOSS'));
+  const receipt={evidenceState:'AVAILABLE',observedAt:loss.observedAt,netReturnFraction:-.21,reasonCodes:['LP_POSITION_MARK_TO_MARKET']};
+  assert.equal(assessLiveExit({policy,economics:loss,lpPositionMtm:receipt,lpPositionMtmFresh:true}).action,'HOLD');
+  const control={evidenceState:'AVAILABLE',observedAt:loss.observedAt,netReturnFraction:-.21,currentPositionValueUsd:79,source:'METEORA_POSITION_PNL_API',scope:'LIVE_POSITION_CONTROL',reasonCodes:['LIVE_CONTROL_PNL_AVAILABLE']};
+  const decision=assessLiveExit({policy,economics:loss,lpPositionMtm:receipt,lpPositionMtmFresh:true,liveControlPnl:control,liveControlPnlFresh:true});assert.equal(decision.action,'EMERGENCY_CLOSE');assert.ok(decision.reasonCodes.includes('EXIT_EMERGENCY_STOP_LOSS'));
 });
 
 test('managed wallet residuals remain accounting context and cannot independently trigger a position stop',()=>{

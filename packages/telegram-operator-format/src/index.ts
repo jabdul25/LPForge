@@ -83,6 +83,9 @@ function valuationAvailable(summary:TelegramPositionSummary):boolean{
 function lpValuationAvailable(summary:TelegramPositionSummary):boolean{
   return chainFresh(summary)&&text(summary.lp_mtm_state,'UNAVAILABLE')==='AVAILABLE'&&number(summary.lp_net_return_fraction)!==undefined;
 }
+function liveControlAvailable(summary:TelegramPositionSummary):boolean{
+  return chainFresh(summary)&&text(summary.live_control_pnl_state,text(summary.lp_mtm_state,'UNAVAILABLE'))==='AVAILABLE'&&number(summary.live_control_return_fraction??summary.lp_net_return_fraction)!==undefined;
+}
 function canonicalFee(summary:TelegramPositionSummary):string|undefined{
   if(!chainFresh(summary))return undefined;
   const fee=sol(summary.fee_value_lamports);
@@ -104,10 +107,10 @@ function compactOne(summary:TelegramPositionSummary,index:number,nowMs:number):s
     `${range(summary).replace('IN RANGE','In range').replace('OUT OF RANGE','Out of range')} · ${positionState(summary)}`,
     '',
   ];
-  const lpReturn=lpValuationAvailable(summary)?signedPercent(summary.lp_net_return_fraction):undefined;
-  lines.push(`Current LP return: ${lpReturn??'unavailable'}`);
-  const lpPeak=lpValuationAvailable(summary)?signedPercent(summary.lp_peak_return_fraction):undefined;
-  if(lpPeak)lines.push(`Peak LP return: ${lpPeak}`);
+  const controlReturn=liveControlAvailable(summary)?signedPercent(summary.live_control_return_fraction??summary.lp_net_return_fraction):undefined;
+  lines.push(`Current PnL: ${controlReturn??'unavailable'} · Meteora-compatible`);
+  const controlPeak=liveControlAvailable(summary)?signedPercent(summary.live_control_peak_return_fraction??summary.lp_peak_return_fraction):undefined;
+  if(controlPeak)lines.push(`Peak PnL: ${controlPeak}`);
   const fees=chainFresh(summary)?sol(summary.fee_value_lamports):undefined;
   lines.push(`Fees earned: ${fees??'unavailable'}`);
   lines.push(`Range: ${text(summary.lower_bin_id)} → ${text(summary.upper_bin_id)}`);
@@ -128,13 +131,17 @@ function detailOne(summary:TelegramPositionSummary,index:number|undefined,nowMs:
     '',
     `Capital: ${sol(summary.initial_capital_lamports)??'unavailable'}`,
   ];
-  if(lpValuationAvailable(summary)){
-    const value=usd(summary.lp_current_position_value_usd),pnl=usd(summary.lp_net_pnl_usd,true),pct=signedPercent(summary.lp_net_return_fraction);
-    lines.push(`LP Value: ${value??'unavailable'}`);
-    lines.push(`LP MTM: ${pnl??'unavailable'}${pct?` (${pct})`:''}`);
-    const peak=signedPercent(summary.lp_peak_return_fraction);
-    if(peak)lines.push(`LP peak return: ${peak}`);
-  }else lines.push('LP MTM: unavailable · entry basis pending');
+  if(liveControlAvailable(summary)){
+    const value=usd(summary.live_control_current_value_usd??summary.lp_current_position_value_usd),pnl=usd(summary.live_control_net_pnl_usd??summary.lp_net_pnl_usd,true),pct=signedPercent(summary.live_control_return_fraction??summary.lp_net_return_fraction);
+    lines.push(`Current PnL: ${pnl??'unavailable'}${pct?` (${pct})`:''}`);
+    lines.push('Source: Meteora-compatible');
+    const peak=signedPercent(summary.live_control_peak_return_fraction??summary.lp_peak_return_fraction);
+    if(peak)lines.push(`Peak PnL: ${peak}`);
+  }else lines.push('Current PnL: unavailable · live control data unavailable');
+  const receiptReturn=number(summary.receipt_lp_mtm_return_fraction);
+  if(receiptReturn!==undefined)lines.push(`Internal LP mark: ${signedPercent(receiptReturn)}`);
+  const delta=number(summary.live_control_reported_delta_fraction);
+  if(delta!==undefined&&delta>0)lines.push(`Meteora component delta: ${(delta*100).toFixed(2)}pp`);
   const managedBasis=sol(summary.managed_economic_contribution_lamports);
   if(managedBasis)lines.push(`Economic basis: ${managedBasis}`);
   if(valuationAvailable(summary)){

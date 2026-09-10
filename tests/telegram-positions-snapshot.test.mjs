@@ -26,34 +26,34 @@ test('telegram close resolution accepts the displayed ordinal, canonical address
   assert.throws(()=>resolveTelegramPositionAddress({target:'5odbT7',positions:[position]}),/LPFORGE_TELEGRAM_LIVE_POSITION_NOT_FOUND/);
   assert.throws(()=>resolveTelegramPositionAddress({target:'5odbT7…jT2X',positions:[position,{...position}]}),/LPFORGE_TELEGRAM_LIVE_POSITION_AMBIGUOUS/);
 });
-test('telegram positions renders a compact fresh LP-return snapshot without inventing accounting',()=>{
+test('telegram positions renders the persisted Meteora-compatible control PnL without external calls',()=>{
   const rendered=formatTelegramPositionSummaries({positions:[position],maxOpenPositions:2,nowMs:now});
   assert.match(rendered,/📊 LPForge Positions — 1 open \/ 2 max/);assert.match(rendered,/5odbT7…jT2X/);assert.match(rendered,/EAf6sh…zpzZ/);
-  assert.match(rendered,/🟢 In range · Open/);assert.match(rendered,/Current LP return: \+6\.00%/);assert.match(rendered,/Peak LP return: \+7\.21%/);
+  assert.match(rendered,/🟢 In range · Open/);assert.match(rendered,/Current PnL: \+6\.00% · Meteora-compatible/);assert.match(rendered,/Peak PnL: \+7\.21%/);
   assert.match(rendered,/Fees earned: 0\.000260 SOL/);assert.match(rendered,/Range: -1381 → -1347/);assert.match(rendered,/Current bin: -1352/);assert.match(rendered,/Opened: 3h 24m ago/);assert.match(rendered,/Updated: 18s ago/);
   assert.doesNotMatch(rendered,/Economic MTM/);assert.doesNotMatch(rendered,/Capital:/);
 });
 test('telegram position detail keeps LP and economic accounting explicitly distinct',()=>{
   const rendered=formatTelegramPositionDetail({position,index:1,nowMs:now});
   assert.match(rendered,/BID_ASK · ONE_SIDED_Y/);assert.match(rendered,/Capital: 0\.030000 SOL/);
-  assert.match(rendered,/LP MTM: \+\$0\.2725 \(\+6\.00%\)/);assert.match(rendered,/LP peak return: \+7\.21%/);assert.match(rendered,/Economic MTM: \+\$0\.2725 \(\+6\.00%\)/);
+  assert.match(rendered,/Current PnL: \+\$0\.2725 \(\+6\.00%\)/);assert.match(rendered,/Source: Meteora-compatible/);assert.match(rendered,/Peak PnL: \+7\.21%/);assert.match(rendered,/Economic MTM: \+\$0\.2725 \(\+6\.00%\)/);
 });
 test('telegram positions formats two independently valued positions and policy capacity',()=>{
   const second={...position,position_address:'7t477abcdefghijkmnopqrstuvwxyz123456789fHYs',pool_address:'PoolBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',orientation:'SKEWED_Y',net_pnl_usd:'-0.0078',net_return_fraction:'-0.0017'};
   const rendered=formatTelegramPositionSummaries({positions:[position,second],maxOpenPositions:2,nowMs:now});
-  assert.match(rendered,/2 open \/ 2 max/);assert.match(rendered,/7t477a…fHYs/);assert.match(rendered,/Current LP return: \+6\.00%/);
+  assert.match(rendered,/2 open \/ 2 max/);assert.match(rendered,/7t477a…fHYs/);assert.match(rendered,/Current PnL: \+6\.00%/);
 });
 test('stale or missing LP valuation is unavailable rather than a stale marked fact',()=>{
   const stale=formatTelegramPositionSummaries({positions:[{...position,observation_stale_data:true,valuation_state:'STALE'}],nowMs:now});
-  assert.match(stale,/CHAIN DATA STALE/);assert.match(stale,/Current LP return: unavailable/);assert.doesNotMatch(stale,/\+\$0\.2725/);
+  assert.match(stale,/CHAIN DATA STALE/);assert.match(stale,/Current PnL: unavailable/);assert.doesNotMatch(stale,/\+\$0\.2725/);
   const missing=formatTelegramPositionSummaries({positions:[{...position,lp_mtm_state:'UNAVAILABLE',lp_net_return_fraction:null}],nowMs:now});
-  assert.match(missing,/Current LP return: unavailable/);
+  assert.match(missing,/Current PnL: unavailable/);
   const chainStale=formatTelegramPositionSummaries({positions:[{...position,chain_truth_fresh:false}],nowMs:now});
-  assert.match(chainStale,/CHAIN DATA STALE/);assert.match(chainStale,/Current LP return: unavailable/);
+  assert.match(chainStale,/CHAIN DATA STALE/);assert.match(chainStale,/Current PnL: unavailable/);
 });
 test('zero PnL, unavailable fees, OOR and reconciliation state remain explicit',()=>{
   const rendered=formatTelegramPositionSummaries({positions:[{...position,lp_net_return_fraction:0,fee_value_lamports:null,oor_range_state:'OUT_OF_RANGE',lifecycle_state:'RECONCILIATION_REQUIRED',reconciliation_status:'UNKNOWN'}],nowMs:now});
-  assert.match(rendered,/Current LP return: \+0\.00%/);assert.match(rendered,/Fees earned: unavailable/);assert.match(rendered,/🔴 Out of range/);assert.match(rendered,/Reconciliation Required \/ Unknown/);
+  assert.match(rendered,/Current PnL: \+0\.00%/);assert.match(rendered,/Fees earned: unavailable/);assert.match(rendered,/🔴 Out of range/);assert.match(rendered,/Reconciliation Required \/ Unknown/);
 });
 test('formatter remains bounded and presentation-only',async()=>{
   const rendered=formatTelegramPositionSummaries({positions:Array.from({length:80},(_,i)=>({...position,position_address:`position-${i}-${position.position_address}`})),maxOpenPositions:80,nowMs:now});
