@@ -147,8 +147,10 @@ test('position lifecycle and deterministic receipt identities fail closed atomic
   assert.match(source,/LPFORGE_OWNED_POSITION_IDENTITY_OR_TERMINAL_STATE_CONFLICT/);
   assert.match(source,/LPFORGE_POSITION_LIFECYCLE_IDENTITY_OR_TERMINAL_STATE_CONFLICT/);
   assert.match(source,/LPFORGE_PARTIAL_ENTRY_RECOVERY_IDENTITY_CONFLICT/);
-  assert.match(source,/partial_entry_recovery\.funded_at=EXCLUDED\.funded_at/);
-  assert.match(source,/partial_entry_recovery\.paired_token_amount=EXCLUDED\.paired_token_amount/);
+  assert.match(source,/partial_entry_recovery\.funding_transaction_id=EXCLUDED\.funding_transaction_id/);
+  assert.match(source,/partial_entry_recovery\.funding_signature=EXCLUDED\.funding_signature/);
+  assert.doesNotMatch(source,/DO UPDATE SET funded_at=EXCLUDED\.funded_at/);
+  assert.doesNotMatch(source,/DO UPDATE SET[^`]*paired_token_amount=EXCLUDED\.paired_token_amount/);
   assert.match(source,/LPFORGE_LIVE_OUTCOME_PREDICTION_LINEAGE_IDENTITY_CONFLICT/);
   const ownedStart=source.indexOf('async upsertOwnedPosition(v)');
   const ownedEnd=source.indexOf('async insertPositionObservation',ownedStart);
