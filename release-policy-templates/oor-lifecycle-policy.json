@@ -1,8 +1,9 @@
 {
-  "schemaVersion": 1,
-  "policyVersion": "oor-lifecycle-v1",
+  "schemaVersion": 2,
+  "policyVersion": "oor-lifecycle-v2",
   "transientMinutes": 10,
   "sustainedMinutes": 30,
   "aboveMaxCloseAndReevaluateMinutes": 30,
+  "belowMinCloseAndReevaluateMinutes": 30,
   "actionRequiredMinutes": 60
 }

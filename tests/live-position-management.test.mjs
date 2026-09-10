@@ -4,31 +4,54 @@ import test from 'node:test';
 import {assessClaimEconomics,assessFeeCompensationObservation,assessLiveManagementContext,assessOorLifecycle,decideLivePositionManagement,parseLivePositionManagementPolicy,parseOorLifecyclePolicy} from '../.build/packages/live-position-management/src/index.js';
 
 const policy={...parseLivePositionManagementPolicy({schemaVersion:1,enabled:true,outOfRangeAction:'RESHAPE',claimAccruedFees:true,estimatedClaimCostLamports:'10',minimumClaimNetBenefitLamports:'10',missingPositionAction:'HOLD',replacementRange:'PRESERVE_WIDTH_CENTER_ACTIVE',planTtlMs:300000}),minimumClaimValueUsd:.10};
-const oorPolicy=parseOorLifecyclePolicy({schemaVersion:1,policyVersion:'oor-lifecycle-v1',transientMinutes:10,sustainedMinutes:30,aboveMaxCloseAndReevaluateMinutes:30,actionRequiredMinutes:60});
+const oorPolicy=parseOorLifecyclePolicy({schemaVersion:2,policyVersion:'oor-lifecycle-v2',transientMinutes:10,sustainedMinutes:30,aboveMaxCloseAndReevaluateMinutes:30,belowMinCloseAndReevaluateMinutes:30,actionRequiredMinutes:60});
 const owned={lpforgePositionId:'p',poolAddress:'POOL',positionAddress:'POS',ownerAddress:'OWNER',strategy:'CURVE',orientation:'BALANCED',lowerBinId:90,upperBinId:110,initialCapitalLamports:20_000_000n,thesisId:'thesis'};
 const fact={address:'POS',pool:'POOL',owner:'OWNER',lowerBinId:90,upperBinId:110,totalXAmount:'10',totalYAmount:'20',feeX:'0',feeY:'0',stamp:{source:'METEORA_SDK',observedAt:'2026-08-13T00:00:00.000Z'},raw:{}};
 
-const oor=(observedAt,prior,inventoryClassification='SAFE_OOR_SOL',rangeState='OUT_OF_RANGE',activeBinId=120)=>assessOorLifecycle({policy:oorPolicy,prior,observation:{observedAt,rangeState,activeBinId,lowerBinId:90,upperBinId:110,chainTruthFresh:true,reconciliationClean:true,noActiveManagementPlan:true,inventoryClassification}});
+const prior=(assessment,rangeState=assessment.state==='IN_RANGE'?'IN_RANGE':'OUT_OF_RANGE')=>({rangeState,...(assessment.direction?{direction:assessment.direction}:{}),...(assessment.firstOorDetectedAt?{firstOorDetectedAt:assessment.firstOorDetectedAt}:{}),...(assessment.continuousOorStartedAt?{continuousOorStartedAt:assessment.continuousOorStartedAt}:{}),...(assessment.belowOorSince?{belowOorSince:assessment.belowOorSince}:{}),latestObservedAt:assessment.latestObservedAt,...(assessment.lastReenteredAt?{lastReenteredAt:assessment.lastReenteredAt}:{}),excursionCount:assessment.excursionCount,totalOorDurationSeconds:assessment.totalOorDurationSeconds});
+const oor=(observedAt,priorState,inventoryClassification='SAFE_OOR_SOL',rangeState='OUT_OF_RANGE',activeBinId=120,safety={})=>assessOorLifecycle({policy:oorPolicy,prior:priorState,observation:{observedAt,rangeState,activeBinId,lowerBinId:90,upperBinId:110,chainTruthFresh:true,reconciliationClean:true,noActiveManagementPlan:true,inventoryClassification,...safety}});
 test('OOR above maximum closes and re-evaluates at the directional 30-minute cap',()=>{
   const first=oor('2026-08-13T00:00:00Z');assert.equal(first.state,'TRANSIENT_OOR');assert.equal(first.action,'HOLD');
-  const sustained=oor('2026-08-13T00:20:00Z',{rangeState:'OUT_OF_RANGE',firstOorDetectedAt:first.firstOorDetectedAt,continuousOorStartedAt:first.continuousOorStartedAt,latestObservedAt:first.latestObservedAt,excursionCount:first.excursionCount,totalOorDurationSeconds:first.totalOorDurationSeconds});assert.equal(sustained.state,'SUSTAINED_OOR');assert.equal(sustained.action,'FRESH_EVALUATION');
-  const stale=oor('2026-08-13T00:30:00Z',{rangeState:'OUT_OF_RANGE',firstOorDetectedAt:first.firstOorDetectedAt,continuousOorStartedAt:first.continuousOorStartedAt,latestObservedAt:sustained.latestObservedAt,excursionCount:first.excursionCount,totalOorDurationSeconds:sustained.totalOorDurationSeconds});assert.equal(stale.state,'OOR_STALE_CAPITAL');assert.equal(stale.action,'CLOSE_AND_REEVALUATE');assert.ok(stale.reasonCodes.includes('POSITION_OOR_ABOVE_MAX_DIRECTIONAL_CAP'));
+  const sustained=oor('2026-08-13T00:20:00Z',prior(first));assert.equal(sustained.state,'SUSTAINED_OOR');assert.equal(sustained.action,'FRESH_EVALUATION');
+  const stale=oor('2026-08-13T00:30:00Z',prior(sustained));assert.equal(stale.state,'OOR_STALE_CAPITAL');assert.equal(stale.action,'CLOSE_AND_REEVALUATE');assert.ok(stale.reasonCodes.includes('POSITION_OOR_ABOVE_MAX_DIRECTIONAL_CAP'));assert.equal(stale.continuousOorDurationSeconds,1800);
   assert.equal(decideLivePositionManagement({policy,owned,position:fact,activeBinId:120,oor:stale}).action,'CLOSE');
 });
-test('OOR below minimum preserves the existing 60-minute stale-capital deadline',()=>{
+test('BELOW_MIN closes and re-evaluates exactly at its direction-specific 30-minute cap',()=>{
   const first=oor('2026-08-13T00:00:00Z',undefined,'SAFE_OOR_SOL','OUT_OF_RANGE',80);
-  const before=oor('2026-08-13T00:45:00Z',{rangeState:'OUT_OF_RANGE',firstOorDetectedAt:first.firstOorDetectedAt,continuousOorStartedAt:first.continuousOorStartedAt,latestObservedAt:first.latestObservedAt,excursionCount:first.excursionCount,totalOorDurationSeconds:first.totalOorDurationSeconds},'SAFE_OOR_SOL','OUT_OF_RANGE',80);
-  assert.equal(before.state,'OOR_ACTION_REQUIRED');assert.equal(before.action,'TEMPORARY_HOLD');
-  const stale=oor('2026-08-13T01:00:00Z',{rangeState:'OUT_OF_RANGE',firstOorDetectedAt:first.firstOorDetectedAt,continuousOorStartedAt:first.continuousOorStartedAt,latestObservedAt:before.latestObservedAt,excursionCount:before.excursionCount,totalOorDurationSeconds:before.totalOorDurationSeconds},'SAFE_OOR_SOL','OUT_OF_RANGE',80);
+  const before=oor('2026-08-13T00:29:59Z',prior(first),'SAFE_OOR_SOL','OUT_OF_RANGE',80);
+  assert.equal(before.state,'SUSTAINED_OOR');assert.equal(before.action,'FRESH_EVALUATION');
+  const stale=oor('2026-08-13T00:30:00Z',prior(before),'SAFE_OOR_SOL','OUT_OF_RANGE',80);
   assert.equal(stale.state,'OOR_STALE_CAPITAL');assert.equal(stale.action,'CLOSE_AND_REEVALUATE');
+  assert.ok(stale.reasonCodes.includes('POSITION_OOR_BELOW_MIN_DIRECTIONAL_CAP'));
+  assert.equal(stale.continuousBelowOorDurationSeconds,1800);
+  assert.equal(decideLivePositionManagement({policy,owned,position:fact,activeBinId:80,oor:stale}).action,'CLOSE');
 });
-test('re-entry resets continuous OOR time and a lower token exposure receives action at 30m',()=>{
-  const first=oor('2026-08-13T00:00:00Z');
-  const reentered=oor('2026-08-13T00:08:00Z',{rangeState:'OUT_OF_RANGE',firstOorDetectedAt:first.firstOorDetectedAt,continuousOorStartedAt:first.continuousOorStartedAt,latestObservedAt:first.latestObservedAt,excursionCount:first.excursionCount,totalOorDurationSeconds:first.totalOorDurationSeconds},'SAFE_OOR_SOL','IN_RANGE',100);assert.equal(reentered.state,'IN_RANGE');assert.equal(reentered.continuousOorDurationSeconds,0);
-  const token=oor('2026-08-13T00:31:00Z',{rangeState:'OUT_OF_RANGE',continuousOorStartedAt:'2026-08-13T00:00:00Z',latestObservedAt:'2026-08-13T00:30:00Z',excursionCount:1,totalOorDurationSeconds:1800},'OOR_TOKEN_EXPOSURE','OUT_OF_RANGE',80);assert.equal(token.state,'OOR_ACTION_REQUIRED');assert.equal(token.action,'CLOSE');
+test('IN_RANGE resets the below timer',()=>{
+  const first=oor('2026-08-13T00:00:00Z',undefined,'SAFE_OOR_SOL','OUT_OF_RANGE',80);
+  const twentyBelow=oor('2026-08-13T00:20:00Z',prior(first),'SAFE_OOR_SOL','OUT_OF_RANGE',80);
+  const reentered=oor('2026-08-13T00:20:01Z',prior(twentyBelow),'SAFE_OOR_SOL','IN_RANGE',100);assert.equal(reentered.state,'IN_RANGE');assert.equal(reentered.continuousBelowOorDurationSeconds,0);
+  const secondBelow=oor('2026-08-13T00:20:02Z',prior(reentered),'SAFE_OOR_SOL','OUT_OF_RANGE',80);
+  const fifteenBelow=oor('2026-08-13T00:35:02Z',prior(secondBelow),'SAFE_OOR_SOL','OUT_OF_RANGE',80);
+  assert.notEqual(fifteenBelow.action,'CLOSE_AND_REEVALUATE');assert.equal(fifteenBelow.continuousBelowOorDurationSeconds,900);
 });
-test('stale or unreconciled chain truth never authorizes OOR close',()=>{
-  const r=assessOorLifecycle({policy:oorPolicy,observation:{observedAt:'2026-08-13T01:01:00Z',rangeState:'OUT_OF_RANGE',activeBinId:120,lowerBinId:90,upperBinId:110,chainTruthFresh:false,reconciliationClean:true,noActiveManagementPlan:true,inventoryClassification:'SAFE_OOR_SOL'}});assert.equal(r.action,'HOLD_CHAIN_RECONCILIATION');
+test('ABOVE_MAX resets the below timer and never contributes elapsed time to it',()=>{
+  const first=oor('2026-08-13T00:00:00Z',undefined,'SAFE_OOR_SOL','OUT_OF_RANGE',80);
+  const twentyBelow=oor('2026-08-13T00:20:00Z',prior(first),'SAFE_OOR_SOL','OUT_OF_RANGE',80);
+  const above=oor('2026-08-13T00:20:01Z',prior(twentyBelow),'SAFE_OOR_SOL','OUT_OF_RANGE',120);assert.equal(above.belowOorSince,undefined);
+  const secondBelow=oor('2026-08-13T00:20:02Z',prior(above),'SAFE_OOR_SOL','OUT_OF_RANGE',80);
+  const fifteenBelow=oor('2026-08-13T00:35:02Z',prior(secondBelow),'SAFE_OOR_SOL','OUT_OF_RANGE',80);
+  assert.notEqual(fifteenBelow.action,'CLOSE_AND_REEVALUATE');assert.equal(fifteenBelow.continuousBelowOorDurationSeconds,900);
+});
+test('40 minutes ABOVE_MAX followed by first BELOW_MIN observation does not fire the below rule',()=>{
+  const firstAbove=oor('2026-08-13T00:00:00Z');
+  const staleAbove=oor('2026-08-13T00:40:00Z',prior(firstAbove));assert.equal(staleAbove.action,'CLOSE_AND_REEVALUATE');assert.ok(staleAbove.reasonCodes.includes('POSITION_OOR_ABOVE_MAX_DIRECTIONAL_CAP'));
+  const firstBelow=oor('2026-08-13T00:40:01Z',prior(staleAbove),'SAFE_OOR_SOL','OUT_OF_RANGE',80);
+  assert.notEqual(firstBelow.action,'CLOSE_AND_REEVALUATE');assert.equal(firstBelow.continuousBelowOorDurationSeconds,0);assert.equal(firstBelow.belowOorSince,'2026-08-13T00:40:01Z');
+});
+test('unavailable chain truth or active management plan never advances or dispatches the below close',()=>{
+  const first=oor('2026-08-13T00:00:00Z',undefined,'SAFE_OOR_SOL','OUT_OF_RANGE',80);
+  const unavailable=oor('2026-08-13T00:30:00Z',prior(first),'SAFE_OOR_SOL','OUT_OF_RANGE',80,{chainTruthFresh:false});assert.equal(unavailable.action,'HOLD_CHAIN_RECONCILIATION');assert.equal(unavailable.continuousBelowOorDurationSeconds,0);assert.equal(unavailable.belowOorSince,first.belowOorSince);
+  const activePlan=oor('2026-08-13T00:30:00Z',prior(first),'SAFE_OOR_SOL','OUT_OF_RANGE',80,{noActiveManagementPlan:false});assert.equal(activePlan.action,'HOLD_CHAIN_RECONCILIATION');assert.ok(activePlan.reasonCodes.includes('POSITION_OOR_MANAGEMENT_PLAN_PENDING'));
 });
 test('routine claims require the configured USD threshold, while close bypasses it',()=>{assert.equal(decideLivePositionManagement({policy,owned,position:{...fact,feeY:'1'},activeBinId:100,claimExpectedValueLamports:100n,claimExpectedValueUsd:.0999}).action,'HOLD');assert.equal(decideLivePositionManagement({policy,owned,position:{...fact,feeY:'1'},activeBinId:100,claimExpectedValueLamports:20n,claimExpectedValueUsd:.10}).action,'CLAIM');assert.equal(decideLivePositionManagement({policy,owned,position:{...fact,feeY:'1'},activeBinId:100,claimExpectedValueLamports:20n,claimExpectedValueUsd:.15}).action,'CLAIM');const exit=decideLivePositionManagement({policy,owned,position:{...fact,feeY:'1'},activeBinId:100,claimExpectedValueLamports:1n,claimExpectedValueUsd:.02,exitDecision:{action:'CLOSE',reasonCodes:['EXIT_TEST']}});assert.equal(exit.action,'CLOSE');assert.equal(decideLivePositionManagement({policy,owned,activeBinId:100}).action,'HOLD');});
 test('fee compensation is observational, restart-safe math and never emits an action',()=>{const r=assessFeeCompensationObservation({mfeInventoryValue:.03,currentInventoryValue:.029038831,mfeCumulativeGrossFees:.0001774,currentCumulativeGrossFees:.000661998});assert.equal(r.economicClassification,'PARTIALLY_FEE_COMPENSATED');assert.ok(Math.abs(r.feeCompensationRatio-.5042)<.0002);assert.ok(Math.abs(r.inventoryDeteriorationSinceMfe-.000961169)<1e-15);assert.ok(Math.abs(r.grossFeesSinceMfe-.000484598)<1e-15);assert.equal(assessFeeCompensationObservation({mfeInventoryValue:1,currentInventoryValue:1,mfeCumulativeGrossFees:0,currentCumulativeGrossFees:.1}).economicClassification,'NO_INVENTORY_DETERIORATION');});
