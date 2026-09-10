@@ -9,7 +9,7 @@ test('a reconciled OPEN resolves a partial-entry row only when construction and 
   const reconciled = worker.indexOf('plan?.action === "OPEN" && plan.state === "RECONCILED" && constructionComplete && plan.positionOpenReconciled', loadPlan);
   const partialHold = worker.indexOf("P6_PARTIAL_ENTRY_REQUIRES_POSITION_RECOVERY", loadPlan);
   const unwindSubmitted = worker.indexOf('if (state === "UNWIND_SUBMITTED")', loadPlan);
-  const genericUnwindHold = worker.indexOf('if (state !== "ENTRY_FUNDED_NOT_OPEN" && state !== "RESUME_OPEN")', loadPlan);
+  const genericUnwindHold = worker.indexOf('state !== "UNWIND_REQUIRED"', loadPlan);
   assert.ok(loadPlan >= 0 && construction > loadPlan && reconciled > construction, 'recovery must check construction and an authoritative owned-position binding first');
   assert.ok(partialHold > reconciled && partialHold < unwindSubmitted && partialHold < genericUnwindHold, 'incomplete construction remains in protective recovery rather than becoming ordinary OPEN');
   assert.match(worker, /P6_PARTIAL_RECOVERY_SUPERSEDED_BY_SUCCESSFUL_ENTRY/);
