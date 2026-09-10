@@ -51,5 +51,17 @@ export async function submitSignedTransaction(input:{authority:ExecutionAuthorit
     throw new SubmissionStatusUnknownError(signature);
   }
 }
+/**
+ * Re-propagates an already prepared and signed transaction without creating a
+ * second submission attempt.  Callers must retain the original durable
+ * attempt; this helper only permits the exact wire signature to be sent.
+ */
+export async function rebroadcastExactSignedTransaction(input:{transport:SubmissionTransport;raw:Uint8Array;signature:string}):Promise<string>{
+  const wireSignature=signedTransactionSignature(input.raw);
+  if(!wireSignature||wireSignature!==input.signature)throw new Error('LPFORGE_REBROADCAST_WIRE_SIGNATURE_MISMATCH');
+  const returned=await input.transport.sendRawTransaction(input.raw,{skipPreflight:false,maxRetries:0});
+  if(returned!==input.signature)throw new Error('LPFORGE_REBROADCAST_SIGNATURE_MISMATCH');
+  return returned;
+}
 export async function observeConfirmation(input:{attemptId:string;record:SubmissionRecordContract;transport:SubmissionTransport;ledger:SubmissionLedger;observedAt:string}):Promise<ConfirmationRecordContract>{const s=await input.transport.getSignatureStatus(input.record.signature);let status:ConfirmationRecordContract['status']='UNKNOWN';let slot:bigint|undefined;let error:string|undefined;if(s?.err!=null){status='FAILED';error=typeof s.err==='string'?s.err:JSON.stringify(s.err);}else if(s?.confirmationStatus){status=s.confirmationStatus==='processed'?'PROCESSED':s.confirmationStatus==='confirmed'?'CONFIRMED':'FINALIZED';if(s.slot!==undefined)slot=BigInt(s.slot);}else if(await input.transport.getBlockHeight()>input.record.lastValidBlockHeight)status='EXPIRED';const result:ConfirmationRecordContract={transactionId:input.record.transactionId,signature:input.record.signature,status,observedAt:input.observedAt,...(slot!==undefined?{slot}:{}),...(error?{error}:{})};await input.ledger.recordConfirmation({attemptId:input.attemptId,signature:input.record.signature,status,observedAt:input.observedAt,...(slot!==undefined?{slot}:{}),...(error?{error}:{}),payload:{lastValidBlockHeight:input.record.lastValidBlockHeight}});return result;}
 export function createWeb3SubmissionTransport(connection:{sendRawTransaction(raw:Uint8Array,options:Record<string,unknown>):Promise<string>;getBlockHeight():Promise<number>;getSignatureStatuses(signatures:string[]):Promise<{value:Array<{confirmationStatus?:'processed'|'confirmed'|'finalized'|null;err?:unknown;slot?:number}|null>}>}):SubmissionTransport{return{sendRawTransaction(raw,options){return connection.sendRawTransaction(raw,options);},getBlockHeight(){return connection.getBlockHeight();},async getSignatureStatus(signature){const r=await connection.getSignatureStatuses([signature]);const v=r.value[0];if(!v)return null;return{...(v.confirmationStatus?{confirmationStatus:v.confirmationStatus}:{}),...(v.err!==undefined?{err:v.err}:{}),...(v.slot!==undefined?{slot:v.slot}:{})};}};}

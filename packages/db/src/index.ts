@@ -1297,6 +1297,12 @@ export interface Phase1Store {
     at: string;
     payload: Record<string, unknown>;
   }): Promise<void>;
+  /**
+   * Narrow terminal recovery only for a chunked OPEN whose economic children
+   * are all confirmed or whose missing children are durably proven no-effect.
+   * This is intentionally not a general terminal-plan resurrection primitive.
+   */
+  reconcileRecoveredChunkedOpenPlan(value:{planId:string;at:string;payload:Record<string,unknown>}):Promise<void>;
   upsertOwnedPosition(value: {
     lpforgePositionId: string;
     poolAddress: string;
@@ -3969,6 +3975,25 @@ return 'APPLIED';
         throw error;
       }
     },
+    async reconcileRecoveredChunkedOpenPlan(v){
+      await db.query("BEGIN");
+      try{
+        const current=await db.query("SELECT p.state,i.action FROM execution.transaction_plans p JOIN execution.intents i ON i.intent_id=p.intent_id WHERE p.plan_id=$1 FOR UPDATE",[v.planId]),currentRow=current.rows[0];
+        if(current.rows.length!==1||!currentRow||String(currentRow.action)!=='OPEN'||!['EXPIRED','RECONCILIATION_REQUIRED'].includes(String(currentRow.state)))throw new Error('LPFORGE_RECOVERED_CHUNKED_OPEN_PLAN_STATE_INVALID');
+        const chunks=await db.query("SELECT s.transaction_id,d.disposition FROM execution.transaction_steps s LEFT JOIN execution.open_chunk_dispositions d ON d.plan_id=s.plan_id AND d.transaction_id=s.transaction_id WHERE s.plan_id=$1 AND s.kind IN ('METEORA_OPEN','METEORA_OPEN_CHUNK') ORDER BY s.sequence FOR UPDATE OF s",[v.planId]);
+        const terminal=new Set(['CONFIRMED','PROVEN_NOT_LANDED','CONFIRMED_FAILED','FAILED_PRE_SIGN','EXPIRED_PRE_SUBMISSION']);
+        const confirmed=chunks.rows.filter(row=>String(row.disposition)==='CONFIRMED').length;
+        const unresolved=chunks.rows.filter(row=>!terminal.has(String(row.disposition))).length;
+        if(chunks.rows.length<2||confirmed<1||unresolved>0)throw new Error('LPFORGE_RECOVERED_CHUNKED_OPEN_CHAIN_PROOF_INCOMPLETE');
+        await db.query("UPDATE execution.transaction_plans SET state='RECONCILED',payload=payload||jsonb_build_object('autonomous_dispatch_completed_at',$2::text,'autonomous_dispatch',COALESCE(payload->'autonomous_dispatch','{}'::jsonb)||$3::jsonb) WHERE plan_id=$1",[v.planId,v.at,json(v.payload)]);
+        await db.query("INSERT INTO execution.plan_state_events(plan_id,prior_state,next_state,observed_at,reason_codes,payload) VALUES($1,$2,'RECONCILED',$3,$4::jsonb,$5::jsonb)",[v.planId,String(currentRow.state),v.at,json(['P6_RECOVERED_CHUNKED_OPEN_RECONCILED']),json(v.payload)]);
+        await db.query("UPDATE execution.execution_journal SET state='RECONCILED',updated_at=$2,payload=payload||jsonb_build_object('terminalPlanState','RECONCILED','terminalizedAt',$2::text) WHERE plan_id=$1 AND state IN ('PLAN_CREATED','BUILT','SIMULATED','APPROVED','SIGNING','SIGNED','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILIATION_REQUIRED','EXPIRED')",[v.planId,v.at]);
+        await db.query("COMMIT");
+      }catch(error){
+        try{await db.query("ROLLBACK");}catch{}
+        throw error;
+      }
+    },
     async upsertOwnedPosition(v) {
       await db.query("BEGIN");
       try {
@@ -5704,6 +5729,7 @@ export function createMemoryStore(): Phase1Store {
     async transitionAutonomousPlan() {},
     async resumePreSubmissionClosePlan() { return false; },
     async completeAutonomousPlan() {},
+    async reconcileRecoveredChunkedOpenPlan() {},
     async upsertOwnedPosition() {},
     async insertPositionObservation() {},
     async loadLatestPositionManagementMetrics() { return null; },

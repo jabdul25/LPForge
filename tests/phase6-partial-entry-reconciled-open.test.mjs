@@ -67,3 +67,20 @@ test('confirmed funding uses fresh post-funding simulation authority and cannot 
   assert.match(worker, /if\(submittedAny\|\|submissionStatusUnknown\|\|fundingSubmitted\)/, 'chunked opens must also preserve confirmed funding as a partial economic effect');
   assert.match(worker, /simulatedAt,\n        input\.config\.riskPermitTtlMs/);
 });
+
+test('an expired chunked OPEN can be reconciled only from its original children, never by a replacement add', () => {
+  const worker = fs.readFileSync('packages/phase6-live-worker/src/index.ts', 'utf8');
+  const store = fs.readFileSync('packages/db/src/index.ts', 'utf8');
+  assert.match(worker, /refreshTerminalOpenChunkTruth/);
+  assert.match(worker, /P6_OPEN_CHUNK_EXPIRED_NO_CHAIN_EFFECT/);
+  assert.match(worker, /reconcileRecoveredChunkedOpen/);
+  assert.match(worker, /rebroadcastExactSignedTransaction/);
+  assert.match(store, /async reconcileRecoveredChunkedOpenPlan\(v\)/);
+  const start = store.indexOf('async reconcileRecoveredChunkedOpenPlan(v)');
+  const end = store.indexOf('async upsertOwnedPosition(v)', start);
+  const method = store.slice(start, end);
+  assert.match(method, /String\(currentRow\.action\)!=='OPEN'/);
+  assert.match(method, /\['EXPIRED','RECONCILIATION_REQUIRED'\]/);
+  assert.match(method, /'CONFIRMED','PROVEN_NOT_LANDED','CONFIRMED_FAILED','FAILED_PRE_SIGN','EXPIRED_PRE_SUBMISSION'/);
+  assert.match(method, /chunks\.rows\.length<2\|\|confirmed<1\|\|unresolved>0/);
+});

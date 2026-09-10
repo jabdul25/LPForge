@@ -48,6 +48,7 @@ import {
 import {
   createWeb3SubmissionTransport,
   observeConfirmation,
+  rebroadcastExactSignedTransaction,
   submitSignedTransaction,
   type SubmissionLedger,
 } from "../../execution-submission/src/index.js";
@@ -75,6 +76,7 @@ import type {
   AutonomousPlanAction,
   LifecycleChildTransaction,
   LifecycleSettlementInput,
+  OpenChunkDisposition,
   OpenChunkDispositionRecord,
   Phase1Store,
   PositionInventoryLot,
@@ -290,6 +292,81 @@ export function assessOpenChunkConstruction(input:{planned:ReadonlyArray<{transa
   const terminal=missing.some(step=>['PROVEN_NOT_LANDED','CONFIRMED_FAILED','FAILED_PRE_SIGN','EXPIRED_PRE_SUBMISSION'].includes(String(byId.get(step.transactionId))));
   const unknown=missing.some(step=>['UNKNOWN_SUBMISSION','SUBMITTED','SIGNING','SIGNED','PENDING'].includes(String(byId.get(step.transactionId))));
   return{fullyConstructed:false,partial:terminal,reasonCodes:[terminal?'P6_OPEN_PARTIAL_CONSTRUCTION':'P6_OPEN_CHUNK_DISPOSITION_PENDING',...(unknown?['P6_OPEN_CHUNK_CHAIN_TRUTH_UNRESOLVED']:[]),...missing.map(step=>`P6_OPEN_CHUNK_NOT_CONFIRMED:${step.transactionId}`)]};
+}
+
+/**
+ * A chunked entry may be adopted as an OPEN_RECOVERED position only after the
+ * missing children have each reached an immutable no-effect terminal state.
+ * This is deliberately stricter than `partial`: a mix of an expired child and
+ * an UNKNOWN child remains reconciliation debt and may not release admission.
+ */
+export function assessTerminalPartialOpenRecovery(input:{
+  planned:ReadonlyArray<{transactionId:string;sequence:number;kind:string}>;
+  dispositions:ReadonlyArray<Pick<OpenChunkDispositionRecord,"transactionId"|"disposition">>;
+}):{eligible:boolean;reasonCodes:string[]}{
+  const economic=input.planned.filter(step=>step.kind==='METEORA_OPEN'||step.kind==='METEORA_OPEN_CHUNK');
+  const byId=new Map(input.dispositions.map(row=>[row.transactionId,row.disposition]));
+  const confirmed=economic.filter(step=>byId.get(step.transactionId)==='CONFIRMED');
+  const missing=economic.filter(step=>byId.get(step.transactionId)!=='CONFIRMED');
+  const terminal=new Set(['PROVEN_NOT_LANDED','CONFIRMED_FAILED','FAILED_PRE_SIGN','EXPIRED_PRE_SUBMISSION']);
+  const reasons:string[]=[];
+  if(economic.length<2)reasons.push('P6_OPEN_RECOVERED_NOT_CHUNKED');
+  if(confirmed.length===0)reasons.push('P6_OPEN_RECOVERED_NO_CONFIRMED_ECONOMIC_CHUNK');
+  if(missing.length===0)reasons.push('P6_OPEN_RECOVERED_CONSTRUCTION_ALREADY_COMPLETE');
+  if(missing.some(step=>!terminal.has(String(byId.get(step.transactionId)))))reasons.push('P6_OPEN_RECOVERED_CHILD_CHAIN_TRUTH_UNRESOLVED');
+  return{eligible:reasons.length===0,reasonCodes:reasons};
+}
+
+/**
+ * Rebroadcasting is only permitted for the exact already-signed wire payload.
+ * It is not a re-sign/rebuild path and therefore cannot create a second
+ * economic chunk.  Terminal confirmation always wins over retransmission.
+ */
+export function shouldRebroadcastKnownOpenChunk(input:{
+  confirmationStatus:'UNKNOWN'|'PROCESSED'|'CONFIRMED'|'FINALIZED'|'FAILED'|'EXPIRED';
+  unknownObservationCount:number;
+  rebroadcastCount:number;
+}):boolean{
+  return input.confirmationStatus==='UNKNOWN'
+    && input.unknownObservationCount>=2
+    && input.rebroadcastCount<2;
+}
+
+/** Classifies only an already-signed chunk from independently read chain truth. */
+export function classifyKnownOpenChunkSignatureTruth(input:{
+  disposition:OpenChunkDisposition;
+  signaturePresent:boolean;
+  lastValidBlockHeight?:bigint;
+  currentBlockHeight?:number;
+  statusReadSucceeded:boolean;
+  status:null|{err?:unknown;confirmationStatus?:string|null};
+}):'UNCHANGED'|'CONFIRMED'|'CONFIRMED_FAILED'|'PROVEN_NOT_LANDED'{
+  if(!input.statusReadSucceeded||!input.signaturePresent||input.lastValidBlockHeight===undefined)return'UNCHANGED';
+  if(!['PENDING','SIGNING','SIGNED','SUBMITTED','UNKNOWN_SUBMISSION'].includes(input.disposition))return'UNCHANGED';
+  if(input.status?.err)return'CONFIRMED_FAILED';
+  if(input.status?.confirmationStatus==='confirmed'||input.status?.confirmationStatus==='finalized')return'CONFIRMED';
+  if(input.status===null&&input.currentBlockHeight!==undefined&&input.currentBlockHeight>Number(input.lastValidBlockHeight))return'PROVEN_NOT_LANDED';
+  return'UNCHANGED';
+}
+
+/**
+ * The partial-entry adoption path may already have created the one wallet
+ * residual lot.  Promotion to OPEN_RECOVERED must reuse it or fail closed;
+ * it must never record the same raw balance a second time.
+ */
+export function assessTerminalPartialOpenResidualLot(input:{
+  lots:ReadonlyArray<Pick<PositionInventoryLot,'planId'|'sourceEvent'|'status'|'rawAmount'|'remainingRawAmount'>>;
+  planId:string;
+  residual:bigint;
+}):'REUSE'|'CREATE'|'CONFLICT'{
+  const existing=input.lots.filter(lot=>
+    lot.planId===input.planId&&
+    (lot.sourceEvent==='OPEN_RESIDUAL'||lot.sourceEvent==='RECOVERY_RESIDUAL')&&
+    (lot.status==='OPEN'||lot.status==='PARTIALLY_SETTLED'),
+  );
+  const matches=existing.filter(lot=>lot.rawAmount===input.residual&&lot.remainingRawAmount===input.residual);
+  if(existing.length!==matches.length||matches.length>1)return'CONFLICT';
+  return matches.length===1?'REUSE':'CREATE';
 }
 function nestedGeneratedPositionAddress(value:unknown):string|undefined{
  if(!value||typeof value!=="object")return undefined;
@@ -1108,7 +1185,7 @@ async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:Auto
       const economicChunk=step.kind==='METEORA_OPEN'||step.kind==='METEORA_OPEN_CHUNK';
       await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'SIGNING',lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:submittedAt,payload:{chunked:true}});
       const submitted=await executeMainnetCanaryOpen({authority:openAuthority,ticket:openTicket,transactionId:step.transactionId,idempotencyKey:`${input.plan.idempotencyKey}:${step.transactionId}`,requiredSignerAddresses:step.requiredSignerAddresses,backend:input.signer,auxiliaryBackends:auxiliaryPositionSignersForOpenStep(step,input.prepared.positionSigner),envelope:step.envelope,phase5RiskDecision:risk,lease:latest,ledger:ledger(input.store),transport:createWeb3SubmissionTransport(input.connection),submittedAt,beforeSubmit:async()=>{const finalSafety=await checkFreshOpenSubmissionSafety({store:input.store,plan:input.plan,config:input.config,permitExpiresAt:risk.expiresAt!});if(!finalSafety.approved)throw new Error("LPFORGE_P6_PRESUBMISSION_SAFETY_BLOCKED:"+finalSafety.reasonCodes.join(","));},onSigned:async({signerBackendId})=>{await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SIGNED',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata,signerBackendId});await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'SIGNED',lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true,signerBackendId}});},onSubmissionUnknown:async({error,signature})=>{submissionStatusUnknown=true;if(signature){lastSignature=signature;currentStep!.signature=signature;}currentStep!.submitted=true;await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'UNKNOWN_SUBMISSION',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata,error},signature);await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'UNKNOWN_SUBMISSION',...(signature?{signature}:{}),lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true,error}});}});submittedAny=true;currentStep!.signature=submitted.signature;currentStep!.submitted=true;lastSignature=submitted.signature;await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SUBMITTED',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata},submitted.signature);await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'SUBMITTED',signature:submitted.signature,lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true}});
-      let confirmed=false;
+      let confirmed=false,unknownObservationCount=0,rebroadcastCount=0;
       for(let attempt=0;attempt<input.config.confirmAttempts;attempt++){
         await new Promise(resolve=>setTimeout(resolve,input.config.confirmPollMs));
         const confirmation=await observeConfirmation({attemptId:`${step.transactionId}:attempt:1`,record:{transactionId:step.transactionId,signature:submitted.signature,submittedAt,blockhash:latest.blockhash,lastValidBlockHeight:latest.lastValidBlockHeight,attempt:1},transport:createWeb3SubmissionTransport(input.connection),ledger:ledger(input.store),observedAt:new Date().toISOString()});
@@ -1127,6 +1204,24 @@ async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:Auto
           }
           await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:confirmation.status==='FAILED'?'CONFIRMED_FAILED':'PROVEN_NOT_LANDED',signature:submitted.signature,lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true,confirmation:confirmation.status,chainLanded:confirmation.status==='FAILED'}});
           throw new Error(`LPFORGE_P6_CHUNK_CONFIRM_${confirmation.status}`);
+        }
+        if(confirmation.status==='UNKNOWN'){
+          unknownObservationCount++;
+          if(shouldRebroadcastKnownOpenChunk({confirmationStatus:confirmation.status,unknownObservationCount,rebroadcastCount})){
+            // This is intentionally the same already-signed wire payload and
+            // signature.  It cannot create another liquidity instruction; it
+            // only asks the RPC to propagate the original transaction again.
+            try{
+              await rebroadcastExactSignedTransaction({transport:createWeb3SubmissionTransport(input.connection),raw:step.envelope.serializeSigned(),signature:submitted.signature});
+              rebroadcastCount++;
+              await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'SUBMITTED',signature:submitted.signature,lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true,safeRebroadcast:true,rebroadcastCount}});
+            }catch(error){
+              // The original submission remains authoritative.  A failed
+              // rebroadcast is not evidence of absence and never authorizes a
+              // new signature or replacement liquidity transaction.
+              await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'SUBMITTED',signature:submitted.signature,lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true,safeRebroadcastFailed:true,rebroadcastCount,error:error instanceof Error?error.message:String(error)}});
+            }
+          }
         }
       }
       if(!confirmed)throw new Error('LPFORGE_P6_CHUNK_CONFIRMATION_PENDING');
@@ -2166,6 +2261,141 @@ async function unwindPartialEntry(input: {
   });
 }
 
+/**
+ * Reconciles a recovered chunked position from its original signed children.
+ * A fully confirmed construction becomes a normal OPEN; a provably missing
+ * final child becomes OPEN_RECOVERED.  Neither case rebuilds or replays a
+ * stale liquidity instruction.
+ */
+async function reconcileRecoveredChunkedOpen(input:{
+  store:Phase1Store;
+  config:LiveWorkerConfig;
+  row:Record<string,unknown>;
+  plan:AutonomousPlan;
+  dispositions:OpenChunkDispositionRecord[];
+  partial:boolean;
+}):Promise<{recovered:boolean;reasonCodes:string[]}>{
+  const positionAddress=input.plan.positionAddress;
+  if(!positionAddress)return{recovered:false,reasonCodes:['P6_OPEN_RECOVERED_POSITION_IDENTITY_MISSING']};
+  const intended=(input.row.intended_range??{}) as Record<string,unknown>;
+  const lower=Number(intended.lowerBinId),upper=Number(intended.upperBinId);
+  if(!Number.isInteger(lower)||!Number.isInteger(upper)||lower>upper)return{recovered:false,reasonCodes:['P6_OPEN_RECOVERED_RANGE_INVALID']};
+  const truth=await createMeteoraReadAdapter({rpcUrl:input.config.rpcUrl,cluster:'mainnet-beta',programId:input.config.programId,priority:'P1_RECOVERY_CRITICAL'}).getPositionV2(input.plan.poolAddress,positionAddress).catch(()=>undefined);
+  if(!truth)return{recovered:false,reasonCodes:['P6_OPEN_RECOVERED_POSITION_TRUTH_UNAVAILABLE']};
+  if(truth.owner!==input.plan.ownerAddress||truth.pool!==input.plan.poolAddress)return{recovered:false,reasonCodes:['P6_OPEN_RECOVERED_POSITION_IDENTITY_MISMATCH']};
+  if(truth.lowerBinId!==lower||truth.upperBinId!==upper)return{recovered:false,reasonCodes:['P6_OPEN_RECOVERED_RANGE_MISMATCH']};
+  const walletTruth=(input.row.wallet_truth??{}) as Record<string,unknown>,measurement=(walletTruth.entryFundingMeasurement??{}) as Record<string,unknown>;
+  let pairedTokenRawBeforeFunding:bigint,pairedTokenReceivedRaw:bigint,capital:bigint;
+  try{
+    pairedTokenRawBeforeFunding=BigInt(String(measurement.pairedTokenRawBeforeFunding??''));
+    pairedTokenReceivedRaw=BigInt(String(input.row.paired_token_amount??''));
+    capital=BigInt(String(input.row.intended_capital_lamports??''));
+  }catch{return{recovered:false,reasonCodes:['P6_OPEN_RECOVERED_FUNDING_PROVENANCE_INVALID']};}
+  const tokenMint=String(input.row.token_mint??'');
+  if(!tokenMint||pairedTokenReceivedRaw<=0n||capital<=0n)return{recovered:false,reasonCodes:['P6_OPEN_RECOVERED_FUNDING_PROVENANCE_INVALID']};
+  const connection=createGovernedConnection({rpcUrl:input.config.rpcUrl,priority:'P1_RECOVERY_CRITICAL'}),currentTokenBalance=await readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:tokenMint}),residual=deriveRecoveredOpenResidualInventory({pairedTokenRawBeforeFunding,pairedTokenRawBeforeClose:currentTokenBalance,pairedTokenRawAfterPriorUnwind:currentTokenBalance,pairedTokenReceivedRaw});
+  if(residual===undefined)return{recovered:false,reasonCodes:['P6_OPEN_RECOVERED_WALLET_ATTRIBUTION_UNPROVEN']};
+  const fundingSignature=String(input.row.funding_signature??'');
+  if(!fundingSignature)return{recovered:false,reasonCodes:['P6_OPEN_RECOVERED_FUNDING_SIGNATURE_MISSING']};
+  const confirmed=input.dispositions.filter(row=>row.disposition==='CONFIRMED'&&row.signature);
+  if(confirmed.length===0)return{recovered:false,reasonCodes:['P6_OPEN_RECOVERED_CONFIRMED_CHUNK_PROOF_MISSING']};
+  // `recoverUnfinishedAutonomousPlans` may already have recorded the exact
+  // wallet residual while the position was marked PARTIAL_ENTRY.  Never add a
+  // second lot for the same funded balance when we promote that position to
+  // OPEN_RECOVERED: two lots would double-count the same wallet inventory at
+  // its eventual settlement.
+  const residualLotAction=assessTerminalPartialOpenResidualLot({
+    lots:await input.store.loadPositionInventoryLots(positionAddress,tokenMint),
+    planId:input.plan.planId,
+    residual,
+  });
+  if(residualLotAction==='CONFLICT')
+    return{recovered:false,reasonCodes:['P6_RECOVERED_CHUNKED_OPEN_RESIDUAL_LOT_CONFLICT']};
+  if(residualLotAction==='CREATE'&&residual>0n){
+    const supply=await connection.getTokenSupply(new PublicKey(tokenMint),'confirmed');
+    await input.store.createPositionInventoryLot({
+      lotId:`${input.plan.planId}:recovered-open-residual:${tokenMint}`,
+      createdEventId:`${input.plan.planId}:recovered-open-residual-created`,
+      positionAddress,
+      planId:input.plan.planId,
+      ownerAddress:input.plan.ownerAddress,
+      poolAddress:input.plan.poolAddress,
+      tokenMint,
+      tokenSide:'X',
+      sourceEvent:input.partial?'RECOVERY_RESIDUAL':'OPEN_RESIDUAL',
+      rawAmount:residual,
+      decimals:supply.value.decimals,
+      acquiredAt:new Date().toISOString(),
+      transactionSignature:fundingSignature,
+      payload:{source:input.partial?'P6_OPEN_RECOVERED_TERMINAL_MISSING_CHUNK':'P6_RECOVERED_CHUNKED_OPEN_CONFIRMED',fundingSignature,pairedTokenRawBeforeFunding:pairedTokenRawBeforeFunding.toString(),pairedTokenReceivedRaw:pairedTokenReceivedRaw.toString()},
+    });
+  }
+  const funding:EntryFundingMeasurement={tokenMint,pairedTokenReceivedRaw,pairedTokenRawBeforeFunding,pairedTokenRawBeforeOpen:BigInt(String(measurement.pairedTokenRawBeforeOpen??pairedTokenRawBeforeFunding)),fundingSignature};
+  const open=openPlan(input.plan);
+  const observedAt=new Date().toISOString(),intent=(input.plan.planPayload.intent??{}) as Record<string,unknown>,entryFunding=(input.plan.intentPayload.entryFunding??{}) as Record<string,unknown>;
+  const entryBasis=await persistReceiptBackedEntryBasis({store:input.store,connection,plan:open,positionAddress,requestedLiquidityCapitalLamports:capital,funding,confirmedSteps:confirmed.map(step=>({transactionId:step.transactionId,kind:step.kind,signature:step.signature!})),observedAt});
+  const contribution=entryBasis.managedEconomicContributionLamports??capital;
+  const recovery=input.partial?'P6_OPEN_RECOVERED_TERMINAL_MISSING_CHUNK':'P6_RECOVERED_CHUNKED_OPEN_CONFIRMED';
+  await input.store.upsertOwnedPosition({lpforgePositionId:`position-${positionAddress}`,poolAddress:input.plan.poolAddress,positionAddress,ownerAddress:input.plan.ownerAddress,strategy:String(intent.strategy??'SPOT'),orientation:String(entryFunding.orientation??'ONE_SIDED_Y'),lowerBinId:truth.lowerBinId,upperBinId:truth.upperBinId,activeBinAtEntry:Number(intent.activeBinId??truth.lowerBinId),initialCapitalLamports:capital,entryPlanId:input.plan.planId,entrySignature:confirmed.at(-1)!.signature!,enteredAt:new Date(String(input.row.funded_at)).toISOString(),lifecycleState:'OPEN',lastPlanId:input.plan.planId,reconciliationStatus:'MATCH',payload:{thesisId:input.plan.thesisId,entryFunding,recovery, ...(input.partial?{partialEntryRecovered:true}:{}),actualEconomicCapitalLamports:contribution.toString(),residualTokenMint:tokenMint,residualTokenRaw:residual.toString()}});
+  await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:open-contribution`,positionAddress,planId:input.plan.planId,flowType:'OPEN_CONTRIBUTION',observedAt,lamports:contribution,payload:{source:entryBasis.basisState==='PROVEN'?'RECEIPT_BACKED_ENTRY_BASIS_V1':'ENTRY_BASIS_INCOMPLETE_FALLBACK',entryBasisId:`${input.plan.planId}:entry-basis:v1`,recovery}});
+  const account=await connection.getAccountInfo(new PublicKey(positionAddress),'confirmed');
+  if(account?.lamports)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:rent-lock`,positionAddress,planId:input.plan.planId,flowType:'RENT_LOCK',observedAt,lamports:BigInt(account.lamports),payload:{source:'POSITION_ACCOUNT_INFO',recovery:'P6_OPEN_RECOVERED_TERMINAL_MISSING_CHUNK'}});
+  for(const step of confirmed){
+    const fee=await confirmedTransactionFeeLamports(connection,step.signature!);
+    if(fee!==undefined)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:tx-cost:${step.transactionId}`,positionAddress,planId:input.plan.planId,flowType:'TX_COST',observedAt,lamports:fee,payload:{signature:step.signature,transactionId:step.transactionId,source:'CHAIN_RECEIPT_META',recovery:'P6_OPEN_RECOVERED_TERMINAL_MISSING_CHUNK'}});
+  }
+  const fundingCost=(await input.store.loadPlanCashflows(input.plan.planId)).find(flow=>flow.flowType==='FUNDING_TX_COST');
+  if(fundingCost?.lamports!==undefined)await input.store.insertPositionCashflow({cashflowId:`${input.plan.planId}:tx-cost:funding`,positionAddress,planId:input.plan.planId,flowType:'TX_COST',observedAt,lamports:fundingCost.lamports,payload:{source:'ENTRY_FUNDING_RECEIPT',...(fundingCost.transactionSignature?{signature:fundingCost.transactionSignature}:{}),recovery:'P6_OPEN_RECOVERED_TERMINAL_MISSING_CHUNK'}});
+  await input.store.insertExecutionReconciliation({reconciliationId:`${input.plan.planId}:recovered-chunked-open`,planId:input.plan.planId,observedAt,status:'MATCH',expected:{owner:input.plan.ownerAddress,pool:input.plan.poolAddress,lowerBinId:lower,upperBinId:upper,allEconomicChunksConfirmed:!input.partial},actual:{positionAddress,residualTokenMint:tokenMint,residualTokenRaw:residual.toString(),confirmedEconomicChunks:confirmed.map(step=>step.transactionId)},discrepancies:[],payload:{recovery}});
+  await input.store.reconcileRecoveredChunkedOpenPlan({planId:input.plan.planId,at:observedAt,payload:{recovery,positionAddress,residualTokenMint:tokenMint,residualTokenRaw:residual.toString()}});
+  if(input.partial)await input.store.upsertPartialEntryRecovery({planId:input.plan.planId,poolAddress:input.plan.poolAddress,ownerAddress:input.plan.ownerAddress,tokenMint,fundingTransactionId:String(input.row.funding_transaction_id),fundingSignature,fundedAt:new Date(String(input.row.funded_at)).toISOString(),pairedTokenAmount:String(input.row.paired_token_amount),intendedCapitalLamports:capital,intendedRange:intended,state:'OPEN_RECOVERED',walletTruth:{...walletTruth,refreshRequired:false,recoveredPositionAddress:positionAddress,recoveredResidualRaw:residual.toString(),recoveredAt:observedAt},payload:{partialEntry:true,reasonCodes:[recovery]},updatedAt:observedAt});
+  else await input.store.supersedePartialEntryRecoveryIfSuccessfulOpen({planId:input.plan.planId,positionAddress,ownerAddress:input.plan.ownerAddress,poolAddress:input.plan.poolAddress,at:observedAt});
+  return{recovered:true,reasonCodes:[recovery]};
+}
+
+/**
+ * Parent OPEN plans may already be terminal before the recurring
+ * partial-entry queue gets a chance to reconcile their final child.  Query
+ * only the original signed child and turn it into no-effect evidence only
+ * after the RPC reports no status beyond its durable blockhash lifetime.
+ * This path never creates, signs, or submits a liquidity transaction.
+ */
+async function refreshTerminalOpenChunkTruth(input:{
+  store:Phase1Store;
+  config:LiveWorkerConfig;
+  planId:string;
+  dispositions:OpenChunkDispositionRecord[];
+}):Promise<OpenChunkDispositionRecord[]>{
+  const candidates=input.dispositions.filter(row=>
+    ['PENDING','SIGNING','SIGNED','SUBMITTED','UNKNOWN_SUBMISSION'].includes(row.disposition)&&
+    Boolean(row.signature)&&
+    row.lastValidBlockHeight!==undefined,
+  );
+  if(candidates.length===0)return input.dispositions;
+  const connection=createGovernedConnection({rpcUrl:input.config.rpcUrl,priority:'P1_RECOVERY_CRITICAL'});
+  let currentBlockHeight:number;
+  try{currentBlockHeight=await connection.getBlockHeight('confirmed');}catch{return input.dispositions;}
+  for(const candidate of candidates){
+    let status:Awaited<ReturnType<typeof connection.getSignatureStatus>>['value'];
+    try{status=(await connection.getSignatureStatus(candidate.signature!,{searchTransactionHistory:true})).value;}catch{continue;}
+    const observedAt=new Date().toISOString();
+    const classification=classifyKnownOpenChunkSignatureTruth({disposition:candidate.disposition,signaturePresent:true,...(candidate.lastValidBlockHeight===undefined?{}:{lastValidBlockHeight:candidate.lastValidBlockHeight}),currentBlockHeight,statusReadSucceeded:true,status});
+    if(classification==='CONFIRMED_FAILED'){
+      await input.store.upsertOpenChunkDisposition({...candidate,disposition:'CONFIRMED_FAILED',observedAt,payload:{...candidate.payload,recovery:'P6_OPEN_CHUNK_CONFIRMED_FAILED',chainError:status?.err}});
+      continue;
+    }
+    if(classification==='CONFIRMED'){
+      await input.store.upsertOpenChunkDisposition({...candidate,disposition:'CONFIRMED',observedAt,payload:{...candidate.payload,recovery:'P6_OPEN_CHUNK_CONFIRMED',confirmationStatus:status?.confirmationStatus}});
+      continue;
+    }
+    if(classification==='PROVEN_NOT_LANDED'){
+      await input.store.markSubmissionExpired(candidate.signature!,observedAt,'P6_OPEN_CHUNK_EXPIRED_NO_CHAIN_EFFECT');
+      await input.store.upsertOpenChunkDisposition({...candidate,disposition:'PROVEN_NOT_LANDED',observedAt,payload:{...candidate.payload,recovery:'P6_OPEN_CHUNK_EXPIRED_NO_CHAIN_EFFECT',currentBlockHeight}});
+    }
+  }
+  return input.store.loadOpenChunkDispositions(input.planId);
+}
+
 /** Resumes a funded entry without ever repeating the already-confirmed Jupiter swap. */
 export async function recoverPartialEntryFunding(input: {
   store: Phase1Store;
@@ -2244,8 +2474,19 @@ export async function recoverPartialEntryFunding(input: {
       continue;
     }
     if(plan?.action==='OPEN'&&construction&&!construction.fullyConstructed){
-      await input.store.upsertPartialEntryRecovery({planId,poolAddress:String(row.pool_address),ownerAddress:String(row.owner_address),tokenMint:String(row.token_mint),fundingTransactionId:String(row.funding_transaction_id),fundingSignature:String(row.funding_signature),fundedAt:new Date(String(row.funded_at)).toISOString(),pairedTokenAmount:String(row.paired_token_amount),intendedCapitalLamports:BigInt(String(row.intended_capital_lamports)),intendedRange:(row.intended_range??{}) as Record<string,unknown>,state:'RECONCILIATION_REQUIRED',walletTruth:{...(row.wallet_truth??{}),refreshRequired:true},payload:{partialEntry:true,reasonCodes:construction.reasonCodes},updatedAt:new Date().toISOString()});
-      results.push({planId,action:'HOLD',reasonCodes:['P6_PARTIAL_ENTRY_REQUIRES_POSITION_RECOVERY',...construction.reasonCodes]});
+      const dispositions=await refreshTerminalOpenChunkTruth({store:input.store,config:input.config,planId,dispositions:await input.store.loadOpenChunkDispositions(planId)}),refreshedConstruction=assessOpenChunkConstruction({planned:plannedChunks,dispositions}),terminal=assessTerminalPartialOpenRecovery({planned:plannedChunks,dispositions});
+      if(refreshedConstruction.fullyConstructed){
+        const recovered=await reconcileRecoveredChunkedOpen({store:input.store,config:input.config,row,plan,dispositions,partial:false});
+        results.push({planId,action:'HOLD',reasonCodes:recovered.reasonCodes});
+        if(recovered.recovered)continue;
+      }
+      if(terminal.eligible){
+        const recovered=await reconcileRecoveredChunkedOpen({store:input.store,config:input.config,row,plan,dispositions,partial:true});
+        results.push({planId,action:'HOLD',reasonCodes:recovered.reasonCodes});
+        if(recovered.recovered)continue;
+      }
+      await input.store.upsertPartialEntryRecovery({planId,poolAddress:String(row.pool_address),ownerAddress:String(row.owner_address),tokenMint:String(row.token_mint),fundingTransactionId:String(row.funding_transaction_id),fundingSignature:String(row.funding_signature),fundedAt:new Date(String(row.funded_at)).toISOString(),pairedTokenAmount:String(row.paired_token_amount),intendedCapitalLamports:BigInt(String(row.intended_capital_lamports)),intendedRange:(row.intended_range??{}) as Record<string,unknown>,state:'RECONCILIATION_REQUIRED',walletTruth:{...(row.wallet_truth??{}),refreshRequired:true},payload:{partialEntry:true,reasonCodes:refreshedConstruction.reasonCodes},updatedAt:new Date().toISOString()});
+      results.push({planId,action:'HOLD',reasonCodes:['P6_PARTIAL_ENTRY_REQUIRES_POSITION_RECOVERY',...terminal.reasonCodes,...refreshedConstruction.reasonCodes]});
       continue;
     }
     if (state === "UNWIND_SUBMITTED") {
@@ -6345,6 +6586,23 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         reasonCodes: ["P6_RECOVERY_SIGNATURE_STATUS_READ_UNKNOWN"],
       });
       continue;
+    }
+    // A parent OPEN can have a real PositionV2 from an earlier confirmed
+    // chunk while its *last* liquidity child has expired without landing.
+    // Reconcile that child independently of parent position existence.  The
+    // position is not evidence that this exact signature had an effect.
+    if(
+      plan.action==='OPEN'&&
+      confirmationStatus==='EXPIRED'&&
+      !signatureStatusReadUnknown&&
+      effectiveRecoverySignature&&
+      journal.transactionId
+    ){
+      const step=plan.steps.find(candidate=>candidate.transactionId===journal.transactionId);
+      if(step&&(step.kind==='METEORA_OPEN'||step.kind==='METEORA_OPEN_CHUNK')){
+        await input.store.markSubmissionExpired(effectiveRecoverySignature,input.now,'P6_OPEN_CHUNK_EXPIRED_NO_CHAIN_EFFECT');
+        await input.store.upsertOpenChunkDisposition({planId:plan.planId,transactionId:step.transactionId,sequence:step.sequence,kind:step.kind,disposition:'PROVEN_NOT_LANDED',signature:effectiveRecoverySignature,...(journal.lastValidBlockHeight===undefined?{}:{lastValidBlockHeight:BigInt(journal.lastValidBlockHeight)}),observedAt:input.now,payload:{recovery:'P6_OPEN_CHUNK_EXPIRED_NO_CHAIN_EFFECT',confirmationStatus:'EXPIRED'}});
+      }
     }
     // A verified on-chain OPEN position must be adopted into the owned
     // registry even when its plan's post-submit bookkeeping died. Adoption

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {assessLiveExit,derivePositionEconomics,parseLiveExitGovernorPolicy} from '../.build/packages/live-exit-governor/src/index.js';
-import {assessOpenChunkConstruction} from '../.build/packages/phase6-live-worker/src/index.js';
+import {assessOpenChunkConstruction,assessTerminalPartialOpenRecovery,assessTerminalPartialOpenResidualLot,classifyKnownOpenChunkSignatureTruth,shouldRebroadcastKnownOpenChunk} from '../.build/packages/phase6-live-worker/src/index.js';
 
 const sol='So11111111111111111111111111111111111111112';
 const policy=parseLiveExitGovernorPolicy({schemaVersion:1,enabled:true,hardStopLossFraction:.12,emergencyStopLossFraction:.20,takeProfitFraction:0,profitProtection:{enabled:true,triggerFraction:.08,maxGivebackFraction:.05,minRetainedProfitFraction:.02},profitRetention:{enabled:true,policyVersion:'profit-retention-ts5-oor-p4-v1',ts5:{enabled:true,mfeActivationFraction:.04,givebackFraction:.02,watchSeconds:300,lowerRangeFraction:1/3,model:'EXPIRE_REARM',previousUsableMaxAgeSeconds:300},oorP4:{enabled:true,mfeActivationFraction:.02,requiresBelowMin:true,requiresTokenExposure:true}},closeOnThesisInvalidated:true,closeOnNonPositiveForwardEv:true,reduceOnRiskBlock:true,reduceFraction:.5,maxHoldMinutes:0,maxHoldRequiresNonPositiveForwardEv:true,toxicityCloseThreshold:.8,toxicityEmergencyThreshold:.95});
@@ -24,6 +24,38 @@ test('a finalized failed OPEN child is landed terminal evidence, never proven-no
   const planned=[{transactionId:'chunk-1',sequence:1,kind:'METEORA_OPEN'},{transactionId:'chunk-2',sequence:2,kind:'METEORA_OPEN_CHUNK'}];
   const result=assessOpenChunkConstruction({planned,dispositions:[{transactionId:'chunk-1',disposition:'CONFIRMED'},{transactionId:'chunk-2',disposition:'CONFIRMED_FAILED'}]});
   assert.equal(result.fullyConstructed,false);assert.equal(result.partial,true);assert.ok(result.reasonCodes.includes('P6_OPEN_PARTIAL_CONSTRUCTION'));
+});
+
+test('only fully terminal missing children may become OPEN_RECOVERED',()=>{
+  const planned=[{transactionId:'chunk-1',sequence:1,kind:'METEORA_OPEN'},{transactionId:'chunk-2',sequence:2,kind:'METEORA_OPEN_CHUNK'}];
+  const recovered=assessTerminalPartialOpenRecovery({planned,dispositions:[{transactionId:'chunk-1',disposition:'CONFIRMED'},{transactionId:'chunk-2',disposition:'PROVEN_NOT_LANDED'}]});
+  assert.equal(recovered.eligible,true);
+  const unknown=assessTerminalPartialOpenRecovery({planned,dispositions:[{transactionId:'chunk-1',disposition:'CONFIRMED'},{transactionId:'chunk-2',disposition:'UNKNOWN_SUBMISSION'}]});
+  assert.equal(unknown.eligible,false);assert.ok(unknown.reasonCodes.includes('P6_OPEN_RECOVERED_CHILD_CHAIN_TRUTH_UNRESOLVED'));
+});
+
+test('only the exact signed UNKNOWN chunk is eligible for a bounded rebroadcast',()=>{
+  assert.equal(shouldRebroadcastKnownOpenChunk({confirmationStatus:'UNKNOWN',unknownObservationCount:1,rebroadcastCount:0}),false);
+  assert.equal(shouldRebroadcastKnownOpenChunk({confirmationStatus:'UNKNOWN',unknownObservationCount:2,rebroadcastCount:0}),true);
+  assert.equal(shouldRebroadcastKnownOpenChunk({confirmationStatus:'UNKNOWN',unknownObservationCount:3,rebroadcastCount:2}),false);
+  for(const confirmationStatus of ['PROCESSED','CONFIRMED','FINALIZED','FAILED','EXPIRED'])assert.equal(shouldRebroadcastKnownOpenChunk({confirmationStatus,unknownObservationCount:9,rebroadcastCount:0}),false);
+});
+
+test('an expired signed child becomes no-effect only after an exact status read past its durable blockhash lifetime',()=>{
+  const base={disposition:'UNKNOWN_SUBMISSION',signaturePresent:true,lastValidBlockHeight:100n,statusReadSucceeded:true,status:null};
+  assert.equal(classifyKnownOpenChunkSignatureTruth({...base,currentBlockHeight:100}),'UNCHANGED');
+  assert.equal(classifyKnownOpenChunkSignatureTruth({...base,currentBlockHeight:101}),'PROVEN_NOT_LANDED');
+  assert.equal(classifyKnownOpenChunkSignatureTruth({...base,currentBlockHeight:101,statusReadSucceeded:false}),'UNCHANGED');
+  assert.equal(classifyKnownOpenChunkSignatureTruth({...base,currentBlockHeight:101,status:{confirmationStatus:'confirmed'}}),'CONFIRMED');
+  assert.equal(classifyKnownOpenChunkSignatureTruth({...base,currentBlockHeight:101,status:{err:'program failure'}}),'CONFIRMED_FAILED');
+});
+
+test('terminal partial recovery reuses one exact residual lot and fails closed on duplicate attribution',()=>{
+  const one=[{planId:'plan',sourceEvent:'OPEN_RESIDUAL',status:'OPEN',rawAmount:17n,remainingRawAmount:17n}];
+  assert.equal(assessTerminalPartialOpenResidualLot({lots:one,planId:'plan',residual:17n}),'REUSE');
+  assert.equal(assessTerminalPartialOpenResidualLot({lots:[],planId:'plan',residual:17n}),'CREATE');
+  assert.equal(assessTerminalPartialOpenResidualLot({lots:[...one,{...one[0],sourceEvent:'RECOVERY_RESIDUAL'}],planId:'plan',residual:17n}),'CONFLICT');
+  assert.equal(assessTerminalPartialOpenResidualLot({lots:[{...one[0],rawAmount:18n}],planId:'plan',residual:17n}),'CONFLICT');
 });
 
 test('complete managed NAV includes attributed wallet inventory and prevents the incident-shaped false emergency stop',()=>{
