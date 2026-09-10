@@ -74,4 +74,9 @@ test('telegram operator uses the bounded DB summary reader for /positions',async
   assert.match(source,/await persist\('ACCEPTED','Command accepted\.'/);
   assert.match(db,/telegram_operator_commands\.status='ACCEPTED' AND EXCLUDED\.status IN \('ACCEPTED','COMPLETED','FAILED'\)/);
   assert.match(db,/FROM operations\.telegram_operator_commands WHERE status<>'ACCEPTED'/);
+  // The summary projection reads persisted receipt/control-PnL diagnostics from
+  // the latest observation. Keep that JSON column in the LATERAL projection:
+  // otherwise PostgreSQL rejects the presentation-only /positions query.
+  assert.match(db,/SELECT observed_at,active_bin_id,range_state,stale_data,payload\s+FROM execution\.position_observations/);
+  assert.match(db,/obs\.payload->'receiptLpMtm'/);
 });

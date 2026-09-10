@@ -5025,7 +5025,7 @@ return 'APPLIED';
           (obs.payload->'liveControlPnl'->>'reportedReturnDeltaFraction')::double precision AS live_control_reported_delta_fraction
         FROM execution.owned_positions p
         LEFT JOIN LATERAL (
-          SELECT observed_at,active_bin_id,range_state,stale_data
+          SELECT observed_at,active_bin_id,range_state,stale_data,payload
           FROM execution.position_observations
           WHERE lpforge_position_id=p.lpforge_position_id
           ORDER BY observed_at DESC
