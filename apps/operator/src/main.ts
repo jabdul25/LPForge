@@ -1029,6 +1029,16 @@ async function persistResult(
   if(globalCycleId)await store.insertProductionGlobalCandidate(productionGlobalCandidateFromOperationalResult(globalCycleId,r));
   await store.recordPostEvidenceEvaluationOutcome({poolAddress:r.poolAddress,observedAt:r.observedAt,phase3Status:r.phase3Status,reasonCodes:r.reasonCodes});
 }
+/** Optional only for a P7 global-selection child. An invalid supplied value is
+ * a configuration fault, never permission to use unbounded nested retries. */
+export function parseP7GlobalDeadlineAt(value = process.env.LPFORGE_P7_GLOBAL_DEADLINE_AT_MS): number | undefined {
+  if (value === undefined || value.trim() === '') return undefined;
+  const deadlineAt = Number(value);
+  if (!Number.isSafeInteger(deadlineAt) || deadlineAt <= 0)
+    throw new Error('LPFORGE_P7_GLOBAL_DEADLINE_INVALID');
+  return deadlineAt;
+}
+
 async function liveOnce() {
   const cfg = loadPhase1Config();
   if (cfg.dataMode !== "LIVE_READ_ONLY")
@@ -1079,11 +1089,13 @@ async function liveOnce() {
       adapter.getPool(cfg.smokePoolAddress),
       adapter.getBinsAroundActive(cfg.smokePoolAddress, evidenceWidth.requiredEvidenceRadius),
     ]);
+    const p7GlobalDeadlineAt = parseP7GlobalDeadlineAt();
     const api = createMeteoraDataApi({
       baseUrl: cfg.meteoraDataApiUrl,
       maxRps: cfg.dataApiMaxRps,
       timeoutMs: cfg.httpTimeoutMs,
       priority: 'P1_PRODUCTION_DECISION',
+      ...(p7GlobalDeadlineAt === undefined ? {} : { deadlineAt: p7GlobalDeadlineAt }),
     });
     // The observation lane is intentionally ahead of the expensive discovery
     // and event-path pipeline.  A stalled/blocked action or evidence path may
