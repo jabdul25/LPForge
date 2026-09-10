@@ -52,11 +52,14 @@ hard-stop close creation without blocking a different position.
 
 ## Release integrity and runtime policy
 
-The immutable release manifest now hashes the live exit-governor policy as
-well as the execution policy. Installation validates and atomically promotes
-the release-bound exit policy to the existing central policy mount before
-runtime identity enforcement. The release itself contains no secret or runtime
-configuration file.
+The immutable release manifest now hashes all six canonical runtime policy
+templates: execution, discovery, autonomous entry, live management, OOR, and
+the exit governor. Installation stages and schema-validates the complete set
+before promoting it to the existing central policy mount; runtime identity
+then verifies every mounted hash. The non-TS/P4 templates are carried forward
+unchanged—the complete-set promotion closes the pre-existing release-alignment
+gap rather than changing their parameters. The release itself contains no
+secret or runtime configuration file.
 
 ## Historical implementation regression
 

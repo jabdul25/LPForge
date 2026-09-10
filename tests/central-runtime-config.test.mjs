@@ -91,11 +91,12 @@ test('release integrity rejects release-local runtime environments', () => {
   assert.match(text, /LPFORGE_RUNTIME_CONFIG_ENFORCED/);
 });
 
-test('deployment promotes only a validated template to the central authority and restarts do not promote', () => {
+test('deployment promotes every validated canonical policy template to the central authority and restarts do not promote', () => {
   const installer=readFileSync('scripts/install-production-release.sh','utf8');
   const launcher=readFileSync('scripts/start-lpforge-service.sh','utf8');
   assert.match(installer,/LPFORGE_RUNTIME_POLICY_TEMPLATE_HASH_MISMATCH/);
-  assert.match(installer,/mv -f "\$policy_stage" "\$runtime_policy"/);
+  assert.match(installer,/runtime_policy_files/);
+  assert.match(installer,/mv -f "\$policy_stage_dir\/\$policy_name" "\$lpforge_home\/policy\/\$policy_name"/);
   assert.doesNotMatch(launcher,/cp .*live-execution-policy/);
   assert.doesNotMatch(launcher,/mv .*live-execution-policy/);
 });
