@@ -86,3 +86,11 @@ test('an expired chunked OPEN can be reconciled only from its original children,
   assert.match(method, /updated_at=\$2::timestamptz/);
   assert.match(method, /chunks\.rows\.length<2\|\|confirmed<1\|\|unresolved>0/);
 });
+
+test('a receipt-proven recovered OPEN promotes only its matching nonterminal lifecycle and clears its active partial marker', () => {
+  const store = fs.readFileSync('packages/db/src/index.ts', 'utf8');
+  assert.match(store, /status='RECONCILIATION_REQUIRED' AND EXCLUDED\.status='OPEN' THEN 'OPEN'/);
+  assert.match(store, /status NOT IN \('CLOSED','SOL_SETTLED'\)/);
+  assert.match(store, /EXCLUDED\.state IN \('OPEN_RECOVERED','SUPERSEDED_BY_SUCCESSFUL_ENTRY','RESOLVED'\)/);
+  assert.match(store, /payload-'partialEntry'/);
+});
