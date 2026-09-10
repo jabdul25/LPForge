@@ -38,6 +38,12 @@ test('an unrelated partial-entry recovery exception cannot strand an independent
   assert.match(src,/dispatchOne\(\{protectiveOnly:true\}\)/);
 });
 
+test('an unsigned partial unwind retries a fresh quote rather than becoming a permanent hold',()=>{
+  const src=fs.readFileSync(new URL('../packages/phase6-live-worker/src/index.ts',import.meta.url),'utf8');
+  assert.match(src,/state !== "UNWIND_REQUIRED"/);
+  assert.match(src,/UNWIND_SUBMITTED remains above and is never resent/);
+});
+
 test('P6 lifecycle persistence migration adds ownership, observations, partial entry recovery, and state events',()=>{
   const sql=fs.readFileSync(new URL('../packages/db/migrations/M0029_live_position_lifecycle.sql',import.meta.url),'utf8');
   for(const table of ['plan_state_events','owned_positions','position_observations','partial_entry_recovery'])assert.match(sql,new RegExp(`execution\\.${table}`));
