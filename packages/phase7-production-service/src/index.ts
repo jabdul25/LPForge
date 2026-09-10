@@ -5,7 +5,7 @@ import {readFileSync,readdirSync} from 'node:fs';
 import path from 'node:path';
 import {PublicKey} from '@solana/web3.js';
 import {loadDeploymentPolicyFile,type MainnetCanaryDeploymentPolicy} from '../../deployment-policy/src/index.js';
-import {createMeteoraDataApi} from '../../data-api/src/index.js';
+import {classifyDataApiFailure,createMeteoraDataApi} from '../../data-api/src/index.js';
 import {resolveLiveExecutionPolicyPath,type Phase1Config} from '../../config/src/index.js';
 import {isPhase3ReadyConsumptionPending,isPostEvidenceEvaluationEligible,type Phase1Store} from '../../db/src/index.js';
 import {createGovernedConnection,createMeteoraReadAdapter,createSolanaRpcClient} from '../../meteora/src/index.js';
@@ -23,6 +23,8 @@ import {governPhase7Portfolio} from '../../phase7-portfolio-governor/src/index.j
 import {GLOBAL_POOL_SELECTION_POLICY_V1,POOL_REENTRY_CONTEXT_POLICY_V1,classifyProductionPoolCandidate,deriveProductionPoolHistory,fairProductionPoolOrder,selectProductionGlobalWinner,type PoolCandidate,type SettledPoolOutcome} from '../../production-global-selection/src/index.js';
 
 export interface Phase7OperatorProbe {exitCode:number;eventDecodeWarnings:number;transactionsScanned:number;decodedSwapEvents:number;operationalCycleComplete:boolean;outputBytes:number;poolAddresses:string[];}
+export type ProductionProbeFailureClass='TRANSIENT_RPC'|'TRANSIENT_DATA_API'|'RPC_BUDGET_SHED'|'CHILD_TIMEOUT'|'DATABASE_FAILURE'|'SCHEMA_OR_PROTOCOL_FAILURE'|'CONFIGURATION_FAILURE'|'UNKNOWN';
+export interface ProductionProbeAttempt {poolAddress:string;attemptNumber:number;startedAt:string;completedAt:string;elapsedMs:number;result:'SUCCESS'|'FAILED'|'SKIPPED_DEADLINE';failureClass?:ProductionProbeFailureClass;failureBoundary?:string;operation?:string;retryable:boolean;retryDelayMs?:number;remainingGlobalDeadlineMs:number;}
 export interface Phase7ProductionOnceResult {runtimeId:string;instanceId:string;cycleKey:string;observedAt:string;operator?:Phase7OperatorProbe;operatorFailure?:true;health?:Phase7HealthAssessment;drift?:Phase7DriftAssessment;control?:ReturnType<typeof buildPhase7LiveControlDecision>;runtime:Awaited<ReturnType<typeof runPhase7RecoveryRuntimeTick>>;evidence?:Awaited<ReturnType<typeof buildPhase7RuntimeEvidence>>;globalSelection?:{globalCycleId:string;outcome:string;winnerPoolAddress?:string;eligiblePoolCount:number;evaluatedPoolCount:number;concurrency:number};directSigner:false;directTransactionSend:false;mainnetTransactionSent:false;}
 export interface ApprovedReleaseIdentity {sourceCommit:string;policyHash:string;migrationCount:number;migrationHead:string;buildIdentity:string;}
 export interface ControlledCanaryWatchAuthorization {entryEvaluationId:string;thesisId:string;poolAddress:string;observedAt:string;expiresAt:string;confidence:number;reasonCodes:string[];payload:Record<string,unknown>;}
@@ -49,6 +51,7 @@ export function loadProducerPlanProvenanceSecret(env:NodeJS.ProcessEnv):string|u
 export const P7_CONTROLLED_CANARY_CLAIM_FRESHNESS_BUDGET_MS=30_000;
 /** The established P7 decision freshness boundary; global selection must fit it. */
 export const P7_GLOBAL_SELECTION_CYCLE_DEADLINE_MS=120_000;
+export const P7_GLOBAL_SELECTION_RETRY_MIN_REMAINING_MS=30_000;
 export function phase7DecisionHealthPoolAddress(input:{smokePoolAddress:string;priorControlPayload?:Record<string,unknown>}):string{
   const prior=String(input.priorControlPayload?.decisionHealthPoolAddress??'').trim();
   return prior||input.smokePoolAddress;
@@ -160,7 +163,7 @@ async function assessLivePortfolioAuthority(input:{store:Phase1Store;cfg:Phase1C
       input.store.loadOwnerPositionInventoryLots(owner),
     ]);
     const adapter=createMeteoraReadAdapter({rpcUrl:input.cfg.solanaRpcHttpUrl,cluster:input.cfg.cluster,programId:input.cfg.programId,expectedSdkVersion:input.cfg.expectedSdkVersion,rpcTimeoutMs:input.cfg.rpcTimeoutMs,priority:'P2_POSITION_MANAGEMENT'});
-    const api=createMeteoraDataApi({baseUrl:input.cfg.meteoraDataApiUrl,maxRps:input.cfg.dataApiMaxRps,timeoutMs:input.cfg.httpTimeoutMs});
+    const api=createMeteoraDataApi({baseUrl:input.cfg.meteoraDataApiUrl,maxRps:input.cfg.dataApiMaxRps,timeoutMs:input.cfg.httpTimeoutMs,priority:'P0_POSITION_PROTECTION'});
     const valuations=await Promise.all(positions.map(async row=>{
       const poolAddress=String(row.pool_address),positionAddress=String(row.position_address);
       const [position,pool,account,cashflows]=await Promise.all([adapter.getPositionV2(poolAddress,positionAddress),api.getPool(poolAddress),connection.getAccountInfo(new PublicKey(positionAddress),'confirmed'),input.store.loadPositionCashflows(positionAddress)]);
@@ -250,6 +253,19 @@ export async function getProductionNewEntryAdmissionSnapshots(store:Pick<Phase1S
 export async function getProductionNewEntryEligiblePools(store:Pick<Phase1Store,'listDiscoveryCandidates'>,env:NodeJS.ProcessEnv,rotationKey=''){return(await getProductionNewEntryAdmissionSnapshots(store,env,rotationKey)).map(snapshot=>snapshot.poolAddress);}
 export function parsePhase7OperatorProbeOutput(combined:string,exitCode:number,poolAddress?:string):Phase7OperatorProbe{const legacyWarnings=(combined.match(/meteora_event_decode_quarantined/g)??[]).length;const machineLine=combined.split(/\r?\n/).find(line=>line.includes('\"event\":\"lpforge_operator_machine_summary\"'));const legacyLine=combined.split(/\r?\n/).find(line=>line.includes('\"event\":\"meteora_ingestion_summary\"'));let transactionsScanned=0,decodedSwapEvents=0,eventDecodeWarnings=legacyWarnings,complete=false;for(const line of [machineLine,legacyLine]){if(!line)continue;try{const x=JSON.parse(line) as Record<string,unknown>;transactionsScanned=Number(x.transactionsScanned??transactionsScanned);decodedSwapEvents=Number(x.decodedSwapEvents??decodedSwapEvents);eventDecodeWarnings=Number(x.eventDecodeWarnings??eventDecodeWarnings);if(x.event==='lpforge_operator_machine_summary')complete=true;}catch{}}if(!complete)complete=combined.includes('operational_cycle_complete');return{exitCode,eventDecodeWarnings,transactionsScanned,decodedSwapEvents,operationalCycleComplete:complete,outputBytes:combined.length,poolAddresses:poolAddress?[poolAddress]:[]};}
 function redactProbeFailureDetail(value:string){return value.replace(/https?:\/\/[^\s"']+/gi,'<redacted-url>').replace(/(?:api[-_]?key|token|secret|password)=[^\s&"']+/gi,'$1=<redacted>').replace(/\s+/g,' ').trim().slice(-500);}
+/** Maps a child failure to a bounded retry decision. Unknown failures fail closed. */
+export function classifyProductionProbeFailure(error:unknown):{failureClass:ProductionProbeFailureClass;failureBoundary:string;operation?:string;retryable:boolean}{
+  const message=error instanceof Error?error.message:String(error);
+  if(/LPFORGE_P7_OPERATOR_PROBE_TIMEOUT/.test(message))return{failureClass:'CHILD_TIMEOUT',failureBoundary:'CHILD_PROCESS',retryable:false};
+  if(/LPFORGE_RPC_BUDGET_SHED/.test(message))return{failureClass:'RPC_BUDGET_SHED',failureBoundary:'RPC',retryable:true};
+  if(/LPFORGE_RPC_(HTTP|.*:-32)/.test(message)||/AbortError|ECONNRESET|ETIMEDOUT|EAI_AGAIN|UND_ERR_/.test(message))return{failureClass:'TRANSIENT_RPC',failureBoundary:'RPC',retryable:true};
+  const data=classifyDataApiFailure(error);
+  if(data.failureClass==='TRANSIENT_DATA_API'||data.failureClass==='DATA_API_RATE_PRESSURE')return{failureClass:'TRANSIENT_DATA_API',failureBoundary:'DATA_API',retryable:true};
+  if(/DATA_API_(SCHEMA|.*IDENTITY)|METEORA_.*SHAPE|PROTOCOL_COMPATIBILITY/.test(message))return{failureClass:'SCHEMA_OR_PROTOCOL_FAILURE',failureBoundary:'DATA_API_OR_PROTOCOL',retryable:false};
+  if(/DATABASE_URL|postgres|database/i.test(message))return{failureClass:'DATABASE_FAILURE',failureBoundary:'DATABASE',retryable:false};
+  if(/CONFIG_REQUIRED|ENV_|POLICY_PATH/.test(message))return{failureClass:'CONFIGURATION_FAILURE',failureBoundary:'CONFIGURATION',retryable:false};
+  return{failureClass:'UNKNOWN',failureBoundary:'CHILD_PROCESS',retryable:false};
+}
 export async function runAutonomousDecisionProbe(input:{cwd:string;env:NodeJS.ProcessEnv;poolAddress?:string;timeoutMs?:number}):Promise<Phase7OperatorProbe>{
   // The operator needs only the public owner address to persist a plan.  It never
   // receives signing authority; the separately supervised execution worker is
@@ -270,15 +286,16 @@ export async function runAutonomousDecisionProbe(input:{cwd:string;env:NodeJS.Pr
  * therefore the only pool-selection authority, while P4/P7/execution retain
  * their existing downstream controls.
  */
-export async function runProductionGlobalSelectionCycle(input:{store:Pick<Phase1Store,'loadProductionGlobalCandidateFacts'|'loadProductionPoolSettlementHistory'|'insertProductionGlobalSelection'>;cwd:string;env:NodeJS.ProcessEnv;cycleKey:string;eligiblePoolAddresses:string[];selectionAdmissionSnapshots?:ProductionSelectionAdmissionSnapshot[];sourceCommit?:string;buildId?:string}){
+export async function runProductionGlobalSelectionCycle(input:{store:Pick<Phase1Store,'loadProductionGlobalCandidateFacts'|'loadProductionPoolSettlementHistory'|'insertProductionGlobalSelection'>;cwd:string;env:NodeJS.ProcessEnv;cycleKey:string;eligiblePoolAddresses:string[];selectionAdmissionSnapshots?:ProductionSelectionAdmissionSnapshot[];sourceCommit?:string;buildId?:string;probeRunner?:typeof runAutonomousDecisionProbe;nowImpl?:()=>number}){
   const globalCycleId=`production-global:${input.cycleKey}`,startedAt=new Date().toISOString(),ordered=fairProductionPoolOrder(input.eligiblePoolAddresses,input.cycleKey);
   const concurrency=Math.max(1,Math.min(2,Math.floor(Number(input.env.LPFORGE_GLOBAL_POOL_SELECTION_CONCURRENCY??2))));
   // P7's existing hard decision boundary is 120 seconds.  A global cycle may
   // stop short of the eligible universe, but it may never turn freshness into
   // a multi-minute queue.  Partial coverage is persisted and fails closed.
-  const deadlineAt=Date.now()+P7_GLOBAL_SELECTION_CYCLE_DEADLINE_MS;
-  const probes:Phase7OperatorProbe[]=[];const failures:{poolAddress:string;reason:string}[]=[];let cursor=0;
-  const worker=async()=>{for(;;){if(Date.now()>=deadlineAt)return;const index=cursor++;if(index>=ordered.length)return;const poolAddress=ordered[index]!,remaining=deadlineAt-Date.now();if(remaining<30_000){failures.push({poolAddress,reason:'GLOBAL_CYCLE_DEADLINE_REACHED'});return;}try{probes.push(await runAutonomousDecisionProbe({cwd:input.cwd,env:{...input.env,LPFORGE_P7_PLAN_DISPATCH_ENABLED:'false',LPFORGE_PRODUCTION_GLOBAL_SELECTION_CYCLE_ID:globalCycleId},poolAddress,timeoutMs:remaining}));}catch(error){failures.push({poolAddress,reason:redactProbeFailureDetail(error instanceof Error?error.message:String(error))});}}};
+  const now=input.nowImpl??(()=>Date.now()),deadlineAt=now()+P7_GLOBAL_SELECTION_CYCLE_DEADLINE_MS;
+  const probes:Phase7OperatorProbe[]=[];const failures:{poolAddress:string;reason:string;failureClass:ProductionProbeFailureClass}[]=[];const probeAttempts:ProductionProbeAttempt[]=[];const probeRunner=input.probeRunner??runAutonomousDecisionProbe;let cursor=0;
+  const attemptPool=async(poolAddress:string,attemptNumber:number):Promise<Phase7OperatorProbe|undefined>=>{const startedMs=now(),remaining=Math.max(0,deadlineAt-startedMs),startedAt=new Date().toISOString();if(remaining<P7_GLOBAL_SELECTION_RETRY_MIN_REMAINING_MS){probeAttempts.push({poolAddress,attemptNumber,startedAt,completedAt:new Date().toISOString(),elapsedMs:0,result:'SKIPPED_DEADLINE',failureClass:'CHILD_TIMEOUT',failureBoundary:'GLOBAL_DEADLINE',retryable:false,remainingGlobalDeadlineMs:remaining});return undefined;}try{const probe=await probeRunner({cwd:input.cwd,env:{...input.env,LPFORGE_P7_PLAN_DISPATCH_ENABLED:'false',LPFORGE_PRODUCTION_GLOBAL_SELECTION_CYCLE_ID:globalCycleId,LPFORGE_P7_GLOBAL_DEADLINE_AT_MS:String(deadlineAt)},poolAddress,timeoutMs:remaining});probeAttempts.push({poolAddress,attemptNumber,startedAt,completedAt:new Date().toISOString(),elapsedMs:Math.max(0,now()-startedMs),result:'SUCCESS',retryable:false,remainingGlobalDeadlineMs:Math.max(0,deadlineAt-now())});return probe;}catch(error){const c=classifyProductionProbeFailure(error);probeAttempts.push({poolAddress,attemptNumber,startedAt,completedAt:new Date().toISOString(),elapsedMs:Math.max(0,now()-startedMs),result:'FAILED',failureClass:c.failureClass,failureBoundary:c.failureBoundary,retryable:c.retryable,retryDelayMs:0,remainingGlobalDeadlineMs:Math.max(0,deadlineAt-now())});return undefined;}};
+  const worker=async()=>{for(;;){if(now()>=deadlineAt)return;const index=cursor++;if(index>=ordered.length)return;const poolAddress=ordered[index]!;let probe=await attemptPool(poolAddress,1);if(!probe){const first=probeAttempts.filter(x=>x.poolAddress===poolAddress).at(-1)!;if(first.result==='FAILED'&&first.retryable&&deadlineAt-now()>=P7_GLOBAL_SELECTION_RETRY_MIN_REMAINING_MS)probe=await attemptPool(poolAddress,2);if(!probe){const last=probeAttempts.filter(x=>x.poolAddress===poolAddress).at(-1)!;failures.push({poolAddress,reason:last.result==='SKIPPED_DEADLINE'?'GLOBAL_CYCLE_DEADLINE_REACHED':String(last.failureClass??'UNKNOWN'),failureClass:last.failureClass??'UNKNOWN'});continue;}}probes.push(probe);}};
   await Promise.all(Array.from({length:Math.min(concurrency,ordered.length)},worker));
   const decisionCutoff=new Date().toISOString();
   // New-entry re-entry cooldowns are central runtime policy, never an
@@ -337,7 +354,7 @@ export async function runPhase7ProductionOnce(input:{cfg:Phase1Config;store:Phas
   const priorControlRow=await input.store.loadLatestPhase7ControlDecision(input.runtimeId),priorControlPayload=(priorControlRow?.payload??{}) as Record<string,unknown>,scheduledDecisionHealthPools=phase7DecisionHealthProbePoolAddresses({smokePoolAddress:input.cfg.smokePoolAddress,priorControlPayload}),latestDecisionFacts=await Promise.all(scheduledDecisionHealthPools.map(async poolAddress=>({poolAddress,facts:await input.store.loadPhase7HealthFacts(poolAddress).catch(()=>undefined)}))),latestDecisionAtByPool:Record<string,string>={};
   for(const row of latestDecisionFacts)if(row.facts?.latestDecisionAt)latestDecisionAtByPool[row.poolAddress]=row.facts.latestDecisionAt;
   const decisionHealthSource=phase7VerifiedDecisionHealthPoolAddress({smokePoolAddress:input.cfg.smokePoolAddress,priorControlPayload,...(priorControlRow?{priorControlObservedAt:new Date(String(priorControlRow.observed_at)).toISOString()}:{}),...(Object.keys(latestDecisionAtByPool).length?{latestDecisionAtByPool}:{})}),decisionHealthPoolAddress=decisionHealthSource.poolAddress;
-  const productionRpcInterval=Math.max(0,Number(input.env.LPFORGE_PRODUCTION_RPC_MIN_INTERVAL_MS??input.cfg.rpcMinIntervalMs));const rpc=createSolanaRpcClient({url:input.cfg.solanaRpcHttpUrl,timeoutMs:input.cfg.rpcTimeoutMs,minIntervalMs:productionRpcInterval,maxRetries:input.cfg.rpcMaxRetries,retryBaseDelayMs:input.cfg.rpcRetryBaseDelayMs,retryMaxDelayMs:input.cfg.rpcRetryMaxDelayMs,priority:'P2_POSITION_MANAGEMENT'});const dataApi=createMeteoraDataApi({baseUrl:input.cfg.meteoraDataApiUrl,maxRps:input.cfg.dataApiMaxRps,timeoutMs:input.cfg.httpTimeoutMs});
+  const productionRpcInterval=Math.max(0,Number(input.env.LPFORGE_PRODUCTION_RPC_MIN_INTERVAL_MS??input.cfg.rpcMinIntervalMs));const rpc=createSolanaRpcClient({url:input.cfg.solanaRpcHttpUrl,timeoutMs:input.cfg.rpcTimeoutMs,minIntervalMs:productionRpcInterval,maxRetries:input.cfg.rpcMaxRetries,retryBaseDelayMs:input.cfg.rpcRetryBaseDelayMs,retryMaxDelayMs:input.cfg.rpcRetryMaxDelayMs,priority:'P2_POSITION_MANAGEMENT'});const dataApi=createMeteoraDataApi({baseUrl:input.cfg.meteoraDataApiUrl,maxRps:input.cfg.dataApiMaxRps,timeoutMs:input.cfg.httpTimeoutMs,priority:'P1_PRODUCTION_DECISION'});
   // Health, drift and the control decision persist BEFORE the operator probes
   // so the operator's own control read sees this cycle's decision — never the
   // previous cycle's. Probe outputs (decoder telemetry, probed pools) lag one

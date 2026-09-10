@@ -1083,6 +1083,7 @@ async function liveOnce() {
       baseUrl: cfg.meteoraDataApiUrl,
       maxRps: cfg.dataApiMaxRps,
       timeoutMs: cfg.httpTimeoutMs,
+      priority: 'P1_PRODUCTION_DECISION',
     });
     // The observation lane is intentionally ahead of the expensive discovery
     // and event-path pipeline.  A stalled/blocked action or evidence path may
@@ -1453,6 +1454,7 @@ async function observeOwnedPositionsOnce() {
       baseUrl: cfg.meteoraDataApiUrl,
       maxRps: cfg.dataApiMaxRps,
       timeoutMs: cfg.httpTimeoutMs,
+      priority: 'P0_POSITION_PROTECTION',
     });
     const result = await observeOwnedPositionsReadOnly({
       store,
@@ -1512,6 +1514,7 @@ async function manageOwnedPositionsProtectiveOnce() {
       baseUrl: cfg.meteoraDataApiUrl,
       maxRps: cfg.dataApiMaxRps,
       timeoutMs: cfg.httpTimeoutMs,
+      priority: 'P0_POSITION_PROTECTION',
     });
     const result = await observeAndPlanOwnedPositions({
       store, adapter, api,

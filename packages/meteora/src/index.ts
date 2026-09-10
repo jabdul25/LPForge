@@ -135,6 +135,18 @@ export function createSolanaRpcClient(opts:SolanaRpcClientOptions):SolanaRpcClie
           throw new Error(`LPFORGE_RPC:${method}:${body.error.code}:${body.error.message}`);
         }
         return body.result as T;
+      } catch(error) {
+        // Reads may safely retry a bounded, known-transient transport failure.
+        // This path is never used to resend an already-submitted transaction.
+        const name=error instanceof Error?error.name:'';
+        const code=error&&typeof error==='object'?String((error as {code?:unknown}).code??''):'';
+        const transient=name==='AbortError'||['ECONNRESET','ETIMEDOUT','EAI_AGAIN','UND_ERR_CONNECT_TIMEOUT','UND_ERR_SOCKET'].includes(code);
+        if(transient&&attempt<maxRetries){
+          await coordinator?.noteRetry(priority,method);
+          await sleepImpl(Math.min(retryMaxDelayMs,retryBaseDelayMs*(2**attempt)));
+          continue;
+        }
+        throw error;
       } finally {clearTimeout(timer);}
     }
   }

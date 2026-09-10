@@ -1,3 +1,5 @@
+import {createHash} from 'node:crypto';
+
 export const METEORA_DATA_API_DEFAULT = 'https://dlmm.datapi.meteora.ag';
 export const METEORA_DISCOVERY_API_DEFAULT = 'https://pool-discovery-api.datapi.meteora.ag';
 export const METEORA_DATA_API_MAX_RPS = 30;
@@ -59,17 +61,42 @@ export class TokenBucketLimiter {
 }
 
 type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
+type SleepLike=(ms:number)=>Promise<void>;
+export type DataApiPriority='P0_POSITION_PROTECTION'|'P1_PRODUCTION_DECISION'|'P2_DISCOVERY_CURRENT'|'P3_RESEARCH_BACKFILL';
+export interface DataApiCoordinator { acquire(priority:DataApiPriority,operation:string,deadlineAt?:number):Promise<void>; note429(priority:DataApiPriority,operation:string,backoffMs:number):Promise<void>; noteRetry(priority:DataApiPriority,operation:string):Promise<void>; }
+export function dataApiProviderKey(url:string){return createHash('sha256').update(url).digest('hex');}
+export class DataApiBudgetShedError extends Error { readonly code='LPFORGE_DATA_API_BUDGET_SHED';constructor(readonly priority:DataApiPriority,readonly operation:string){super(`LPFORGE_DATA_API_BUDGET_SHED:${priority}:${operation}`);}}
+export class DataApiDeadlineError extends Error {readonly code='LPFORGE_DATA_API_DEADLINE_EXCEEDED';constructor(){super('LPFORGE_DATA_API_DEADLINE_EXCEEDED');}}
+type PgClient={connect:()=>Promise<void>;query:(sql:string,params?:unknown[])=>Promise<{rows:Array<Record<string,unknown>>}>;end:()=>Promise<void>;on:(event:'error',listener:(error:Error)=>void)=>unknown};
+type DataApiBudgetConfig={total:number;p0:number;p1:number;p2:number;p3:number};
+const sleep=(ms:number)=>new Promise<void>(resolve=>setTimeout(resolve,ms));
+function envInt(name:string,fallback:number,min:number){const value=Number(process.env[name]??fallback);return Number.isSafeInteger(value)&&value>=min?value:fallback;}
+const priorityWaitMs:Record<DataApiPriority,number>={P0_POSITION_PROTECTION:60_000,P1_PRODUCTION_DECISION:30_000,P2_DISCOVERY_CURRENT:15_000,P3_RESEARCH_BACKFILL:10_000};
+function dataApiBudgetConfig():DataApiBudgetConfig{const total=envInt('LPFORGE_DATA_API_GLOBAL_MAX_RPS',envInt('LPFORGE_DATA_API_MAX_RPS',25,1),1);const p0=envInt('LPFORGE_DATA_API_P0_RESERVED_RPS',total>=4?1:0,0),p1=envInt('LPFORGE_DATA_API_P1_RESERVED_RPS',total>=4?1:0,0);if(p0+p1>=total)throw new Error('LPFORGE_DATA_API_BUDGET_INVALID');const available=Math.max(1,total-p0-p1);return{total,p0,p1,p2:envInt('LPFORGE_DATA_API_P2_MAX_RPS',available,1),p3:envInt('LPFORGE_DATA_API_P3_MAX_RPS',Math.max(1,Math.floor(available/2)),1)};}
+class PostgresDataApiCoordinator implements DataApiCoordinator {
+  private client:PgClient|undefined;private readonly providerKey:string;private readonly config=dataApiBudgetConfig();
+  constructor(url:string){this.providerKey=dataApiProviderKey(url);}
+  private async db():Promise<PgClient>{if(this.client)return this.client;const pg=await import('pg') as unknown as {Client:new(input:{connectionString:string})=>PgClient};const url=process.env.DATABASE_URL?.trim();if(!url)throw new Error('LPFORGE_DATA_API_COORDINATOR_DATABASE_URL_REQUIRED');const client=new pg.Client({connectionString:url});client.on('error',()=>{if(this.client===client)this.client=undefined;});await client.connect();this.client=client;return client;}
+  async acquire(priority:DataApiPriority,operation:string,deadlineAt?:number):Promise<void>{const started=Date.now();for(;;){if(deadlineAt!==undefined&&Date.now()>=deadlineAt)throw new DataApiDeadlineError();const db=await this.db();const r=await db.query('SELECT * FROM execution.acquire_data_api_permit($1,$2,$3,$4,$5,$6,$7,$8)',[this.providerKey,priority,operation,this.config.total,this.config.p0,this.config.p1,this.config.p2,this.config.p3]);const row=r.rows[0]??{};if(row.granted===true||row.granted==='t')return;const maxWait=Math.min(priorityWaitMs[priority],deadlineAt===undefined?Infinity:Math.max(0,deadlineAt-started));if(Date.now()-started>=maxWait)throw new DataApiBudgetShedError(priority,operation);await sleep(Math.max(1,Math.min(Number(row.wait_ms??100),1000,deadlineAt===undefined?1000:Math.max(1,deadlineAt-Date.now()))));}}
+  async note429(priority:DataApiPriority,operation:string,backoffMs:number):Promise<void>{const db=await this.db();await db.query('SELECT execution.report_data_api_pressure($1,$2,$3,$4)',[this.providerKey,priority,operation,Math.max(1,backoffMs)]);}
+  async noteRetry(priority:DataApiPriority,operation:string):Promise<void>{const db=await this.db();await db.query("SELECT execution.data_api_metric_event($1,$2,$3,'RETRY',0)",[this.providerKey,priority,operation]);}
+}
+const sharedCoordinators=new Map<string,DataApiCoordinator>();
+/** Process handles share a PostgreSQL permit authority; the URL itself is never persisted. */
+export function defaultDataApiCoordinator(providerUrl:string):DataApiCoordinator|undefined{if(!process.env.DATABASE_URL?.trim())return undefined;return sharedCoordinators.get(providerUrl)??(()=>{const c=new PostgresDataApiCoordinator(providerUrl);sharedCoordinators.set(providerUrl,c);return c;})();}
+function retryAfterMs(response:Response,now:number):number|undefined{const raw=response.headers.get('retry-after')?.trim();if(!raw)return undefined;const seconds=Number(raw);if(Number.isFinite(seconds)&&seconds>=0)return Math.ceil(seconds*1000);const at=Date.parse(raw);return Number.isFinite(at)?Math.max(0,at-now):undefined;}
+function errorCode(error:unknown){return error&&typeof error==='object'?String((error as {code?:unknown}).code??''):'';}
+export function classifyDataApiFailure(error:unknown):{failureClass:'TRANSIENT_DATA_API'|'DATA_API_RATE_PRESSURE'|'SCHEMA_OR_PROTOCOL_FAILURE'|'UNKNOWN';retryable:boolean}{const message=error instanceof Error?error.message:String(error),name=error instanceof Error?error.name:'',code=errorCode(error);if(error instanceof DataApiBudgetShedError||/DATA_API_HTTP:429/.test(message))return{failureClass:'DATA_API_RATE_PRESSURE',retryable:true};if(name==='AbortError'||['ECONNRESET','ETIMEDOUT','EAI_AGAIN','UND_ERR_CONNECT_TIMEOUT','UND_ERR_SOCKET'].includes(code)||/DATA_API_HTTP:(500|502|503|504)/.test(message))return{failureClass:'TRANSIENT_DATA_API',retryable:true};if(/DATA_API_(SCHEMA|.*IDENTITY|.*TIMEFRAME|.*PAGE)/.test(message))return{failureClass:'SCHEMA_OR_PROTOCOL_FAILURE',retryable:false};return{failureClass:'UNKNOWN',retryable:false};}
 function assertObject(value: unknown, code: string): Record<string, unknown> { if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(code); return value as Record<string,unknown>; }
 
-export function createMeteoraDataApi(opts: {baseUrl?:string;discoveryBaseUrl?:string;maxRps?:number;timeoutMs?:number;fetchImpl?:FetchLike} = {}): MeteoraDataApi {
+export function createMeteoraDataApi(opts: {baseUrl?:string;discoveryBaseUrl?:string;maxRps?:number;timeoutMs?:number;fetchImpl?:FetchLike;maxRetries?:number;sleepImpl?:SleepLike;priority?:DataApiPriority;coordinator?:DataApiCoordinator;deadlineAt?:number;nowImpl?:()=>number} = {}): MeteoraDataApi {
   const base=(opts.baseUrl ?? METEORA_DATA_API_DEFAULT).replace(/\/$/,'');
   const discoveryBase=(opts.discoveryBaseUrl ?? METEORA_DISCOVERY_API_DEFAULT).replace(/\/$/,'');
-  const limiter=new TokenBucketLimiter(opts.maxRps ?? 25); const timeout=opts.timeoutMs ?? 10000; const fetchImpl=opts.fetchImpl ?? fetch;
+  const limiter=new TokenBucketLimiter(opts.maxRps ?? 25); const timeout=opts.timeoutMs ?? 10000; const fetchImpl=opts.fetchImpl ?? fetch; const maxRetries=Math.max(0,opts.maxRetries??2); const sleepImpl=opts.sleepImpl??sleep;const nowImpl=opts.nowImpl??(()=>Date.now());const priority=opts.priority??'P2_DISCOVERY_CURRENT';const coordinator=opts.coordinator??defaultDataApiCoordinator(base);
   async function getAt(apiBase:string,path:string, query:Record<string,string|number|undefined>={}): Promise<unknown> {
-    await limiter.take(); const url=new URL(apiBase+path); for (const [k,v] of Object.entries(query)) if (v!==undefined) url.searchParams.set(k,String(v));
-    const controller=new AbortController(); const timer=setTimeout(()=>controller.abort(),timeout);
-    try { const response=await fetchImpl(url,{method:'GET',headers:{accept:'application/json'},signal:controller.signal}); if (!response.ok) throw new Error(`LPFORGE_DATA_API_HTTP:${response.status}`); return await response.json(); }
-    finally { clearTimeout(timer); }
+    const url=new URL(apiBase+path); for (const [k,v] of Object.entries(query)) if (v!==undefined) url.searchParams.set(k,String(v));
+    const operation=`GET ${path}`;
+    for(let attempt=0;;attempt++){const remaining=opts.deadlineAt===undefined?Infinity:opts.deadlineAt-nowImpl();if(remaining<=0)throw new DataApiDeadlineError();await coordinator?.acquire(priority,operation,opts.deadlineAt);await limiter.take();const requestTimeout=Math.max(1,Math.min(timeout,remaining));const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),requestTimeout);try {const response=await fetchImpl(url,{method:'GET',headers:{accept:'application/json'},signal:controller.signal});if(!response.ok){const retryable=[429,500,502,503,504].includes(response.status);const retryDelay=Math.max(100,retryAfterMs(response,nowImpl())??100*(2**attempt));if(retryable&&attempt<maxRetries&&retryDelay<(opts.deadlineAt===undefined?Infinity:Math.max(0,opts.deadlineAt-nowImpl()))){if(response.status===429)await coordinator?.note429(priority,operation,retryDelay);else await coordinator?.noteRetry(priority,operation);await sleepImpl(retryDelay);continue;}throw new Error(`LPFORGE_DATA_API_HTTP:${response.status}`);}return await response.json();}catch(error){const name=error instanceof Error?error.name:'';const code=errorCode(error);const transient=name==='AbortError'||['ECONNRESET','ETIMEDOUT','EAI_AGAIN','UND_ERR_CONNECT_TIMEOUT','UND_ERR_SOCKET'].includes(code);const retryDelay=100*(2**attempt);if(transient&&attempt<maxRetries&&retryDelay<(opts.deadlineAt===undefined?Infinity:Math.max(0,opts.deadlineAt-nowImpl()))){await coordinator?.noteRetry(priority,operation);await sleepImpl(retryDelay);continue;}throw error;}finally{clearTimeout(timer);}}
   }
   const get=(path:string,query:Record<string,string|number|undefined>={})=>getAt(base,path,query);
   return {

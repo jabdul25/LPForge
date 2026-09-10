@@ -159,7 +159,7 @@ async function collectCounterfactuals(store:Awaited<ReturnType<typeof createPost
  }if(throttled)console.warn(json({event:'DISCOVERY_COUNTERFACTUAL_RATE_LIMITED',authority:'RESEARCH_ONLY_NO_POLICY_MUTATION',processedBeforeThrottle:inserted}));return{inserted,throttled};
 }
 async function once(options:{includeForwardMaturation?:boolean}={}){
- const now=new Date().toISOString(),store=await createPostgresStore(env('DATABASE_URL')),api=createMeteoraDataApi({...((process.env.LPFORGE_METEORA_DATA_API_URL??'').trim()?{baseUrl:process.env.LPFORGE_METEORA_DATA_API_URL!}:{}),maxRps:Number(process.env.LPFORGE_DATA_API_MAX_RPS??1),timeoutMs:Number(process.env.LPFORGE_HTTP_TIMEOUT_MS??10000)});
+ const now=new Date().toISOString(),store=await createPostgresStore(env('DATABASE_URL')),api=createMeteoraDataApi({...((process.env.LPFORGE_METEORA_DATA_API_URL??'').trim()?{baseUrl:process.env.LPFORGE_METEORA_DATA_API_URL!}:{}),maxRps:Number(process.env.LPFORGE_DATA_API_MAX_RPS??1),timeoutMs:Number(process.env.LPFORGE_HTTP_TIMEOUT_MS??10000),priority:'P3_RESEARCH_BACKFILL'});
  try{
   memory('cycle:start');
   let postEntryTelemetry;try{postEntryTelemetry=await runPostEntryTelemetryCapture({store,now});}catch(error){postEntryTelemetry={status:'ERROR',error:error instanceof Error?error.message:String(error)};console.error(json({event:'POST_ENTRY_TELEMETRY_CAPTURE_FAILED',authority:'RESEARCH_ONLY_NO_POLICY_MUTATION',...postEntryTelemetry}));}memory('post-entry:complete');
