@@ -5342,7 +5342,15 @@ return 'APPLIED';
              FROM execution.transaction_plans p
              LEFT JOIN execution.execution_journal j ON j.plan_id=p.plan_id
              WHERE p.state IN ('RECOVERING','RECONCILIATION_REQUIRED')
-                OR j.state IN ('SIGNED','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED')`,
+                OR (j.state IN ('SIGNED','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED')
+                    AND NOT EXISTS (
+                      -- A confirmed entry funding transaction is no longer
+                      -- unresolved once its exact durable partial-entry
+                      -- family has completed the compensating SOL settlement.
+                      SELECT 1 FROM execution.partial_entry_recovery r
+                      WHERE r.plan_id=p.plan_id
+                        AND r.state='ABORTED_SOL_SETTLED'
+                    ))`,
           ),
           db.query(
             `SELECT count(*)::int AS n FROM execution.submission_attempts WHERE state='UNKNOWN'`,
