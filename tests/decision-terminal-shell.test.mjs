@@ -136,3 +136,15 @@ test('row number parsing does not turn nullable database evidence into a numeric
   assert.match(source, /raw === null \|\| raw === undefined \|\| raw === ''/);
   assert.doesNotMatch(source, /Number\(row\[key\]\)/);
 });
+
+test('terminal uses the exact persisted paired-token symbol for a WSOL pool and otherwise falls back', () => {
+  const row = {
+    pool_address: 'EAf6shtt8QGJ7UiSRrDc6pzwXKEmb5s7tCCpSDe5zpzZ',
+    token_x_mint: 'TokenMint111111111111111111111111111111111111',
+    token_y_mint: 'So11111111111111111111111111111111111111112',
+    paired_token_mint: 'TokenMint111111111111111111111111111111111111',
+    paired_token_symbol: 'CLANKER'
+  };
+  assert.equal(terminal.formatTerminalPoolDisplay(row), 'CLANKER/SOL');
+  assert.equal(terminal.formatTerminalPoolDisplay({ ...row, paired_token_mint: 'different-mint' }), 'EAf6sh…zpzZ');
+});

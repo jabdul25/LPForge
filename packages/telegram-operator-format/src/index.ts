@@ -6,6 +6,7 @@
 export type TelegramPositionSummary = Record<string, unknown>;
 
 const LAMPORTS_PER_SOL=1_000_000_000;
+const WSOL_MINT='So11111111111111111111111111111111111111112';
 const finite=(value:unknown):value is number=>typeof value==='number'&&Number.isFinite(value);
 const number=(value:unknown):number|undefined=>{
   if(finite(value))return value;
@@ -22,6 +23,26 @@ const text=(value:unknown,fallback='unavailable')=>typeof value==='string'&&valu
 export function shortenTelegramPositionAddress(value:unknown):string{
   const address=text(value,'unavailable');
   return address.length>12?`${address.slice(0,6)}…${address.slice(-4)}`:address;
+}
+
+/**
+ * Resolves a pool label solely from persisted pool topology and discovery
+ * metadata.  The discovery label is accepted only for the exact non-WSOL
+ * mint in the current pool; an address remains the safe display fallback.
+ */
+export function formatTelegramPoolDisplay(summary:TelegramPositionSummary):string{
+  const pool=shortenTelegramPositionAddress(summary.pool_address);
+  const xMint=text(summary.token_x_mint,'');
+  const yMint=text(summary.token_y_mint,'');
+  const x=xMint===WSOL_MINT?'SOL':text(summary.token_x_symbol,'');
+  const y=yMint===WSOL_MINT?'SOL':text(summary.token_y_symbol,'');
+  const pairedMint=text(summary.paired_token_mint,'');
+  const pairedSymbol=text(summary.paired_token_symbol,'');
+  const exactWsolPair=Boolean(pairedSymbol&&pairedMint&&(
+    (xMint===WSOL_MINT&&pairedMint===yMint)||(yMint===WSOL_MINT&&pairedMint===xMint)
+  ));
+  if(exactWsolPair)return `${pairedSymbol}/SOL`;
+  return x&&y?`${x}/${y}`:pool;
 }
 
 /**
@@ -103,7 +124,7 @@ function compactOne(summary:TelegramPositionSummary,index:number,nowMs:number):s
   const updated=age(summary.lp_mtm_observed_at??summary.valuation_observed_at??summary.chain_observed_at??summary.latest_observed_at??summary.observation_observed_at,nowMs);
   const lines=[
     `${index}. ${shortenTelegramPositionAddress(summary.position_address)}`,
-    `Pool: ${shortenTelegramPositionAddress(summary.pool_address)}`,
+    `Pool: ${formatTelegramPoolDisplay(summary)}`,
     `${range(summary).replace('IN RANGE','In range').replace('OUT OF RANGE','Out of range')} · ${positionState(summary)}`,
     '',
   ];
@@ -125,7 +146,7 @@ function detailOne(summary:TelegramPositionSummary,index:number|undefined,nowMs:
   const updated=age(summary.lp_mtm_observed_at??summary.valuation_observed_at??summary.chain_observed_at??summary.latest_observed_at??summary.observation_observed_at,nowMs);
   const lines=[
     `${index===undefined?'Position':`${index}.`} ${shortenTelegramPositionAddress(summary.position_address)}`,
-    `Pool: ${shortenTelegramPositionAddress(summary.pool_address)}`,
+    `Pool: ${formatTelegramPoolDisplay(summary)}`,
     `${text(summary.strategy)} · ${text(summary.orientation)}`,
     `${range(summary)} · ${text(summary.lifecycle_state)} / ${text(summary.reconciliation_status)}`,
     '',

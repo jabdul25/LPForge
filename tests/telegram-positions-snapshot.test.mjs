@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {readFile} from 'node:fs/promises';
-import {formatTelegramPositionDetail,formatTelegramPositionSummaries,resolveTelegramPositionAddress,shortenTelegramPositionAddress} from '../.build/packages/telegram-operator-format/src/index.js';
+import {formatTelegramPoolDisplay,formatTelegramPositionDetail,formatTelegramPositionSummaries,resolveTelegramPositionAddress,shortenTelegramPositionAddress} from '../.build/packages/telegram-operator-format/src/index.js';
 
 const now=Date.parse('2026-09-07T05:00:00.000Z');
 const position={
   position_address:'5odbT7abcdefghijkmnopqrstuvwxyz123456789jT2X',pool_address:'EAf6shtt8QGJ7UiSRrDc6pzwXKEmb5s7tCCpSDe5zpzZ',
+  token_x_mint:'TokenMint111111111111111111111111111111111111',token_y_mint:'So11111111111111111111111111111111111111112',paired_token_mint:'TokenMint111111111111111111111111111111111111',paired_token_symbol:'CLANKER',
   strategy:'BID_ASK',orientation:'ONE_SIDED_Y',lower_bin_id:-1381,upper_bin_id:-1347,observation_active_bin_id:-1352,
   initial_capital_lamports:'30000000',entered_at:'2026-09-07T01:36:00.000Z',lifecycle_state:'OPEN',reconciliation_status:'MATCH',
   observation_observed_at:'2026-09-07T04:59:42.000Z',chain_observed_at:'2026-09-07T04:59:42.000Z',observation_range_state:'IN_RANGE',observation_stale_data:false,
@@ -28,15 +29,21 @@ test('telegram close resolution accepts the displayed ordinal, canonical address
 });
 test('telegram positions renders the persisted Meteora-compatible control PnL without external calls',()=>{
   const rendered=formatTelegramPositionSummaries({positions:[position],maxOpenPositions:2,nowMs:now});
-  assert.match(rendered,/📊 LPForge Positions — 1 open \/ 2 max/);assert.match(rendered,/5odbT7…jT2X/);assert.match(rendered,/EAf6sh…zpzZ/);
+  assert.match(rendered,/📊 LPForge Positions — 1 open \/ 2 max/);assert.match(rendered,/5odbT7…jT2X/);assert.match(rendered,/Pool: CLANKER\/SOL/);
   assert.match(rendered,/🟢 In range · Open/);assert.match(rendered,/Current PnL: \+6\.00% · Meteora-compatible/);assert.match(rendered,/Peak PnL: \+7\.21%/);
   assert.match(rendered,/Fees earned: 0\.000260 SOL/);assert.match(rendered,/Range: -1381 → -1347/);assert.match(rendered,/Current bin: -1352/);assert.match(rendered,/Opened: 3h 24m ago/);assert.match(rendered,/Updated: 18s ago/);
   assert.doesNotMatch(rendered,/Economic MTM/);assert.doesNotMatch(rendered,/Capital:/);
 });
 test('telegram position detail keeps LP and economic accounting explicitly distinct',()=>{
   const rendered=formatTelegramPositionDetail({position,index:1,nowMs:now});
+  assert.match(rendered,/Pool: CLANKER\/SOL/);
   assert.match(rendered,/BID_ASK · ONE_SIDED_Y/);assert.match(rendered,/Capital: 0\.030000 SOL/);
   assert.match(rendered,/Current PnL: \+\$0\.2725 \(\+6\.00%\)/);assert.match(rendered,/Source: Meteora-compatible/);assert.match(rendered,/Peak PnL: \+7\.21%/);assert.match(rendered,/Economic MTM: \+\$0\.2725 \(\+6\.00%\)/);
+});
+test('telegram pool display requires an exact persisted paired-token mint and falls back safely',()=>{
+  assert.equal(formatTelegramPoolDisplay(position),'CLANKER/SOL');
+  assert.equal(formatTelegramPoolDisplay({...position,paired_token_mint:'wrong-mint'}),'EAf6sh…zpzZ');
+  assert.equal(formatTelegramPoolDisplay({...position,paired_token_symbol:undefined}),'EAf6sh…zpzZ');
 });
 test('telegram positions formats two independently valued positions and policy capacity',()=>{
   const second={...position,position_address:'7t477abcdefghijkmnopqrstuvwxyz123456789fHYs',pool_address:'PoolBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',orientation:'SKEWED_Y',net_pnl_usd:'-0.0078',net_return_fraction:'-0.0017'};
@@ -79,4 +86,7 @@ test('telegram operator uses the bounded DB summary reader for /positions',async
   // otherwise PostgreSQL rejects the presentation-only /positions query.
   assert.match(db,/SELECT observed_at,active_bin_id,range_state,stale_data,payload\s+FROM execution\.position_observations/);
   assert.match(db,/obs\.payload->'receiptLpMtm'/);
+  assert.match(db,/LEFT JOIN protocol\.pools proto ON proto\.address=p\.pool_address/);
+  assert.match(db,/LEFT JOIN market\.pool_discovery_registry registry ON registry\.pool_address=p\.pool_address/);
+  assert.match(db,/registry\.paired_token_mint,registry\.paired_token_symbol/);
 });

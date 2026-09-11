@@ -5232,6 +5232,8 @@ return 'APPLIED';
           p.lpforge_position_id,p.position_address,p.pool_address,p.owner_address,p.strategy,p.orientation,
           p.lower_bin_id,p.upper_bin_id,p.initial_capital_lamports,p.entered_at,p.lifecycle_state,
           p.reconciliation_status,p.last_plan_id,
+          proto.token_x_mint,proto.token_y_mint,tx.symbol AS token_x_symbol,ty.symbol AS token_y_symbol,
+          registry.paired_token_mint,registry.paired_token_symbol,
           obs.observed_at AS observation_observed_at,obs.active_bin_id AS observation_active_bin_id,
           obs.range_state AS observation_range_state,obs.stale_data AS observation_stale_data,
           oor.range_state AS oor_range_state,oor.lifecycle_state AS oor_lifecycle_state,
@@ -5260,6 +5262,10 @@ return 'APPLIED';
           (obs.payload->'receiptLpMtm'->>'netReturnFraction')::double precision AS receipt_lp_mtm_return_fraction,
           (obs.payload->'liveControlPnl'->>'reportedReturnDeltaFraction')::double precision AS live_control_reported_delta_fraction
         FROM execution.owned_positions p
+        LEFT JOIN protocol.pools proto ON proto.address=p.pool_address
+        LEFT JOIN protocol.tokens tx ON tx.mint=proto.token_x_mint
+        LEFT JOIN protocol.tokens ty ON ty.mint=proto.token_y_mint
+        LEFT JOIN market.pool_discovery_registry registry ON registry.pool_address=p.pool_address
         LEFT JOIN LATERAL (
           SELECT observed_at,active_bin_id,range_state,stale_data,payload
           FROM execution.position_observations

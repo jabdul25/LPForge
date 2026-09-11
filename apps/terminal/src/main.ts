@@ -10,6 +10,7 @@ import { Pool } from 'pg';
 import { loadPhase1Config } from '../../../packages/config/src/index.js';
 import {
   advanceCandidateIndex,
+  formatTerminalPoolDisplay,
   nextEventFilter,
   nextPositionFilter,
   renderDecisionTerminal,
@@ -23,7 +24,6 @@ import {
   type TerminalSnapshot
 } from './model.js';
 
-const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 const OPEN_POSITION_STATES = ['OPEN', 'CLOSING', 'RECONCILIATION_REQUIRED', 'ENTRY_FUNDED_NOT_OPEN'];
 const ACTIVE_PLAN_STATES = ['PLANNED', 'CLAIMED', 'DISPATCHING', 'BUILDING', 'BUILT', 'SIMULATING', 'SIMULATED', 'RISK_APPROVED', 'SIGNING', 'SIGNED', 'SUBMITTING', 'SUBMITTED', 'UNKNOWN_SUBMISSION', 'CONFIRMED', 'RECONCILING', 'RECOVERING', 'RECONCILIATION_REQUIRED'];
 const PARTIAL_TERMINAL_STATES = ['RESOLVED', 'OPEN_RECOVERED', 'SUPERSEDED_BY_SUCCESSFUL_ENTRY', 'ABORTED_SOL_SETTLED'];
@@ -65,15 +65,7 @@ const iso = (value: unknown): string | undefined => {
 };
 const record = (value: unknown): Row => value && typeof value === 'object' && !Array.isArray(value) ? value as Row : {};
 const strings = (value: unknown): string[] => Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
-const short = (value: string): string => value.length <= 12 ? value : `${value.slice(0, 6)}…${value.slice(-4)}`;
-const displayPool = (row: Row): string => {
-  const pool = text(row, 'pool_address') || 'unknown';
-  const xMint = text(row, 'token_x_mint');
-  const yMint = text(row, 'token_y_mint');
-  const x = xMint === WSOL_MINT ? 'SOL' : text(row, 'token_x_symbol');
-  const y = yMint === WSOL_MINT ? 'SOL' : text(row, 'token_y_symbol');
-  return x && y ? `${x}/${y}` : short(pool);
-};
+const displayPool = formatTerminalPoolDisplay;
 
 function terminalProtection(row: Row): string {
   const reasons = strings(row.last_reason_codes);
@@ -134,12 +126,14 @@ async function loadCandidates(pool: Pool): Promise<TerminalCandidate[]> {
       LIMIT 1
     )
     SELECT c.*,p.token_x_mint,p.token_y_mint,tx.symbol AS token_x_symbol,ty.symbol AS token_y_symbol,
+      registry.paired_token_mint,registry.paired_token_symbol,
       latest.winner_pool_address
     FROM latest
     JOIN execution.production_global_candidates c ON c.global_cycle_id=latest.global_cycle_id
     LEFT JOIN protocol.pools p ON p.address=c.pool_address
     LEFT JOIN protocol.tokens tx ON tx.mint=p.token_x_mint
     LEFT JOIN protocol.tokens ty ON ty.mint=p.token_y_mint
+    LEFT JOIN market.pool_discovery_registry registry ON registry.pool_address=c.pool_address
     ORDER BY CASE WHEN c.pool_address=latest.winner_pool_address THEN 0 WHEN c.operational_state='ENTRY_READY' THEN 1 WHEN c.operational_state='WARMING' THEN 2 ELSE 3 END,
       c.confidence DESC NULLS LAST,c.pool_address ASC
   `);
@@ -156,6 +150,7 @@ async function loadActivePools(pool: Pool): Promise<TerminalPosition[]> {
   const result = await pool.query<Row>(`
     SELECT p.lpforge_position_id,p.position_address,p.pool_address,p.entered_at,p.lifecycle_state,p.reconciliation_status,p.lower_bin_id,p.upper_bin_id,
       tx.symbol AS token_x_symbol,ty.symbol AS token_y_symbol,proto.token_x_mint,proto.token_y_mint,
+      registry.paired_token_mint,registry.paired_token_symbol,
       obs.active_bin_id,obs.range_state,es.evidence_state AS valuation_state,
       es.lp_mtm_evidence_state AS live_control_state,
       es.lp_mtm_net_return_fraction AS live_control_return_fraction,
@@ -166,6 +161,7 @@ async function loadActivePools(pool: Pool): Promise<TerminalPosition[]> {
     LEFT JOIN protocol.pools proto ON proto.address=p.pool_address
     LEFT JOIN protocol.tokens tx ON tx.mint=proto.token_x_mint
     LEFT JOIN protocol.tokens ty ON ty.mint=proto.token_y_mint
+    LEFT JOIN market.pool_discovery_registry registry ON registry.pool_address=p.pool_address
     LEFT JOIN LATERAL (
       SELECT active_bin_id,range_state FROM execution.position_observations
       WHERE lpforge_position_id=p.lpforge_position_id ORDER BY observed_at DESC LIMIT 1
@@ -197,7 +193,8 @@ async function loadRecentPositions(pool: Pool, active: TerminalPosition[]): Prom
     SELECT l.lifecycle_id,l.position_address,l.pool_address,l.created_at,latest.settled_at,latest.realized_sol_pnl_lamports,
       COALESCE(re.entry_capital_lamports,o.initial_capital_lamports) AS capital_lamports,
       re.gross_lp_fee_lamports,COALESCE(summary.terminal_reason,re.close_reason) AS exit_reason,
-      p.token_x_mint,p.token_y_mint,tx.symbol AS token_x_symbol,ty.symbol AS token_y_symbol
+      p.token_x_mint,p.token_y_mint,tx.symbol AS token_x_symbol,ty.symbol AS token_y_symbol,
+      registry.paired_token_mint,registry.paired_token_symbol
     FROM latest
     JOIN execution.position_lifecycles l ON l.lifecycle_id=latest.lifecycle_id AND l.status='SOL_SETTLED'
     LEFT JOIN execution.owned_positions o ON o.position_address=l.position_address
@@ -206,6 +203,7 @@ async function loadRecentPositions(pool: Pool, active: TerminalPosition[]): Prom
     LEFT JOIN protocol.pools p ON p.address=l.pool_address
     LEFT JOIN protocol.tokens tx ON tx.mint=p.token_x_mint
     LEFT JOIN protocol.tokens ty ON ty.mint=p.token_y_mint
+    LEFT JOIN market.pool_discovery_registry registry ON registry.pool_address=l.pool_address
     ORDER BY latest.settled_at DESC LIMIT 12
   `);
   const closed = settled.rows.map(row => {

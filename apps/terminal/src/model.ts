@@ -1,5 +1,32 @@
 export type TerminalLevel = 'INFO' | 'WARN' | 'ERROR';
 
+const WSOL_MINT = 'So11111111111111111111111111111111111111112';
+
+/**
+ * Presentation-only pool label using persisted pool topology and discovery
+ * metadata. A paired token symbol is accepted only when its mint exactly
+ * matches the non-WSOL side of the current pool.
+ */
+export function formatTerminalPoolDisplay(row: Record<string, unknown>): string {
+  const field = (key: string): string | undefined => {
+    const value = row[key];
+    return value === null || value === undefined ? undefined : String(value).trim() || undefined;
+  };
+  const pool = field('pool_address') ?? 'unknown';
+  const short = (value: string): string => value.length <= 12 ? value : `${value.slice(0, 6)}…${value.slice(-4)}`;
+  const xMint = field('token_x_mint');
+  const yMint = field('token_y_mint');
+  const x = xMint === WSOL_MINT ? 'SOL' : field('token_x_symbol');
+  const y = yMint === WSOL_MINT ? 'SOL' : field('token_y_symbol');
+  const pairedMint = field('paired_token_mint');
+  const pairedSymbol = field('paired_token_symbol');
+  const exactWsolPair = Boolean(pairedSymbol && pairedMint && (
+    (xMint === WSOL_MINT && pairedMint === yMint) || (yMint === WSOL_MINT && pairedMint === xMint)
+  ));
+  if (exactWsolPair) return `${pairedSymbol}/SOL`;
+  return x && y ? `${x}/${y}` : short(pool);
+}
+
 export interface TerminalEvent {
   id: string;
   observedAt: string;
