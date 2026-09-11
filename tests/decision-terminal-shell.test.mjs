@@ -96,11 +96,47 @@ test('compact active-pool and empty states remain intentional', () => {
   assert.match(output, /No matching canonical lifecycle\./);
 });
 
-test('wide and supported narrow dimensions do not exceed terminal width', () => {
-  for (const [columns, rows] of [[180, 50], [160, 45], [140, 40], [120, 35]]) {
+test('wide, narrow, and phone dimensions do not exceed terminal width', () => {
+  for (const [columns, rows] of [[180, 50], [160, 45], [140, 40], [120, 35], [80, 24], [60, 20], [40, 18]]) {
     const output = terminal.renderDecisionTerminal(snapshot(), { columns, rows, color: false, interactive: true });
     for (const rendered of output.split('\n')) assert.ok(rendered.length <= columns, `${columns} columns: ${rendered}`);
+    if (columns < 100) assert.ok(output.split('\n').length <= rows, `${columns}x${rows}: too many rendered rows`);
   }
+});
+
+test('phone renderer uses a compact overview instead of squeezing the desktop grid', () => {
+  const output = terminal.renderDecisionTerminal(snapshot(), { columns: 80, rows: 24, color: false, interactive: true, mobileView: 'OVERVIEW' });
+  assert.match(output, /LPFORGE DECISION TERMINAL/);
+  assert.match(output, /◎ DECISION 1\/1/);
+  assert.match(output, /■ ENTRY WATCH \(1\)/);
+  assert.match(output, /■ OPEN POSITIONS \(1\/2\)/);
+  assert.match(output, /♥ SYSTEM HEALTH/);
+  assert.match(output, /m activity/);
+  assert.doesNotMatch(output, /┌|└|│/);
+});
+
+test('phone activity view keeps loaded events, fills, engines, and filters accessible', () => {
+  const output = terminal.renderDecisionTerminal(snapshot(), { columns: 80, rows: 24, color: false, interactive: true, mobileView: 'ACTIVITY', eventFilter: 'EXECUTION', positionFilter: 'CLOSED' });
+  assert.match(output, /● LIVE EVENTS EXECUTION/);
+  assert.match(output, /P6_RECOVERY_PENDING/);
+  assert.match(output, /▤ RECENT POSITIONS CLOSED/);
+  assert.match(output, /OTHER\/SOL CLOSED -1\.37%/);
+  assert.match(output, /⚙ ENGINE DESK/);
+  assert.match(output, /m overview/);
+  assert.equal(terminal.nextMobileView('OVERVIEW'), 'ACTIVITY');
+  assert.equal(terminal.nextMobileView('ACTIVITY'), 'OVERVIEW');
+});
+
+test('phone health keeps an execution RPC outage visible without horizontal overflow', () => {
+  const source = snapshot();
+  source.health = { ...source.health, rpcHealth: [
+    { role: 'PRODUCTION', state: 'HEALTHY' },
+    { role: 'DISCOVERY', state: 'DEGRADED' },
+    { role: 'EXECUTION', state: 'UNAVAILABLE' }
+  ] };
+  const output = terminal.renderDecisionTerminal(source, { columns: 40, rows: 18, color: false, interactive: true, mobileView: 'OVERVIEW' });
+  assert.match(output, /RPC EXECUTION DOWN/);
+  for (const rendered of output.split('\n')) assert.ok(rendered.length <= 40, rendered);
 });
 
 test('shell terminal candidate and filter navigation are bounded and deterministic', () => {

@@ -167,6 +167,8 @@ export interface TerminalRenderOptions {
   color: boolean;
   eventFilter?: 'ALL' | 'POOLS' | 'ENGINES' | 'EXECUTION' | undefined;
   positionFilter?: 'ALL' | 'OPEN' | 'CLOSED' | undefined;
+  /** Compact shell presentation selected only on phone-sized terminal widths. */
+  mobileView?: 'OVERVIEW' | 'ACTIVITY' | undefined;
   /** Plain diagnostic output keeps durable event identities visible. */
   showCanonicalEventCodes?: boolean | undefined;
   interactive?: boolean | undefined;
@@ -436,8 +438,129 @@ function healthLines(snapshot: TerminalSnapshot, color: boolean): string[] {
   ];
 }
 
+function mobileSection(title: string, content: string[], width: number, color: boolean): string[] {
+  return [paint(`── ${title} ${'─'.repeat(Math.max(0, width - visible(title).length - 4))}`, 'lime', color), ...content.map(value => clip(value, width))];
+}
+
+function compactCandidateLines(snapshot: TerminalSnapshot, width: number, color: boolean): string[] {
+  const candidate = snapshot.candidates[snapshot.selectedCandidateIndex] || snapshot.candidates[0];
+  if (!candidate) return [paint('No current candidate cycle.', 'muted', color)];
+  const range = candidate.lowerBinId === undefined || candidate.upperBinId === undefined ? '—' : `${candidate.lowerBinId}→${candidate.upperBinId}`;
+  const score = candidate.confidence === undefined ? '—' : candidate.confidence.toFixed(2);
+  const ev = candidate.riskAdjustedExpectedNetEv ?? candidate.predictedNetEv;
+  const evText = ev === undefined || !Number.isFinite(ev) ? '—' : `${ev >= 0 ? '+' : ''}${ev.toFixed(6)}`;
+  return [
+    `${paint('POOL', 'muted', color)} ${state(candidate.poolDisplay, color)}`,
+    `${paint('STATE', 'muted', color)} ${state(candidate.operationalState, color)}  ${paint('P3', 'muted', color)} ${state(candidate.operationalState, color)}`,
+    `${paint('P4', 'muted', color)} ${state(candidate.phase4State, color)}  ${paint('SCORE', 'muted', color)} ${paint(score, score === '—' ? 'muted' : 'cyan', color)}`,
+    `${paint('EV', 'muted', color)} ${paint(evText, evText === '—' ? 'muted' : ev !== undefined && ev >= 0 ? 'green' : 'red', color)}  ${paint('RANGE', 'muted', color)} ${range}`,
+    `${paint('NEXT', 'muted', color)} ${state(nextWatchGate(candidate), color)}`
+  ].map(value => clip(value, width));
+}
+
+function compactPipelineLines(snapshot: TerminalSnapshot, width: number, color: boolean): string[] {
+  const totals = new Map<string, number>();
+  for (const candidate of snapshot.candidates) totals.set(candidate.operationalState, (totals.get(candidate.operationalState) || 0) + 1);
+  if (!totals.size) return [paint('No current candidate facts.', 'muted', color)];
+  return [...totals.entries()].sort(([a], [b]) => a.localeCompare(b)).slice(0, 2).map(([name, count]) => `${pad(state(name, color), Math.max(10, Math.min(16, width - 5)))} ${count}`);
+}
+
+function compactWatchLines(snapshot: TerminalSnapshot, width: number, color: boolean, limit: number): string[] {
+  const pools = snapshot.entryWatchPools;
+  if (!pools.length) return [paint('No actively monitored pools.', 'muted', color)];
+  const visiblePools = pools.slice(0, Math.max(1, limit));
+  const rows = visiblePools.map(pool => clip(`${state(pool.poolDisplay, color)} ${state(pool.operationalState, color)} → ${state(nextWatchGate(pool), color)}`, width));
+  if (pools.length > visiblePools.length) rows.push(paint(`+${pools.length - visiblePools.length} more`, 'muted', color));
+  return rows;
+}
+
+function compactOpenPositionLines(snapshot: TerminalSnapshot, width: number, color: boolean, limit: number): string[] {
+  if (!snapshot.activePools.length) return [paint('No open LP positions.', 'muted', color)];
+  return snapshot.activePools.slice(0, Math.max(1, limit)).map(position => clip(`${state(position.poolDisplay, color)} ${state(position.lifecycleState, color)} ${signedPercent(position.liveControlReturnFraction, color)} ${paint('PK', 'muted', color)} ${signedPercent(position.liveControlPeakReturnFraction, color)} ${state(position.protection, color)}`, width));
+}
+
+function compactEventLines(snapshot: TerminalSnapshot, width: number, filter: TerminalRenderOptions['eventFilter'], color: boolean, limit: number, showCanonical = false): string[] {
+  const rows = snapshot.events.filter(event => !filter || filter === 'ALL' || eventCategory(event) === filter).slice(0, Math.max(1, limit));
+  if (!rows.length) return [paint('No canonical events.', 'muted', color)];
+  return rows.map(row => {
+    const time = new Date(row.observedAt).toISOString().slice(11, 16);
+    const event = showCanonical ? row.event : displayEventCode(row.event);
+    const prefix = `${time} ${event}`;
+    return clip(`${paint(time, 'muted', color)} ${state(event, color)} ${clip(row.message || row.status, Math.max(8, width - visible(prefix).length - 1))}`, width);
+  });
+}
+
+function compactRecentPositionLines(snapshot: TerminalSnapshot, width: number, filter: TerminalRenderOptions['positionFilter'], color: boolean, limit: number): string[] {
+  const positions = snapshot.recentPositions.filter(position => !filter || filter === 'ALL' || position.state === filter).slice(0, Math.max(1, limit));
+  if (!positions.length) return [paint('No matching positions.', 'muted', color)];
+  return positions.map(position => {
+    const coloured = position.state === 'OPEN' ? signedPercent(position.liveControlReturnFraction, color) : signedPercent(position.realizedReturnFraction, color);
+    const age = position.holdSeconds === undefined ? 'n/a' : formatAge(new Date(Date.now() - position.holdSeconds * 1000).toISOString());
+    return clip(`${state(position.poolDisplay, color)} ${state(position.state, color)} ${coloured} ${paint(age, 'muted', color)}`, width);
+  });
+}
+
+function compactEngineLines(snapshot: TerminalSnapshot, width: number, color: boolean, limit: number): string[] {
+  return snapshot.engines.slice(0, Math.max(1, limit)).map(engine => clip(`${paint(engine.name, 'muted', color)} ${state(engine.status, color)} ${paint(formatAge(engine.observedAt), 'muted', color)}`, width));
+}
+
+function compactSystemLines(snapshot: TerminalSnapshot, width: number, color: boolean, limit: number): string[] {
+  const health = snapshot.health;
+  const byRole = new Map(health.rpcHealth.map(rpc => [rpc.role, rpc]));
+  const rpc = (role: 'PRODUCTION' | 'DISCOVERY' | 'EXECUTION'): string => byRole.get(role)?.state || 'UNKNOWN';
+  const mobileRpcState = (role: 'PRODUCTION' | 'DISCOVERY' | 'EXECUTION'): string => {
+    const value = rpc(role);
+    const label = value === 'HEALTHY' ? 'OK' : value === 'DEGRADED' ? 'DEG' : value === 'UNAVAILABLE' ? 'DOWN' : '?';
+    return state(label, color);
+  };
+  return [
+    `${paint('P7', 'muted', color)} ${state(health.healthStatus, color)} ${paint('SAFE', 'muted', color)} ${state(health.safetyMode, color)}`,
+    `${paint('ENTRY', 'muted', color)} ${state(health.newEconomicActionAllowed ? 'ALLOWED' : 'BLOCKED', color)} ${paint('REC', 'muted', color)} ${state(String(health.recoveryQueueCount), color)}`,
+    `${paint('RPC', 'muted', color)} P:${mobileRpcState('PRODUCTION')} D:${mobileRpcState('DISCOVERY')} E:${mobileRpcState('EXECUTION')}`,
+    `${paint('PLAN', 'muted', color)} ${state(String(health.activeManagementPlans), color)} ${paint('UNK', 'muted', color)} ${state(String(health.unknownSubmissionCount), color)}`
+  ].slice(0, Math.max(1, limit)).map(value => clip(value, width));
+}
+
+function renderMobileDecisionTerminal(snapshot: TerminalSnapshot, options: TerminalRenderOptions): string {
+  const color = options.color;
+  const width = Math.max(36, Math.min(99, Math.floor(options.columns)));
+  const rows = Math.max(18, Math.min(60, Math.floor(options.rows ?? 24)));
+  const health = snapshot.health;
+  const mobileView = options.mobileView || 'OVERVIEW';
+  const header = [
+    paint(width >= 52 ? 'LPFORGE DECISION TERMINAL' : 'LPFORGE TERMINAL', 'lime', color),
+    `${paint('P7', 'muted', color)} ${state(health.healthStatus, color)}  ${paint('SAFE', 'muted', color)} ${state(health.safetyMode, color)}`,
+    `${paint('ENTRY', 'muted', color)} ${state(health.newEconomicActionAllowed ? 'ALLOWED' : 'BLOCKED', color)}  ${paint('POS', 'muted', color)} ${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'}`,
+    `${paint(`WATCH ${snapshot.entryWatchPools.length}`, 'amber', color)}  ${paint(`CAND ${snapshot.candidates.length}`, 'cyan', color)}  ${paint(`REC ${health.recoveryQueueCount}`, health.recoveryQueueCount ? 'amber' : 'muted', color)}`,
+    `${state(rpcSummary(snapshot), color)}  ${paint(new Date().toISOString().slice(11, 19), 'muted', color)}`
+  ].map(value => clip(value, width));
+  const footer = options.interactive
+    ? clip(paint(`q quit | m ${mobileView === 'OVERVIEW' ? 'activity' : 'overview'} | h/l candidate | r refresh`, 'muted', color), width)
+    : paint('LPFORGE | SOLANA | READ-ONLY', 'muted', color);
+  const bodyBudget = Math.max(8, rows - header.length - 2);
+  const body: string[] = [];
+  const append = (title: string, content: string[], minimum = 2): void => {
+    const section = mobileSection(title, content, width, color);
+    if (body.length + Math.min(minimum, section.length) <= bodyBudget) body.push(...section.slice(0, Math.max(minimum, Math.min(section.length, bodyBudget - body.length))));
+  };
+  if (mobileView === 'OVERVIEW') {
+    append(`◎ DECISION ${snapshot.candidates.length ? `${snapshot.selectedCandidateIndex + 1}/${snapshot.candidates.length}` : '0/0'}`, compactCandidateLines(snapshot, width, color), 5);
+    append(`■ ENTRY WATCH (${snapshot.entryWatchPools.length})`, compactWatchLines(snapshot, width, color, bodyBudget >= 20 ? 3 : 2), 3);
+    append(`■ OPEN POSITIONS (${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'})`, compactOpenPositionLines(snapshot, width, color, 2), 2);
+    append('♥ SYSTEM HEALTH', compactSystemLines(snapshot, width, color, bodyBudget >= 20 ? 4 : 3), 3);
+    append('▥ CANDIDATE PIPELINE', compactPipelineLines(snapshot, width, color), 2);
+  } else {
+    append(`● LIVE EVENTS ${options.eventFilter || 'ALL'}`, compactEventLines(snapshot, width, options.eventFilter, color, bodyBudget >= 20 ? 6 : 4, options.showCanonicalEventCodes), 5);
+    append(`▤ RECENT POSITIONS ${options.positionFilter || 'ALL'}`, compactRecentPositionLines(snapshot, width, options.positionFilter, color, bodyBudget >= 20 ? 5 : 3), 4);
+    append('⚙ ENGINE DESK', compactEngineLines(snapshot, width, color, 3), 3);
+    append('♥ SYSTEM HEALTH', compactSystemLines(snapshot, width, color, 3), 3);
+  }
+  return [...header, paint('─'.repeat(width), 'muted', color), ...body.slice(0, bodyBudget), footer].join('\n');
+}
+
 export function renderDecisionTerminal(snapshot: TerminalSnapshot, options: TerminalRenderOptions): string {
   const color = options.color;
+  if (options.columns < 100) return renderMobileDecisionTerminal(snapshot, options);
   const width = Math.max(100, Math.min(220, options.columns));
   const rows = Math.max(30, Math.min(80, Math.floor(options.rows ?? 50)));
   const health = snapshot.health;
@@ -518,4 +641,8 @@ export function nextEventFilter(value: TerminalRenderOptions['eventFilter'] = 'A
 export function nextPositionFilter(value: TerminalRenderOptions['positionFilter'] = 'ALL'): NonNullable<TerminalRenderOptions['positionFilter']> {
   const filters: NonNullable<TerminalRenderOptions['positionFilter']>[] = ['ALL', 'OPEN', 'CLOSED'];
   return filters[(filters.indexOf(value) + 1) % filters.length] ?? 'ALL';
+}
+
+export function nextMobileView(value: NonNullable<TerminalRenderOptions['mobileView']> = 'OVERVIEW'): NonNullable<TerminalRenderOptions['mobileView']> {
+  return value === 'OVERVIEW' ? 'ACTIVITY' : 'OVERVIEW';
 }

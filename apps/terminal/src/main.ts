@@ -12,6 +12,7 @@ import {
   advanceCandidateIndex,
   formatTerminalPoolDisplay,
   nextEventFilter,
+  nextMobileView,
   nextPositionFilter,
   renderDecisionTerminal,
   type TerminalCandidate,
@@ -409,7 +410,7 @@ function arg(name: string): string | undefined {
   return index >= 0 ? process.argv[index + 1] : undefined;
 }
 function showHelp(): void {
-  io.stdout.write('LPForge Decision Terminal (read-only)\n\nUsage: pnpm terminal [--once] [--refresh-seconds N] [--plain]\n\nInteractive keys: q quit | ←/h previous candidate | →/l next candidate | e event filter | f fills filter | r refresh\n');
+  io.stdout.write('LPForge Decision Terminal (read-only)\n\nUsage: pnpm terminal [--once] [--refresh-seconds N] [--plain]\n\nInteractive keys: q quit | ←/h previous candidate | →/l next candidate | e event filter | f fills filter | m mobile overview/activity | r refresh\n');
 }
 
 async function main(): Promise<void> {
@@ -428,6 +429,7 @@ async function main(): Promise<void> {
   let candidateIndex = 0;
   let eventFilter: Parameters<typeof renderDecisionTerminal>[1]['eventFilter'] = 'ALL';
   let positionFilter: Parameters<typeof renderDecisionTerminal>[1]['positionFilter'] = 'ALL';
+  let mobileView: NonNullable<Parameters<typeof renderDecisionTerminal>[1]['mobileView']> = 'OVERVIEW';
   let lastSnapshot: TerminalSnapshot | undefined;
   const cleanup = async (exitCode?: number): Promise<void> => {
     if (stopped) return;
@@ -446,6 +448,7 @@ async function main(): Promise<void> {
       color: !plain && Boolean(io.stdout.isTTY),
       eventFilter,
       positionFilter,
+      mobileView,
       interactive: true
     });
     io.stdout.write(`\u001b[?25l\u001b[2J\u001b[H${output}`);
@@ -487,6 +490,7 @@ async function main(): Promise<void> {
     if (key === '\u001b[C' || key === 'l') candidateIndex = lastSnapshot ? advanceCandidateIndex(lastSnapshot, candidateIndex, 1) : 0;
     if (key === 'e' || key === 'E') eventFilter = nextEventFilter(eventFilter);
     if (key === 'f' || key === 'F') positionFilter = nextPositionFilter(positionFilter);
+    if (key === 'm' || key === 'M') mobileView = nextMobileView(mobileView);
     if (lastSnapshot) draw(lastSnapshot);
     if (key === 'r' || key === 'R') void refresh();
   });
