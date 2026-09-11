@@ -3,6 +3,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 service="${1:?LPFORGE_SERVICE_REQUIRED}"
+service_args=("${@:2}")
+node_args=(start)
 # This establishes the stable operational root and central configuration
 # paths.  Immutable releases carry code only, never runtime configuration.
 LPFORGE_HOME="${LPFORGE_HOME:-/root/systems/LPForge}"
@@ -88,8 +90,22 @@ case "$service" in
     export LPFORGE_RPC_ROLE=PRODUCTION
     target='.build/apps/telegram-operator/src/main.js'
     ;;
+  terminal)
+    # The shell Decision Terminal is an on-demand observer, not a daemon. It
+    # receives the shared runtime facts and policy provenance but never the
+    # P6 execution overlay or signer material.
+    unset LIVE_SIGNING LPFORGE_LIVE_SIGNING LPFORGE_LIVE_EXECUTION PRIVATE_KEY SEED_PHRASE \
+      WALLET_SECRET WALLET_PRIVATE_KEY SIGNER_KEYPAIR LPFORGE_P6_PRIVATE_KEY \
+      LPFORGE_P6_SIGNER_BACKEND_ID LPFORGE_P6_SIGNER_MODE \
+      LPFORGE_P6_SIGNER_CUSTODY_MODE LPFORGE_P6_SIGNER_PUBLIC_KEY
+    export LPFORGE_RPC_ROLE=PRODUCTION
+    target='.build/apps/terminal/src/main.js'
+    # Unlike daemon services, the TUI accepts only local display arguments
+    # such as --once/--plain. It never receives an economic command.
+    node_args=("${service_args[@]}")
+    ;;
   *) echo "LPFORGE_SERVICE_UNKNOWN:${service}" >&2; exit 1 ;;
 esac
 
 node "${env_args[@]}" scripts/verify-runtime-release-identity.mjs
-exec node "${env_args[@]}" --enable-source-maps "$target" start
+exec node "${env_args[@]}" --enable-source-maps "$target" "${node_args[@]}"

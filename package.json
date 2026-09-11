@@ -17,6 +17,7 @@
     "verify:migrations": "node scripts/verify-migrations.mjs",
     "db:migrate": "node scripts/db-migrate.mjs",
     "api": "node --enable-source-maps .build/apps/api/src/main.js",
+    "terminal": "node --enable-source-maps .build/apps/terminal/src/main.js",
     "collector": "node --enable-source-maps .build/apps/collector/src/main.js",
     "observer": "node --enable-source-maps .build/apps/observer/src/main.js",
     "replay": "node --enable-source-maps .build/apps/replay/src/main.js",
