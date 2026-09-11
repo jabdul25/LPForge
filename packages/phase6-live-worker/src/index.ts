@@ -76,6 +76,7 @@ import type {
   AutonomousPlanAction,
   LifecycleChildTransaction,
   LifecycleSettlementInput,
+  CanonicalPostTradeReport,
   OpenChunkDisposition,
   OpenChunkDispositionRecord,
   Phase1Store,
@@ -89,16 +90,18 @@ import {
   type ExecutionJournal,
 } from "../../execution-recovery/src/index.js";
 import { computePlanProvenanceHmac } from "../../execution-contracts/src/index.js";
-import { enqueueAndDispatchPhase7Alert, loadPhase7TelegramConfig } from "../../phase7-alerting/src/index.js";
+import { enqueueAndDispatchPhase7Alert, loadPhase7TelegramConfig, postTradeSettlementAlert } from "../../phase7-alerting/src/index.js";
 
 const JUPITER_SWAP_V6_PROGRAM_ID = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
 const telegramOpenConfig=loadPhase7TelegramConfig();
 function queueOpenedPositionAlert(input:{positionAddress:string;poolAddress:string;planId:string;strategy:string;orientation:string;capitalLamports:bigint;lowerBinId:number;upperBinId:number;activeBinId:number;observedAt:string}){
   void enqueueAndDispatchPhase7Alert({databaseUrl:process.env.DATABASE_URL,config:telegramOpenConfig,alert:{severity:'INFO',code:'POSITION_OPENED',title:'Position opened',message:'The LP position is confirmed on-chain and LPForge has matched it to this plan.\nAction needed: none.',observedAt:input.observedAt,entityType:'POSITION',entityId:input.positionAddress,transitionKey:'NOT_OPEN->OPEN',topic:'TRADES',positionAddress:input.positionAddress,poolAddress:input.poolAddress,planId:input.planId,details:{Strategy:input.strategy,Orientation:input.orientation,'Capital SOL':(Number(input.capitalLamports)/1_000_000_000).toFixed(6),'Active bin':input.activeBinId,Range:`${input.lowerBinId} → ${input.upperBinId}`,Bins:input.upperBinId-input.lowerBinId+1,Reconciliation:'MATCH'}}}).catch(()=>{});
 }
-function queuePositionSettledAlert(input:{positionAddress:string;poolAddress:string;planId:string;observedAt:string;capitalLamports:bigint;realizedPnlLamports:bigint;totalInLamports:bigint;totalOutLamports:bigint}){
-  const pnlSol=Number(input.realizedPnlLamports)/1_000_000_000,capitalSol=Number(input.capitalLamports)/1_000_000_000;
-  void enqueueAndDispatchPhase7Alert({databaseUrl:process.env.DATABASE_URL,config:telegramOpenConfig,alert:{severity:'INFO',code:'POSITION_SETTLED',title:'Position closed and settled',message:'The position is closed. LPForge verified all attributed inventory and SOL settlement.\nAction needed: none.',observedAt:input.observedAt,entityType:'POSITION',entityId:input.positionAddress,transitionKey:'CLOSED->SOL_SETTLED',topic:'TRADES',positionAddress:input.positionAddress,poolAddress:input.poolAddress,planId:input.planId,details:{'Initial capital SOL':capitalSol.toFixed(6),'Realized economic PnL SOL':pnlSol.toFixed(9),'Realized economic return':capitalSol>0?`${(pnlSol/capitalSol*100).toFixed(2)}%`:'N/A','SOL inflows':(Number(input.totalInLamports)/1e9).toFixed(9),'SOL outflows':(Number(input.totalOutLamports)/1e9).toFixed(9),Settlement:'Fully settled'}}}).catch(()=>{});
+function queuePositionSettledAlert(report:CanonicalPostTradeReport){
+  // This runs only after immutable settlement persistence. The durable alert
+  // outbox owns retry/deduplication; a reporting or Telegram failure is never
+  // allowed to change settlement, P6 execution, or trading authority.
+  void enqueueAndDispatchPhase7Alert({databaseUrl:process.env.DATABASE_URL,config:telegramOpenConfig,alert:postTradeSettlementAlert(report)}).catch(()=>{});
 }
 
 export interface LiveWorkerConfig {
@@ -125,6 +128,8 @@ export interface LiveWorkerConfig {
   maxOpenPositions?: number;
   /** Present only while the explicitly approved controlled canary is armed. */
   controlledCanary?: ControlledCanaryDeploymentPolicy;
+  /** Immutable-settlement reporting policy. Observability only. */
+  postTradeReporting?:{enabled:boolean;policyVersion:string;runningStatsStartAt:string};
 }
 export interface LiveWorkerResult {
   status: "IDLE" | "AWAITING_FRESH_P7_CONTROL" | "BLOCKED" | "SUBMITTED" | "RECONCILED" | "UNKNOWN";
@@ -4890,7 +4895,7 @@ export function confirmedTerminalClaimTransactions(
 }
 
 /** A recovered close reaches the same durable settlement boundary as a normal close. */
-async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:AutonomousPlan;positionAddress:string;connection:Connection;config:Pick<LiveWorkerConfig,"rpcUrl"|"residualDustThresholdUsd"|"meteoraDataApiUrl"|"dataApiMaxRps"|"httpTimeoutMs"|"policyHash">}):Promise<{ready:boolean;reasonCodes:string[]}>{
+async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:AutonomousPlan;positionAddress:string;connection:Connection;config:Pick<LiveWorkerConfig,"rpcUrl"|"residualDustThresholdUsd"|"meteoraDataApiUrl"|"dataApiMaxRps"|"httpTimeoutMs"|"policyHash"|"postTradeReporting">}):Promise<{ready:boolean;reasonCodes:string[]}>{
   const positionCheck=await input.connection.getAccountInfoAndContext(new PublicKey(input.positionAddress),"confirmed");
   if(positionCheck.value!==null)return{ready:false,reasonCodes:["SETTLEMENT_POSITION_STILL_EXISTS"]};
   const dispatch=closeSettlementDispatch(input.plan),closeSignature=typeof dispatch.signature==="string"?dispatch.signature:typeof dispatch.pendingSignature==="string"?dispatch.pendingSignature:undefined,closeTransactionId=typeof dispatch.transactionId==="string"?dispatch.transactionId:undefined;
@@ -4992,6 +4997,13 @@ async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:Au
       .flatMap(transaction=>transaction.signature?[transaction.signature]:[]);
   if(!primaryRemoveSignature)return{ready:false,reasonCodes:["SETTLEMENT_REMOVE_RECEIPT_MISSING"]};
   await input.store.finalizeCloseFeeAttribution({closePlanId:rootClosePlanId,positionAddress:input.positionAddress,removeSignature:primaryRemoveSignature,...(claimSignatures.length===0?{}:{claimSignatures}),terminalSettlementId:persisted.settlementId,at});
+  // The report is built from the just-committed immutable settlement and its
+  // finalized close attribution before audit compaction.  It is only a
+  // snapshot for the durable alert outbox; no report field can affect this
+  // canonical close or its accounting.
+  const postTradeReport=input.config.postTradeReporting?.enabled
+    ?await input.store.loadCanonicalPostTradeReport({settlementId:persisted.settlementId,runningStatsStartAt:input.config.postTradeReporting.runningStatsStartAt,reportPolicyVersion:input.config.postTradeReporting.policyVersion})
+    :undefined;
   await input.store.compactPositionManagementDecisionAudit({positionAddress:input.positionAddress,at});
   // Existing research outcomes are immutable. A settlement supersession fixes
   // the accounting authority without mutating or duplicating V3 evidence.
@@ -4999,8 +5011,7 @@ async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:Au
     const outcome=await input.store.createLiveSolSettledLearningOutcome({positionAddress:input.positionAddress,at});
     if(!outcome.outcome)throw new Error(`LPFORGE_LIVE_OUTCOME_MATERIALIZATION_FAILED:${outcome.reasonCodes.join(',')}`);
   }
-  const entryCapital=settlementInput.cashflows.filter(flow=>flow.flowType==='OPEN_CONTRIBUTION').reduce((total,flow)=>total+(flow.lamports??0n),0n);
-  queuePositionSettledAlert({positionAddress:input.positionAddress,poolAddress:input.plan.poolAddress,planId:input.plan.planId,observedAt:at,capitalLamports:entryCapital,realizedPnlLamports:assessment.realizedSolPnlLamports,totalInLamports:assessment.totalSolInLamports,totalOutLamports:assessment.totalSolOutLamports});
+  if(postTradeReport)queuePositionSettledAlert(postTradeReport);
   return{ready:true,reasonCodes:[]};
 }
 

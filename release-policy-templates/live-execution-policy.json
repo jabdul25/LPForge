@@ -37,6 +37,11 @@
   "feeClaim": {
     "minimumClaimValueUsd": 0.50
   },
+  "postTradeReporting": {
+    "enabled": true,
+    "policyVersion": "post-trade-reporting-v1",
+    "runningStatsStartAt": "2026-09-01T00:00:00.000Z"
+  },
   "poolReentry": {
     "policyVersion": "pool-reentry-cooldown-v1",
     "normalProfitCloseCooldownMinutes": 120,

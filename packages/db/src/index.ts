@@ -684,6 +684,23 @@ export interface LifecycleSettlementAssessment {
   netRentCostLamports:bigint;
   realizedSolPnlLamports:bigint;
 }
+/**
+ * Read-only projection for the durable post-trade alert outbox.  The
+ * immutable lifecycle settlement is the realized-result authority; all other
+ * fields are optional enrichment and must remain explicitly unavailable when
+ * durable evidence is absent.
+ */
+export interface CanonicalPostTradeReport {
+  lifecycleId:string;settlementId:string;settlementVersion:number;
+  correction?:{previousSettlementVersion:number;previousPnlLamports:bigint;previousReturnFraction?:number;reason?:string};
+  positionAddress:string;poolAddress:string;poolDisplay:string;entryPlanId?:string;closePlanId?:string;
+  openedAt:string;settledAt:string;capitalLamports:bigint;realizedPnlLamports:bigint;realizedReturnFraction?:number;
+  peakMfeFraction?:number;lpFeesLamports?:bigint;inventoryPnlLamports?:bigint;transactionCostsLamports?:bigint;
+  protection:{ts5:'CONFIRMED'|'ARMED_NOT_CONFIRMED'|'NOT_TRIGGERED'|'UNAVAILABLE';oorP4:'CONFIRMED'|'NOT_TRIGGERED'|'UNAVAILABLE';triggerPeakFraction?:number;triggerReturnFraction?:number;closeDecisionReturnFraction?:number;exitReasonCodes:string[]};
+  execution:{decisionAt?:string;planCreatedAt?:string;submittedAt?:string;confirmedAt?:string};
+  running:{settled:number;wins:number;losses:number;breakEven:number;netPnlLamports:bigint;grossProfitLamports:bigint;grossLossLamports:bigint;avgWinnerReturnFraction?:number;avgLoserReturnFraction?:number};
+  provenance:{policyVersion?:string;policyHash?:string;releaseSha?:string;accountingVersion?:string};
+}
 export interface LiveLearningOutcome {outcomeId:string;outcomeKind:"LIVE_SOL_SETTLED"|"LIVE_ENTRY_ABORTED_SOL_SETTLED";settlementId?:string;lifecycleId?:string;entryPlanId:string;predictionId:string;recommendationId:string;thesisId:string;poolAddress:string;realizedSolPnlLamports:bigint;realizedReturnFraction?:number;}
 const SETTLEMENT_TERMINAL_TRANSACTION_STATES=new Set<LifecycleChildTransactionState>(["CONFIRMED","FAILED_FINAL","PROVEN_NOT_LANDED"]);
 /**
@@ -1431,6 +1448,8 @@ export interface Phase1Store {
   linkPositionLifecyclePlan(value:{positionAddress:string;planId:string;role:"ENTRY"|"MANAGEMENT"|"CLOSE"|"RECOVERY";at:string}):Promise<void>;
   loadLifecycleSettlementInput(positionAddress:string):Promise<Omit<LifecycleSettlementInput,"positionAbsent"|"positionCheckedAt"|"positionCheckedSlot">|undefined>;
   persistLifecycleSolSettlement(value:{assessment:LifecycleSettlementAssessment;input:LifecycleSettlementInput;sourceCommit?:string;policyHash?:string;migrationHead?:string;buildId?:string;at:string}):Promise<{lifecycleId:string;settlementId:string;created:boolean;superseded?:boolean}>;
+  /** Read-only canonical report source; no report field can change settlement. */
+  loadCanonicalPostTradeReport(value:{settlementId:string;runningStatsStartAt:string;reportPolicyVersion?:string}):Promise<CanonicalPostTradeReport|undefined>;
   upsertLifecycleSettlementChainReconciliation(value:{positionAddress:string;closePlanId:string;status:"RECONCILED_CHAIN"|"RECONCILIATION_REQUIRED";chainSolInLamports:bigint;chainSolOutLamports:bigint;dbSolInLamports:bigint;dbSolOutLamports:bigint;reasonCodes:string[];payload:Record<string,unknown>;observedAt:string}):Promise<void>;
   loadTerminalCloseRentRecoveryCandidates(limit?:number):Promise<Array<{planId:string;positionAddress:string}>>;
   loadPendingPositionManagementDecisionAuditCompactions(limit?:number):Promise<string[]>;
@@ -4265,6 +4284,112 @@ return 'APPLIED';
         await db.query("COMMIT");return{lifecycleId:input.lifecycle.lifecycleId,settlementId,created:true,...(prior?{superseded:true}:{})};
       }catch(error){try{await db.query("ROLLBACK");}catch{}throw error;}
     },
+    async loadCanonicalPostTradeReport(v){
+      const start=new Date(v.runningStatsStartAt);
+      if(!Number.isFinite(start.getTime()))throw new Error('LPFORGE_POST_TRADE_REPORT_START_INVALID');
+      // This projection deliberately starts from the requested immutable
+      // settlement. The latest-version guard prevents a delayed v1 request
+      // from reporting stale accounting after v2 has superseded it.
+      const result=await db.query(`
+        WITH requested AS (
+          SELECT s.*,l.created_at AS opened_at,l.settled_at AS lifecycle_settled_at,l.entry_plan_id AS lifecycle_entry_plan_id,
+            o.lpforge_position_id,o.initial_capital_lamports,
+            p.token_x_mint,p.token_y_mint,tx.symbol AS token_x_symbol,ty.symbol AS token_y_symbol
+          FROM execution.lifecycle_sol_settlements s
+          JOIN execution.position_lifecycles l ON l.lifecycle_id=s.lifecycle_id AND l.status='SOL_SETTLED'
+          LEFT JOIN execution.owned_positions o ON o.position_address=l.position_address
+          LEFT JOIN protocol.pools p ON p.address=s.pool_address
+          LEFT JOIN protocol.tokens tx ON tx.mint=p.token_x_mint
+          LEFT JOIN protocol.tokens ty ON ty.mint=p.token_y_mint
+          WHERE s.settlement_id=$1
+            AND NOT EXISTS(SELECT 1 FROM execution.lifecycle_sol_settlements newer WHERE newer.lifecycle_id=s.lifecycle_id AND newer.settlement_version>s.settlement_version)
+        ), latest AS (
+          SELECT DISTINCT ON (l.lifecycle_id) l.lifecycle_id,s.realized_sol_pnl_lamports,
+            COALESCE(re.entry_capital_lamports,o.initial_capital_lamports) AS capital_lamports
+          FROM execution.position_lifecycles l
+          JOIN execution.lifecycle_sol_settlements s ON s.lifecycle_id=l.lifecycle_id
+          LEFT JOIN execution.position_realized_economics re ON re.lifecycle_id=l.lifecycle_id
+          LEFT JOIN execution.owned_positions o ON o.position_address=l.position_address
+          WHERE l.status='SOL_SETTLED' AND l.created_at>=$2::timestamptz
+          ORDER BY l.lifecycle_id,s.settlement_version DESC
+        ), stats AS (
+          SELECT count(*)::int AS settled,
+            count(*) FILTER(WHERE realized_sol_pnl_lamports>0)::int AS wins,
+            count(*) FILTER(WHERE realized_sol_pnl_lamports<0)::int AS losses,
+            count(*) FILTER(WHERE realized_sol_pnl_lamports=0)::int AS break_even,
+            COALESCE(sum(realized_sol_pnl_lamports),0)::bigint AS net_pnl_lamports,
+            COALESCE(sum(realized_sol_pnl_lamports) FILTER(WHERE realized_sol_pnl_lamports>0),0)::bigint AS gross_profit_lamports,
+            COALESCE(sum(realized_sol_pnl_lamports) FILTER(WHERE realized_sol_pnl_lamports<0),0)::bigint AS gross_loss_lamports,
+            avg(realized_sol_pnl_lamports::numeric/NULLIF(capital_lamports,0)) FILTER(WHERE realized_sol_pnl_lamports>0) AS avg_winner_return_fraction,
+            avg(realized_sol_pnl_lamports::numeric/NULLIF(capital_lamports,0)) FILTER(WHERE realized_sol_pnl_lamports<0) AS avg_loser_return_fraction
+          FROM latest
+        )
+        SELECT r.lifecycle_id,r.settlement_id,r.settlement_version,r.position_address,r.pool_address,r.entry_plan_id,r.lifecycle_entry_plan_id,r.opened_at,r.settled_at,
+          r.realized_sol_pnl_lamports,r.source_commit,r.policy_hash,r.payload AS settlement_payload,
+          COALESCE(re.entry_capital_lamports,r.initial_capital_lamports) AS capital_lamports,
+          re.close_plan_id,re.gross_lp_fee_lamports,re.inventory_unwind_pnl_lamports,
+          CASE WHEN re.transaction_cost_lamports IS NULL AND re.swap_cost_lamports IS NULL THEN NULL ELSE COALESCE(re.transaction_cost_lamports,0)+COALESCE(re.swap_cost_lamports,0) END AS transaction_costs_lamports,
+          es.peak_net_return_fraction,es.net_return_fraction AS close_decision_return_fraction,es.last_reason_codes,es.payload AS exit_payload,
+          summary.terminal_reason,
+          es.peak_net_return_fraction AS peak_mfe_fraction,
+          close_plan.plan_id AS selected_close_plan_id,close_plan.created_at AS plan_created_at,
+          close_submit.submitted_at,close_confirm.confirmed_at,close_decision.decision_at,
+          previous.settlement_version AS previous_settlement_version,previous.realized_sol_pnl_lamports AS previous_pnl_lamports,previous.payload AS previous_payload,
+          CASE WHEN r.token_x_mint=$3 THEN 'SOL' ELSE NULLIF(r.token_x_symbol,'') END AS token_x_display,
+          CASE WHEN r.token_y_mint=$3 THEN 'SOL' ELSE NULLIF(r.token_y_symbol,'') END AS token_y_display,
+          stats.*
+        FROM requested r
+        CROSS JOIN stats
+        LEFT JOIN execution.position_realized_economics re ON re.lifecycle_id=r.lifecycle_id
+        LEFT JOIN execution.position_exit_state es ON es.lpforge_position_id=r.lpforge_position_id
+        LEFT JOIN execution.position_management_summaries summary ON summary.position_address=r.position_address
+        LEFT JOIN LATERAL (
+          SELECT p.plan_id,p.created_at FROM execution.lifecycle_plan_links link
+          JOIN execution.transaction_plans p ON p.plan_id=link.plan_id
+          WHERE link.lifecycle_id=r.lifecycle_id AND link.role='CLOSE'
+          ORDER BY CASE WHEN p.plan_id=re.close_plan_id THEN 0 ELSE 1 END,p.created_at DESC LIMIT 1
+        ) close_plan ON true
+        LEFT JOIN LATERAL (
+          SELECT min(a.submitted_at) AS submitted_at FROM execution.transaction_steps step
+          JOIN execution.submission_attempts a ON a.transaction_id=step.transaction_id
+          WHERE step.plan_id=close_plan.plan_id AND a.submitted_at IS NOT NULL
+        ) close_submit ON true
+        LEFT JOIN LATERAL (
+          SELECT min(c.observed_at) AS confirmed_at FROM execution.transaction_steps step
+          JOIN execution.submission_attempts a ON a.transaction_id=step.transaction_id
+          JOIN execution.confirmations c ON c.attempt_id=a.attempt_id
+          WHERE step.plan_id=close_plan.plan_id AND c.status IN ('CONFIRMED','FINALIZED')
+        ) close_confirm ON true
+        LEFT JOIN LATERAL (
+          SELECT min(audit.observed_at) AS decision_at FROM execution.position_management_decision_audit audit
+          WHERE audit.position_address=r.position_address AND audit.management_action IN ('CLOSE','EMERGENCY_CLOSE')
+        ) close_decision ON true
+        LEFT JOIN LATERAL (
+          SELECT prior.settlement_version,prior.realized_sol_pnl_lamports,prior.payload
+          FROM execution.lifecycle_sol_settlements prior
+          WHERE prior.lifecycle_id=r.lifecycle_id AND prior.settlement_version<r.settlement_version
+          ORDER BY prior.settlement_version DESC LIMIT 1
+        ) previous ON true
+      `,[v.settlementId,start.toISOString(),WSOL_MINT]);
+      const row=result.rows[0];if(!row)return undefined;
+      const finite=(value:unknown)=>{const n=Number(value);return Number.isFinite(n)?n:undefined;};
+      const amount=(key:string)=>row[key]===null||row[key]===undefined?undefined:BigInt(String(row[key]));
+      const textArray=(value:unknown)=>Array.isArray(value)?value.filter((item):item is string=>typeof item==='string'):[];
+      const exitPayload=row.exit_payload&&typeof row.exit_payload==='object'&&!Array.isArray(row.exit_payload)?row.exit_payload as Record<string,unknown>:{};
+      const watch=exitPayload.profitRetentionWatch&&typeof exitPayload.profitRetentionWatch==='object'&&!Array.isArray(exitPayload.profitRetentionWatch)?exitPayload.profitRetentionWatch as Record<string,unknown>:{};
+      const assessment=exitPayload.profitRetentionAssessment&&typeof exitPayload.profitRetentionAssessment==='object'&&!Array.isArray(exitPayload.profitRetentionAssessment)?exitPayload.profitRetentionAssessment as Record<string,unknown>:{};
+      const assessmentKind=typeof assessment.kind==='string'?assessment.kind:'';
+      const lastReasons=textArray(row.last_reason_codes),summaryReason=typeof row.terminal_reason==='string'&&row.terminal_reason?String(row.terminal_reason):undefined;
+      const ts5=assessmentKind==='TS5_PROTECTION_CONFIRMED'||lastReasons.includes('PROFIT_RETENTION_TS5_CONFIRMED')?'CONFIRMED' as const:watch.state==='WATCH_ARMED'||watch.state==='EXPIRED'?'ARMED_NOT_CONFIRMED' as const:row.exit_payload?'NOT_TRIGGERED' as const:'UNAVAILABLE' as const;
+      const oorP4=assessmentKind==='OOR_P4_PROTECTION_CONFIRMED'||lastReasons.includes('PROFIT_RETENTION_OOR_P4_CONFIRMED')?'CONFIRMED' as const:row.exit_payload?'NOT_TRIGGERED' as const:'UNAVAILABLE' as const;
+      const capital=amount('capital_lamports');if(capital===undefined||capital<=0n)return undefined;
+      const pnl=amount('realized_sol_pnl_lamports');if(pnl===undefined)return undefined;
+      const x=typeof row.token_x_display==='string'?String(row.token_x_display):undefined,y=typeof row.token_y_display==='string'?String(row.token_y_display):undefined,pool=String(row.pool_address),poolDisplay=x&&y?`${x} / ${y}`:`${pool.slice(0,6)}…${pool.slice(-4)}`;
+      const previousPnl=amount('previous_pnl_lamports'),previousVersion=finite(row.previous_settlement_version),priorReturn=previousPnl===undefined?undefined:Number(previousPnl)/Number(capital);
+      const policyPayload=row.settlement_payload&&typeof row.settlement_payload==='object'&&!Array.isArray(row.settlement_payload)?row.settlement_payload as Record<string,unknown>:{};
+      const entryPlanId=row.entry_plan_id??row.lifecycle_entry_plan_id,peakMfeFraction=finite(row.peak_mfe_fraction),lpFeesLamports=amount('gross_lp_fee_lamports'),inventoryPnlLamports=amount('inventory_unwind_pnl_lamports'),transactionCostsLamports=amount('transaction_costs_lamports'),triggerPeakFraction=finite(watch.anchorMfeReturn),closeDecisionReturnFraction=finite(row.close_decision_return_fraction),avgWinnerReturnFraction=finite(row.avg_winner_return_fraction),avgLoserReturnFraction=finite(row.avg_loser_return_fraction);
+      return{lifecycleId:String(row.lifecycle_id),settlementId:String(row.settlement_id),settlementVersion:Number(row.settlement_version),...(previousVersion!==undefined&&previousPnl!==undefined?{correction:{previousSettlementVersion:previousVersion,previousPnlLamports:previousPnl,...(priorReturn!==undefined&&Number.isFinite(priorReturn)?{previousReturnFraction:priorReturn}:{}),...(typeof policyPayload.supersessionReason==='string'?{reason:String(policyPayload.supersessionReason)}:{})}}:{}),positionAddress:String(row.position_address),poolAddress:pool,poolDisplay,...(entryPlanId?{entryPlanId:String(entryPlanId)}:{}),...(row.selected_close_plan_id?{closePlanId:String(row.selected_close_plan_id)}:{}),openedAt:toIsoTimestamp(row.opened_at),settledAt:toIsoTimestamp(row.settled_at),capitalLamports:capital,realizedPnlLamports:pnl,realizedReturnFraction:Number(pnl)/Number(capital),...(peakMfeFraction!==undefined?{peakMfeFraction}:{}),...(lpFeesLamports!==undefined?{lpFeesLamports}:{}),...(inventoryPnlLamports!==undefined?{inventoryPnlLamports}:{}),...(transactionCostsLamports!==undefined?{transactionCostsLamports}:{}),protection:{ts5,oorP4,...(triggerPeakFraction!==undefined?{triggerPeakFraction}:{}),...(ts5==='CONFIRMED'&&closeDecisionReturnFraction!==undefined?{triggerReturnFraction:closeDecisionReturnFraction}:{}),...(closeDecisionReturnFraction!==undefined?{closeDecisionReturnFraction}:{}),exitReasonCodes:[...new Set([...lastReasons,...(summaryReason?[summaryReason]:[])])]},execution:{...(row.decision_at?{decisionAt:toIsoTimestamp(row.decision_at)}:{}),...(row.plan_created_at?{planCreatedAt:toIsoTimestamp(row.plan_created_at)}:{}),...(row.submitted_at?{submittedAt:toIsoTimestamp(row.submitted_at)}:{}),...(row.confirmed_at?{confirmedAt:toIsoTimestamp(row.confirmed_at)}:{})},running:{settled:Number(row.settled),wins:Number(row.wins),losses:Number(row.losses),breakEven:Number(row.break_even),netPnlLamports:BigInt(String(row.net_pnl_lamports)),grossProfitLamports:BigInt(String(row.gross_profit_lamports)),grossLossLamports:BigInt(String(row.gross_loss_lamports)),...(avgWinnerReturnFraction!==undefined?{avgWinnerReturnFraction}:{}),...(avgLoserReturnFraction!==undefined?{avgLoserReturnFraction}:{})},provenance:{...(v.reportPolicyVersion?{policyVersion:v.reportPolicyVersion}:{}),...(row.policy_hash?{policyHash:String(row.policy_hash)}:{}),...(row.source_commit?{releaseSha:String(row.source_commit)}:{}),...(typeof policyPayload.accountingConvention==='string'?{accountingVersion:String(policyPayload.accountingConvention)}:{})}};
+    },
     async upsertLifecycleSettlementChainReconciliation(v){
       const lifecycle=await db.query("SELECT lifecycle_id FROM execution.position_lifecycles WHERE position_address=$1",[v.positionAddress]);
       if(!lifecycle.rows[0])throw new Error("LPFORGE_SETTLEMENT_LIFECYCLE_MISSING");
@@ -5770,6 +5895,7 @@ export function createMemoryStore(): Phase1Store {
     async linkPositionLifecyclePlan() {},
     async loadLifecycleSettlementInput() { return undefined; },
     async persistLifecycleSolSettlement(v) { if(!v.assessment.ready)throw new Error("LPFORGE_SETTLEMENT_NOT_READY");return{lifecycleId:v.input.lifecycle.lifecycleId,settlementId:`settlement:${v.input.lifecycle.lifecycleId}:v1`,created:true}; },
+    async loadCanonicalPostTradeReport() { return undefined; },
     async upsertLifecycleSettlementChainReconciliation() {},
     async upsertCloseFeeAttributionSnapshot() {},
     async finalizeCloseFeeAttribution() { return {status:'UNAVAILABLE' as const,reasonCodes:['FIXTURE_CLOSE_FEE_ATTRIBUTION_UNAVAILABLE']}; },
