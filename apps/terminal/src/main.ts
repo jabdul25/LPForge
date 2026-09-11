@@ -153,7 +153,11 @@ async function loadActivePools(pool: Pool): Promise<TerminalPosition[]> {
   const result = await pool.query<Row>(`
     SELECT p.lpforge_position_id,p.position_address,p.pool_address,p.entered_at,p.lifecycle_state,p.reconciliation_status,p.lower_bin_id,p.upper_bin_id,
       tx.symbol AS token_x_symbol,ty.symbol AS token_y_symbol,proto.token_x_mint,proto.token_y_mint,
-      obs.active_bin_id,obs.range_state,es.evidence_state AS valuation_state,es.net_return_fraction,es.peak_net_return_fraction,es.last_reason_codes,es.payload AS exit_payload,
+      obs.active_bin_id,obs.range_state,es.evidence_state AS valuation_state,
+      es.lp_mtm_evidence_state AS live_control_state,
+      es.lp_mtm_net_return_fraction AS live_control_return_fraction,
+      es.lp_mtm_peak_return_fraction AS live_control_peak_return_fraction,
+      es.last_reason_codes,es.payload AS exit_payload,
       oor.lifecycle_state AS oor_lifecycle_state,oor.direction AS oor_direction,oor.inventory_classification,oor.fee_value_lamports
     FROM execution.owned_positions p
     LEFT JOIN protocol.pools proto ON proto.address=p.pool_address
@@ -169,13 +173,13 @@ async function loadActivePools(pool: Pool): Promise<TerminalPosition[]> {
     ORDER BY p.entered_at ASC
   `, [OPEN_POSITION_STATES]);
   return result.rows.map(row => {
-    const valuationAvailable = text(row, 'valuation_state') === 'AVAILABLE';
+    const liveControlAvailable = text(row, 'live_control_state') === 'AVAILABLE';
     const enteredAt = iso(row.entered_at) || new Date(0).toISOString();
     return {
       lpforgePositionId: text(row, 'lpforge_position_id') || 'unknown', positionAddress: text(row, 'position_address') || 'unknown', poolAddress: text(row, 'pool_address') || 'unknown', poolDisplay: displayPool(row), enteredAt,
       lifecycleState: text(row, 'lifecycle_state') || 'UNKNOWN', reconciliationStatus: text(row, 'reconciliation_status') || 'UNKNOWN',
       ...(integer(row, 'lower_bin_id') !== undefined ? { lowerBinId: integer(row, 'lower_bin_id') } : {}), ...(integer(row, 'upper_bin_id') !== undefined ? { upperBinId: integer(row, 'upper_bin_id') } : {}), ...(integer(row, 'active_bin_id') !== undefined ? { activeBinId: integer(row, 'active_bin_id') } : {}), ...(text(row, 'range_state') ? { rangeState: text(row, 'range_state') } : {}),
-      ...(valuationAvailable && number(row, 'net_return_fraction') !== undefined ? { managedReturnFraction: number(row, 'net_return_fraction') } : {}), ...(valuationAvailable && number(row, 'peak_net_return_fraction') !== undefined ? { mfeReturnFraction: number(row, 'peak_net_return_fraction') } : {}), ...(lamports(row, 'fee_value_lamports') !== undefined ? { feeLamports: lamports(row, 'fee_value_lamports') } : {}),
+      ...(liveControlAvailable && number(row, 'live_control_return_fraction') !== undefined ? { liveControlReturnFraction: number(row, 'live_control_return_fraction') } : {}), ...(liveControlAvailable && number(row, 'live_control_peak_return_fraction') !== undefined ? { liveControlPeakReturnFraction: number(row, 'live_control_peak_return_fraction') } : {}), ...(lamports(row, 'fee_value_lamports') !== undefined ? { feeLamports: lamports(row, 'fee_value_lamports') } : {}),
       ...(text(row, 'valuation_state') ? { valuationState: text(row, 'valuation_state') } : {}), ...(text(row, 'oor_lifecycle_state') ? { oorLifecycleState: text(row, 'oor_lifecycle_state') } : {}), ...(text(row, 'oor_direction') ? { oorDirection: text(row, 'oor_direction') } : {}), ...(text(row, 'inventory_classification') ? { inventoryClassification: text(row, 'inventory_classification') } : {}), protection: terminalProtection(row)
     };
   });
@@ -208,12 +212,12 @@ async function loadRecentPositions(pool: Pool, active: TerminalPosition[]): Prom
     const settledAt = iso(row.settled_at) || new Date(0).toISOString();
     return {
       lifecycleId: text(row, 'lifecycle_id') || 'unknown', positionAddress: text(row, 'position_address') || 'unknown', poolAddress: text(row, 'pool_address') || 'unknown', poolDisplay: displayPool(row), state: 'CLOSED' as const, observedAt: settledAt,
-      ...(value !== undefined && capital !== undefined && capital > 0n ? { returnFraction: Number(value) / Number(capital) } : {}), ...(lamports(row, 'gross_lp_fee_lamports') !== undefined ? { feeLamports: lamports(row, 'gross_lp_fee_lamports') } : {}), ...(openedAt ? { holdSeconds: Math.max(0, Math.floor((Date.parse(settledAt) - Date.parse(openedAt)) / 1000)) } : {}), ...(text(row, 'exit_reason') ? { exitReason: text(row, 'exit_reason') } : {})
+      ...(value !== undefined && capital !== undefined && capital > 0n ? { realizedReturnFraction: Number(value) / Number(capital) } : {}), ...(lamports(row, 'gross_lp_fee_lamports') !== undefined ? { feeLamports: lamports(row, 'gross_lp_fee_lamports') } : {}), ...(openedAt ? { holdSeconds: Math.max(0, Math.floor((Date.parse(settledAt) - Date.parse(openedAt)) / 1000)) } : {}), ...(text(row, 'exit_reason') ? { exitReason: text(row, 'exit_reason') } : {})
     };
   });
   const open = active.map(position => ({
     lifecycleId: `open:${position.positionAddress}`, positionAddress: position.positionAddress, poolAddress: position.poolAddress, poolDisplay: position.poolDisplay, state: 'OPEN' as const, observedAt: position.enteredAt,
-    ...(position.managedReturnFraction !== undefined ? { returnFraction: position.managedReturnFraction } : {}), ...(position.feeLamports !== undefined ? { feeLamports: position.feeLamports } : {}), holdSeconds: Math.max(0, Math.floor((Date.now() - Date.parse(position.enteredAt)) / 1000)), exitReason: 'MANAGED MARK'
+    ...(position.liveControlReturnFraction !== undefined ? { liveControlReturnFraction: position.liveControlReturnFraction } : {}), ...(position.feeLamports !== undefined ? { feeLamports: position.feeLamports } : {}), holdSeconds: Math.max(0, Math.floor((Date.now() - Date.parse(position.enteredAt)) / 1000)), exitReason: 'LIVE CONTROL MARK'
   }));
   return [...open, ...closed].sort((a, b) => Date.parse(b.observedAt) - Date.parse(a.observedAt)).slice(0, 12);
 }
