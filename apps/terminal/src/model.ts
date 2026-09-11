@@ -251,11 +251,11 @@ function pipelineLines(snapshot: TerminalSnapshot, width: number, color: boolean
 }
 function activePoolLines(snapshot: TerminalSnapshot, width: number, color: boolean): string[] {
   if (!snapshot.activePools.length) return [paint('No active LP positions.', 'muted', color)];
-  const head = `${pad('POOL', 14)} ${pad('STATE', 10)} ${pad('LIVE PNL', 10)} ${pad('LIVE PEAK', 10)} ${pad('RANGE', 15)} ALERT`;
-  const alertWidth = Math.max(8, width - 14 - 1 - 10 - 1 - 10 - 1 - 10 - 1 - 15 - 1);
+  const head = `${pad('POOL', 12)} ${pad('POSITION', 12)} ${pad('STATE', 9)} ${pad('LIVE PNL', 10)} ${pad('LIVE PEAK', 10)} ${pad('RANGE', 15)} ALERT`;
+  const alertWidth = Math.max(8, width - 12 - 1 - 12 - 1 - 9 - 1 - 10 - 1 - 10 - 1 - 15 - 1);
   return [paint(head, 'muted', color), ...snapshot.activePools.map(position => {
     const range = position.lowerBinId === undefined || position.upperBinId === undefined ? 'n/a' : `${position.lowerBinId}:${position.upperBinId} @${position.activeBinId ?? '?'}`;
-    return `${pad(position.poolDisplay, 14)} ${pad(state(position.lifecycleState, color), 10)} ${pad(signedPercent(position.liveControlReturnFraction, color), 10)} ${pad(signedPercent(position.liveControlPeakReturnFraction, color), 10)} ${pad(range, 15)} ${clip(state(position.protection, color), alertWidth)}`;
+    return `${pad(position.poolDisplay, 12)} ${pad(short(position.positionAddress), 12)} ${pad(state(position.lifecycleState, color), 9)} ${pad(signedPercent(position.liveControlReturnFraction, color), 10)} ${pad(signedPercent(position.liveControlPeakReturnFraction, color), 10)} ${pad(range, 15)} ${clip(state(position.protection, color), alertWidth)}`;
   })];
 }
 function engineLines(snapshot: TerminalSnapshot, width: number, color: boolean): string[] {
@@ -265,12 +265,12 @@ function engineLines(snapshot: TerminalSnapshot, width: number, color: boolean):
 function recentPositionLines(snapshot: TerminalSnapshot, width: number, filter: TerminalRenderOptions['positionFilter'], color: boolean): string[] {
   const rows = snapshot.recentPositions.filter(row => !filter || filter === 'ALL' || row.state === filter).slice(0, 8);
   if (!rows.length) return [paint('No matching canonical lifecycle.', 'muted', color)];
-  const head = `${pad('TIME', 8)} ${pad('POOL', 14)} ${pad('STATE', 7)} ${pad('SETTLED/LIVE', 12)} ${pad('AGE', 8)} REASON`;
+  const head = `${pad('TIME', 8)} ${pad('POOL', 12)} ${pad('POSITION', 12)} ${pad('STATE', 7)} ${pad('SETTLED/LIVE', 12)} ${pad('AGE', 8)} REASON`;
   return [paint(head, 'muted', color), ...rows.map(row => {
     const time = new Date(row.observedAt).toISOString().slice(5, 16).replace('T', ' ');
     const label = row.state === 'OPEN' ? `LIVE ${formatPercent(row.liveControlReturnFraction)}` : formatPercent(row.realizedReturnFraction);
     const value = row.state === 'OPEN' ? label : signedPercent(row.realizedReturnFraction, color);
-    return `${pad(time, 8)} ${pad(row.poolDisplay, 14)} ${pad(state(row.state, color), 7)} ${pad(value, 12)} ${pad(row.holdSeconds === undefined ? 'n/a' : formatAge(new Date(Date.now() - row.holdSeconds * 1000).toISOString()), 8)} ${clip(row.exitReason || (row.state === 'OPEN' ? 'LIVE CONTROL MARK' : 'n/a'), Math.max(8, width - 54))}`;
+    return `${pad(time, 8)} ${pad(row.poolDisplay, 12)} ${pad(short(row.positionAddress), 12)} ${pad(state(row.state, color), 7)} ${pad(value, 12)} ${pad(row.holdSeconds === undefined ? 'n/a' : formatAge(new Date(Date.now() - row.holdSeconds * 1000).toISOString()), 8)} ${clip(row.exitReason || (row.state === 'OPEN' ? 'LIVE CONTROL MARK' : 'n/a'), Math.max(8, width - 67))}`;
   })];
 }
 function healthLines(snapshot: TerminalSnapshot, color: boolean): string[] {

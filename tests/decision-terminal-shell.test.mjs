@@ -21,6 +21,8 @@ test('shell terminal renders every required operational region without a portfol
   for (const heading of ['LPFORGE DECISION TERMINAL', 'LIVE EVENT STREAM', 'DECISION TERMINAL', 'CANDIDATE PIPELINE', 'ACTIVE POOLS', 'AGENT / ENGINE DESK', 'FILLS / RECENT POSITIONS', 'SYSTEM HEALTH']) assert.match(output, new RegExp(heading));
   assert.match(output, /LIVE \+2\.40%/);
   assert.match(output, /LIVE PNL/);
+  assert.match(output, /POSITION/);
+  assert.match(output, /positi…ress/);
   assert.match(output, /TS5 WATCH/);
   assert.doesNotMatch(output, /portfolio|equity chart|order book/i);
 });
