@@ -7,8 +7,9 @@ const terminal = await import('../.build/apps/terminal/src/model.js');
 const snapshot = () => ({
   generatedAt: '2026-09-11T12:00:00.000Z',
   runtime: { releaseSha: '0123456789abcdef0123456789abcdef01234567', policyVersion: 'live-v1', policyHash: 'a'.repeat(64), cluster: 'mainnet-beta', maxOpenPositions: 2 },
-  health: { authorityMode: 'PRODUCTION', healthStatus: 'HEALTHY', safetyMode: 'NORMAL', daemonPlan: 'DECISION_CYCLE', newEconomicActionAllowed: true, recoveryQueueCount: 0, unknownSubmissionCount: 0, activeManagementPlans: 0, partialEntryRecoveryCount: 0, activeIncidentCount: 0, telegramStatus: 'SENT' },
+  health: { authorityMode: 'PRODUCTION', healthStatus: 'HEALTHY', safetyMode: 'NORMAL', daemonPlan: 'DECISION_CYCLE', newEconomicActionAllowed: true, recoveryQueueCount: 0, unknownSubmissionCount: 0, activeManagementPlans: 0, partialEntryRecoveryCount: 0, activeIncidentCount: 0, telegramStatus: 'SENT', rpcHealth: [{ role: 'PRODUCTION', state: 'HEALTHY', latencyMs: 42, quotaState: 'OK', observedAt: '2026-09-11T11:59:59.000Z' }, { role: 'DISCOVERY', state: 'HEALTHY', quotaState: 'OK', observedAt: '2026-09-11T11:59:58.000Z' }, { role: 'EXECUTION', state: 'HEALTHY', quotaState: 'OK', observedAt: '2026-09-11T11:59:58.000Z' }] },
   candidates: [{ poolAddress: 'pool', poolDisplay: 'TOKEN/SOL', operationalState: 'ENTRY_READY', phase4State: 'ENTRY_READY', lowerBinId: -667, upperBinId: -595, activeBinId: -610, confidence: .92, uncertainty: .25, oorRisk: .11, riskAdjustedExpectedNetEv: .0012, reasonCodes: ['P4_READY'] }],
+  entryWatchPools: [{ poolAddress: 'pool', poolDisplay: 'TOKEN/SOL', operationalState: 'ENTRY_READY', phase4State: 'ENTRY_READY', rank: 1, confidence: .92, riskAdjustedExpectedNetEv: .0012, reasonCodes: ['P4_READY'], registryState: 'ACTIVE_CANDIDATE' }],
   selectedCandidateIndex: 0,
   activePools: [{ lpforgePositionId: 'position-1', positionAddress: 'position-address', poolAddress: 'pool', poolDisplay: 'TOKEN/SOL', enteredAt: '2026-09-11T10:00:00.000Z', lifecycleState: 'OPEN', reconciliationStatus: 'MATCH', lowerBinId: -667, upperBinId: -595, activeBinId: -610, rangeState: 'IN_RANGE', liveControlReturnFraction: .024, liveControlPeakReturnFraction: .048, protection: 'TS5 WATCH' }],
   recentPositions: [{ lifecycleId: 'open:position-address', positionAddress: 'position-address', poolAddress: 'pool', poolDisplay: 'TOKEN/SOL', state: 'OPEN', observedAt: '2026-09-11T10:00:00.000Z', liveControlReturnFraction: .024, holdSeconds: 7200, exitReason: 'LIVE CONTROL MARK' }, { lifecycleId: 'closed:position-address', positionAddress: 'closed-position', poolAddress: 'pool2', poolDisplay: 'OTHER/SOL', state: 'CLOSED', observedAt: '2026-09-11T09:00:00.000Z', realizedReturnFraction: -.0137, holdSeconds: 3600, exitReason: 'PROFIT_RETENTION_TS5_CONFIRMED' }],
@@ -18,7 +19,7 @@ const snapshot = () => ({
 
 test('shell terminal renders every required operational region without a portfolio dashboard', () => {
   const output = terminal.renderDecisionTerminal(snapshot(), { columns: 180, color: false, eventFilter: 'ALL', positionFilter: 'ALL' });
-  for (const heading of ['LPFORGE DECISION TERMINAL', 'LIVE EVENT STREAM', 'DECISION TERMINAL', 'CANDIDATE PIPELINE', 'ACTIVE POOLS', 'AGENT / ENGINE DESK', 'FILLS / RECENT POSITIONS', 'SYSTEM HEALTH']) assert.match(output, new RegExp(heading));
+  for (const heading of ['LPFORGE DECISION TERMINAL', 'LIVE EVENT STREAM', 'DECISION TERMINAL', 'CANDIDATE PIPELINE', 'ENTRY WATCH POOLS', 'OPEN POSITIONS', 'AGENT / ENGINE DESK', 'FILLS / RECENT POSITIONS', 'SYSTEM HEALTH']) assert.match(output, new RegExp(heading));
   assert.match(output, /LIVE \+2\.40%/);
   assert.match(output, /LIVE PNL/);
   assert.match(output, /POSITION/);
@@ -36,7 +37,7 @@ test('shell terminal filters loaded events and position rows locally', () => {
   assert.doesNotMatch(execution, /LIVE CONTROL MARK/);
 });
 
-test('header keeps P7 health, entry authority, recovery, and unknown submissions distinct', () => {
+test('header keeps P7 health, entry authority, recovery, watch pools, and RPC status distinct', () => {
   const source = snapshot();
   source.health = { ...source.health, newEconomicActionAllowed: false, recoveryQueueCount: 3, unknownSubmissionCount: 1 };
   const output = terminal.renderDecisionTerminal(source, { columns: 180, rows: 50, color: false, interactive: true });
@@ -44,7 +45,8 @@ test('header keeps P7 health, entry authority, recovery, and unknown submissions
   assert.match(output, /SAFETY NORMAL/);
   assert.match(output, /ENTRY BLOCKED/);
   assert.match(output, /RECOVERY 3/);
-  assert.match(output, /UNKNOWN 1/);
+  assert.match(output, /WATCH 1/);
+  assert.match(output, /RPC 3\/3 HEALTHY/);
   assert.match(output, /q quit  h\/l candidate/);
 });
 
@@ -87,8 +89,8 @@ test('compact active-pool and empty states remain intentional', () => {
   none.candidates = [];
   none.events = [];
   const output = terminal.renderDecisionTerminal(none, { columns: 180, rows: 50, color: false });
-  assert.match(output, /ACTIVE POOLS \(0\)/);
-  assert.match(output, /No active LP positions\./);
+  assert.match(output, /OPEN POSITIONS \(0\/2\)/);
+  assert.match(output, /No open LP positions\./);
   assert.match(output, /No current canonical candidate cycle\./);
   assert.match(output, /No canonical events in the current bounded window\./);
   assert.match(output, /No matching canonical lifecycle\./);
@@ -147,4 +149,51 @@ test('terminal uses the exact persisted paired-token symbol for a WSOL pool and 
   };
   assert.equal(terminal.formatTerminalPoolDisplay(row), 'CLANKER/SOL');
   assert.equal(terminal.formatTerminalPoolDisplay({ ...row, paired_token_mint: 'different-mint' }), 'EAf6sh…zpzZ');
+});
+
+test('RPC health renders each logical role, preserves missing telemetry, and prioritizes execution down', () => {
+  const source = snapshot();
+  source.health = { ...source.health, rpcHealth: [
+    { role: 'PRODUCTION', state: 'HEALTHY', latencyMs: 42, quotaState: 'OK' },
+    { role: 'DISCOVERY', state: 'DEGRADED', quotaState: 'WARN' },
+    { role: 'EXECUTION', state: 'UNAVAILABLE' }
+  ] };
+  const output = terminal.renderDecisionTerminal(source, { columns: 180, rows: 50, color: false });
+  assert.match(output, /RPC EXECUTION DOWN/);
+  assert.match(output, /RPC PRODUCTION.*HEALTHY.*42ms.*QUOTA OK/);
+  assert.match(output, /RPC DISCOVERY.*DEGRADED.*—.*QUOTA WARN/);
+  assert.match(output, /RPC EXECUTION.*UNAVAILABLE.*—.*QUOTA —/);
+});
+
+test('entry watch pools are a distinct display cohort and retain unavailable evidence as em dashes', () => {
+  const source = snapshot();
+  source.entryWatchPools = [
+    { poolAddress: 'ready', poolDisplay: 'READY/SOL', operationalState: 'ENTRY_READY', phase4State: 'WAIT', rank: 4, confidence: .31, riskAdjustedExpectedNetEv: .00077, reasonCodes: ['AWAITING_P4_CONFIRMATION'], registryState: 'ACTIVE_CANDIDATE' },
+    { poolAddress: 'warming', poolDisplay: 'WARM/SOL', operationalState: 'WARMING', phase4State: 'WARMING', rank: 1, reasonCodes: ['ENTRY_LIVE_CONFIRMATION_INSUFFICIENT_OBSERVATIONS'], registryState: 'ACTIVE_CANDIDATE' }
+  ];
+  const output = terminal.renderDecisionTerminal(source, { columns: 220, rows: 50, color: false });
+  assert.match(output, /ENTRY WATCH POOLS \(2\)/);
+  assert.match(output, /READY\/SOL.*ENTRY_READY.*0\.31.*\+0\.000770.*P4/);
+  assert.match(output, /WARM\/SOL.*WARMING.*—.*—.*MORE DATA/);
+  assert.ok(output.indexOf('READY/SOL') < output.indexOf('WARM/SOL'));
+});
+
+test('empty entry watch set remains intentional and has no fabricated observation progress', () => {
+  const source = snapshot();
+  source.entryWatchPools = [];
+  const output = terminal.renderDecisionTerminal(source, { columns: 180, rows: 50, color: false });
+  assert.match(output, /WATCH 0/);
+  assert.match(output, /ENTRY WATCH POOLS \(0\)/);
+  assert.match(output, /No actively monitored entry pools\./);
+  assert.doesNotMatch(output, /0\/12/);
+});
+
+test('terminal read model uses existing bounded facts and never serializes RPC endpoints or credentials', () => {
+  const source = fs.readFileSync('apps/terminal/src/main.ts', 'utf8');
+  assert.match(source, /registry\.current_state='ACTIVE_CANDIDATE'/);
+  assert.match(source, /rpc_provider_budget_state/);
+  assert.match(source, /rpc_provider_metrics/);
+  assert.doesNotMatch(source, /LPFORGE_P6_PRIVATE_WRITE_RPC_URL/);
+  assert.doesNotMatch(source, /console\.log\(.*RPC_URL/);
+  assert.doesNotMatch(source, /fetch\(/);
 });

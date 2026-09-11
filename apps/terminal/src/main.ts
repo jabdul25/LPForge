@@ -20,6 +20,7 @@ import {
   type TerminalHealth,
   type TerminalPosition,
   type TerminalRecentPosition,
+  type TerminalRpcHealth,
   type TerminalRuntime,
   type TerminalSnapshot
 } from './model.js';
@@ -27,6 +28,10 @@ import {
 const OPEN_POSITION_STATES = ['OPEN', 'CLOSING', 'RECONCILIATION_REQUIRED', 'ENTRY_FUNDED_NOT_OPEN'];
 const ACTIVE_PLAN_STATES = ['PLANNED', 'CLAIMED', 'DISPATCHING', 'BUILDING', 'BUILT', 'SIMULATING', 'SIMULATED', 'RISK_APPROVED', 'SIGNING', 'SIGNED', 'SUBMITTING', 'SUBMITTED', 'UNKNOWN_SUBMISSION', 'CONFIRMED', 'RECONCILING', 'RECOVERING', 'RECONCILIATION_REQUIRED'];
 const PARTIAL_TERMINAL_STATES = ['RESOLVED', 'OPEN_RECOVERED', 'SUPERSEDED_BY_SUCCESSFUL_ENTRY', 'ABORTED_SOL_SETTLED'];
+/** Existing freshness authority, copied from the P7 health contract. */
+const RPC_HEALTH_FRESHNESS_MS = 30_000;
+/** Existing active-candidate evidence staleness authority. */
+const DISCOVERY_RPC_HEALTH_FRESHNESS_MS = 180_000;
 
 type Row = Record<string, unknown>;
 type Manifest = { sourceCommit?: unknown; policyHash?: unknown };
@@ -66,6 +71,11 @@ const iso = (value: unknown): string | undefined => {
 const record = (value: unknown): Row => value && typeof value === 'object' && !Array.isArray(value) ? value as Row : {};
 const strings = (value: unknown): string[] => Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 const displayPool = formatTerminalPoolDisplay;
+
+function providerKey(value: string | undefined): string | undefined {
+  const endpoint = value?.trim();
+  return endpoint ? createHash('sha256').update(endpoint).digest('hex') : undefined;
+}
 
 function terminalProtection(row: Row): string {
   const reasons = strings(row.last_reason_codes);
@@ -117,33 +127,74 @@ function readRuntime(): TerminalRuntime {
   };
 }
 
-async function loadCandidates(pool: Pool): Promise<TerminalCandidate[]> {
+function terminalCandidate(row: Row): TerminalCandidate {
+  return {
+    poolAddress: text(row, 'pool_address') || 'unknown', poolDisplay: displayPool(row), operationalState: text(row, 'operational_state') || 'UNKNOWN', phase4State: text(row, 'phase4_state') || 'UNKNOWN',
+    ...(text(row, 'candidate_id') ? { candidateId: text(row, 'candidate_id') } : {}), ...(text(row, 'strategy') ? { strategy: text(row, 'strategy') } : {}), ...(text(row, 'orientation') ? { orientation: text(row, 'orientation') } : {}),
+    ...(integer(row, 'lower_bin_id') !== undefined ? { lowerBinId: integer(row, 'lower_bin_id') } : {}), ...(integer(row, 'upper_bin_id') !== undefined ? { upperBinId: integer(row, 'upper_bin_id') } : {}), ...(integer(row, 'active_bin_id') !== undefined ? { activeBinId: integer(row, 'active_bin_id') } : {}),
+    ...(number(row, 'predicted_gross_fees') !== undefined ? { predictedGrossFees: number(row, 'predicted_gross_fees') } : {}), ...(number(row, 'predicted_net_ev') !== undefined ? { predictedNetEv: number(row, 'predicted_net_ev') } : {}), ...(number(row, 'risk_adjusted_expected_net_ev') !== undefined ? { riskAdjustedExpectedNetEv: number(row, 'risk_adjusted_expected_net_ev') } : {}), ...(number(row, 'uncertainty') !== undefined ? { uncertainty: number(row, 'uncertainty') } : {}), ...(number(row, 'confidence') !== undefined ? { confidence: number(row, 'confidence') } : {}), ...(number(row, 'oor_risk') !== undefined ? { oorRisk: number(row, 'oor_risk') } : {}),
+    ...(text(row, 'registry_state') ? { registryState: text(row, 'registry_state') } : {}), ...(integer(row, 'last_rank') !== undefined ? { rank: integer(row, 'last_rank') } : {}), reasonCodes: strings(row.reason_codes)
+  };
+}
+
+function entryWatchOrder(a: TerminalCandidate, b: TerminalCandidate): number {
+  const priority = (candidate: TerminalCandidate): number => candidate.operationalState === 'ENTRY_READY' ? 0 : candidate.phase4State === 'WAIT' ? 1 : candidate.operationalState === 'WARMING' ? 2 : 3;
+  return priority(a) - priority(b) || (a.rank ?? Number.MAX_SAFE_INTEGER) - (b.rank ?? Number.MAX_SAFE_INTEGER) || (b.confidence ?? -Infinity) - (a.confidence ?? -Infinity) || a.poolAddress.localeCompare(b.poolAddress);
+}
+
+async function loadCandidates(pool: Pool): Promise<{ candidates: TerminalCandidate[]; entryWatchPools: TerminalCandidate[] }> {
   const result = await pool.query<Row>(`
     WITH latest AS (
       SELECT global_cycle_id,winner_pool_address
       FROM execution.production_global_selection_cycles
       ORDER BY completed_at DESC,decision_cutoff DESC
       LIMIT 1
+    ), candidate_rows AS (
+      SELECT 'CANDIDATE'::text AS terminal_source,
+        c.pool_address,c.operational_state,c.phase4_state,c.candidate_id,c.strategy,c.orientation,c.lower_bin_id,c.upper_bin_id,c.active_bin_id,
+        c.predicted_gross_fees,c.predicted_net_ev,c.risk_adjusted_expected_net_ev,c.uncertainty,c.confidence,c.oor_risk,c.reason_codes,
+        p.token_x_mint,p.token_y_mint,tx.symbol AS token_x_symbol,ty.symbol AS token_y_symbol,
+        registry.paired_token_mint,registry.paired_token_symbol,registry.current_state AS registry_state,registry.last_rank,
+        latest.winner_pool_address
+      FROM latest
+      JOIN execution.production_global_candidates c ON c.global_cycle_id=latest.global_cycle_id
+      LEFT JOIN protocol.pools p ON p.address=c.pool_address
+      LEFT JOIN protocol.tokens tx ON tx.mint=p.token_x_mint
+      LEFT JOIN protocol.tokens ty ON ty.mint=p.token_y_mint
+      LEFT JOIN market.pool_discovery_registry registry ON registry.pool_address=c.pool_address
+    ), watch_rows AS (
+      SELECT 'WATCH'::text AS terminal_source,
+        registry.pool_address,
+        COALESCE(c.operational_state,forward.phase3_status,registry.current_state) AS operational_state,
+        COALESCE(c.phase4_state,forward.phase4_status,'UNKNOWN') AS phase4_state,
+        c.candidate_id,c.strategy,c.orientation,c.lower_bin_id,c.upper_bin_id,c.active_bin_id,
+        c.predicted_gross_fees,c.predicted_net_ev,c.risk_adjusted_expected_net_ev,c.uncertainty,c.confidence,c.oor_risk,
+        COALESCE(c.reason_codes,registry.reason_codes,'[]'::jsonb) AS reason_codes,
+        p.token_x_mint,p.token_y_mint,tx.symbol AS token_x_symbol,ty.symbol AS token_y_symbol,
+        registry.paired_token_mint,registry.paired_token_symbol,registry.current_state AS registry_state,registry.last_rank,
+        latest.winner_pool_address
+      FROM market.pool_discovery_registry registry
+      LEFT JOIN latest ON true
+      LEFT JOIN execution.production_global_candidates c ON c.global_cycle_id=latest.global_cycle_id AND c.pool_address=registry.pool_address
+      LEFT JOIN LATERAL (
+        SELECT phase3_status,phase4_status FROM operations.forward_cycles
+        WHERE pool_address=registry.pool_address ORDER BY observed_at DESC LIMIT 1
+      ) forward ON true
+      LEFT JOIN protocol.pools p ON p.address=registry.pool_address
+      LEFT JOIN protocol.tokens tx ON tx.mint=p.token_x_mint
+      LEFT JOIN protocol.tokens ty ON ty.mint=p.token_y_mint
+      WHERE registry.current_state='ACTIVE_CANDIDATE'
     )
-    SELECT c.*,p.token_x_mint,p.token_y_mint,tx.symbol AS token_x_symbol,ty.symbol AS token_y_symbol,
-      registry.paired_token_mint,registry.paired_token_symbol,
-      latest.winner_pool_address
-    FROM latest
-    JOIN execution.production_global_candidates c ON c.global_cycle_id=latest.global_cycle_id
-    LEFT JOIN protocol.pools p ON p.address=c.pool_address
-    LEFT JOIN protocol.tokens tx ON tx.mint=p.token_x_mint
-    LEFT JOIN protocol.tokens ty ON ty.mint=p.token_y_mint
-    LEFT JOIN market.pool_discovery_registry registry ON registry.pool_address=c.pool_address
-    ORDER BY CASE WHEN c.pool_address=latest.winner_pool_address THEN 0 WHEN c.operational_state='ENTRY_READY' THEN 1 WHEN c.operational_state='WARMING' THEN 2 ELSE 3 END,
-      c.confidence DESC NULLS LAST,c.pool_address ASC
+    SELECT * FROM candidate_rows
+    UNION ALL
+    SELECT * FROM watch_rows
   `);
-  return result.rows.map(row => ({
-    poolAddress: text(row, 'pool_address') || 'unknown', poolDisplay: displayPool(row), operationalState: text(row, 'operational_state') || 'UNKNOWN', phase4State: text(row, 'phase4_state') || 'UNKNOWN',
-    ...(text(row, 'candidate_id') ? { candidateId: text(row, 'candidate_id') } : {}), ...(text(row, 'strategy') ? { strategy: text(row, 'strategy') } : {}), ...(text(row, 'orientation') ? { orientation: text(row, 'orientation') } : {}),
-    ...(integer(row, 'lower_bin_id') !== undefined ? { lowerBinId: integer(row, 'lower_bin_id') } : {}), ...(integer(row, 'upper_bin_id') !== undefined ? { upperBinId: integer(row, 'upper_bin_id') } : {}), ...(integer(row, 'active_bin_id') !== undefined ? { activeBinId: integer(row, 'active_bin_id') } : {}),
-    ...(number(row, 'predicted_gross_fees') !== undefined ? { predictedGrossFees: number(row, 'predicted_gross_fees') } : {}), ...(number(row, 'predicted_net_ev') !== undefined ? { predictedNetEv: number(row, 'predicted_net_ev') } : {}), ...(number(row, 'risk_adjusted_expected_net_ev') !== undefined ? { riskAdjustedExpectedNetEv: number(row, 'risk_adjusted_expected_net_ev') } : {}), ...(number(row, 'uncertainty') !== undefined ? { uncertainty: number(row, 'uncertainty') } : {}), ...(number(row, 'confidence') !== undefined ? { confidence: number(row, 'confidence') } : {}), ...(number(row, 'oor_risk') !== undefined ? { oorRisk: number(row, 'oor_risk') } : {}),
-    reasonCodes: strings(row.reason_codes)
-  }));
+  const candidates = result.rows.filter(row => text(row, 'terminal_source') === 'CANDIDATE').sort((a, b) => {
+    const rank = (row: Row): number => text(row, 'pool_address') === text(row, 'winner_pool_address') ? 0 : text(row, 'operational_state') === 'ENTRY_READY' ? 1 : text(row, 'operational_state') === 'WARMING' ? 2 : 3;
+    return rank(a) - rank(b) || (number(b, 'confidence') ?? -Infinity) - (number(a, 'confidence') ?? -Infinity) || (text(a, 'pool_address') || '').localeCompare(text(b, 'pool_address') || '');
+  }).map(terminalCandidate);
+  const entryWatchPools = result.rows.filter(row => text(row, 'terminal_source') === 'WATCH').map(terminalCandidate).sort(entryWatchOrder);
+  return { candidates, entryWatchPools };
 }
 
 async function loadActivePools(pool: Pool): Promise<TerminalPosition[]> {
@@ -234,8 +285,57 @@ async function loadEvents(pool: Pool): Promise<TerminalEvent[]> {
   }));
 }
 
-async function loadHealth(pool: Pool, runtimeId: string): Promise<{ health: TerminalHealth; engines: TerminalEngine[] }> {
+function freshAt(value: unknown, maxAgeMs: number, now = Date.now()): boolean {
+  const at = Date.parse(String(value ?? ''));
+  return Number.isFinite(at) && at <= now && now - at <= maxAgeMs;
+}
+
+function quotaActive(value: unknown, now = Date.now()): boolean {
+  const at = Date.parse(String(value ?? ''));
+  return Number.isFinite(at) && at > now;
+}
+
+function phase7RpcObservation(payload: Row): Row {
+  const observations = Array.isArray(payload.observations) ? payload.observations : [];
+  return record(observations.find(value => record(value).domain === 'RPC'));
+}
+
+function classifyRpcHealth(input: {
+  role: TerminalRpcHealth['role'];
+  observedAt?: string | undefined;
+  pressureUntil?: string | undefined;
+  freshnessMs: number;
+  phase7State?: string | undefined;
+  latencyMs?: number | undefined;
+}): TerminalRpcHealth {
+  const pressure = quotaActive(input.pressureUntil);
+  let state: TerminalRpcHealth['state'];
+  if (input.role === 'PRODUCTION' && input.phase7State === 'CRITICAL') state = 'UNAVAILABLE';
+  else if (pressure || (input.role === 'PRODUCTION' && input.phase7State === 'DEGRADED')) state = 'DEGRADED';
+  else if (freshAt(input.observedAt, input.freshnessMs)) state = 'HEALTHY';
+  else state = 'UNKNOWN';
+  return {
+    role: input.role, state,
+    ...(input.observedAt ? { observedAt: input.observedAt } : {}),
+    ...(input.latencyMs !== undefined ? { latencyMs: input.latencyMs } : {}),
+    ...((pressure || input.observedAt) ? { quotaState: pressure ? 'WARN' : 'OK' } : {})
+  };
+}
+
+async function loadHealth(pool: Pool, runtimeId: string, rpcKeys: { production?: string | undefined; discovery?: string | undefined }): Promise<{ health: TerminalHealth; engines: TerminalEngine[] }> {
   const result = await pool.query<Row>(`
+    WITH latest_phase7_health AS (
+      SELECT observed_at,status,domain_status,payload
+      FROM operations.phase7_health_assessments
+      WHERE runtime_id=$1
+      ORDER BY observed_at DESC LIMIT 1
+    ), latest_execution_rpc AS (
+      SELECT metrics.provider_key,metrics.updated_at,budget.pressure_until
+      FROM execution.rpc_provider_metrics metrics
+      LEFT JOIN execution.rpc_provider_budget_state budget ON budget.provider_key=metrics.provider_key
+      WHERE metrics.priority IN ('P0_EXECUTION_CRITICAL','P1_RECOVERY_CRITICAL')
+      ORDER BY metrics.updated_at DESC LIMIT 1
+    )
     SELECT
       (SELECT observed_at FROM operations.phase7_control_decisions WHERE runtime_id=$1 ORDER BY observed_at DESC LIMIT 1) AS control_observed_at,
       (SELECT authority_mode FROM operations.phase7_control_decisions WHERE runtime_id=$1 ORDER BY observed_at DESC LIMIT 1) AS authority_mode,
@@ -253,8 +353,17 @@ async function loadHealth(pool: Pool, runtimeId: string): Promise<{ health: Term
       (SELECT observed_at FROM execution.phase7_telegram_alert_outbox ORDER BY updated_at DESC LIMIT 1) AS telegram_observed_at,
       (SELECT completed_at FROM execution.production_global_selection_cycles ORDER BY completed_at DESC LIMIT 1) AS candidate_completed_at,
       (SELECT outcome FROM execution.production_global_selection_cycles ORDER BY completed_at DESC LIMIT 1) AS candidate_outcome,
-      (SELECT settled_at FROM execution.lifecycle_sol_settlements ORDER BY settled_at DESC LIMIT 1) AS settlement_observed_at
-  `, [runtimeId, ACTIVE_PLAN_STATES, PARTIAL_TERMINAL_STATES]);
+      (SELECT settled_at FROM execution.lifecycle_sol_settlements ORDER BY settled_at DESC LIMIT 1) AS settlement_observed_at,
+      (SELECT observed_at FROM latest_phase7_health) AS phase7_rpc_observed_at,
+      (SELECT domain_status->>'RPC' FROM latest_phase7_health) AS phase7_rpc_status,
+      (SELECT payload FROM latest_phase7_health) AS phase7_health_payload,
+      (SELECT max(updated_at) FROM execution.rpc_provider_metrics WHERE provider_key=$4 AND priority='P2_POSITION_MANAGEMENT') AS production_rpc_metric_at,
+      (SELECT pressure_until FROM execution.rpc_provider_budget_state WHERE provider_key=$4) AS production_rpc_pressure_until,
+      (SELECT max(updated_at) FROM execution.rpc_provider_metrics WHERE provider_key=$5 AND priority IN ('P3_DISCOVERY','P4_BACKFILL')) AS discovery_rpc_metric_at,
+      (SELECT pressure_until FROM execution.rpc_provider_budget_state WHERE provider_key=$5) AS discovery_rpc_pressure_until,
+      (SELECT updated_at FROM latest_execution_rpc) AS execution_rpc_metric_at,
+      (SELECT pressure_until FROM latest_execution_rpc) AS execution_rpc_pressure_until
+  `, [runtimeId, ACTIVE_PLAN_STATES, PARTIAL_TERMINAL_STATES, rpcKeys.production ?? null, rpcKeys.discovery ?? null]);
   const c = result.rows[0] || {};
   const recoveryQueue = integer(c, 'recovery_queue') || 0;
   const unknown = integer(c, 'unknown_journal') || 0;
@@ -262,9 +371,18 @@ async function loadHealth(pool: Pool, runtimeId: string): Promise<{ health: Term
   const partialCount = integer(c, 'partial_entry_count') || 0;
   const incidentCount = integer(c, 'incident_count') || 0;
   const telegramStatus = text(c, 'telegram_status') || 'NO_EVIDENCE';
+  const phase7Payload = record(c.phase7_health_payload);
+  const productionObservation = phase7RpcObservation(phase7Payload);
+  const productionObservedAt = iso(productionObservation.observedAt) || iso(c.phase7_rpc_observed_at) || iso(c.production_rpc_metric_at);
+  const productionLatency = number(record(productionObservation.metrics), 'latencyMs');
+  const rpcHealth: TerminalRpcHealth[] = [
+    classifyRpcHealth({ role: 'PRODUCTION', observedAt: productionObservedAt, pressureUntil: iso(c.production_rpc_pressure_until), freshnessMs: RPC_HEALTH_FRESHNESS_MS, phase7State: text(c, 'phase7_rpc_status'), ...(productionLatency !== undefined ? { latencyMs: productionLatency } : {}) }),
+    classifyRpcHealth({ role: 'DISCOVERY', observedAt: iso(c.discovery_rpc_metric_at), pressureUntil: iso(c.discovery_rpc_pressure_until), freshnessMs: DISCOVERY_RPC_HEALTH_FRESHNESS_MS }),
+    classifyRpcHealth({ role: 'EXECUTION', observedAt: iso(c.execution_rpc_metric_at), pressureUntil: iso(c.execution_rpc_pressure_until), freshnessMs: RPC_HEALTH_FRESHNESS_MS })
+  ];
   const health: TerminalHealth = {
     ...(text(c, 'authority_mode') ? { authorityMode: text(c, 'authority_mode') } : {}), ...(text(c, 'health_status') ? { healthStatus: text(c, 'health_status') } : {}), ...(text(c, 'safety_mode') ? { safetyMode: text(c, 'safety_mode') } : {}), ...(text(c, 'daemon_plan') ? { daemonPlan: text(c, 'daemon_plan') } : {}), ...(typeof c.new_economic_action_allowed === 'boolean' ? { newEconomicActionAllowed: c.new_economic_action_allowed } : {}),
-    recoveryQueueCount: recoveryQueue, unknownSubmissionCount: unknown, activeManagementPlans: activePlans, partialEntryRecoveryCount: partialCount, activeIncidentCount: incidentCount, telegramStatus
+    recoveryQueueCount: recoveryQueue, unknownSubmissionCount: unknown, activeManagementPlans: activePlans, partialEntryRecoveryCount: partialCount, activeIncidentCount: incidentCount, telegramStatus, rpcHealth
   };
   const p6Status = unknown > 0 || recoveryQueue > 0 || partialCount > 0 ? 'RECOVERY' : 'READY';
   return {
@@ -280,9 +398,10 @@ async function loadHealth(pool: Pool, runtimeId: string): Promise<{ health: Term
 }
 
 async function loadSnapshot(pool: Pool, runtimeId: string): Promise<TerminalSnapshot> {
-  const [candidates, activePools, events, healthResult] = await Promise.all([loadCandidates(pool), loadActivePools(pool), loadEvents(pool), loadHealth(pool, runtimeId)]);
+  const rpcKeys = { production: providerKey(process.env.LPFORGE_PRODUCTION_RPC_URL), discovery: providerKey(process.env.LPFORGE_DISCOVERY_RPC_URL) };
+  const [candidateResult, activePools, events, healthResult] = await Promise.all([loadCandidates(pool), loadActivePools(pool), loadEvents(pool), loadHealth(pool, runtimeId, rpcKeys)]);
   const recentPositions = await loadRecentPositions(pool, activePools);
-  return { generatedAt: new Date().toISOString(), runtime: readRuntime(), health: healthResult.health, candidates, selectedCandidateIndex: 0, activePools, recentPositions, engines: healthResult.engines, events };
+  return { generatedAt: new Date().toISOString(), runtime: readRuntime(), health: healthResult.health, candidates: candidateResult.candidates, entryWatchPools: candidateResult.entryWatchPools, selectedCandidateIndex: 0, activePools, recentPositions, engines: healthResult.engines, events };
 }
 
 function arg(name: string): string | undefined {
