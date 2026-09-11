@@ -118,6 +118,7 @@ test('terminal implementation has no browser, HTTP route, or economic control su
   assert.match(source, /read-only/);
   assert.match(source, /SIGWINCH/);
   assert.match(source, /showCanonicalEventCodes: true/);
+  assert.match(source, /io\.stdin\.pause\(\)/);
   assert.match(launcher, /terminal\)[\s\S]*node_args=\("\$\{service_args\[@\]\}"\)/);
 });
 

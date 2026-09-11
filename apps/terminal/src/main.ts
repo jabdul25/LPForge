@@ -32,7 +32,7 @@ type Row = Record<string, unknown>;
 type Manifest = { sourceCommit?: unknown; policyHash?: unknown };
 type RuntimePolicy = { policyVersion?: unknown; version?: unknown; policyId?: unknown };
 type TerminalIo = {
-  stdin: { isTTY?: boolean; setRawMode(enabled: boolean): void; resume(): void; setEncoding(encoding: string): void; on(event: 'data', listener: (value: string) => void): void };
+  stdin: { isTTY?: boolean; setRawMode(enabled: boolean): void; resume(): void; pause(): void; setEncoding(encoding: string): void; on(event: 'data', listener: (value: string) => void): void };
   stdout: { isTTY?: boolean; columns?: number; rows?: number; write(value: string): void };
   stderr: { write(value: string): void };
   once(event: 'SIGINT' | 'SIGTERM', listener: () => void): void;
@@ -316,6 +316,7 @@ async function main(): Promise<void> {
     if (stopped) return;
     stopped = true;
     if (io.stdin.isTTY) io.stdin.setRawMode(false);
+    io.stdin.pause();
     if (io.stdout.isTTY) io.stdout.write('\u001b[?25h\u001b[0m\n');
     await pool.end();
     if (exitCode !== undefined) process.exitCode = exitCode;
