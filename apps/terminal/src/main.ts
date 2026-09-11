@@ -33,9 +33,10 @@ type Manifest = { sourceCommit?: unknown; policyHash?: unknown };
 type RuntimePolicy = { policyVersion?: unknown; version?: unknown; policyId?: unknown };
 type TerminalIo = {
   stdin: { isTTY?: boolean; setRawMode(enabled: boolean): void; resume(): void; setEncoding(encoding: string): void; on(event: 'data', listener: (value: string) => void): void };
-  stdout: { isTTY?: boolean; columns?: number; write(value: string): void };
+  stdout: { isTTY?: boolean; columns?: number; rows?: number; write(value: string): void };
   stderr: { write(value: string): void };
   once(event: 'SIGINT' | 'SIGTERM', listener: () => void): void;
+  on(event: 'SIGWINCH', listener: () => void): void;
 };
 const io = process as unknown as TerminalIo;
 
@@ -44,7 +45,9 @@ const text = (row: Row, key: string): string | undefined => {
   return value === null || value === undefined ? undefined : String(value);
 };
 const number = (row: Row, key: string): number | undefined => {
-  const value = Number(row[key]);
+  const raw = row[key];
+  if (raw === null || raw === undefined || raw === '') return undefined;
+  const value = Number(raw);
   return Number.isFinite(value) ? value : undefined;
 };
 const integer = (row: Row, key: string): number | undefined => {
@@ -319,8 +322,15 @@ async function main(): Promise<void> {
   };
   const draw = (snapshot: TerminalSnapshot): void => {
     snapshot.selectedCandidateIndex = candidateIndex;
-    const output = renderDecisionTerminal(snapshot, { columns: io.stdout.columns || 160, color: !plain && Boolean(io.stdout.isTTY), eventFilter, positionFilter });
-    io.stdout.write(`\u001b[?25l\u001b[2J\u001b[H${output}\n${plain ? '' : '\u001b[2m'}q quit | ←/→ candidate | e events ${eventFilter} | f fills ${positionFilter} | r refresh${plain ? '' : '\u001b[0m'}`);
+    const output = renderDecisionTerminal(snapshot, {
+      columns: io.stdout.columns || 160,
+      rows: io.stdout.rows || 50,
+      color: !plain && Boolean(io.stdout.isTTY),
+      eventFilter,
+      positionFilter,
+      interactive: true
+    });
+    io.stdout.write(`\u001b[?25l\u001b[2J\u001b[H${output}`);
   };
   const refresh = async (): Promise<void> => {
     if (refreshing || stopped) return;
@@ -329,7 +339,15 @@ async function main(): Promise<void> {
       const snapshot = await loadSnapshot(pool, runtimeId);
       candidateIndex = snapshot.candidates.length ? candidateIndex % snapshot.candidates.length : 0;
       lastSnapshot = snapshot;
-      if (once) io.stdout.write(`${renderDecisionTerminal(snapshot, { columns: io.stdout.columns || 160, color: false, eventFilter, positionFilter })}\n`);
+      if (once) io.stdout.write(`${renderDecisionTerminal(snapshot, {
+        columns: io.stdout.columns || 160,
+        rows: io.stdout.rows || 50,
+        color: false,
+        eventFilter,
+        positionFilter,
+        showCanonicalEventCodes: true,
+        interactive: false
+      })}\n`);
       else draw(snapshot);
     } catch (error) {
       const message = error instanceof Error ? error.message.replace(/postgres(?:ql)?:\/\/[^\s]+/gi, '[redacted]') : 'LPFORGE_TERMINAL_SNAPSHOT_FAILED';
@@ -339,6 +357,7 @@ async function main(): Promise<void> {
   };
   io.once('SIGINT', () => { void cleanup(0); });
   io.once('SIGTERM', () => { void cleanup(0); });
+  io.on('SIGWINCH', () => { if (!once && lastSnapshot && !stopped) draw(lastSnapshot); });
   await refresh();
   if (once) { await cleanup(0); return; }
   io.stdin.setRawMode(true);

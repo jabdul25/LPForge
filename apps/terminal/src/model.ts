@@ -117,9 +117,13 @@ export interface TerminalSnapshot {
 
 export interface TerminalRenderOptions {
   columns: number;
+  rows?: number | undefined;
   color: boolean;
   eventFilter?: 'ALL' | 'POOLS' | 'ENGINES' | 'EXECUTION' | undefined;
   positionFilter?: 'ALL' | 'OPEN' | 'CLOSED' | undefined;
+  /** Plain diagnostic output keeps durable event identities visible. */
+  showCanonicalEventCodes?: boolean | undefined;
+  interactive?: boolean | undefined;
 }
 
 const ansi = {
@@ -192,6 +196,17 @@ function meter(value: number | undefined, width: number, color: boolean, invert 
   return `${paint('█'.repeat(used), used ? (invert ? 'green' : 'cyan') : 'muted', color)}${paint('░'.repeat(width - used), 'muted', color)}`;
 }
 
+function metric(value: number | undefined, digits: number, color: boolean, withMeter = false, invert = false): string {
+  if (value === undefined || !Number.isFinite(value)) return paint('—', 'muted', color);
+  const text = value.toFixed(digits);
+  return withMeter ? `${text} ${meter(value, 12, color, invert)}` : text;
+}
+
+function signedSol(value: number | undefined, color: boolean): string {
+  if (value === undefined || !Number.isFinite(value)) return paint('—', 'muted', color);
+  return paint(`${value >= 0 ? '+' : ''}${value.toFixed(6)} SOL`, value >= 0 ? 'green' : 'red', color);
+}
+
 function panel(title: string, width: number, height: number, content: string[], color: boolean, suffix?: string): string[] {
   const inner = Math.max(8, width - 2);
   const heading = `${paint(title, 'lime', color)}${suffix ? right(paint(suffix, 'muted', color), Math.max(0, inner - visible(title).length)) : ''}`;
@@ -208,35 +223,62 @@ function eventCategory(event: TerminalEvent): 'POOLS' | 'ENGINES' | 'EXECUTION' 
   if (event.entityType === 'RUNTIME' || /^(P7|DISCOVERY|TELEGRAM|RPC)/.test(event.event)) return 'ENGINES';
   return 'POOLS';
 }
-function eventRows(snapshot: TerminalSnapshot, width: number, filter: TerminalRenderOptions['eventFilter'], color: boolean): string[] {
+const EVENT_DISPLAY_ALIASES: Readonly<Record<string, string>> = {
+  POSITION_LIVE_CONTROL_PNL_RESTORED: 'PNL_RESTORED',
+  POSITION_LIVE_CONTROL_PNL_UNAVAILABLE: 'PNL_UNAVAILABLE',
+  POSITION_OOR_STALE_CAPITAL: 'OOR_STALE_CAPITAL',
+  POSITION_OOR_SUSTAINED: 'OOR_SUSTAINED',
+  LPFORGE_RPC_USAGE_QUOTA_RECOVERED: 'RPC_QUOTA_RECOVERED',
+  LPFORGE_RPC_USAGE_QUOTA_EXCEEDED: 'RPC_QUOTA_EXCEEDED',
+  P6_EXECUTION_RECOVERY_PENDING: 'P6_RECOVERY_PENDING',
+  P6_EXECUTION_SUBMISSION_UNKNOWN: 'P6_SUBMISSION_UNKNOWN',
+  P6_EXECUTION_RECONCILED: 'P6_RECONCILED',
+  POSITION_OPENED: 'POSITION_OPENED',
+  POSITION_CLOSE_TRIGGERED: 'CLOSE_TRIGGERED'
+};
+
+export function displayEventCode(eventCode: string): string { return EVENT_DISPLAY_ALIASES[eventCode] || eventCode; }
+
+function eventRows(snapshot: TerminalSnapshot, width: number, filter: TerminalRenderOptions['eventFilter'], color: boolean, showCanonical = false): string[] {
   const rows = snapshot.events.filter(e => !filter || filter === 'ALL' || eventCategory(e) === filter).slice(0, 18);
   if (!rows.length) return [paint('No canonical events in the current bounded window.', 'muted', color)];
-  const eventWidth = Math.min(38, Math.max(18, width - 9 - 1 - 5 - 1 - 12 - 1 - 12 - 1));
-  const head = `${pad('TIME', 9)} ${pad('LVL', 5)} ${pad('EVENT', eventWidth)} ${pad('ENTITY', 12)} MESSAGE`;
-  const messageWidth = Math.max(12, width - 9 - 1 - 5 - 1 - eventWidth - 1 - 12 - 1);
+  const entityWidth = Math.max(8, Math.min(10, Math.floor(width / 7)));
+  const eventCap = showCanonical ? 38 : 21;
+  const eventWidth = Math.min(eventCap, Math.max(14, width - 9 - 1 - 5 - 1 - entityWidth - 1 - 18 - 1));
+  const head = `${pad('TIME', 9)} ${pad('LVL', 5)} ${pad('EVENT', eventWidth)} ${pad('ENTITY', entityWidth)} MESSAGE`;
+  const messageWidth = Math.max(12, width - 9 - 1 - 5 - 1 - eventWidth - 1 - entityWidth - 1);
   return [paint(head, 'muted', color), ...rows.map(row => {
     const time = new Date(row.observedAt).toISOString().slice(11, 19);
     const message = row.message || row.status;
-    return `${pad(time, 9)} ${pad(state(row.level, color), 5)} ${pad(state(row.event, color), eventWidth)} ${pad(short(row.entityId), 12)} ${clip(message, messageWidth)}`;
+    const event = showCanonical ? row.event : displayEventCode(row.event);
+    return `${pad(time, 9)} ${pad(state(row.level, color), 5)} ${pad(state(event, color), eventWidth)} ${pad(short(row.entityId, 5, 3), entityWidth)} ${clip(message, messageWidth)}`;
   })];
 }
 function candidateLines(snapshot: TerminalSnapshot, width: number, color: boolean): string[] {
   const candidate = snapshot.candidates[snapshot.selectedCandidateIndex] || snapshot.candidates[0];
   if (!candidate) return [paint('No current canonical candidate cycle.', 'muted', color)];
-  const range = candidate.lowerBinId === undefined || candidate.upperBinId === undefined ? 'n/a' : `${candidate.lowerBinId} → ${candidate.upperBinId}`;
-  const lines = [
+  const range = candidate.lowerBinId === undefined || candidate.upperBinId === undefined ? '—' : `${candidate.lowerBinId} → ${candidate.upperBinId}`;
+  const score = metric(candidate.confidence, 2, color, true);
+  const uncertainty = metric(candidate.uncertainty, 2, color, true, true);
+  const oorRisk = metric(candidate.oorRisk, 2, color, true, true);
+  const netEv = signedSol(candidate.riskAdjustedExpectedNetEv ?? candidate.predictedNetEv, color);
+  return [
     `${paint('POOL', 'muted', color)}      ${state(candidate.poolDisplay, color)}`,
     `${paint('STATE', 'muted', color)}     ${state(candidate.operationalState, color)}`,
+    '',
+    `${paint('P3', 'muted', color)}        ${state(candidate.operationalState, color)}`,
     `${paint('P4', 'muted', color)}        ${state(candidate.phase4State, color)}`,
+    '',
+    `${paint('SCORE', 'muted', color)}     ${score}`,
+    `${paint('UNCERTAINTY', 'muted', color)} ${uncertainty}`,
+    `${paint('NET EV', 'muted', color)}    ${netEv}`,
+    '',
     `${paint('RANGE', 'muted', color)}     ${range}`,
-    `${paint('ACTIVE BIN', 'muted', color)} ${candidate.activeBinId ?? 'n/a'}`,
-    `${paint('SCORE', 'muted', color)}     ${meter(candidate.confidence, Math.min(18, Math.max(8, width - 18)), color)} ${formatPercent(candidate.confidence, 0)}`,
-    `${paint('UNCERTAINTY', 'muted', color)} ${meter(candidate.uncertainty, Math.min(18, Math.max(8, width - 18)), color, true)} ${candidate.uncertainty?.toFixed(2) ?? 'n/a'}`,
-    `${paint('OOR RISK', 'muted', color)}  ${meter(candidate.oorRisk, Math.min(18, Math.max(8, width - 18)), color, true)} ${candidate.oorRisk?.toFixed(2) ?? 'n/a'}`,
-    `${paint('NET EV', 'muted', color)}    ${candidate.riskAdjustedExpectedNetEv?.toFixed(6) ?? candidate.predictedNetEv?.toFixed(6) ?? 'n/a'}`,
-    `${paint('REASONS', 'muted', color)}   ${clip(candidate.reasonCodes.join(', ') || '—', Math.max(8, width - 12))}`
+    `${paint('ACTIVE BIN', 'muted', color)} ${candidate.activeBinId === undefined ? '—' : candidate.activeBinId}`,
+    `${paint('OOR RISK', 'muted', color)}  ${oorRisk}`,
+    '',
+    `${paint('REASON', 'muted', color)}    ${clip(candidate.reasonCodes.join(', ') || '—', Math.max(8, width - 12))}`
   ];
-  return lines;
 }
 function pipelineLines(snapshot: TerminalSnapshot, width: number, color: boolean): string[] {
   const totals = new Map<string, number>();
@@ -285,52 +327,71 @@ function healthLines(snapshot: TerminalSnapshot, color: boolean): string[] {
     `${paint('ACTIVE PLANS', 'muted', color)}   ${state(String(health.activeManagementPlans), color)}`,
     `${paint('PARTIAL ENTRY', 'muted', color)}  ${state(String(health.partialEntryRecoveryCount), color)}`,
     `${paint('INCIDENTS', 'muted', color)}      ${state(String(health.activeIncidentCount), color)}`,
-    `${paint('TELEGRAM', 'muted', color)}       ${state(health.telegramStatus, color)}`
+    `${paint('TELEGRAM', 'muted', color)}       ${state(health.telegramStatus, color)}`,
+    `${paint('RELEASE', 'muted', color)}        ${paint(short(snapshot.runtime.releaseSha), 'cyan', color)}`,
+    `${paint('POLICY', 'muted', color)}         ${paint(short(snapshot.runtime.policyHash), 'cyan', color)}`
   ];
 }
 
 export function renderDecisionTerminal(snapshot: TerminalSnapshot, options: TerminalRenderOptions): string {
   const color = options.color;
   const width = Math.max(100, Math.min(220, options.columns));
+  const rows = Math.max(30, Math.min(80, Math.floor(options.rows ?? 50)));
   const health = snapshot.health;
   const headerStatus = health.healthStatus === 'HEALTHY' ? 'HEALTHY' : health.healthStatus || 'UNKNOWN';
+  const entry = health.newEconomicActionAllowed ? 'ENTRY ALLOWED' : 'ENTRY BLOCKED';
+  const recovery = health.recoveryQueueCount > 0 ? `RECOVERY ${health.recoveryQueueCount}` : 'RECOVERY 0';
+  const unknown = health.unknownSubmissionCount > 0 ? `UNKNOWN ${health.unknownSubmissionCount}` : 'UNKNOWN 0';
+  const recoveryState = paint(recovery, health.recoveryQueueCount > 0 ? 'amber' : 'muted', color);
+  const unknownState = paint(unknown, health.unknownSubmissionCount > 0 ? 'red' : 'muted', color);
   const header = [
-    `${paint('LPForge', 'lime', color)}  ${paint('LPFORGE DECISION TERMINAL', 'bold', color)}  ${state(health.authorityMode || 'UNKNOWN', color)} | ${state(headerStatus, color)} | ${state(health.safetyMode || 'UNKNOWN', color)}`,
-    `${paint('REFRESH 2s', 'muted', color)} | OPEN POSITIONS ${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'} | CANDIDATES ${snapshot.candidates.length} | POLICY ${short(snapshot.runtime.policyVersion, 10, 0)} | ${paint('UTC', 'cyan', color)} ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`,
-    `${paint(`SOLANA | ${snapshot.runtime.cluster.toUpperCase()} | RELEASE ${short(snapshot.runtime.releaseSha)} | POLICY HASH ${short(snapshot.runtime.policyHash)}`, 'muted', color)}`
+    `${paint('LPFORGE DECISION TERMINAL', 'lime', color)}  ${state(health.authorityMode === 'PRODUCTION' ? 'PROD' : health.authorityMode || 'UNKNOWN', color)} | ${state(`P7 ${headerStatus}`, color)} | ${state(`SAFETY ${health.safetyMode || 'UNKNOWN'}`, color)} | ${state(entry, color)}`,
+    `${paint(`POS ${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'}`, 'cyan', color)} | ${paint(`CAND ${snapshot.candidates.length}`, 'cyan', color)} | ${recoveryState} | ${unknownState} | ${paint('REFRESH 2s', 'muted', color)} | ${paint(`UTC ${new Date().toISOString().slice(11, 19)}`, 'cyan', color)}`
   ].map(value => clip(value, width));
   const divider = paint('═'.repeat(width), 'muted', color);
+  const panelRows = Math.max(25, rows - header.length - 2);
+  const topHeight = Math.max(14, Math.min(22, Math.floor(panelRows * .44)));
+  const engineHeight = 8;
+  const activeHeight = Math.max(4, Math.min(7, snapshot.activePools.length + 4));
+  const middleHeight = Math.max(engineHeight, activeHeight);
+  const bottomHeight = Math.max(9, panelRows - topHeight - middleHeight);
+  const help = 'q quit  h/l candidate  e events  f fills  r refresh';
+  const identity = 'LPFORGE | SOLANA | METEORA DLMM | READ-ONLY';
+  const helpText = clip(help, Math.max(0, width - identity.length - 1));
+  const footer = options.interactive
+    ? `${paint(helpText, 'muted', color)}${right(paint(identity, 'muted', color), Math.max(0, width - visible(helpText).length))}`
+    : paint(identity, 'muted', color);
   if (width < 135) {
     const narrow = [
-      ...panel('● LIVE EVENT STREAM', width, 18, eventRows(snapshot, width - 2, options.eventFilter, color), color, options.eventFilter || 'ALL'),
-      ...panel('◎ DECISION TERMINAL', width, 14, candidateLines(snapshot, width - 2, color), color),
+      ...panel('● LIVE EVENT STREAM', width, Math.max(9, Math.min(18, topHeight)), eventRows(snapshot, width - 2, options.eventFilter, color, options.showCanonicalEventCodes), color, options.eventFilter || 'ALL'),
+      ...panel('◎ DECISION TERMINAL', width, Math.max(12, Math.min(18, topHeight)), candidateLines(snapshot, width - 2, color), color),
       ...panel('▥ CANDIDATE PIPELINE', width, 8, pipelineLines(snapshot, width - 2, color), color),
-      ...panel(`▰ ACTIVE POOLS (${snapshot.activePools.length})`, width, 7, activePoolLines(snapshot, width - 2, color), color),
-      ...panel('⚙ ENGINE DESK', width, 11, engineLines(snapshot, width - 2, color), color),
-      ...panel('▤ FILLS / RECENT POSITIONS', width, 10, recentPositionLines(snapshot, width - 2, options.positionFilter, color), color, options.positionFilter || 'ALL'),
-      ...panel('♥ SYSTEM HEALTH', width, 12, healthLines(snapshot, color), color)
+      ...panel(`▰ ACTIVE POOLS (${snapshot.activePools.length})`, width, activeHeight, activePoolLines(snapshot, width - 2, color), color),
+      ...panel('⚙ ENGINE DESK', width, engineHeight, engineLines(snapshot, width - 2, color), color),
+      ...panel('▤ FILLS / RECENT POSITIONS', width, bottomHeight, recentPositionLines(snapshot, width - 2, options.positionFilter, color), color, options.positionFilter || 'ALL'),
+      ...panel('♥ SYSTEM HEALTH', width, Math.max(10, bottomHeight), healthLines(snapshot, color), color)
     ];
-    return [...header, divider, ...narrow, paint('LPFORGE | SOLANA | METEORA DLMM | AUTONOMOUS LIQUIDITY', 'muted', color)].join('\n');
+    return [...header, divider, ...narrow, footer].join('\n');
   }
   const gap = 2;
   const left = Math.floor((width - gap * 2) * .45);
   const center = Math.floor((width - gap * 2) * .29);
   const rightWidth = width - left - center - gap * 2;
   const top = joinPanels([
-    panel('● LIVE EVENT STREAM', left, 22, eventRows(snapshot, left - 2, options.eventFilter, color), color, options.eventFilter || 'ALL'),
-    panel('◎ DECISION TERMINAL', center, 22, candidateLines(snapshot, center - 2, color), color, snapshot.candidates.length ? `${snapshot.selectedCandidateIndex + 1}/${snapshot.candidates.length}` : '0/0'),
-    panel('▥ CANDIDATE PIPELINE', rightWidth, 22, pipelineLines(snapshot, rightWidth - 2, color), color)
+    panel('● LIVE EVENT STREAM', left, topHeight, eventRows(snapshot, left - 2, options.eventFilter, color, options.showCanonicalEventCodes), color, options.eventFilter || 'ALL'),
+    panel('◎ DECISION TERMINAL', center, topHeight, candidateLines(snapshot, center - 2, color), color, snapshot.candidates.length ? `${snapshot.selectedCandidateIndex + 1}/${snapshot.candidates.length}` : '0/0'),
+    panel('▥ CANDIDATE PIPELINE', rightWidth, topHeight, pipelineLines(snapshot, rightWidth - 2, color), color)
   ]);
   const lowerLeft = left + center + gap;
   const middle = joinPanels([
-    panel(`▰ ACTIVE POOLS (${snapshot.activePools.length})`, lowerLeft, 11, activePoolLines(snapshot, lowerLeft - 2, color), color),
-    panel('⚙ AGENT / ENGINE DESK', rightWidth, 11, engineLines(snapshot, rightWidth - 2, color), color, health.healthStatus || 'UNKNOWN')
+    panel(`▰ ACTIVE POOLS (${snapshot.activePools.length})`, lowerLeft, activeHeight, activePoolLines(snapshot, lowerLeft - 2, color), color),
+    panel('⚙ AGENT / ENGINE DESK', rightWidth, engineHeight, engineLines(snapshot, rightWidth - 2, color), color, health.healthStatus || 'UNKNOWN')
   ]);
   const bottom = joinPanels([
-    panel('▤ FILLS / RECENT POSITIONS', lowerLeft, 12, recentPositionLines(snapshot, lowerLeft - 2, options.positionFilter, color), color, options.positionFilter || 'ALL'),
-    panel('♥ SYSTEM HEALTH', rightWidth, 12, healthLines(snapshot, color), color, health.healthStatus || 'UNKNOWN')
+    panel('▤ FILLS / RECENT POSITIONS', lowerLeft, bottomHeight, recentPositionLines(snapshot, lowerLeft - 2, options.positionFilter, color), color, options.positionFilter || 'ALL'),
+    panel('♥ SYSTEM HEALTH', rightWidth, bottomHeight, healthLines(snapshot, color), color, health.healthStatus || 'UNKNOWN')
   ]);
-  return [...header, divider, ...top, ...middle, ...bottom, paint('LPFORGE | SOLANA | METEORA DLMM | AUTONOMOUS LIQUIDITY', 'muted', color)].join('\n');
+  return [...header, divider, ...top, ...middle, ...bottom, footer].join('\n');
 }
 
 export function advanceCandidateIndex(snapshot: TerminalSnapshot, index: number, direction: -1 | 1): number {

@@ -30,10 +30,75 @@ test('shell terminal renders every required operational region without a portfol
 test('shell terminal filters loaded events and position rows locally', () => {
   const source = snapshot();
   const execution = terminal.renderDecisionTerminal(source, { columns: 180, color: false, eventFilter: 'EXECUTION', positionFilter: 'CLOSED' });
-  assert.match(execution, /P6_EXECUTION_RECOVERY_PENDING/);
+  assert.match(execution, /P6_RECOVERY_PENDING/);
   assert.doesNotMatch(execution, /TS5_WATCH_ARMED/);
   assert.match(execution, /PROFIT_RETENTION_TS5_CONFIRMED/);
   assert.doesNotMatch(execution, /LIVE CONTROL MARK/);
+});
+
+test('header keeps P7 health, entry authority, recovery, and unknown submissions distinct', () => {
+  const source = snapshot();
+  source.health = { ...source.health, newEconomicActionAllowed: false, recoveryQueueCount: 3, unknownSubmissionCount: 1 };
+  const output = terminal.renderDecisionTerminal(source, { columns: 180, rows: 50, color: false, interactive: true });
+  assert.match(output, /P7 HEALTHY/);
+  assert.match(output, /SAFETY NORMAL/);
+  assert.match(output, /ENTRY BLOCKED/);
+  assert.match(output, /RECOVERY 3/);
+  assert.match(output, /UNKNOWN 1/);
+  assert.match(output, /q quit  h\/l candidate/);
+});
+
+test('candidate renderer preserves actual zero and renders unavailable values as an em dash', () => {
+  const zero = snapshot();
+  zero.candidates = [{ ...zero.candidates[0], lowerBinId: 0, upperBinId: 0, activeBinId: 0, confidence: 0, uncertainty: 0, oorRisk: 0, riskAdjustedExpectedNetEv: 0 }];
+  const zeroOutput = terminal.renderDecisionTerminal(zero, { columns: 180, color: false });
+  assert.match(zeroOutput, /RANGE     0 → 0/);
+  assert.match(zeroOutput, /ACTIVE BIN 0/);
+  assert.match(zeroOutput, /SCORE     0\.00/);
+  assert.match(zeroOutput, /NET EV    \+0\.000000 SOL/);
+
+  const unavailable = snapshot();
+  unavailable.candidates = [{ ...unavailable.candidates[0], lowerBinId: undefined, upperBinId: undefined, activeBinId: undefined, confidence: undefined, uncertainty: undefined, oorRisk: undefined, riskAdjustedExpectedNetEv: undefined, predictedNetEv: undefined }];
+  const unavailableOutput = terminal.renderDecisionTerminal(unavailable, { columns: 180, color: false });
+  assert.match(unavailableOutput, /RANGE     —/);
+  assert.match(unavailableOutput, /ACTIVE BIN —/);
+  assert.match(unavailableOutput, /SCORE     —/);
+  assert.match(unavailableOutput, /NET EV    —/);
+  assert.doesNotMatch(unavailableOutput, /RANGE     0 → 0/);
+  assert.doesNotMatch(unavailableOutput, /SCORE     \+?0\.00/);
+});
+
+test('event aliases are display-only and plain diagnostics retain canonical event identity', () => {
+  const source = snapshot();
+  assert.equal(terminal.displayEventCode('P6_EXECUTION_RECOVERY_PENDING'), 'P6_RECOVERY_PENDING');
+  assert.equal(terminal.displayEventCode('UNRECOGNISED_EVENT'), 'UNRECOGNISED_EVENT');
+  const visual = terminal.renderDecisionTerminal(source, { columns: 180, color: false });
+  const diagnostic = terminal.renderDecisionTerminal(source, { columns: 180, color: false, showCanonicalEventCodes: true });
+  assert.match(visual, /P6_RECOVERY_PENDING/);
+  assert.doesNotMatch(visual, /P6_EXECUTION_RECOVERY_PENDING/);
+  assert.match(diagnostic, /P6_EXECUTION_RECOVERY_PENDING/);
+  assert.equal(source.events[1].event, 'P6_EXECUTION_RECOVERY_PENDING');
+});
+
+test('compact active-pool and empty states remain intentional', () => {
+  const none = snapshot();
+  none.activePools = [];
+  none.recentPositions = [];
+  none.candidates = [];
+  none.events = [];
+  const output = terminal.renderDecisionTerminal(none, { columns: 180, rows: 50, color: false });
+  assert.match(output, /ACTIVE POOLS \(0\)/);
+  assert.match(output, /No active LP positions\./);
+  assert.match(output, /No current canonical candidate cycle\./);
+  assert.match(output, /No canonical events in the current bounded window\./);
+  assert.match(output, /No matching canonical lifecycle\./);
+});
+
+test('wide and supported narrow dimensions do not exceed terminal width', () => {
+  for (const [columns, rows] of [[180, 50], [160, 45], [140, 40], [120, 35]]) {
+    const output = terminal.renderDecisionTerminal(snapshot(), { columns, rows, color: false, interactive: true });
+    for (const rendered of output.split('\n')) assert.ok(rendered.length <= columns, `${columns} columns: ${rendered}`);
+  }
 });
 
 test('shell terminal candidate and filter navigation are bounded and deterministic', () => {
@@ -51,6 +116,8 @@ test('terminal implementation has no browser, HTTP route, or economic control su
   assert.doesNotMatch(source, /createServer|fetch\(|transaction_send|signMessage|submitTransaction|POST\s*\//);
   assert.match(source, /LPFORGE_PHASE1_LIVE_SIGNING_PROHIBITED|loadPhase1Config/);
   assert.match(source, /read-only/);
+  assert.match(source, /SIGWINCH/);
+  assert.match(source, /showCanonicalEventCodes: true/);
   assert.match(launcher, /terminal\)[\s\S]*node_args=\("\$\{service_args\[@\]\}"\)/);
 });
 
@@ -61,4 +128,10 @@ test('open PnL is sourced from receipt-backed live-control marks, never managed 
   assert.match(source, /lp_mtm_peak_return_fraction AS live_control_peak_return_fraction/);
   assert.doesNotMatch(source, /es\.net_return_fraction/);
   assert.doesNotMatch(source, /es\.peak_net_return_fraction/);
+});
+
+test('row number parsing does not turn nullable database evidence into a numeric zero', () => {
+  const source = fs.readFileSync('apps/terminal/src/main.ts', 'utf8');
+  assert.match(source, /raw === null \|\| raw === undefined \|\| raw === ''/);
+  assert.doesNotMatch(source, /Number\(row\[key\]\)/);
 });
