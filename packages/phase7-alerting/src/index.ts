@@ -76,6 +76,24 @@ const operatorReason=(code:string):string|undefined=>{
 export function operatorReasonSummary(reasonCodes:string[]|undefined):string[]{return [...new Set((reasonCodes??[]).map(operatorReason).filter((v):v is string=>Boolean(v)))].slice(0,3);}
 export function phase7AlertTopic(a:Phase7Alert):Phase7AlertTopic{if(a.topic)return a.topic;if(a.code.startsWith('POSITION_'))return a.code.includes('EMERGENCY')?'RISK':'TRADES';if(a.code.includes('RECONCILIATION')||a.code.includes('UNKNOWN')||a.code.includes('EMERGENCY'))return'RISK';return'SYSTEM';}
 export function phase7AlertFingerprint(a:Phase7Alert){return createHash('sha256').update([a.code,a.entityType??'RUNTIME',a.entityId??a.runtimeId??'lpforge',a.transitionKey??(a.reasonCodes??[]).slice().sort().join(',')].join('|')).digest('hex');}
+/**
+ * Maps a real OOR lifecycle transition to its operator-facing alert.  A newly
+ * opened position commonly has no prior OOR row; its first normal IN_RANGE
+ * observation is initialization, not a re-entry and must never be presented
+ * as an OOR warning.
+ */
+export function assessOorLifecycleAlertTransition(priorState:string|undefined,state:string):Pick<Phase7Alert,'severity'|'code'|'title'|'message'>|undefined{
+  if(priorState===state)return undefined;
+  if(state==='IN_RANGE'){
+    if(!priorState||priorState==='IN_RANGE')return undefined;
+    return{severity:'INFO',code:'POSITION_RANGE_REENTERED',title:'Position back in range',message:'The current price returned to the position’s configured range. LPForge will continue normal monitoring.\nAction needed: none.'};
+  }
+  if(state==='TRANSIENT_OOR')return{severity:'WARNING',code:'POSITION_OOR_STARTED',title:'Position moved outside its range',message:'LPForge detected that the current price is outside the position’s configured range. It is monitoring the position and will follow its existing risk rules.\nAction needed: none right now.'};
+  if(state==='SUSTAINED_OOR')return{severity:'WARNING',code:'POSITION_OOR_SUSTAINED',title:'Position range needs attention',message:'LPForge detected that the current price is outside the position’s configured range. It is monitoring the position and will follow its existing risk rules.\nAction needed: none right now.'};
+  if(state==='OOR_ACTION_REQUIRED')return{severity:'WARNING',code:'POSITION_OOR_ACTION_REQUIRED',title:'Position range needs attention',message:'LPForge detected that the current price is outside the position’s configured range. It is monitoring the position and will follow its existing risk rules.\nAction needed: none right now.'};
+  if(state==='OOR_STALE_CAPITAL')return{severity:'WARNING',code:'POSITION_OOR_STALE_CAPITAL',title:'Position range needs attention',message:'LPForge detected that the current price is outside the position’s configured range. It is monitoring the position and will follow its existing risk rules.\nAction needed: none right now.'};
+  return undefined;
+}
 type RpcPressureRow={pressure_until?:unknown;pressure_level?:unknown;last_429_at?:unknown;updated_at?:unknown};
 export type RpcAlertLane='DISCOVERY'|'PRODUCTION'|'EXECUTION';
 const asIso=(value:unknown)=>{const ms=Date.parse(String(value??''));return Number.isFinite(ms)?new Date(ms).toISOString():undefined;};

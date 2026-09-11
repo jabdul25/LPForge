@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {alertsForRpcQuotaPressure,loadPhase7TelegramConfig,operatorReasonSummary,phase7AlertFingerprint,phase7AlertTopic,renderPhase7TelegramAlert,RpcQuotaAlertObserver,Phase7TelegramDeliveryError} from '../.build/packages/phase7-alerting/src/index.js';
+import {alertsForRpcQuotaPressure,assessOorLifecycleAlertTransition,loadPhase7TelegramConfig,operatorReasonSummary,phase7AlertFingerprint,phase7AlertTopic,renderPhase7TelegramAlert,RpcQuotaAlertObserver,Phase7TelegramDeliveryError} from '../.build/packages/phase7-alerting/src/index.js';
 
 test('terminal close transition awaits the durable Telegram outbox but contains delivery failures', async () => {
   const source = await import('node:fs/promises').then(fs => fs.readFile('apps/operator/src/main.ts', 'utf8'));
@@ -14,6 +14,15 @@ const base={severity:'WARNING',code:'POSITION_OOR_STARTED',title:'Position out o
 test('same lifecycle code for two positions has distinct durable identities',()=>{
   assert.notEqual(phase7AlertFingerprint({...base,entityId:'position-a'}),phase7AlertFingerprint({...base,entityId:'position-b'}));
   assert.equal(phase7AlertFingerprint({...base,entityId:'position-a'}),phase7AlertFingerprint({...base,entityId:'position-a'}));
+});
+test('initial in-range observation is not misreported as stale capital, while a genuine re-entry remains visible',()=>{
+  assert.equal(assessOorLifecycleAlertTransition(undefined,'IN_RANGE'),undefined);
+  const reentered=assessOorLifecycleAlertTransition('SUSTAINED_OOR','IN_RANGE');
+  assert.equal(reentered?.code,'POSITION_RANGE_REENTERED');
+  assert.equal(reentered?.severity,'INFO');
+  const stale=assessOorLifecycleAlertTransition('SUSTAINED_OOR','OOR_STALE_CAPITAL');
+  assert.equal(stale?.code,'POSITION_OOR_STALE_CAPITAL');
+  assert.equal(stale?.severity,'WARNING');
 });
 test('topic routing honors dedicated thread configuration with fallback',()=>{
   const cfg=loadPhase7TelegramConfig({LPFORGE_TELEGRAM_ALERTS_ENABLED:'true',LPFORGE_TELEGRAM_BOT_TOKEN:'x',LPFORGE_TELEGRAM_CHAT_ID:'1',LPFORGE_TELEGRAM_THREAD_ID:'11',LPFORGE_TELEGRAM_TRADES_THREAD_ID:'12',LPFORGE_TELEGRAM_RISK_THREAD_ID:'13'});
