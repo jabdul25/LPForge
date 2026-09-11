@@ -1,10 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { assessProfitRetentionProtection, parseLiveExitGovernorPolicy } from '../.build/packages/live-exit-governor/src/index.js';
+import { assessProfitRetentionProtection, isManagementFactFreshForObservation, parseLiveExitGovernorPolicy } from '../.build/packages/live-exit-governor/src/index.js';
 
 const policy=parseLiveExitGovernorPolicy({schemaVersion:1,enabled:true,hardStopLossFraction:.12,emergencyStopLossFraction:.2,takeProfitFraction:0,profitProtection:{enabled:true,triggerFraction:.08,maxGivebackFraction:.05,minRetainedProfitFraction:.02},profitRetention:{enabled:true,policyVersion:'profit-retention-ts5-oor-p4-v1',ts5:{enabled:true,mfeActivationFraction:.04,givebackFraction:.02,watchSeconds:300,lowerRangeFraction:1/3,model:'EXPIRE_REARM',previousUsableMaxAgeSeconds:300},oorP4:{enabled:true,mfeActivationFraction:.02,requiresBelowMin:true,requiresTokenExposure:true}},closeOnThesisInvalidated:true,closeOnNonPositiveForwardEv:true,reduceOnRiskBlock:true,reduceFraction:.5,maxHoldMinutes:0,maxHoldRequiresNonPositiveForwardEv:true,toxicityCloseThreshold:.8,toxicityEmergencyThreshold:.95}).profitRetention;
 const at=seconds=>new Date(Date.parse('2026-09-07T12:00:00.000Z')+seconds*1000).toISOString();
 const input=(overrides={})=>({policy,observedAt:at(0),economics:{evidenceState:'AVAILABLE',observedAt:at(0),netReturnFraction:.03,reasonCodes:[]},highWater:{peakNetReturnFraction:.06,peakObservedAt:at(-60)},currentFactsFresh:true,reconciliationClean:true,noActiveManagementPlan:true,poolAddress:'pool',rangeState:'IN_RANGE',activeBinId:10,lowerBinId:0,upperBinId:30,previousUsable:{observedAt:at(-30),managedReturnFraction:.04,fresh:true,poolAddress:'pool'},...overrides});
+
+test('current management fact freshness accepts a fact fetched later in the same cycle but rejects stale or implausibly future facts',()=>{
+  assert.equal(isManagementFactFreshForObservation({observationObservedAt:at(0),factObservedAt:at(.599),maxAgeSeconds:300}),true);
+  assert.equal(isManagementFactFreshForObservation({observationObservedAt:at(0),factObservedAt:at(-300),maxAgeSeconds:300}),true);
+  assert.equal(isManagementFactFreshForObservation({observationObservedAt:at(0),factObservedAt:at(-300.001),maxAgeSeconds:300}),false);
+  assert.equal(isManagementFactFreshForObservation({observationObservedAt:at(0),factObservedAt:at(300.001),maxAgeSeconds:300}),false);
+  assert.equal(isManagementFactFreshForObservation({observationObservedAt:at(0),factObservedAt:undefined,maxAgeSeconds:300}),false);
+});
 
 test('TS-5 arms only with managed MFE >=4%, two percentage point giveback, and fresh in-range facts',()=>{
   assert.equal(assessProfitRetentionProtection(input({highWater:{peakNetReturnFraction:.039,peakObservedAt:at(-60)}})).kind,'NONE');

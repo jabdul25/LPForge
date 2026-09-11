@@ -42,6 +42,7 @@ import {
   deriveLpPositionMarkToMarket,
   deriveMeteoraComparableLpPositionMarkToMarket,
   assessProfitRetentionProtection,
+  isManagementFactFreshForObservation,
   parseProfitRetentionWatch,
   loadLiveExitGovernorPolicy,
   type ExitHighWaterState,
@@ -631,13 +632,12 @@ async function observeAndPlanOwnedPositions(input: {
     // prior mark is read from durable observations, never process memory.
     const previousUsable=await input.store.loadPreviousUsableManagedEconomicObservation({lpforgePositionId:position.lpforgePositionId,beforeObservedAt:input.observedAt,poolAddress:position.poolAddress});
     const previousAge=previousUsable?Date.parse(input.observedAt)-Date.parse(previousUsable.observedAt):Number.POSITIVE_INFINITY;
-    const currentFactAge=fact?.stamp.observedAt?Date.parse(input.observedAt)-Date.parse(fact.stamp.observedAt):Number.POSITIVE_INFINITY;
     const profitRetention=assessProfitRetentionProtection({
       policy:exitPolicy.profitRetention,
       policyHash:await sha256Hex(canonicalJson(exitPolicy.profitRetention)),
       priorWatch:parseProfitRetentionWatch(priorPayload.profitRetentionWatch),
       observedAt:input.observedAt,economics,highWater:exitDecision.highWater,
-      currentFactsFresh:Boolean(fact&&activeBinChainFresh&&apiPool&&Number.isFinite(currentFactAge)&&currentFactAge>=0&&currentFactAge<=exitPolicy.profitRetention.ts5.previousUsableMaxAgeSeconds*1000),
+      currentFactsFresh:Boolean(fact&&activeBinChainFresh&&apiPool&&isManagementFactFreshForObservation({observationObservedAt:input.observedAt,factObservedAt:fact.stamp.observedAt,maxAgeSeconds:exitPolicy.profitRetention.ts5.previousUsableMaxAgeSeconds})),
       reconciliationClean:Boolean(fact)&&String(row.reconciliation_status??'MATCH')==='MATCH',
       noActiveManagementPlan:!activePlanForPosition,
       positionTerminal:['CLOSED','SOL_SETTLED','ABORTED'].includes(String(row.lifecycle_state??'')),

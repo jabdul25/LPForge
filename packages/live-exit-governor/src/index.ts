@@ -65,6 +65,23 @@ export interface ProfitRetentionWatch {
 }
 export type ProfitRetentionAssessmentKind='NONE'|'TS5_WATCH_ARMED'|'TS5_WATCH_EXPIRED'|'TS5_PROTECTION_CONFIRMED'|'OOR_P4_PROTECTION_CONFIRMED';
 export interface ProfitRetentionAssessment {kind:ProfitRetentionAssessmentKind;reasonCodes:string[];watch:ProfitRetentionWatch;rangeFraction?:number|undefined;}
+
+/**
+ * A chain fact is gathered during a management observation.  The observation
+ * timestamp is taken when that cycle begins, so a successfully fetched fact
+ * is normally stamped a little later.  Freshness is therefore a bounded
+ * distance from the cycle timestamp, not a one-sided "fact must be older"
+ * check.  Invalid timestamps and either direction beyond the policy window
+ * still fail closed.
+ */
+export function isManagementFactFreshForObservation(input:{
+  observationObservedAt:string;
+  factObservedAt:string|undefined;
+  maxAgeSeconds:number;
+}):boolean{
+  const observationAt=Date.parse(input.observationObservedAt),factAt=input.factObservedAt===undefined?Number.NaN:Date.parse(input.factObservedAt),maxAgeMs=input.maxAgeSeconds*1000;
+  return Number.isFinite(observationAt)&&Number.isFinite(factAt)&&Number.isFinite(maxAgeMs)&&maxAgeMs>=0&&Math.abs(factAt-observationAt)<=maxAgeMs;
+}
 export interface PositionEconomicsSnapshot {
   evidenceState:ExitEvidenceState;
   observedAt:string;
