@@ -131,6 +131,26 @@ export interface LiveWorkerConfig {
   /** Immutable-settlement reporting policy. Observability only. */
   postTradeReporting?:{enabled:boolean;policyVersion:string;runningStatsStartAt:string};
 }
+type SettlementFinalizationConfig=Pick<LiveWorkerConfig,"rpcUrl"|"residualDustThresholdUsd"|"meteoraDataApiUrl"|"dataApiMaxRps"|"httpTimeoutMs"|"policyHash"|"postTradeReporting">;
+type SettlementFinalizationConfigInput=Omit<SettlementFinalizationConfig,"rpcUrl">&{rpcUrl?:string};
+
+/**
+ * The normal CLOSE path and reconciliation-only CLOSE recovery must reach the
+ * same immutable-settlement boundary with the same observability policy. In
+ * particular, a recovery is allowed to finalize accounting, but must not
+ * silently bypass the durable post-trade-report outbox.
+ */
+export function settlementFinalizationConfig(input:SettlementFinalizationConfigInput):SettlementFinalizationConfig{
+  return{
+    rpcUrl:input.rpcUrl??'',
+    ...(input.residualDustThresholdUsd===undefined?{}:{residualDustThresholdUsd:input.residualDustThresholdUsd}),
+    ...(input.meteoraDataApiUrl===undefined?{}:{meteoraDataApiUrl:input.meteoraDataApiUrl}),
+    ...(input.dataApiMaxRps===undefined?{}:{dataApiMaxRps:input.dataApiMaxRps}),
+    ...(input.httpTimeoutMs===undefined?{}:{httpTimeoutMs:input.httpTimeoutMs}),
+    ...(input.policyHash===undefined?{}:{policyHash:input.policyHash}),
+    ...(input.postTradeReporting===undefined?{}:{postTradeReporting:input.postTradeReporting}),
+  };
+}
 export interface LiveWorkerResult {
   status: "IDLE" | "AWAITING_FRESH_P7_CONTROL" | "BLOCKED" | "SUBMITTED" | "RECONCILED" | "UNKNOWN";
   planId?: string;
@@ -4895,7 +4915,7 @@ export function confirmedTerminalClaimTransactions(
 }
 
 /** A recovered close reaches the same durable settlement boundary as a normal close. */
-async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:AutonomousPlan;positionAddress:string;connection:Connection;config:Pick<LiveWorkerConfig,"rpcUrl"|"residualDustThresholdUsd"|"meteoraDataApiUrl"|"dataApiMaxRps"|"httpTimeoutMs"|"policyHash"|"postTradeReporting">}):Promise<{ready:boolean;reasonCodes:string[]}>{
+async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:AutonomousPlan;positionAddress:string;connection:Connection;config:SettlementFinalizationConfig}):Promise<{ready:boolean;reasonCodes:string[]}>{
   const positionCheck=await input.connection.getAccountInfoAndContext(new PublicKey(input.positionAddress),"confirmed");
   if(positionCheck.value!==null)return{ready:false,reasonCodes:["SETTLEMENT_POSITION_STILL_EXISTS"]};
   const dispatch=closeSettlementDispatch(input.plan),closeSignature=typeof dispatch.signature==="string"?dispatch.signature:typeof dispatch.pendingSignature==="string"?dispatch.pendingSignature:undefined,closeTransactionId=typeof dispatch.transactionId==="string"?dispatch.transactionId:undefined;
@@ -5265,6 +5285,8 @@ export async function recoverUnfinishedAutonomousPlans(input: {
   dataApiMaxRps?: number;
   httpTimeoutMs?: number;
   policyHash?: string;
+  /** The canonical post-settlement observability policy. */
+  postTradeReporting?: NonNullable<LiveWorkerConfig["postTradeReporting"]>;
   /** Test seam; production creates its governed recovery connection below. */
   connection?: Connection;
   /** Test seam; production uses the RPC connection below. */
@@ -6421,7 +6443,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
           results.push({ planId: plan.planId, action: "HOLD_FOR_OPERATOR", reasonCodes: ["P6_CLOSE_SETTLEMENT_RPC_UNAVAILABLE"] });
           continue;
         }
-        const settlement=await finalizeClosedPositionSettlement({store:input.store,plan,positionAddress:recoveryPositionAddress,connection,config:{rpcUrl:input.rpcUrl,...(input.residualDustThresholdUsd===undefined?{}:{residualDustThresholdUsd:input.residualDustThresholdUsd}),...(input.meteoraDataApiUrl===undefined?{}:{meteoraDataApiUrl:input.meteoraDataApiUrl}),...(input.dataApiMaxRps===undefined?{}:{dataApiMaxRps:input.dataApiMaxRps}),...(input.httpTimeoutMs===undefined?{}:{httpTimeoutMs:input.httpTimeoutMs}),...(input.policyHash===undefined?{}:{policyHash:input.policyHash})}});
+        const settlement=await finalizeClosedPositionSettlement({store:input.store,plan,positionAddress:recoveryPositionAddress,connection,config:settlementFinalizationConfig(input)});
         if(!settlement.ready){
           results.push({ planId: plan.planId, action: "HOLD_FOR_OPERATOR", reasonCodes: settlement.reasonCodes });
           continue;
@@ -6500,7 +6522,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     // transaction and is idempotent against the immutable raw cashflows.
     const pendingTerminalDispatch=closeSettlementDispatch(plan);
     if(isAccountCloseOnlyPlan(plan)&&positionTruth.exists===false&&(pendingTerminalDispatch.stage==='SOL_SETTLEMENT_CHAIN_RECONCILIATION_BLOCKED'||pendingTerminalDispatch.stage==='SOL_SETTLEMENT_BLOCKED')&&connection&&recoveryPositionAddress){
-      const settlement=await finalizeClosedPositionSettlement({store:input.store,plan,positionAddress:recoveryPositionAddress,connection,config:{rpcUrl:input.rpcUrl??'',...(input.residualDustThresholdUsd===undefined?{}:{residualDustThresholdUsd:input.residualDustThresholdUsd}),...(input.meteoraDataApiUrl===undefined?{}:{meteoraDataApiUrl:input.meteoraDataApiUrl}),...(input.dataApiMaxRps===undefined?{}:{dataApiMaxRps:input.dataApiMaxRps}),...(input.httpTimeoutMs===undefined?{}:{httpTimeoutMs:input.httpTimeoutMs}),...(input.policyHash===undefined?{}:{policyHash:input.policyHash})}});
+      const settlement=await finalizeClosedPositionSettlement({store:input.store,plan,positionAddress:recoveryPositionAddress,connection,config:settlementFinalizationConfig(input)});
       if(settlement.ready){
         await input.store.completeAutonomousPlan({planId:plan.planId,state:'COMPLETED',at:input.now,payload:{action:'CLOSE',recovery:'ACCOUNT_CLOSE_ONLY_SETTLEMENT_RECONCILED'}});
         results.push({planId:plan.planId,action:'MARK_RECONCILED',reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_SETTLEMENT_RECONCILED']});
@@ -6968,7 +6990,7 @@ export async function recoverUnfinishedAutonomousPlans(input: {
     for(const candidate of await input.store.loadTerminalCloseRentRecoveryCandidates(16)){
       const plan=await input.store.loadAutonomousPlan(candidate.planId);
       if(!plan||!plan.positionAddress||plan.positionAddress!==candidate.positionAddress)continue;
-      const settlement=await finalizeClosedPositionSettlement({store:input.store,plan,positionAddress:candidate.positionAddress,connection,config:{rpcUrl:input.rpcUrl,...(input.residualDustThresholdUsd===undefined?{}:{residualDustThresholdUsd:input.residualDustThresholdUsd}),...(input.meteoraDataApiUrl===undefined?{}:{meteoraDataApiUrl:input.meteoraDataApiUrl}),...(input.dataApiMaxRps===undefined?{}:{dataApiMaxRps:input.dataApiMaxRps}),...(input.httpTimeoutMs===undefined?{}:{httpTimeoutMs:input.httpTimeoutMs}),...(input.policyHash===undefined?{}:{policyHash:input.policyHash})}});
+      const settlement=await finalizeClosedPositionSettlement({store:input.store,plan,positionAddress:candidate.positionAddress,connection,config:settlementFinalizationConfig(input)});
       results.push({planId:plan.planId,action:settlement.ready?"MARK_RECONCILED":"HOLD_FOR_OPERATOR",reasonCodes:settlement.ready?["P6_CLOSE_POSITION_RENT_RECOVERY_RECONCILED"]:settlement.reasonCodes});
     }
   }

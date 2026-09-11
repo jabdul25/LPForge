@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {phase7AlertFingerprint,postTradeSettlementAlert,renderPhase7TelegramAlert,serializePhase7Alert} from '../.build/packages/phase7-alerting/src/index.js';
 import {parseDeploymentPolicy} from '../.build/packages/deployment-policy/src/index.js';
+import {settlementFinalizationConfig} from '../.build/packages/phase6-live-worker/src/index.js';
 
 const base=()=>({
   lifecycleId:'lifecycle:position-1234567890',settlementId:'settlement:lifecycle:position-1234567890:v1',settlementVersion:1,
@@ -71,4 +72,17 @@ test('the worker builds the report only after immutable settlement and finalized
   const settlement=source.indexOf('persistLifecycleSolSettlement'),fees=source.indexOf('finalizeCloseFeeAttribution',settlement),report=source.indexOf('loadCanonicalPostTradeReport',fees),compact=source.indexOf('compactPositionManagementDecisionAudit',report),queue=source.indexOf('queuePositionSettledAlert(postTradeReport)',compact);
   assert.ok(settlement>=0&&fees>settlement&&report>fees&&compact>report&&queue>compact,'settlement → attribution → report snapshot → compaction → outbox queue');
   assert.match(source,/postTradeSettlementAlert\(report\)/);assert.match(source,/\.catch\(\(\)=>\{\}\)/);
+});
+
+test('reconciliation-only settlement carries the same post-trade reporting policy as a direct close',async()=>{
+  const policy={enabled:true,policyVersion:'post-trade-reporting-v1',runningStatsStartAt:'2026-09-01T00:00:00.000Z'};
+  const finalization=settlementFinalizationConfig({rpcUrl:'http://rpc',residualDustThresholdUsd:0,meteoraDataApiUrl:'http://api',dataApiMaxRps:25,httpTimeoutMs:10_000,policyHash:'policy-hash',postTradeReporting:policy});
+  assert.deepEqual(finalization.postTradeReporting,policy);
+  const [worker,execution]=await Promise.all([
+    import('node:fs/promises').then(fs=>fs.readFile('packages/phase6-live-worker/src/index.ts','utf8')),
+    import('node:fs/promises').then(fs=>fs.readFile('apps/execution/src/main.ts','utf8')),
+  ]);
+  assert.match(worker,/postTradeReporting\?: NonNullable<LiveWorkerConfig\["postTradeReporting"\]>/);
+  assert.equal((worker.match(/config:settlementFinalizationConfig\(input\)/g)??[]).length,3,'every reconciliation settlement route retains the reporting policy');
+  assert.match(execution,/postTradeReporting:config\.postTradeReporting/,'P6 recovery receives the validated canonical policy');
 });

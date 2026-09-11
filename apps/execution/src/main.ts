@@ -410,6 +410,7 @@ async function recoverOnce() {
       dataApiMaxRps: config.dataApiMaxRps,
       httpTimeoutMs: config.httpTimeoutMs,
       policyHash: config.policyHash,
+      ...(config.postTradeReporting?{postTradeReporting:config.postTradeReporting}:{}),
     });
     // CLOSE/EMERGENCY_CLOSE stages that were durably confirmed before a
     // process interruption are protective workflows. Resume only the next
