@@ -76,6 +76,6 @@ test('terminal implementation is receipt-bound and final settlement requires cha
   assert.match(worker,/upsertLifecycleSettlementChainReconciliation/);
   assert.match(worker,/persisted\.created&&!persisted\.superseded/);
   const db=fs.readFileSync('packages/db/src/index.ts','utf8');
-  assert.match(db,/WHERE l\.status='CLOSED' AND p\.state=ANY/);
+  assert.match(db,/WHERE l\.status IN \('CLOSED','RECONCILIATION_REQUIRED'\) AND p\.state=ANY/);
   assert.doesNotMatch(db,/WHERE l\.status IN \('CLOSED','SOL_SETTLED'\) AND p\.state=ANY/);
 });
