@@ -4115,6 +4115,51 @@ export function shouldRebuildExpiredCloseUnwind(input:{
 }
 
 /**
+ * A finalized program failure is not an expired transaction.  It may be
+ * retried once only when the exact failed primary-unwind child has a durable
+ * fee-only receipt, the parent was terminalized by the known legacy branch,
+ * the measured inventory remains durably attributed, and the confirmed
+ * REMOVE/CLAIM boundary is still available.  This authorizes a *new* child
+ * identity; it never resends the failed signature.
+ */
+export function shouldRebuildFinalizedFailedCloseUnwind(input:{
+  signatureStatusReadUnknown:boolean;
+  confirmationStatus:"PROCESSED"|"CONFIRMED"|"FINALIZED"|"EXPIRED"|"FAILED"|"UNKNOWN";
+  failureFinalized:boolean;
+  planState:string;
+  journalState:string;
+  terminalRecovery:unknown;
+  positionExists:boolean;
+  positionOwner:unknown;
+  positionPool:unknown;
+  expectedOwner:string;
+  expectedPool:string;
+  pendingStage:CloseSettlementPendingStage;
+  failedReceiptProven:boolean;
+  durableInventoryProven:boolean;
+  confirmedPredecessor:boolean;
+  exactPendingAttempt:boolean;
+  retryCount:unknown;
+}):boolean{
+  const retry=Number(input.retryCount);
+  return !input.signatureStatusReadUnknown&&
+    input.confirmationStatus==='FAILED'&&
+    input.failureFinalized&&
+    input.planState==='FAILED'&&
+    input.journalState==='FAILED'&&
+    input.terminalRecovery==='P6_CLOSE_PENDING_STAGE_FAILED_CONFIRMED_NO_PROTOCOL_EFFECT'&&
+    input.positionExists&&
+    input.positionOwner===input.expectedOwner&&
+    input.positionPool===input.expectedPool&&
+    input.pendingStage==='CLOSE_UNWIND_SUBMITTED'&&
+    input.failedReceiptProven&&
+    input.durableInventoryProven&&
+    input.confirmedPredecessor&&
+    input.exactPendingAttempt&&
+    Number.isSafeInteger(retry)&&retry===0;
+}
+
+/**
  * The first REMOVE child is safe to rebuild only after its exact signature
  * has expired, PositionV2 is still present, and no earlier remove child could
  * have changed liquidity.  Callers additionally prove the pending signature
@@ -5448,7 +5493,8 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       | "EXPIRED"
       | "FAILED"
       | "UNKNOWN" = "UNKNOWN";
-    let signatureStatusReadUnknown = false;
+    let signatureStatusReadUnknown = false,
+      failureFinalized=false;
     if (effectiveRecoverySignature && (connection || input.signatureStatusProvider)) {
       let status:
         | { err: unknown; confirmationStatus?: string | null }
@@ -5465,7 +5511,10 @@ export async function recoverUnfinishedAutonomousPlans(input: {
       } catch {
         signatureStatusReadUnknown = true;
       }
-      if (status?.err) confirmationStatus = "FAILED";
+      if (status?.err) {
+        confirmationStatus = "FAILED";
+        failureFinalized=status.confirmationStatus==='finalized';
+      }
       else if (status?.confirmationStatus === "processed")
         confirmationStatus = "PROCESSED";
       else if (status?.confirmationStatus === "confirmed")
@@ -5810,12 +5859,102 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         // FAILED means the signed transaction landed and the program rejected
         // it.  Before any successor/retry decision, bind the exact pending
         // child to its submission row and persist the paid network fee.
+        let failedTransactionId:string|undefined,
+          failedReceiptProven=false;
         if(confirmationStatus==='FAILED'){
-          const failedTransactionId=closePendingTransactionId(plan,closePending),failedAttempt=failedTransactionId?await input.store.loadSubmissionAttemptByTransactionId(failedTransactionId):undefined;
-          const failedReceiptProven=Boolean(connection&&recoveryPositionAddress&&failedTransactionId&&failedAttempt?.signature===closePending.signature&&await persistConfirmedFailedTransactionCost({store:input.store,connection:connection!,plan,positionAddress:recoveryPositionAddress!,signature:closePending.signature,transactionId:failedTransactionId!,observedAt:input.now}));
+          failedTransactionId=closePendingTransactionId(plan,closePending);
+          const failedAttempt=failedTransactionId?await input.store.loadSubmissionAttemptByTransactionId(failedTransactionId):undefined;
+          failedReceiptProven=Boolean(connection&&recoveryPositionAddress&&failedTransactionId&&failedAttempt?.signature===closePending.signature&&await persistConfirmedFailedTransactionCost({store:input.store,connection:connection!,plan,positionAddress:recoveryPositionAddress!,signature:closePending.signature,transactionId:failedTransactionId!,observedAt:input.now}));
           if(!failedReceiptProven){
             await input.store.transitionAutonomousPlan({planId:plan.planId,state:'RECONCILIATION_REQUIRED',at:input.now,reasonCodes:['P6_CLOSE_FAILED_RECEIPT_PROOF_REQUIRED'],payload:{pendingStage:closePending.stage,pendingSignature:closePending.signature,expectedTransactionId:failedTransactionId??null}});
             results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:['P6_CLOSE_FAILED_RECEIPT_PROOF_REQUIRED']});
+            continue;
+          }
+        }
+        // Legacy versions terminalized a close parent after a finalized
+        // no-protocol-effect primary unwind.  Rehydrate exactly that parent
+        // only after independently re-proving the failure receipt, its bound
+        // position/owner/pool, durable token attribution, and a confirmed
+        // predecessor.  The fresh child below has a new `:retry-1` identity.
+        if(confirmationStatus==='FAILED'&&closePending.stage==='CLOSE_UNWIND_SUBMITTED'){
+          const dispatch=closeSettlementDispatch(plan),
+            originalUnwindTransactionId=typeof dispatch.unwindTransactionId==='string'?dispatch.unwindTransactionId:undefined,
+            persistedLotAllocations=parseDurableCloseLotAllocations(dispatch.attributableFeeLotAllocations),
+            attributableTokenX=closeSettlementAmount(dispatch.attributableTokenX),
+            predecessorIds=[
+              ...(Array.isArray(dispatch.claimTransactionIds)?dispatch.claimTransactionIds.filter((value):value is string=>typeof value==='string').reverse():[]),
+              ...(Array.isArray(dispatch.removeChildTransactionIds)?dispatch.removeChildTransactionIds.filter((value):value is string=>typeof value==='string').reverse():[]),
+            ];
+          const [unwindAttempt,...predecessors]=await Promise.all([
+            originalUnwindTransactionId?input.store.loadSubmissionAttemptByTransactionId(originalUnwindTransactionId):Promise.resolve(undefined),
+            ...predecessorIds.map(transactionId=>input.store.loadConfirmedSubmissionByTransactionId(transactionId)),
+          ]);
+          const allPredecessorsConfirmed=predecessorIds.length>0&&predecessors.length===predecessorIds.length&&predecessors.every(Boolean),
+            confirmedPredecessor=allPredecessorsConfirmed&&predecessorIds[0]&&predecessors[0]
+              ? {transactionId:predecessorIds[0],signature:predecessors[0].signature}
+              : undefined;
+          if(shouldRebuildFinalizedFailedCloseUnwind({
+            signatureStatusReadUnknown,
+            confirmationStatus,
+            failureFinalized,
+            planState:plan.state,
+            journalState:journal.state,
+            terminalRecovery:dispatch.recovery,
+            positionExists:positionTruth.exists===true,
+            positionOwner:positionTruth.owner,
+            positionPool:positionTruth.pool,
+            expectedOwner:plan.ownerAddress,
+            expectedPool:plan.poolAddress,
+            pendingStage:closePending.stage,
+            failedReceiptProven,
+            durableInventoryProven:attributableTokenX!==undefined&&attributableTokenX>0n&&persistedLotAllocations.ok&&persistedLotAllocations.allocations.length>0,
+            confirmedPredecessor:Boolean(confirmedPredecessor),
+            exactPendingAttempt:Boolean(originalUnwindTransactionId&&failedTransactionId===originalUnwindTransactionId&&unwindAttempt?.signature===closePending.signature),
+            retryCount:dispatch.closeUnwindRetryCount,
+          })){
+            await input.store.updateExecutionJournal({
+              idempotencyKey:plan.idempotencyKey,
+              expectedVersion:journal.version,
+              transactionId:confirmedPredecessor!.transactionId,
+              state:'CONFIRMED',
+              signature:confirmedPredecessor!.signature,
+              updatedAt:input.now,
+              payload:{
+                ...journal.payload,
+                recovery:'P6_CLOSE_UNWIND_FAILED_NO_PROTOCOL_EFFECT_REHYDRATED',
+                failedPrimaryUnwindSignature:closePending.signature,
+                failedPrimaryUnwindTransactionId:originalUnwindTransactionId,
+                failedReceiptProven:true,
+                priorJournalState:journal.state,
+                confirmationStatus,
+                positionTruth,
+              },
+            });
+            await input.store.transitionAutonomousPlan({
+              planId:plan.planId,
+              state:'RECONCILING',
+              at:input.now,
+              reasonCodes:[
+                'P6_CLOSE_UNWIND_FAILED_NO_PROTOCOL_EFFECT_REHYDRATED',
+                'P6_CLOSE_UNWIND_REBUILD_READY',
+              ],
+              payload:{
+                stage:'CLOSE_INVENTORY_MEASURED',
+                pendingStage:null,
+                pendingSignature:null,
+                closeUnwindRetryCount:1,
+                failedPrimaryUnwindSignature:closePending.signature,
+                failedPrimaryUnwindTransactionId:originalUnwindTransactionId,
+              },
+            });
+            results.push({
+              planId:plan.planId,
+              action:'RESUME_CLOSE_SETTLEMENT',
+              reasonCodes:[
+                'P6_CLOSE_UNWIND_FAILED_NO_PROTOCOL_EFFECT_REHYDRATED',
+                'P6_CLOSE_UNWIND_REBUILD_READY',
+              ],
+            });
             continue;
           }
         }
