@@ -174,6 +174,24 @@ export interface TerminalRenderOptions {
   interactive?: boolean | undefined;
 }
 
+/**
+ * P7's global-selection collection pass intentionally disables plan
+ * persistence while it evaluates every pool.  The operational runtime records
+ * this fact as a canonical reason on an otherwise eligible candidate.  It is
+ * not an entry-authority block: only the identity-locked winner gets a later
+ * dispatch-capable construction pass.  Keep the raw reason on the snapshot
+ * for diagnostics, but do not present this collection-pass implementation
+ * detail as an operator-facing reason in the shell terminal.
+ */
+const TERMINAL_COLLECTION_PASS_ONLY_REASONS = new Set([
+  'OPERATIONAL_PLAN_DISPATCH_DISABLED'
+]);
+
+/** Display-only projection; it never mutates canonical candidate reasons. */
+export function operatorVisibleCandidateReasonCodes(candidate: TerminalCandidate): string[] {
+  return candidate.reasonCodes.filter(code => !TERMINAL_COLLECTION_PASS_ONLY_REASONS.has(code));
+}
+
 const ansi = {
   reset: '\u001b[0m', bold: '\u001b[1m', dim: '\u001b[2m', lime: '\u001b[38;5;154m', green: '\u001b[38;5;84m', cyan: '\u001b[38;5;80m', amber: '\u001b[38;5;220m', magenta: '\u001b[38;5;205m', red: '\u001b[38;5;204m', gray: '\u001b[38;5;250m', muted: '\u001b[38;5;245m'
 } as const;
@@ -305,6 +323,7 @@ function eventRows(snapshot: TerminalSnapshot, width: number, filter: TerminalRe
 function candidateLines(snapshot: TerminalSnapshot, width: number, color: boolean): string[] {
   const candidate = snapshot.candidates[snapshot.selectedCandidateIndex] || snapshot.candidates[0];
   if (!candidate) return [paint('No current canonical candidate cycle.', 'muted', color)];
+  const visibleReasons = operatorVisibleCandidateReasonCodes(candidate);
   const range = candidate.lowerBinId === undefined || candidate.upperBinId === undefined ? '—' : `${candidate.lowerBinId} → ${candidate.upperBinId}`;
   const score = metric(candidate.confidence, 2, color, true);
   const uncertainty = metric(candidate.uncertainty, 2, color, true, true);
@@ -325,7 +344,7 @@ function candidateLines(snapshot: TerminalSnapshot, width: number, color: boolea
     `${paint('ACTIVE BIN', 'muted', color)} ${candidate.activeBinId === undefined ? '—' : candidate.activeBinId}`,
     `${paint('OOR RISK', 'muted', color)}  ${oorRisk}`,
     '',
-    `${paint('REASON', 'muted', color)}    ${clip(candidate.reasonCodes.join(', ') || '—', Math.max(8, width - 12))}`
+    `${paint('REASON', 'muted', color)}    ${clip(visibleReasons.join(', ') || '—', Math.max(8, width - 12))}`
   ];
 }
 function pipelineLines(snapshot: TerminalSnapshot, width: number, color: boolean): string[] {
@@ -342,14 +361,15 @@ function pipelineLines(snapshot: TerminalSnapshot, width: number, color: boolean
 
 /** Compact display-only synopsis of durable current candidate reasons. */
 function nextWatchGate(candidate: TerminalCandidate): string {
-  const reasons = candidate.reasonCodes.join('|');
+  const visibleReasons = operatorVisibleCandidateReasonCodes(candidate);
+  const reasons = visibleReasons.join('|');
   if (/RAW_REPLAY|REPLAY/.test(reasons)) return 'REPLAY';
   if (/P4|PHASE4/.test(reasons) || (candidate.operationalState === 'ENTRY_READY' && candidate.phase4State !== 'ENTRY_READY')) return 'P4';
   if (/CAPITAL/.test(reasons)) return 'CAPITAL';
   if (/UNCERTAINTY/.test(reasons)) return 'UNCERTAINTY';
   if (/RANGE/.test(reasons)) return 'RANGE';
   if (/LIVE_EVIDENCE|LIVE_CONFIRMATION|OBSERVATION|HISTORY/.test(reasons) || candidate.operationalState === 'WARMING') return 'MORE DATA';
-  return candidate.reasonCodes[0] ? candidate.reasonCodes[0].replace(/^OPERATIONAL_/, '').replace(/^ENTRY_/, '') : '—';
+  return visibleReasons[0] ? visibleReasons[0].replace(/^OPERATIONAL_/, '').replace(/^ENTRY_/, '') : '—';
 }
 
 function entryWatchLines(snapshot: TerminalSnapshot, width: number, color: boolean): string[] {

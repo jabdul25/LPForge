@@ -70,6 +70,25 @@ test('candidate renderer preserves actual zero and renders unavailable values as
   assert.doesNotMatch(unavailableOutput, /SCORE     \+?0\.00/);
 });
 
+test('terminal hides the deliberate global-selection collection-pass marker but preserves raw canonical reasons', () => {
+  const source = snapshot();
+  source.candidates = [{
+    ...source.candidates[0],
+    reasonCodes: ['OPERATIONAL_PLAN_DISPATCH_DISABLED', 'ENTRY_LIVE_CONFIRMATION_PENDING']
+  }];
+  source.entryWatchPools = [{
+    ...source.entryWatchPools[0],
+    reasonCodes: ['OPERATIONAL_PLAN_DISPATCH_DISABLED']
+  }];
+  const output = terminal.renderDecisionTerminal(source, { columns: 180, rows: 50, color: false });
+
+  assert.deepEqual(source.candidates[0].reasonCodes, ['OPERATIONAL_PLAN_DISPATCH_DISABLED', 'ENTRY_LIVE_CONFIRMATION_PENDING']);
+  assert.deepEqual(terminal.operatorVisibleCandidateReasonCodes(source.candidates[0]), ['ENTRY_LIVE_CONFIRMATION_PENDING']);
+  assert.match(output, /ENTRY_LIVE_CONFIRMATION_PENDING/);
+  assert.doesNotMatch(output, /OPERATIONAL_PLAN_DISPATCH_DISABLED/);
+  assert.match(output, /TOKEN\/SOL.*ENTRY_READY.*—/);
+});
+
 test('event aliases are display-only and plain diagnostics retain canonical event identity', () => {
   const source = snapshot();
   assert.equal(terminal.displayEventCode('P6_EXECUTION_RECOVERY_PENDING'), 'P6_RECOVERY_PENDING');
