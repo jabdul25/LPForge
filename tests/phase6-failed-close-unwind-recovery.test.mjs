@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFile } from 'node:fs/promises';
-import { shouldRebuildFinalizedFailedCloseUnwind } from '../.build/packages/phase6-live-worker/src/index.js';
+import {
+  shouldRebuildFinalizedFailedCloseUnwind,
+  shouldTerminalizeUnsubmittedCloseSupersededByCanonicalSettlement,
+} from '../.build/packages/phase6-live-worker/src/index.js';
 
 const exact={
   signatureStatusReadUnknown:false,
@@ -53,4 +56,36 @@ test('a retry is bounded: a failed replacement child cannot self-resend',()=>{
 test('the durable unresolved-plan query reloads the exact legacy failed-close marker',async()=>{
   const source=await readFile(new URL('../packages/db/src/index.ts',import.meta.url),'utf8');
   assert.match(source,/P6_CLOSE_PENDING_STAGE_FAILED_CONFIRMED_NO_PROTOCOL_EFFECT/);
+});
+
+const supersededUnsubmittedClose={
+  action:'CLOSE',
+  planState:'RECONCILIATION_REQUIRED',
+  journalState:'FAILED',
+  journalHasSignature:false,
+  positionLifecycleSettled:true,
+  positionAddress:'position',
+  positionAbsenceProven:true,
+  hasPendingChild:false,
+  hasCanonicalCloseWorkflow:true,
+  anyChildSubmission:false,
+};
+
+test('only an unsigned duplicate close linked to canonical SOL settlement may terminalize',()=>{
+  assert.equal(shouldTerminalizeUnsubmittedCloseSupersededByCanonicalSettlement(supersededUnsubmittedClose),true);
+});
+
+test('canonical settlement cannot suppress an unproven or submitted close',()=>{
+  for(const patch of [
+    {action:'OPEN'},
+    {planState:'FAILED'},
+    {journalState:'PLAN_CREATED'},
+    {journalHasSignature:true},
+    {positionLifecycleSettled:false},
+    {positionAddress:undefined},
+    {positionAbsenceProven:false},
+    {hasPendingChild:true},
+    {hasCanonicalCloseWorkflow:false},
+    {anyChildSubmission:true},
+  ])assert.equal(shouldTerminalizeUnsubmittedCloseSupersededByCanonicalSettlement({...supersededUnsubmittedClose,...patch}),false);
 });

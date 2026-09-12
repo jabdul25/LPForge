@@ -4168,6 +4168,39 @@ export function shouldRebuildFinalizedFailedCloseUnwind(input:{
 }
 
 /**
+ * A second CLOSE intent may be created while another close plan for the same
+ * lifecycle is still completing.  It is safe to retire that duplicate only
+ * when it has never crossed a network boundary and the linked lifecycle is
+ * already canonically SOL-settled.  This is deliberately not a generic
+ * "position absent" escape hatch: the settled lifecycle, exact absence, a
+ * canonical unsigned close workflow, and absence of every child submission
+ * are all required.
+ */
+export function shouldTerminalizeUnsubmittedCloseSupersededByCanonicalSettlement(input:{
+  action:AutonomousPlanAction;
+  planState:string;
+  journalState:string;
+  journalHasSignature:boolean;
+  positionLifecycleSettled:boolean;
+  positionAddress:string|undefined;
+  positionAbsenceProven:boolean;
+  hasPendingChild:boolean;
+  hasCanonicalCloseWorkflow:boolean;
+  anyChildSubmission:boolean;
+}):boolean{
+  return (input.action==='CLOSE'||input.action==='EMERGENCY_CLOSE')&&
+    input.planState==='RECONCILIATION_REQUIRED'&&
+    input.journalState==='FAILED'&&
+    !input.journalHasSignature&&
+    input.positionLifecycleSettled&&
+    typeof input.positionAddress==='string'&&input.positionAddress.length>0&&
+    input.positionAbsenceProven&&
+    !input.hasPendingChild&&
+    input.hasCanonicalCloseWorkflow&&
+    !input.anyChildSubmission;
+}
+
+/**
  * The first REMOVE child is safe to rebuild only after its exact signature
  * has expired, PositionV2 is still present, and no earlier remove child could
  * have changed liquidity.  Callers additionally prove the pending signature
@@ -5660,6 +5693,57 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         reasonCodes:[resumed?"P6_CLOSE_MULTI_REMOVE_PRE_SUBMISSION_RESUME_READY":"P6_CLOSE_MULTI_REMOVE_PRE_SUBMISSION_RESUME_NOT_APPLIED"],
       });
       continue;
+    }
+    // This plan has not submitted any child of its own, while the exact
+    // linked position lifecycle has already reached canonical SOL settlement
+    // through another close plan.  Retiring it prevents stale duplicate close
+    // intent from becoming global P7 recovery debt.  It cannot submit, retry,
+    // or settle anything here.
+    if(
+      plan.positionLifecycleSettled===true&&
+      positionTruth.exists===false&&
+      positionTruth.absenceProven===true&&
+      !closePending&&
+      hasCanonicalCloseWorkflow&&
+      (plan.action==='CLOSE'||plan.action==='EMERGENCY_CLOSE')&&
+      plan.state==='RECONCILIATION_REQUIRED'&&
+      journal.state==='FAILED'&&
+      !journal.signature&&
+      recoveryPositionAddress
+    ){
+      const childSubmissions=await Promise.all(closeSteps.map(step=>input.store.loadSubmissionAttemptByTransactionId(step.transactionId)));
+      if(shouldTerminalizeUnsubmittedCloseSupersededByCanonicalSettlement({
+        action:plan.action,
+        planState:plan.state,
+        journalState:journal.state,
+        journalHasSignature:Boolean(journal.signature),
+        positionLifecycleSettled:plan.positionLifecycleSettled===true,
+        positionAddress:recoveryPositionAddress,
+        positionAbsenceProven:positionTruth.exists===false&&positionTruth.absenceProven===true,
+        hasPendingChild:Boolean(closePending),
+        hasCanonicalCloseWorkflow,
+        anyChildSubmission:childSubmissions.some(Boolean),
+      })){
+        await input.store.completeAutonomousPlan({
+          planId:plan.planId,
+          state:'FAILED',
+          at:input.now,
+          payload:{
+            action:plan.action,
+            recovery:'P6_CLOSE_UNSUBMITTED_PLAN_SUPERSEDED_BY_CANONICAL_SOL_SETTLEMENT',
+            positionAddress:recoveryPositionAddress,
+            positionLifecycleSettled:true,
+            positionAbsenceProven:true,
+            childSubmissionCount:0,
+          },
+        });
+        results.push({
+          planId:plan.planId,
+          action:'MARK_RECONCILED',
+          reasonCodes:['P6_CLOSE_UNSUBMITTED_PLAN_SUPERSEDED_BY_CANONICAL_SOL_SETTLEMENT'],
+        });
+        continue;
+      }
     }
     // Historical compatibility: before the sequential-child journal contract
     // was deployed, a confirmed CLAIM/UNWIND could leave the shared close
