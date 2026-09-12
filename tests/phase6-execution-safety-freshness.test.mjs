@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {loadFreshExecutionSafetyFacts,checkFreshOpenSubmissionSafety,assessFreshOpenPortfolioTruth,isStaleOnlyPreSignP7ControlBlock} from '../.build/packages/phase6-live-worker/src/index.js';
+import {loadFreshExecutionSafetyFacts,checkFreshOpenSubmissionSafety,assessFreshOpenPortfolioTruth,isStaleOnlyPreSignP7ControlBlock,P6_OPEN_PREFUNDING_CONTROL_FRESHNESS_BUDGET_MS} from '../.build/packages/phase6-live-worker/src/index.js';
 const now='2026-08-29T12:00:00.000Z';
 const plan={planId:'fresh-open',intentId:'intent',idempotencyKey:'idem',action:'OPEN',poolAddress:'pool',ownerAddress:'owner',thesisId:'thesis',observedAt:now,expiresAt:'2026-08-29T12:05:00.000Z',planPayload:{provenance:{phase7Control:{decisionId:'latest'}},intent:{capitalLamports:'30000000',candidateId:'candidate'}},intentPayload:{},steps:[]};
 const control=(overrides={})=>({decision_id:'latest',cycle_key:'cycle',authority_mode:'PRODUCTION',health_status:'HEALTHY',drift_status:'WATCH',safety_mode:'NORMAL',new_economic_action_allowed:true,observed_at:now,payload:{releaseIdentity:{valid:true},portfolio:{valid:true},activeIncidentIds:[],controlledCanaryRevokedApprovalIds:[]},...overrides});
@@ -23,9 +23,22 @@ test('a stale P7 control remains fail-closed when its bounded reload is still st
  const r=await loadFreshExecutionSafetyFacts({store:staleStore,plan,config,connection,now,protocolCompatibility:async()=>true,staleControlReloadDelayMs:0});
  assert.equal(reads,2);assert.equal(r.globalKillSwitch,true);assert.deepEqual(r.reasonCodes,['P6_CLAIM_P7_CONTROL_STALE']);
 });
+test('a near-expiry P7 control is re-read and remains blocked before a funded open can start',async()=>{
+ const nearExpiry=control({observed_at:'2026-08-29T11:59:29.999Z'});let reads=0;
+ const staleStore={async loadLatestPhase7ControlDecision(){reads++;return nearExpiry;},async loadPhase7ControlDecision(){return nearExpiry;},async loadPhase7PortfolioFacts(){return portfolio({pendingExecutionCount:1});}};
+ const r=await loadFreshExecutionSafetyFacts({store:staleStore,plan,config,connection,now,protocolCompatibility:async()=>true,staleControlReloadDelayMs:0,preFundingControlFreshnessBudgetMs:P6_OPEN_PREFUNDING_CONTROL_FRESHNESS_BUDGET_MS});
+ assert.equal(reads,2);assert.equal(r.globalKillSwitch,true);assert.deepEqual(r.reasonCodes,['P6_CLAIM_P7_CONTROL_FRESHNESS_BUDGET_INSUFFICIENT']);
+});
+test('a bounded P7 refresh can replace a near-expiry control before funding',async()=>{
+ const nearExpiry=control({observed_at:'2026-08-29T11:59:25.000Z'}),fresh=control({observed_at:now});let reads=0;
+ const reloadingStore={async loadLatestPhase7ControlDecision(){reads++;return reads===1?nearExpiry:fresh;},async loadPhase7ControlDecision(){return fresh;},async loadPhase7PortfolioFacts(){return portfolio({pendingExecutionCount:1});}};
+ const r=await loadFreshExecutionSafetyFacts({store:reloadingStore,plan,config,connection,now,protocolCompatibility:async()=>true,staleControlReloadDelayMs:0,preFundingControlFreshnessBudgetMs:P6_OPEN_PREFUNDING_CONTROL_FRESHNESS_BUDGET_MS});
+ assert.equal(reads,2);assert.equal(r.globalKillSwitch,false);assert.deepEqual(r.reasonCodes,[]);
+});
 test('only the stale-control-derived global kill switch is eligible for unsigned requeue',()=>{
  assert.equal(isStaleOnlyPreSignP7ControlBlock('LPFORGE_P6_SWAP_RISK_BLOCKED:EXEC_GLOBAL_KILL_SWITCH,P6_CLAIM_P7_CONTROL_STALE'),true);
  assert.equal(isStaleOnlyPreSignP7ControlBlock(['EXEC_GLOBAL_KILL_SWITCH','P6_CLAIM_P7_CONTROL_STALE']),true);
+ assert.equal(isStaleOnlyPreSignP7ControlBlock(['EXEC_GLOBAL_KILL_SWITCH','P6_CLAIM_P7_CONTROL_FRESHNESS_BUDGET_INSUFFICIENT']),true);
  assert.equal(isStaleOnlyPreSignP7ControlBlock(['EXEC_GLOBAL_KILL_SWITCH','P6_CLAIM_P7_CONTROL_STALE','P6_CLAIM_P7_HEALTH_NOT_HEALTHY']),false);
  assert.equal(isStaleOnlyPreSignP7ControlBlock(['EXEC_GLOBAL_KILL_SWITCH']),false);
 });

@@ -66,7 +66,7 @@ import {
   loadAutonomousEntryPolicy,
   readJupiterMetisQuote,
 } from "../../phase6-swap-quote/src/index.js";
-import { phase7ExecutionControlFromRow, validateFreshOpenPhase7Safety } from "../../phase6-claim-guard/src/index.js";
+import { P6_CURRENT_CONTROL_MAX_AGE_MS, phase7ExecutionControlFromRow, validateFreshOpenPhase7Safety } from "../../phase6-claim-guard/src/index.js";
 import { createGovernedConnection, createMeteoraReadAdapter, type MeteoraReadAdapter } from "../../meteora/src/index.js";
 import { createMeteoraDataApi } from "../../data-api/src/index.js";
 import type { ControlledCanaryDeploymentPolicy } from "../../deployment-policy/src/index.js";
@@ -638,30 +638,62 @@ export function assessConfirmedFailedOpenRecovery(input:{confirmationStatus:stri
 // fraction of a cycle before P7 commits its next control record.
 const P7_STALE_CONTROL_RELOAD_DELAY_MS=5_000;
 /**
+ * An OPEN with a Jupiter funding leg has two economic boundaries.  Do not
+ * start the first one if the current P7 control cannot remain inside P6's
+ * established 60-second hard freshness limit through the bounded hand-off to
+ * the position-open boundary.  This is a safety margin, not an extension of
+ * authority: insufficient remaining freshness requeues before signing.
+ */
+export const P6_OPEN_PREFUNDING_CONTROL_FRESHNESS_BUDGET_MS=30_000;
+function p7ControlFreshnessBudgetInsufficient(input:{observedAt:string|undefined;now:string;budgetMs:number}):boolean{
+  const observedAt=Date.parse(input.observedAt??''),now=Date.parse(input.now);
+  return !Number.isFinite(observedAt)||!Number.isFinite(now)||now<observedAt||now-observedAt+input.budgetMs>P6_CURRENT_CONTROL_MAX_AGE_MS;
+}
+function p7FreshnessOnlyCodes(codes:readonly string[]):boolean{
+  return codes.length===1&&[
+    'P6_CLAIM_P7_CONTROL_STALE',
+    'P6_CLAIM_P7_CONTROL_FRESHNESS_BUDGET_INSUFFICIENT',
+  ].includes(codes[0]!);
+}
+/**
  * A stale P7 control maps to EXEC_GLOBAL_KILL_SWITCH in the execution-risk
- * layer. Treat that pair as one pre-sign freshness miss, but never collapse a
- * real health, drift, portfolio, or market veto into a retryable condition.
+ * layer. Treat that pair, and a pre-funding remaining-freshness miss, as
+ * pre-sign requeues. Never collapse a real health, drift, portfolio, or
+ * market veto into a retryable condition.
  */
 export function isStaleOnlyPreSignP7ControlBlock(reason:string|readonly string[]):boolean{
   const raw:readonly string[]=typeof reason==='string'?(reason.split(':').at(-1)?.split(',')??[]):reason;
   const codes=raw.map(code=>code.trim()).filter(Boolean);
-  return codes.includes('P6_CLAIM_P7_CONTROL_STALE')&&codes.every(code=>code==='P6_CLAIM_P7_CONTROL_STALE'||code==='EXEC_GLOBAL_KILL_SWITCH');
+  const freshnessCodes=[
+    'P6_CLAIM_P7_CONTROL_STALE',
+    'P6_CLAIM_P7_CONTROL_FRESHNESS_BUDGET_INSUFFICIENT',
+  ];
+  return codes.some(code=>freshnessCodes.includes(code))&&codes.every(code=>freshnessCodes.includes(code)||code==='EXEC_GLOBAL_KILL_SWITCH');
 }
 async function requeueUnsignedStaleControlOpen(input:{store:Phase1Store;plan:AutonomousOpenPlan;reason:string;stage:string}):Promise<LiveWorkerResult>{
-  await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'PLANNED',at:new Date().toISOString(),reasonCodes:['P6_CLAIM_P7_CONTROL_STALE_REQUEUED'],payload:{stage:input.stage,retryDisposition:'AWAIT_FRESH_P7_CONTROL',priorReason:input.reason,noChainEffect:true}});
-  return{status:'AWAITING_FRESH_P7_CONTROL',planId:input.plan.planId,reasonCodes:['P6_CLAIM_P7_CONTROL_STALE'],transactionSubmitted:false};
+  const retryCode=input.reason.includes('P6_CLAIM_P7_CONTROL_FRESHNESS_BUDGET_INSUFFICIENT')
+    ?'P6_CLAIM_P7_CONTROL_FRESHNESS_BUDGET_REQUEUED'
+    :'P6_CLAIM_P7_CONTROL_STALE_REQUEUED';
+  const reasonCode=retryCode==='P6_CLAIM_P7_CONTROL_FRESHNESS_BUDGET_REQUEUED'
+    ?'P6_CLAIM_P7_CONTROL_FRESHNESS_BUDGET_INSUFFICIENT'
+    :'P6_CLAIM_P7_CONTROL_STALE';
+  await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'PLANNED',at:new Date().toISOString(),reasonCodes:[retryCode],payload:{stage:input.stage,retryDisposition:'AWAIT_FRESH_P7_CONTROL',priorReason:input.reason,noChainEffect:true}});
+  return{status:'AWAITING_FRESH_P7_CONTROL',planId:input.plan.planId,reasonCodes:[reasonCode],transactionSubmitted:false};
 }
-export async function loadFreshExecutionSafetyFacts(input:{store:Pick<Phase1Store,'loadLatestPhase7ControlDecision'|'loadPhase7ControlDecision'|'loadPhase7PortfolioFacts'>;plan:AutonomousOpenPlan;config:Pick<LiveWorkerConfig,'rpcUrl'|'programId'|'maxOpenPositions'|'controlledCanary'>;connection?:Pick<Connection,'getLatestBlockhash'>;now?:string;phase7RuntimeId?:string;protocolCompatibility?:()=>Promise<boolean>;staleControlReloadDelayMs?:number}):Promise<FreshExecutionSafetyFacts>{
+export async function loadFreshExecutionSafetyFacts(input:{store:Pick<Phase1Store,'loadLatestPhase7ControlDecision'|'loadPhase7ControlDecision'|'loadPhase7PortfolioFacts'>;plan:AutonomousOpenPlan;config:Pick<LiveWorkerConfig,'rpcUrl'|'programId'|'maxOpenPositions'|'controlledCanary'>;connection?:Pick<Connection,'getLatestBlockhash'>;now?:string;phase7RuntimeId?:string;protocolCompatibility?:()=>Promise<boolean>;staleControlReloadDelayMs?:number;preFundingControlFreshnessBudgetMs?:number}):Promise<FreshExecutionSafetyFacts>{
   const now=input.now??new Date().toISOString(),reasons:string[]=[],runtimeId=input.phase7RuntimeId??(process.env.LPFORGE_P7_RUNTIME_ID??'lpforge-production').trim(),provenance=planRecord(input.plan.planPayload.provenance),binding=planRecord(provenance.phase7Control),boundDecisionId=String(binding.decisionId??'');
   let portfolio:Awaited<ReturnType<Phase1Store['loadPhase7PortfolioFacts']>>|undefined,current;
   try{
     const readPhase7=async(at:string)=>{
       const [currentRow,boundRow,facts]=await Promise.all([input.store.loadLatestPhase7ControlDecision(runtimeId),boundDecisionId?input.store.loadPhase7ControlDecision(runtimeId,boundDecisionId):Promise.resolve(undefined),input.store.loadPhase7PortfolioFacts(input.plan.ownerAddress)]);
       const fresh=phase7ExecutionControlFromRow(currentRow),bound=phase7ExecutionControlFromRow(boundRow);
-      return{current:fresh,portfolio:facts,reasonCodes:validateFreshOpenPhase7Safety({plan:input.plan as unknown as AutonomousPlan,current:fresh,bound,now:at,controlledCanary:controlledCanaryAuthorization(input.plan),maxConcurrentPositions:input.config.maxOpenPositions})};
+      const reasonCodes=validateFreshOpenPhase7Safety({plan:input.plan as unknown as AutonomousPlan,current:fresh,bound,now:at,controlledCanary:controlledCanaryAuthorization(input.plan),maxConcurrentPositions:input.config.maxOpenPositions});
+      const budget=Math.max(0,Math.floor(input.preFundingControlFreshnessBudgetMs??0));
+      if(reasonCodes.length===0&&budget>0&&p7ControlFreshnessBudgetInsufficient({observedAt:fresh?.observedAt,now:at,budgetMs:budget}))reasonCodes.push('P6_CLAIM_P7_CONTROL_FRESHNESS_BUDGET_INSUFFICIENT');
+      return{current:fresh,portfolio:facts,reasonCodes};
     };
     let phase7=await readPhase7(now);
-    if(phase7.reasonCodes.length===1&&phase7.reasonCodes[0]==='P6_CLAIM_P7_CONTROL_STALE'){
+    if(p7FreshnessOnlyCodes(phase7.reasonCodes)){
       const delay=Math.max(0,Math.min(5_000,Math.floor(input.staleControlReloadDelayMs??P7_STALE_CONTROL_RELOAD_DELAY_MS)));
       if(delay>0)await new Promise<void>(resolve=>setTimeout(resolve,delay));
       // Tests provide `now` for deterministic control-age assertions.  A live
@@ -687,8 +719,8 @@ export async function checkFreshOpenSubmissionSafety(input:{store:Pick<Phase1Sto
   try{const [currentRow,boundRow,portfolio]=await Promise.all([input.store.loadLatestPhase7ControlDecision(runtimeId),boundDecisionId?input.store.loadPhase7ControlDecision(runtimeId,boundDecisionId):Promise.resolve(undefined),input.store.loadPhase7PortfolioFacts(input.plan.ownerAddress)]);reasons.push(...validateFreshOpenPhase7Safety({plan:input.plan as unknown as AutonomousPlan,current:phase7ExecutionControlFromRow(currentRow),bound:phase7ExecutionControlFromRow(boundRow),now,controlledCanary:controlledCanaryAuthorization(input.plan),maxConcurrentPositions:input.config.maxOpenPositions}));if(!assessFreshOpenPortfolioTruth({...portfolio,maxOpenPositions:input.config.maxOpenPositions}).clean)reasons.push("P6_PRESUBMISSION_RECONCILIATION_OR_PORTFOLIO_BLOCK");}catch{reasons.push("P6_PRESUBMISSION_SAFETY_UNAVAILABLE");}
   return{approved:reasons.length===0,reasonCodes:[...new Set(reasons)].sort()};
 }
-async function governFreshOpenRisk(input:{store:Pick<Phase1Store,'loadLatestPhase7ControlDecision'|'loadPhase7ControlDecision'|'loadPhase7PortfolioFacts'>;plan:AutonomousOpenPlan;config:LiveWorkerConfig;connection?:Pick<Connection,'getLatestBlockhash'>;simulation:{ok:boolean;simulationFreshUntil:string};costApproved:boolean;fields:ReturnType<typeof planFields>}):Promise<ReturnType<typeof governExecutionRisk>>{
-  const [market,safety]=await Promise.all([readOpenPresignMarketFacts({rpcUrl:input.config.rpcUrl,programId:input.config.programId,poolAddress:input.plan.poolAddress,plannedActiveBinId:input.fields.plannedActiveBinId,plannedBinStep:input.fields.binStep,lowerBinId:input.fields.lower,upperBinId:input.fields.upper}),loadFreshExecutionSafetyFacts({store:input.store,plan:input.plan,config:input.config,...(input.connection?{connection:input.connection}:{})})]);
+async function governFreshOpenRisk(input:{store:Pick<Phase1Store,'loadLatestPhase7ControlDecision'|'loadPhase7ControlDecision'|'loadPhase7PortfolioFacts'>;plan:AutonomousOpenPlan;config:LiveWorkerConfig;connection?:Pick<Connection,'getLatestBlockhash'>;simulation:{ok:boolean;simulationFreshUntil:string};costApproved:boolean;fields:ReturnType<typeof planFields>;preFundingControlFreshnessBudgetMs?:number}):Promise<ReturnType<typeof governExecutionRisk>>{
+  const [market,safety]=await Promise.all([readOpenPresignMarketFacts({rpcUrl:input.config.rpcUrl,programId:input.config.programId,poolAddress:input.plan.poolAddress,plannedActiveBinId:input.fields.plannedActiveBinId,plannedBinStep:input.fields.binStep,lowerBinId:input.fields.lower,upperBinId:input.fields.upper}),loadFreshExecutionSafetyFacts({store:input.store,plan:input.plan,config:input.config,...(input.connection?{connection:input.connection}:{}),...(input.preFundingControlFreshnessBudgetMs!==undefined?{preFundingControlFreshnessBudgetMs:input.preFundingControlFreshnessBudgetMs}:{})})]);
   const risk=governExecutionRisk({action:'OPEN',planId:input.plan.planId,now:new Date().toISOString(),thesisExpiresAt:input.plan.expiresAt,planExpiresAt:input.plan.expiresAt,simulationOk:input.simulation.ok,simulationFreshUntil:input.simulation.simulationFreshUntil,walletTruthConsistent:safety.walletTruthConsistent,protocolCompatible:safety.protocolCompatible,rpcHealthy:safety.rpcHealthy,referenceDivergenceBps:market.referenceDivergenceBps,activeBinId:market.activeBinId,intendedCenterBinId:input.fields.plannedActiveBinId,costApproved:input.costApproved,reconciliationRequired:safety.reconciliationRequired,globalKillSwitch:safety.globalKillSwitch,liquidityCollapse:market.outsidePlannedRange},{maxReferenceDivergenceBps:input.config.maxPresignReferenceDivergenceBps,maxActiveBinDriftBins:input.config.maxPresignActiveBinDriftBins,approvalTtlMs:input.config.riskPermitTtlMs,allowEmergencyCostOverride:false});
   return safety.reasonCodes.length?{...risk,reasonCodes:[...new Set([...risk.reasonCodes,...safety.reasonCodes])].sort()}:risk;
 }
@@ -1089,7 +1121,7 @@ async function executeRequiredJupiterSwap(input: {
       maxFeeFractionOfCapital: input.config.maxFeeFraction,
     }),
     fields=planFields(input.plan),
-    risk=await governFreshOpenRisk({store:input.store,plan:input.plan,config:input.config,connection:input.connection,simulation,costApproved:cost.approved,fields});
+    risk=await governFreshOpenRisk({store:input.store,plan:input.plan,config:input.config,connection:input.connection,simulation,costApproved:cost.approved,fields,preFundingControlFreshnessBudgetMs:P6_OPEN_PREFUNDING_CONTROL_FRESHNESS_BUDGET_MS});
   if (risk.decision !== "APPROVE" || !risk.permitId || !risk.expiresAt)
     throw new Error(
       `LPFORGE_P6_SWAP_RISK_BLOCKED:${risk.reasonCodes.join(",")}`,

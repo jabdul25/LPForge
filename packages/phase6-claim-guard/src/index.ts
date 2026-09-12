@@ -14,6 +14,8 @@ export interface ProductionAdmissionCandidate {poolAddress:string;state:string;t
 export interface VerifiedGlobalWinnerAdmission {globalCycleId:string;poolAddress:string;candidateId:string;selectionTier:string;selectionState:string;selectionDynamicEligible:boolean;winnerObservedAt:string;tokenYMint?:string|undefined;verified:boolean;}
 export interface DiscoveryAdmissionAudit {winnerBindingVerified:boolean;winnerObservedAt?:string;registryCandidatePresent:boolean;registryObservedAt?:string;registryState?:string;registryTier?:string;registryAuthorityOrder:'NOT_APPLICABLE'|'ABSENT'|'OLDER_THAN_WINNER'|'NEWER_THAN_WINNER'|'EQUAL_OR_AMBIGUOUS'|'UNVERIFIABLE';registryTerminal:boolean;decisionPredicate:string;decisionAt:string;}
 const WSOL_MINT='So11111111111111111111111111111111111111112';
+/** The hard P6 authority window applied at claim and signing boundaries. */
+export const P6_CURRENT_CONTROL_MAX_AGE_MS=60_000;
 export interface Phase7ExecutionControl {decisionId?:string;cycleKey?:string;authorityMode:string;healthStatus:string;driftStatus:string;safetyMode:string;newEconomicActionAllowed:boolean;observedAt:string;poolDrift?:Record<string,string>;blockedPools?:string[];activeIncidentIds?:string[];releaseIntegrityValid?:boolean;portfolioValid?:boolean;revokedApprovalIds?:string[];}
 /** Canonical projection used by both claim-time and execution-time P7 checks. */
 export function phase7ExecutionControlFromRow(controlRow:Record<string,unknown>|undefined):Phase7ExecutionControl|undefined{
@@ -21,7 +23,7 @@ export function phase7ExecutionControlFromRow(controlRow:Record<string,unknown>|
  const payload=record(controlRow.payload),rawPoolDrift=Array.isArray(payload.poolDrift)?payload.poolDrift:[],releaseIdentity=record(payload.releaseIdentity),portfolio=record(payload.portfolio),strings=(value:unknown)=>Array.isArray(value)?value.map(String).filter(Boolean):[];
  return{decisionId:String(controlRow.decision_id),cycleKey:String(controlRow.cycle_key),authorityMode:String(controlRow.authority_mode),healthStatus:String(controlRow.health_status),driftStatus:String(controlRow.drift_status),safetyMode:String(controlRow.safety_mode),newEconomicActionAllowed:Boolean(controlRow.new_economic_action_allowed),observedAt:new Date(String(controlRow.observed_at)).toISOString(),poolDrift:Object.fromEntries(rawPoolDrift.filter(row=>row&&typeof row==="object").map(row=>{const value=row as Record<string,unknown>;return[String(value.poolAddress??""),String(value.rawStatus??value.status??"")]}).filter(([pool])=>Boolean(pool))),blockedPools:strings(payload.blockedPools),activeIncidentIds:strings(payload.activeIncidentIds),releaseIntegrityValid:releaseIdentity.valid===true,portfolioValid:portfolio.valid===true,revokedApprovalIds:strings(payload.controlledCanaryRevokedApprovalIds)};
 }
-export function validateFreshPhase7ExecutionControl(control:Phase7ExecutionControl|undefined,now:string,maxAgeMs=60_000):string[]{
+export function validateFreshPhase7ExecutionControl(control:Phase7ExecutionControl|undefined,now:string,maxAgeMs=P6_CURRENT_CONTROL_MAX_AGE_MS):string[]{
  if(!control)return ['P6_CLAIM_P7_CONTROL_MISSING'];
  const reasons:string[]=[];const age=Date.parse(now)-Date.parse(control.observedAt);
  if(control.authorityMode!=='PRODUCTION')reasons.push('P6_CLAIM_P7_AUTHORITY_NOT_PRODUCTION');if(control.healthStatus!=='HEALTHY')reasons.push('P6_CLAIM_P7_HEALTH_NOT_HEALTHY');if(control.driftStatus==='BLOCK')reasons.push('P6_CLAIM_P7_DRIFT_BLOCK');if(control.safetyMode!=='NORMAL')reasons.push('P6_CLAIM_P7_SAFETY_NOT_NORMAL');if(!control.newEconomicActionAllowed)reasons.push('P6_CLAIM_P7_NEW_ACTION_BLOCKED');
@@ -143,7 +145,7 @@ function validateCanaryHardRevocation(input:{current:Phase7ExecutionControl|unde
  const control=input.current,reasons:string[]=[];
  if(!control){reasons.push('P6_CANARY_CURRENT_CONTROL_MISSING');return reasons;}
  const age=Date.parse(input.now)-Date.parse(control.observedAt);
- if(!Number.isFinite(age)||age<0||age>60_000)reasons.push('P6_CANARY_CURRENT_CONTROL_STALE');
+ if(!Number.isFinite(age)||age<0||age>P6_CURRENT_CONTROL_MAX_AGE_MS)reasons.push('P6_CANARY_CURRENT_CONTROL_STALE');
  if(control.healthStatus!=='HEALTHY')reasons.push('P6_CANARY_CURRENT_HEALTH_NOT_HEALTHY');
  if(control.driftStatus==='BLOCK')reasons.push('P6_CANARY_CURRENT_DRIFT_BLOCK');
  if(control.safetyMode!=='NORMAL')reasons.push('P6_CANARY_CURRENT_SAFETY_NOT_NORMAL');
