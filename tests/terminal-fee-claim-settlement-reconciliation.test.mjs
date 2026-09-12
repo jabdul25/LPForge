@@ -8,6 +8,9 @@ const OWNER='OWNER',POSITION='POSITION',PLAN='close-plan',SIGNATURE='claim-signa
 function claimReceipt({gross=801_666n,fee=5_000n}={}){
   return {slot:1,version:0,transaction:{message:{accountKeys:[OWNER]}},meta:{err:null,fee:Number(fee),preBalances:[1_000_000],postBalances:[Number(1_000_000n+gross-fee)],loadedAddresses:{writable:[],readonly:[]},preTokenBalances:[],postTokenBalances:[],innerInstructions:[]}};
 }
+function failedReceipt({fee=105_000n}={}){
+  return {slot:1,version:0,transaction:{message:{accountKeys:[OWNER]}},meta:{err:{InstructionError:[3,{Custom:14}]},fee:Number(fee),preBalances:[1_000_000],postBalances:[Number(1_000_000n-fee)],loadedAddresses:{writable:[],readonly:[]},preTokenBalances:[],postTokenBalances:[],innerInstructions:[]}};
+}
 function input({includeClaim=true}={}){
   const cashflows=[
     {cashflowId:'entry',planId:'entry-plan',flowType:'OPEN_CONTRIBUTION',lamports:30_000_000n},
@@ -30,6 +33,25 @@ test('terminal settlement ignores an expired claim predecessor and selects its c
     {transactionId:'close:remove',signature:'remove',state:'CONFIRMED',planId:PLAN,planRole:'CLOSE',kind:'METEORA_REMOVE'},
   ]);
   assert.deepEqual(claims.map(claim=>[claim.transactionId,claim.signature]),[['close:claim:retry-1','confirmed-claim']]);
+});
+test('a finalized failed close child contributes only its receipt-backed network fee',async()=>{
+  const transactionId='close:unwind',signature='failed-unwind',fee=105_000n,
+    settlementInput={
+      lifecycle:{lifecycleId:'life',positionAddress:POSITION,ownerAddress:OWNER,poolAddress:'pool',status:'CLOSED'},
+      cashflows:[{cashflowId:'failed-fee',planId:PLAN,flowType:'TX_COST',lamports:fee,payload:{signature,transactionId}}],
+      inventoryLots:[],
+      transactions:[{transactionId,signature,state:'FAILED_FINAL',planId:PLAN,planRole:'CLOSE',kind:'JUPITER_UNWIND'}],
+      reconciliationClean:true,
+      reservationClean:true,
+    };
+  const ok=await reconcileTerminalSettlementChainEffects({connection:{async getTransaction(){return failedReceipt({fee});}},plan:{planId:PLAN,ownerAddress:OWNER},positionAddress:POSITION,settlementInput});
+  assert.equal(ok.ok,true);
+  assert.equal(ok.chainSolInLamports,0n);
+  assert.equal(ok.chainSolOutLamports,fee);
+  assert.equal(ok.dbSolOutLamports,fee);
+  const missing=await reconcileTerminalSettlementChainEffects({connection:{async getTransaction(){return failedReceipt({fee});}},plan:{planId:PLAN,ownerAddress:OWNER},positionAddress:POSITION,settlementInput:{...settlementInput,cashflows:[]}});
+  assert.equal(missing.ok,false);
+  assert.ok(missing.reasonCodes.includes(`SETTLEMENT_CHAIN_FAILED_TX_COST_MISSING:${transactionId}`));
 });
 test('HVEbGM terminal cashflow regression is -1,925,242 lamports, not the stale -2,726,908',()=>{
   const result=assessLifecycleSettlement({lifecycle:{lifecycleId:'hve',positionAddress:'HVE',ownerAddress:OWNER,poolAddress:'pool',status:'CLOSED'},positionAbsent:true,positionCheckedAt:'2026-08-31T18:07:00.000Z',reconciliationClean:true,reservationClean:true,inventoryLots:[],transactions:[],cashflows:[

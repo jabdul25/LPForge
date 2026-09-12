@@ -3018,7 +3018,7 @@ export async function reconcileTerminalSettlementChainEffects(input:{connection:
   // dispositions. A finalized FAILED transaction can still consume its
   // transaction fee, while PROVEN_NOT_LANDED has no chain effect. Neither is
   // a confirmed successful protocol receipt.
-  const terminalTransactions=allTerminalTransactions.filter(tx=>tx.state==='CONFIRMED');
+  const terminalTransactions=allTerminalTransactions.filter(tx=>tx.state==='CONFIRMED'||tx.state==='FAILED_FINAL');
   for(const transaction of allTerminalTransactions)
     if(transaction.state!=='CONFIRMED'&&transaction.state!=='FAILED_FINAL'&&transaction.state!=='PROVEN_NOT_LANDED')
       reasons.push(`SETTLEMENT_CHAIN_RECEIPT_UNAVAILABLE:${transaction.transactionId}`);
@@ -3033,8 +3033,16 @@ export async function reconcileTerminalSettlementChainEffects(input:{connection:
   const steps:Array<Record<string,unknown>>=[];
   const exact=(flowType:string,signature:string,amount:bigint)=>closeFlows.some(flow=>flow.flowType===flowType&&settlementFlowSignature(flow)===signature&&settlementFlowAmount(flow)===amount);
   for(const transaction of terminalTransactions){
-    if(transaction.state!=="CONFIRMED"||!transaction.signature){reasons.push(`SETTLEMENT_CHAIN_RECEIPT_UNAVAILABLE:${transaction.transactionId}`);continue;}
+    if(!transaction.signature){reasons.push(`SETTLEMENT_CHAIN_RECEIPT_UNAVAILABLE:${transaction.transactionId}`);continue;}
     const receipt=await loadConfirmedExecutionReceipt(input.connection,transaction.signature);
+    if(transaction.state==='FAILED_FINAL'){
+      if(receipt.state!=="CONFIRMED_FAILURE"){reasons.push(`SETTLEMENT_CHAIN_FAILED_RECEIPT_${receipt.state}:${transaction.transactionId}`);continue;}
+      const txFee=receipt.feeLamports??0n;
+      chainSolOutLamports+=txFee;
+      if(!exact("TX_COST",transaction.signature,txFee))reasons.push(`SETTLEMENT_CHAIN_FAILED_TX_COST_MISSING:${transaction.transactionId}`);
+      steps.push({transactionId:transaction.transactionId,kind:transaction.kind??"UNKNOWN",signature:transaction.signature,feeLamports:txFee.toString(),protocolEffect:'FAILED'});
+      continue;
+    }
     if(receipt.state!=="CONFIRMED_SUCCESS"){reasons.push(`SETTLEMENT_CHAIN_RECEIPT_${receipt.state}:${transaction.transactionId}`);continue;}
     const txFee=receipt.feeLamports??0n;
     chainSolOutLamports+=txFee;
