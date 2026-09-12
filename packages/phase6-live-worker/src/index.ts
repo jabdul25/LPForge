@@ -2234,15 +2234,46 @@ async function executeJupiterUnwindStep(input: {
   };
 }
 
+const MAX_AUTOMATIC_PARTIAL_ENTRY_UNWIND_RETRIES = 1;
+
+export type PartialEntryUnwindRetryDecision =
+  | { action: "SUBMIT"; retryCount: number; transactionId: string; idempotencyKey: string; reasonCodes: string[] }
+  | { action: "HOLD"; reasonCodes: string[] };
+
+/**
+ * A partial-entry unwind is allowed to acquire a fresh child identity only
+ * when the earlier child is proven finalized-failed.  Pending, unknown, or
+ * successful signatures are never retried.  The bounded retry keeps a
+ * deterministic protocol failure from creating an endless transaction loop.
+ */
+export function decidePartialEntryUnwindRetry(input:{planId:string;planIdempotencyKey:string;payload:Record<string,unknown>;priorStatus?:{err?:unknown;confirmationStatus?:string|null}|null;statusReadSucceeded:boolean}):PartialEntryUnwindRetryDecision{
+  const retryRaw=Number(input.payload.partialEntryUnwindRetryCount??0),retryCount=Number.isSafeInteger(retryRaw)&&retryRaw>=0?retryRaw:undefined,
+    priorSignature=typeof input.payload.unwindSignature==='string'&&input.payload.unwindSignature.length>0?input.payload.unwindSignature:undefined;
+  if(retryCount===undefined)return{action:'HOLD',reasonCodes:['P6_PARTIAL_UNWIND_RETRY_COUNT_INVALID']};
+  if(!priorSignature){
+    if(retryCount!==0)return{action:'HOLD',reasonCodes:['P6_PARTIAL_UNWIND_RETRY_PROVENANCE_MISSING']};
+    const transactionId=`${input.planId}:unwind`;
+    return{action:'SUBMIT',retryCount,transactionId,idempotencyKey:`${input.planIdempotencyKey}:${transactionId}`,reasonCodes:['P6_PARTIAL_UNWIND_INITIAL_SUBMISSION']};
+  }
+  if(!input.statusReadSucceeded)return{action:'HOLD',reasonCodes:['P6_PARTIAL_UNWIND_RETRY_STATUS_READ_UNKNOWN']};
+  if(!input.priorStatus?.confirmationStatus)return{action:'HOLD',reasonCodes:['P6_PARTIAL_UNWIND_RETRY_CONFIRMATION_PENDING']};
+  if(input.priorStatus.err===undefined||input.priorStatus.err===null)return{action:'HOLD',reasonCodes:['P6_PARTIAL_UNWIND_RETRY_PRIOR_RESULT_NOT_FAILED']};
+  if(input.priorStatus.confirmationStatus!=='finalized')return{action:'HOLD',reasonCodes:['P6_PARTIAL_UNWIND_RETRY_FAILURE_NOT_FINAL']};
+  if(retryCount>=MAX_AUTOMATIC_PARTIAL_ENTRY_UNWIND_RETRIES)return{action:'HOLD',reasonCodes:['P6_PARTIAL_UNWIND_RETRY_LIMIT_REACHED']};
+  const nextRetry=retryCount+1,transactionId=`${input.planId}:unwind:retry-${nextRetry}`;
+  return{action:'SUBMIT',retryCount:nextRetry,transactionId,idempotencyKey:`${input.planIdempotencyKey}:${transactionId}`,reasonCodes:['P6_PARTIAL_UNWIND_PRIOR_FINALIZED_FAILED','P6_PARTIAL_UNWIND_RETRY_AUTHORIZED']};
+}
+
 async function unwindPartialEntry(input: {
   store: Phase1Store;
   plan: AutonomousPlan;
   row: Record<string, unknown>;
   signer: MainnetSignerBackend;
   config: LiveWorkerConfig;
+  identity:{retryCount:number;transactionId:string;idempotencyKey:string};
 }): Promise<{ ok: boolean; submitted: boolean; reasonCodes: string[] }> {
   const amount = BigInt(String(input.row.paired_token_amount)),
-    transactionId = `${input.plan.planId}:unwind`;
+    transactionId = input.identity.transactionId;
   return executeJupiterUnwindStep({
     store: input.store,
     plan: input.plan,
@@ -2252,7 +2283,7 @@ async function unwindPartialEntry(input: {
     economicReferenceLamports: BigInt(String(input.row.intended_capital_lamports)),
     action: "CLOSE",
     transactionId,
-    idempotencyKey: `${input.plan.idempotencyKey}:unwind`,
+    idempotencyKey: input.identity.idempotencyKey,
     stage: "PARTIAL_ENTRY_UNWIND",
     reasonPrefix: "P6_PARTIAL_UNWIND",
     fundingTransactionId: String(input.row.funding_transaction_id),
@@ -2279,6 +2310,7 @@ async function unwindPartialEntry(input: {
           reasonCodes: ["P6_PARTIAL_UNWIND_SUBMITTED"],
           unwindTransactionId: transactionId,
           unwindSignature: submitted.signature,
+          partialEntryUnwindRetryCount: input.identity.retryCount,
         },
         updatedAt: new Date().toISOString(),
       });
@@ -2641,6 +2673,33 @@ export async function recoverPartialEntryFunding(input: {
       continue;
     }
     if (Date.parse(plan.expiresAt) <= Date.now()) {
+      const priorUnwindPayload=(row.payload??{}) as Record<string,unknown>;
+      let priorStatus:{err?:unknown;confirmationStatus?:string|null}|null|undefined,statusReadSucceeded=true;
+      if(typeof priorUnwindPayload.unwindSignature==='string'&&priorUnwindPayload.unwindSignature.length>0){
+        try{priorStatus=(await createGovernedConnection({rpcUrl:input.config.rpcUrl,priority:'P1_RECOVERY_CRITICAL'}).getSignatureStatuses([priorUnwindPayload.unwindSignature],{searchTransactionHistory:true})).value[0];}
+        catch{statusReadSucceeded=false;}
+      }
+      const unwindIdentity=decidePartialEntryUnwindRetry({planId,planIdempotencyKey:plan.idempotencyKey,payload:priorUnwindPayload,statusReadSucceeded,...(priorStatus===undefined?{}:{priorStatus})});
+      if(unwindIdentity.action==='HOLD'){
+        await input.store.upsertPartialEntryRecovery({
+          planId,
+          poolAddress: plan.poolAddress,
+          ownerAddress: plan.ownerAddress,
+          tokenMint: String(row.token_mint),
+          fundingTransactionId: String(row.funding_transaction_id),
+          fundingSignature: String(row.funding_signature),
+          fundedAt: new Date(String(row.funded_at)).toISOString(),
+          pairedTokenAmount: String(row.paired_token_amount),
+          intendedCapitalLamports: BigInt(String(row.intended_capital_lamports)),
+          intendedRange: (row.intended_range ?? {}) as Record<string, unknown>,
+          state: "UNWIND_REQUIRED",
+          walletTruth: { refreshRequired: true },
+          payload: { reasonCodes: unwindIdentity.reasonCodes },
+          updatedAt: new Date().toISOString(),
+        });
+        results.push({planId,action:'HOLD',reasonCodes:unwindIdentity.reasonCodes});
+        continue;
+      }
       await input.store.upsertPartialEntryRecovery({
         planId,
         poolAddress: plan.poolAddress,
@@ -2666,6 +2725,7 @@ export async function recoverPartialEntryFunding(input: {
         row,
         signer: input.signer,
         config: input.config,
+        identity: unwindIdentity,
       });
       await input.store.upsertPartialEntryRecovery({
         planId,
@@ -2680,7 +2740,7 @@ export async function recoverPartialEntryFunding(input: {
         intendedRange: (row.intended_range ?? {}) as Record<string, unknown>,
         state: unwind.ok ? "ABORTED_SOL_SETTLED" : unwind.submitted ? "UNWIND_SUBMITTED" : "UNWIND_REQUIRED",
         walletTruth: { refreshedAt: new Date().toISOString() },
-        payload: { reasonCodes: unwind.reasonCodes },
+        payload: { reasonCodes: [...unwindIdentity.reasonCodes,...unwind.reasonCodes], unwindTransactionId: unwindIdentity.transactionId, partialEntryUnwindRetryCount: unwindIdentity.retryCount },
         updatedAt: new Date().toISOString(),
       });
       results.push({

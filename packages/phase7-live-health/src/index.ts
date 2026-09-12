@@ -4,7 +4,15 @@ import type {Phase1Store} from '../../db/src/index.js';
 import type {SolanaRpcClient} from '../../meteora/src/index.js';
 import type {Phase7HealthObservation} from '../../phase7-health/src/index.js';
 
-export interface Phase7LiveHealthInput {assessmentAt:string;poolAddress:string;rpc:Pick<SolanaRpcClient,'getSlot'>;dataApi:Pick<MeteoraDataApi,'getPool'>;store:Pick<Phase1Store,'health'|'loadPhase7HealthFacts'>;}
+export interface Phase7LiveHealthInput {assessmentAt:string;poolAddress:string;rpc:Pick<SolanaRpcClient,'getSlot'>;dataApi:Pick<MeteoraDataApi,'getPool'>;store:Pick<Phase1Store,'health'|'loadPhase7HealthFacts'>;
+  /**
+   * A recovery-only P7 cycle deliberately does not produce a fresh entry
+   * decision.  In that narrowly scoped mode, decision freshness must not
+   * turn an otherwise healthy control plane CRITICAL.  The caller still
+   * independently blocks new economic action through recovery control.
+   */
+  decisionFreshnessRequired?:boolean;
+}
 const errorMessage=(e:unknown)=>e instanceof Error?e.message:String(e);
 export async function collectPhase7LiveHealthObservations(input:Phase7LiveHealthInput):Promise<Phase7HealthObservation[]> {
   const nowMs=Date.parse(input.assessmentAt);if(!Number.isFinite(nowMs))throw new Error('LPFORGE_P7_LIVE_HEALTH_TIME');
@@ -15,7 +23,9 @@ export async function collectPhase7LiveHealthObservations(input:Phase7LiveHealth
   if(!dbHealthy){for(const domain of ['DECISION','EXECUTION','PORTFOLIO','RECONCILIATION'] as const)observations.push({domain,observedAt:input.assessmentAt,status:'CRITICAL',reasonCodes:[`P7_LIVE_${domain}_STATE_UNAVAILABLE`]});return observations;}
   try{
     const f=await input.store.loadPhase7HealthFacts(input.poolAddress);
-    if(f.latestDecisionAt){const ageMs=Math.max(0,nowMs-Date.parse(f.latestDecisionAt));observations.push({domain:'DECISION',observedAt:f.latestDecisionAt,status:ageMs<=120_000?'HEALTHY':ageMs<=300_000?'DEGRADED':'CRITICAL',reasonCodes:ageMs<=120_000?[]:[ageMs<=300_000?'P7_LIVE_DECISION_AGING':'P7_LIVE_DECISION_STALE'],metrics:{ageMs}});}else observations.push({domain:'DECISION',observedAt:input.assessmentAt,status:'CRITICAL',reasonCodes:['P7_LIVE_DECISION_MISSING']});
+    if(input.decisionFreshnessRequired===false){
+      observations.push({domain:'DECISION',observedAt:input.assessmentAt,status:'HEALTHY',reasonCodes:['P7_LIVE_DECISION_DEFERRED_FOR_RECOVERY'],metrics:{decisionFreshnessRequired:false,...(f.latestDecisionAt?{latestDecisionAt:f.latestDecisionAt}:{})}});
+    }else if(f.latestDecisionAt){const ageMs=Math.max(0,nowMs-Date.parse(f.latestDecisionAt));observations.push({domain:'DECISION',observedAt:f.latestDecisionAt,status:ageMs<=120_000?'HEALTHY':ageMs<=300_000?'DEGRADED':'CRITICAL',reasonCodes:ageMs<=120_000?[]:[ageMs<=300_000?'P7_LIVE_DECISION_AGING':'P7_LIVE_DECISION_STALE'],metrics:{ageMs}});}else observations.push({domain:'DECISION',observedAt:input.assessmentAt,status:'CRITICAL',reasonCodes:['P7_LIVE_DECISION_MISSING']});
     const executionCritical=f.unknownSubmissionCount>0;observations.push({domain:'EXECUTION',observedAt:input.assessmentAt,status:executionCritical?'CRITICAL':'HEALTHY',reasonCodes:executionCritical?['P7_LIVE_UNKNOWN_SUBMISSION']:[],metrics:{unknownSubmissionCount:f.unknownSubmissionCount,activeExecutionJournalCount:f.activeExecutionJournalCount}});
     observations.push({domain:'PORTFOLIO',observedAt:input.assessmentAt,status:'HEALTHY',reasonCodes:[],metrics:{openCanarySessionCount:f.openCanarySessionCount,...(f.latestPortfolioObservedAt?{latestPortfolioObservedAt:f.latestPortfolioObservedAt}:{})}});
     const reconCritical=f.unresolvedReconciliationDebt>0;observations.push({domain:'RECONCILIATION',observedAt:input.assessmentAt,status:reconCritical?'CRITICAL':'HEALTHY',reasonCodes:reconCritical?['P7_LIVE_RECONCILIATION_DEBT']:[],metrics:{unresolvedReconciliationDebt:f.unresolvedReconciliationDebt}});
