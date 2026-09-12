@@ -18,7 +18,9 @@ test('health, drift and the control decision persist before the canonical global
   assert.ok(healthAt>=0&&driftAt>healthAt&&controlAt>driftAt,'health → drift → control assessment order');
   assert.ok(probeAt>controlAt,'the operator probe starts only after the control decision is durable');
   assert.ok(runAt>probeAt,'the global cycle lives inside the post-control block');
-  assert.ok(probeAt<src.indexOf('runPhase7RecoveryRuntimeTick({store:input.store,runtimeId:input.runtimeId,instanceId:input.instanceId,cycleKey:input.cycleKey,now:new Date().toISOString(),leaseTtlMs:ttl,restarted:input.restarted,control:{authorityMode:control.authorityMode,healthStatus:control.healthStatus'),'the runtime tick follows the global cycle');
+  const recoveryAt=src.indexOf('if(recoveryBlocksNewEntries)'),normalRuntimeAt=src.indexOf('const runtime=await runPhase7RecoveryRuntimeTick({store:input.store',runAt);
+  assert.ok(recoveryAt>controlAt,'recovery-only execution branches only after the fresh control is durable');
+  assert.ok(normalRuntimeAt>runAt,'the normal runtime tick follows the global cycle');
 });
 
 test('drift reads lagged decoder telemetry from the prior evidence snapshot, falling back to the prior drift payload',()=>{
