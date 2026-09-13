@@ -347,7 +347,14 @@ async function loadHealth(pool: Pool, runtimeId: string, rpcKeys: { production?:
       (SELECT count(*)::int
        FROM execution.transaction_plans p
        LEFT JOIN execution.execution_journal j ON j.plan_id=p.plan_id
-       WHERE p.state IN ('RECOVERING','RECONCILIATION_REQUIRED')
+       WHERE (p.state IN ('RECOVERING','RECONCILIATION_REQUIRED')
+          AND NOT EXISTS (
+            -- Keep the operator display aligned with P7: an exact
+            -- receipt-confirmed compensating unwind is terminal, even during
+            -- the brief parent-plan terminalization handoff.
+            SELECT 1 FROM execution.partial_entry_recovery r
+            WHERE r.plan_id=p.plan_id AND r.state='ABORTED_SOL_SETTLED'
+          ))
           OR (j.state IN ('SIGNED','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED')
               AND NOT EXISTS (
                 SELECT 1 FROM execution.partial_entry_recovery r

@@ -5605,7 +5605,16 @@ return 'APPLIED';
             `SELECT count(*)::int AS n
              FROM execution.transaction_plans p
              LEFT JOIN execution.execution_journal j ON j.plan_id=p.plan_id
-             WHERE p.state IN ('RECOVERING','RECONCILIATION_REQUIRED')
+             WHERE (p.state IN ('RECOVERING','RECONCILIATION_REQUIRED')
+                AND NOT EXISTS (
+                  -- The parent OPEN plan is terminalized by P6 on the next
+                  -- recovery pass.  Do not let that brief bookkeeping window
+                  -- re-block P7 after the compensating unwind is already
+                  -- receipt-confirmed and SOL-settled.
+                  SELECT 1 FROM execution.partial_entry_recovery r
+                  WHERE r.plan_id=p.plan_id
+                    AND r.state='ABORTED_SOL_SETTLED'
+                ))
                 OR (j.state IN ('SIGNED','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED')
                     AND NOT EXISTS (
                       -- A confirmed entry funding transaction is no longer

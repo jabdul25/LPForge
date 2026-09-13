@@ -424,6 +424,18 @@ export function classifyFundedOpenPositionReconciliation(input:{
   if(input.position.owner!==input.expectedOwner||input.position.pool!==input.expectedPool)return{kind:'HOLD',reasonCode:'P6_FUNDED_OPEN_POSITION_IDENTITY_CONFLICT'};
   return{kind:'EXISTS'};
 }
+/**
+ * A receipt-confirmed compensating unwind is the terminal outcome of the
+ * original OPEN plan.  Leaving that parent in RECOVERING would turn an
+ * already-settled partial entry into permanent P7 recovery debt.  This is
+ * deliberately idempotent: only a non-terminal OPEN parent is finalized.
+ */
+async function terminalizeAbortedFundedOpenPlan(input:{store:Phase1Store;planId:string;at:string;reasonCodes:string[]}):Promise<void>{
+  const plan=await input.store.loadAutonomousPlan(input.planId);
+  if(!plan||plan.action!=='OPEN')throw new Error('LPFORGE_P6_FUNDED_OPEN_ABORTED_PLAN_IDENTITY_INVALID');
+  if(['RECONCILED','COMPLETED','EXPIRED','FAILED','BLOCKED'].includes(plan.state))return;
+  await input.store.completeAutonomousPlan({planId:input.planId,state:'FAILED',at:input.at,payload:{action:'OPEN',recovery:'FUNDED_OPEN_UNWIND_CONFIRMED',partialEntryState:'ABORTED_SOL_SETTLED',reasonCodes:input.reasonCodes}});
+}
 function planFields(plan: AutonomousOpenPlan) {
   const intent = plan.planPayload.intent as Record<string, unknown> | undefined;
   if (!intent) throw new Error("LPFORGE_P6_PLAN_INTENT_MISSING");
@@ -2576,6 +2588,7 @@ export async function recoverPartialEntryFunding(input: {
     try {
     const state = String(row.state);
     if (state === "ABORTED_SOL_SETTLED") {
+      await terminalizeAbortedFundedOpenPlan({store:input.store,planId,at:new Date().toISOString(),reasonCodes:['P6_PARTIAL_UNWIND_RECONCILED']});
       const outcome = await input.store.createLiveEntryAbortedLearningOutcome({
         planId,
         at: new Date().toISOString(),
@@ -2734,6 +2747,7 @@ export async function recoverPartialEntryFunding(input: {
         payload: { reasonCodes: ["P6_PARTIAL_UNWIND_RECONCILED"] },
         updatedAt: new Date().toISOString(),
       });
+      await terminalizeAbortedFundedOpenPlan({store:input.store,planId,at:new Date().toISOString(),reasonCodes:['P6_PARTIAL_UNWIND_RECONCILED']});
       results.push({ planId, action: "HOLD", reasonCodes: ["P6_PARTIAL_UNWIND_RECONCILED"] });
       continue;
     }
@@ -2858,6 +2872,7 @@ export async function recoverPartialEntryFunding(input: {
         payload: { reasonCodes: [...unwindIdentity.reasonCodes,...unwind.reasonCodes], unwindTransactionId: unwindIdentity.transactionId, partialEntryUnwindRetryCount: unwindIdentity.retryCount },
         updatedAt: new Date().toISOString(),
       });
+      if(unwind.ok)await terminalizeAbortedFundedOpenPlan({store:input.store,planId,at:new Date().toISOString(),reasonCodes:['P6_PARTIAL_UNWIND_RECONCILED']});
       results.push({
         planId,
         action: "UNWIND_REQUIRED",

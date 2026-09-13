@@ -80,3 +80,19 @@ for an existing account, and owner/pool mismatch continue to HOLD fail-closed.
 The correction adds no funding path, no new strategy decision, and no
 unbounded probing. Focused regression tests cover absent, unavailable,
 mismatched, and matching position-account outcomes.
+
+## Follow-up terminal parent cleanup
+
+An exact receipt-confirmed unwind is the terminal outcome of its original
+funded-but-unopened `OPEN` plan. P6 now terminalizes that non-terminal parent
+as `FAILED` with explicit `FUNDED_OPEN_UNWIND_CONFIRMED` provenance, which also
+terminalizes its unresolved parent journal. This is idempotent and does not
+alter the durable partial-entry recovery row or historical evidence.
+
+P7 and the read-only shell terminal additionally exclude a plan from
+*actionable* recovery during only the short parent-terminalization handoff
+when its exact partial-entry row is already `ABORTED_SOL_SETTLED`. This prevents
+a safely compensated plan from retaining a global entry block merely because
+bookkeeping is one recovery pass behind. No recovery row is deleted, no new
+economic authority is introduced, and a missing/unconfirmed unwind is never
+treated as terminal.

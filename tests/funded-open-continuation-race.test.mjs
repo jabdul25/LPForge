@@ -58,8 +58,15 @@ test('an absent generated position proceeds to bounded unwind while an RPC or id
 });
 
 test('terminal and P6 retain the bounded, no-repeat continuation design',()=>{
- const worker=fs.readFileSync('packages/phase6-live-worker/src/index.ts','utf8'),terminal=fs.readFileSync('apps/terminal/src/main.ts','utf8'),db=fs.readFileSync('packages/db/src/index.ts','utf8');
+  const worker=fs.readFileSync('packages/phase6-live-worker/src/index.ts','utf8'),terminal=fs.readFileSync('apps/terminal/src/main.ts','utf8'),db=fs.readFileSync('packages/db/src/index.ts','utf8');
  assert.match(worker,/P6_FUNDED_OPEN_CONTINUATION_EXPIRED/);assert.match(worker,/FUNDED_OPEN_CONTINUATION_UNSAFE/);assert.match(worker,/fundingSignature/);
  assert.match(terminal,/r\.state='ENTRY_FUNDED_NOT_OPEN'/);assert.match(db,/fundedOpenContinuations/);
- assert.doesNotMatch(worker,/executeRequiredJupiterSwap[\s\S]{0,500}FUNDED_OPEN_CONTINUATION/);
+  assert.doesNotMatch(worker,/executeRequiredJupiterSwap[\s\S]{0,500}FUNDED_OPEN_CONTINUATION/);
+});
+
+test('receipt-confirmed funded unwind terminalizes its parent and cannot remain actionable recovery debt',()=>{
+ const worker=fs.readFileSync('packages/phase6-live-worker/src/index.ts','utf8'),db=fs.readFileSync('packages/db/src/index.ts','utf8'),terminal=fs.readFileSync('apps/terminal/src/main.ts','utf8');
+ assert.match(worker,/terminalizeAbortedFundedOpenPlan/);
+ assert.match(worker,/recovery:'FUNDED_OPEN_UNWIND_CONFIRMED'/);
+ for(const source of [db,terminal])assert.match(source,/r\.state='ABORTED_SOL_SETTLED'/);
 });
