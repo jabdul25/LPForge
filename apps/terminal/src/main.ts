@@ -344,6 +344,7 @@ async function loadHealth(pool: Pool, runtimeId: string, rpcKeys: { production?:
       (SELECT safety_mode FROM operations.phase7_control_decisions WHERE runtime_id=$1 ORDER BY observed_at DESC LIMIT 1) AS safety_mode,
       (SELECT daemon_plan FROM operations.phase7_control_decisions WHERE runtime_id=$1 ORDER BY observed_at DESC LIMIT 1) AS daemon_plan,
       (SELECT new_economic_action_allowed FROM operations.phase7_control_decisions WHERE runtime_id=$1 ORDER BY observed_at DESC LIMIT 1) AS new_economic_action_allowed,
+      (SELECT reason_codes FROM operations.phase7_control_decisions WHERE runtime_id=$1 ORDER BY observed_at DESC LIMIT 1) AS entry_control_reason_codes,
       (SELECT count(*)::int
        FROM execution.transaction_plans p
        LEFT JOIN execution.execution_journal j ON j.plan_id=p.plan_id
@@ -425,7 +426,7 @@ async function loadHealth(pool: Pool, runtimeId: string, rpcKeys: { production?:
   ];
   const health: TerminalHealth = {
     ...(text(c, 'authority_mode') ? { authorityMode: text(c, 'authority_mode') } : {}), ...(text(c, 'health_status') ? { healthStatus: text(c, 'health_status') } : {}), ...(text(c, 'safety_mode') ? { safetyMode: text(c, 'safety_mode') } : {}), ...(text(c, 'daemon_plan') ? { daemonPlan: text(c, 'daemon_plan') } : {}), ...(typeof c.new_economic_action_allowed === 'boolean' ? { newEconomicActionAllowed: c.new_economic_action_allowed } : {}),
-    recoveryQueueCount: recoveryQueue, unknownSubmissionCount: unknown, activeManagementPlans: activePlans, partialEntryRecoveryCount: partialCount, activeIncidentCount: incidentCount, telegramStatus, rpcHealth
+    entryControlReasonCodes: strings(c.entry_control_reason_codes), recoveryQueueCount: recoveryQueue, unknownSubmissionCount: unknown, activeManagementPlans: activePlans, partialEntryRecoveryCount: partialCount, activeIncidentCount: incidentCount, telegramStatus, rpcHealth
   };
   const p6Status = unknown > 0 || recoveryQueue > 0 || partialCount > 0 ? 'RECOVERY' : 'READY';
   return {

@@ -130,6 +130,8 @@ export interface TerminalHealth {
   safetyMode?: string | undefined;
   daemonPlan?: string | undefined;
   newEconomicActionAllowed?: boolean | undefined;
+  /** Canonical reasons from the same P7 control decision that gates entries. */
+  entryControlReasonCodes: string[];
   recoveryQueueCount: number;
   unknownSubmissionCount: number;
   activeManagementPlans: number;
@@ -396,11 +398,11 @@ function entryWatchLines(snapshot: TerminalSnapshot, width: number, color: boole
 
 function activePoolLines(snapshot: TerminalSnapshot, width: number, color: boolean): string[] {
   if (!snapshot.activePools.length) return [paint('No open LP positions.', 'muted', color)];
-  const head = `${pad('POOL', 12)} ${pad('POSITION', 12)} ${pad('STATE', 9)} ${pad('LIVE PNL', 10)} ${pad('LIVE PEAK', 10)} ${pad('RANGE', 15)} ALERT`;
-  const alertWidth = Math.max(8, width - 12 - 1 - 12 - 1 - 9 - 1 - 10 - 1 - 10 - 1 - 15 - 1);
+  const head = `${pad('POOL', 12)} ${pad('POSITION', 12)} ${pad('STATE', 9)} ${pad('LIVE PNL', 10)} ${pad('LIVE PEAK', 10)} ${pad('LP FEES', 12)} ${pad('RANGE', 15)} ALERT`;
+  const alertWidth = Math.max(8, width - 12 - 1 - 12 - 1 - 9 - 1 - 10 - 1 - 10 - 1 - 12 - 1 - 15 - 1);
   return [paint(head, 'muted', color), ...snapshot.activePools.map(position => {
     const range = position.lowerBinId === undefined || position.upperBinId === undefined ? '—' : `${position.lowerBinId}:${position.upperBinId} @${position.activeBinId ?? '?'}`;
-    return `${pad(position.poolDisplay, 12)} ${pad(short(position.positionAddress), 12)} ${pad(state(position.lifecycleState, color), 9)} ${pad(signedPercent(position.liveControlReturnFraction, color), 10)} ${pad(signedPercent(position.liveControlPeakReturnFraction, color), 10)} ${pad(range, 15)} ${clip(state(position.protection, color), alertWidth)}`;
+    return `${pad(position.poolDisplay, 12)} ${pad(short(position.positionAddress), 12)} ${pad(state(position.lifecycleState, color), 9)} ${pad(signedPercent(position.liveControlReturnFraction, color), 10)} ${pad(signedPercent(position.liveControlPeakReturnFraction, color), 10)} ${pad(formatSolLamports(position.feeLamports), 12)} ${pad(range, 15)} ${clip(state(position.protection, color), alertWidth)}`;
   })];
 }
 
@@ -439,13 +441,29 @@ function recentPositionLines(snapshot: TerminalSnapshot, width: number, filter: 
     return `${pad(time, 8)} ${pad(row.poolDisplay, 12)} ${pad(short(row.positionAddress), 12)} ${pad(state(row.state, color), 7)} ${pad(value, 12)} ${pad(row.holdSeconds === undefined ? 'n/a' : formatAge(new Date(Date.now() - row.holdSeconds * 1000).toISOString()), 8)} ${clip(row.exitReason || (row.state === 'OPEN' ? 'LIVE CONTROL MARK' : 'n/a'), Math.max(8, width - 67))}`;
   })];
 }
+function entryBlockSummary(health: TerminalHealth): string | undefined {
+  if (health.newEconomicActionAllowed !== false) return undefined;
+  const decisive = health.entryControlReasonCodes.filter(code => /(?:BLOCK|DRAWDOWN|RECOVERY|UNKNOWN|RECONCILIATION|PAUS|LIMIT|EXPOSURE|RESERVE|RELEASE|IDENTITY|INCIDENT|HEALTH|SAFETY|EMERGENCY|EXPIRED|REVOKED|MISSING|MISMATCH)/.test(code));
+  const selected = decisive.length ? decisive : health.entryControlReasonCodes;
+  if (!selected.length) return 'P7_CONTROL_REASON_UNAVAILABLE';
+  return selected.map(code => {
+    if (code === 'P7_PORTFOLIO_DAILY_DRAWDOWN') return 'DAILY DRAWDOWN LIMIT';
+    if (code === 'P7_PORTFOLIO_ROLLING_DRAWDOWN') return 'ROLLING DRAWDOWN LIMIT';
+    if (code === 'P7_PORTFOLIO_POSITION_LIMIT' || code === 'P7_PLAN_OPEN_POSITION_LIMIT') return 'POSITION CAP REACHED';
+    if (code === 'P7_CONTROL_RECOVERY_PENDING') return 'RECOVERY PENDING';
+    return code;
+  }).join(', ');
+}
+
 function healthLines(snapshot: TerminalSnapshot, color: boolean): string[] {
   const health = snapshot.health;
+  const entryBlock = entryBlockSummary(health);
   return [
     `${paint('P7 MODE', 'muted', color)}        ${state(health.authorityMode, color)}`,
     `${paint('P7 HEALTH', 'muted', color)}      ${state(health.healthStatus, color)}`,
     `${paint('SAFETY', 'muted', color)}         ${state(health.safetyMode, color)}`,
     `${paint('NEW ENTRIES', 'muted', color)}    ${state(health.newEconomicActionAllowed ? 'ALLOWED' : 'BLOCKED', color)}`,
+    ...(entryBlock ? [`${paint('ENTRY BLOCK', 'muted', color)}    ${state(entryBlock, color)}`] : []),
     ...rpcLines(snapshot, color),
     `${paint('RECOVERY QUEUE', 'muted', color)} ${state(String(health.recoveryQueueCount), color)}`,
     `${paint('UNKNOWN TX', 'muted', color)}     ${state(String(health.unknownSubmissionCount), color)}`,
@@ -496,7 +514,7 @@ function compactWatchLines(snapshot: TerminalSnapshot, width: number, color: boo
 
 function compactOpenPositionLines(snapshot: TerminalSnapshot, width: number, color: boolean, limit: number): string[] {
   if (!snapshot.activePools.length) return [paint('No open LP positions.', 'muted', color)];
-  return snapshot.activePools.slice(0, Math.max(1, limit)).map(position => clip(`${state(position.poolDisplay, color)} ${state(position.lifecycleState, color)} ${signedPercent(position.liveControlReturnFraction, color)} ${paint('PK', 'muted', color)} ${signedPercent(position.liveControlPeakReturnFraction, color)} ${state(position.protection, color)}`, width));
+  return snapshot.activePools.slice(0, Math.max(1, limit)).map(position => clip(`${state(position.poolDisplay, color)} ${state(position.lifecycleState, color)} ${signedPercent(position.liveControlReturnFraction, color)} ${paint('PK', 'muted', color)} ${signedPercent(position.liveControlPeakReturnFraction, color)} ${paint('FEE', 'muted', color)} ${formatSolLamports(position.feeLamports)} ${state(position.protection, color)}`, width));
 }
 
 function compactEventLines(snapshot: TerminalSnapshot, width: number, filter: TerminalRenderOptions['eventFilter'], color: boolean, limit: number, showCanonical = false): string[] {
@@ -526,6 +544,7 @@ function compactEngineLines(snapshot: TerminalSnapshot, width: number, color: bo
 
 function compactSystemLines(snapshot: TerminalSnapshot, width: number, color: boolean, limit: number): string[] {
   const health = snapshot.health;
+  const entryBlock = entryBlockSummary(health);
   const byRole = new Map(health.rpcHealth.map(rpc => [rpc.role, rpc]));
   const rpc = (role: 'PRODUCTION' | 'DISCOVERY' | 'EXECUTION'): string => byRole.get(role)?.state || 'UNKNOWN';
   const mobileRpcState = (role: 'PRODUCTION' | 'DISCOVERY' | 'EXECUTION'): string => {
@@ -536,6 +555,7 @@ function compactSystemLines(snapshot: TerminalSnapshot, width: number, color: bo
   return [
     `${paint('P7', 'muted', color)} ${state(health.healthStatus, color)} ${paint('SAFE', 'muted', color)} ${state(health.safetyMode, color)}`,
     `${paint('ENTRY', 'muted', color)} ${state(health.newEconomicActionAllowed ? 'ALLOWED' : 'BLOCKED', color)} ${paint('REC', 'muted', color)} ${state(String(health.recoveryQueueCount), color)}`,
+    ...(entryBlock ? [`${paint('BLOCK', 'muted', color)} ${state(entryBlock, color)}`] : []),
     `${paint('RPC', 'muted', color)} P:${mobileRpcState('PRODUCTION')} D:${mobileRpcState('DISCOVERY')} E:${mobileRpcState('EXECUTION')}`,
     `${paint('PLAN', 'muted', color)} ${state(String(health.activeManagementPlans), color)} ${paint('UNK', 'muted', color)} ${state(String(health.unknownSubmissionCount), color)}`
   ].slice(0, Math.max(1, limit)).map(value => clip(value, width));
