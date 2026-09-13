@@ -49,9 +49,9 @@ The forensic cohort had seven true failed/unwound funding entries, funded with `
 - Typecheck: pass.
 - Build: pass.
 - Focused continuation/recovery/P6/P7 tests: 51 passed.
-- Full CI: pass (`pnpm test:ci`).
+- Full CI: pass — 1,207 passed, 0 failed, 1 intentionally skipped (1,208 total).
 - PostgreSQL concurrency proof: pass; exactly one of two independent clients acquired the same continuation advisory lock, then the released lock was acquirable.
-- Release integrity: pending immutable artifact build and production installation.
+- Immutable release build/integrity: pass — 1,113 checksummed files, build identity `1e2da7126faf2d2e81c23d1c3dd1f595e0bd796ae97cb8c2b8360d4b13b4e015`, policy hash `c3e3af0ac1bdc1370efedba87bfa3e5f8027933a2a16ad78b284e8f9bc37e95f`, migration head unchanged at `M0079_shared_data_api_coordinator.sql`.
 
 The focused tests cover exact identity matching, global blocking of a different plan, continuation-before-deadline, expiry, unchanged generic entry guards, no funding resend route, recovery lock behavior, and the terminal's actionable recovery query. Existing partial-entry, P6 lifecycle, and P7 recovery tests remain green.
 
@@ -63,4 +63,4 @@ No changes were made to entry strategy selection, P3/P4, max positions, same-poo
 
 ## Deployment and first-live validation
 
-Deployment status and final immutable release provenance are recorded after the release gate. No synthetic economic entry is created; the first normal funded entry must end in either an exact LP open or a bounded attributable unwind, with no repeated funding.
+The immutable release artifact passed all release gates and is ready for production installation. No synthetic economic entry is created; the first normal funded entry must end in either an exact LP open or a bounded attributable unwind, with no repeated funding. Final activation provenance is recorded after the release is installed.
