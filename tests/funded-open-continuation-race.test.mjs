@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import {phase7ExecutionControlFromRow,validateFreshFundedOpenContinuation} from '../.build/packages/phase6-claim-guard/src/index.js';
 import {deriveFundedOpenContinuationControlFacts,phase7RecoveryBlocksNewEntries} from '../.build/packages/phase7-production-service/src/index.js';
-import {loadFreshExecutionSafetyFacts,checkFreshOpenSubmissionSafety} from '../.build/packages/phase6-live-worker/src/index.js';
+import {loadFreshExecutionSafetyFacts,checkFreshOpenSubmissionSafety,classifyFundedOpenPositionReconciliation} from '../.build/packages/phase6-live-worker/src/index.js';
 
 const fundedAt='2026-09-13T05:22:10.000Z';
 const now='2026-09-13T05:22:25.000Z';
@@ -48,6 +48,13 @@ test('a funded continuation blocks unrelated new entries without becoming generi
  const clean={recoveryQueueCount:0,unknownSubmissionCount:0,unresolvedReconciliationDebt:0,partialEntryRecoveryCount:0,fundedOpenContinuations:[]};
  assert.equal(phase7RecoveryBlocksNewEntries(clean),false);
  assert.equal(phase7RecoveryBlocksNewEntries({...clean,fundedOpenContinuations:[{}]}),true);
+});
+
+test('an absent generated position proceeds to bounded unwind while an RPC or identity failure holds fail-closed',()=>{
+ assert.deepEqual(classifyFundedOpenPositionReconciliation({accountReadSucceeded:true,accountPresent:false,expectedOwner:'owner',expectedPool:'pool'}),{kind:'ABSENT'});
+ assert.deepEqual(classifyFundedOpenPositionReconciliation({accountReadSucceeded:false,accountPresent:false,expectedOwner:'owner',expectedPool:'pool'}),{kind:'HOLD',reasonCode:'P6_FUNDED_OPEN_POSITION_RECONCILIATION_UNAVAILABLE'});
+ assert.deepEqual(classifyFundedOpenPositionReconciliation({accountReadSucceeded:true,accountPresent:true,positionReadSucceeded:true,position:{owner:'other',pool:'pool'},expectedOwner:'owner',expectedPool:'pool'}),{kind:'HOLD',reasonCode:'P6_FUNDED_OPEN_POSITION_IDENTITY_CONFLICT'});
+ assert.deepEqual(classifyFundedOpenPositionReconciliation({accountReadSucceeded:true,accountPresent:true,positionReadSucceeded:true,position:{owner:'owner',pool:'pool'},expectedOwner:'owner',expectedPool:'pool'}),{kind:'EXISTS'});
 });
 
 test('terminal and P6 retain the bounded, no-repeat continuation design',()=>{

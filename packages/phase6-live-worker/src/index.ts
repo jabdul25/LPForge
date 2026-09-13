@@ -403,6 +403,27 @@ function nestedGeneratedPositionAddress(value:unknown):string|undefined{
  for(const key of ["autonomous_dispatch","open","prepared","payload","metadata","fundedOpenContinuation"]){const found=nestedGeneratedPositionAddress(row[key]);if(found)return found;}
  return undefined;
 }
+/**
+ * A generated PositionV2 address has three materially different outcomes:
+ * absence is proof that a never-landed OPEN cannot be reconciled, while a
+ * transport failure is unknown chain truth and must hold.  The Meteora SDK
+ * throws for both shapes, so the recovery lane first proves account absence
+ * through a governed account read before asking the SDK to decode an account.
+ */
+export function classifyFundedOpenPositionReconciliation(input:{
+  accountReadSucceeded:boolean;
+  accountPresent:boolean;
+  positionReadSucceeded?:boolean;
+  position?:Pick<Awaited<ReturnType<MeteoraReadAdapter['getPositionV2']>>,'owner'|'pool'>;
+  expectedOwner:string;
+  expectedPool:string;
+}):{kind:'ABSENT'|'EXISTS'|'HOLD';reasonCode?:string}{
+  if(!input.accountReadSucceeded)return{kind:'HOLD',reasonCode:'P6_FUNDED_OPEN_POSITION_RECONCILIATION_UNAVAILABLE'};
+  if(!input.accountPresent)return{kind:'ABSENT'};
+  if(!input.positionReadSucceeded||!input.position)return{kind:'HOLD',reasonCode:'P6_FUNDED_OPEN_POSITION_RECONCILIATION_UNAVAILABLE'};
+  if(input.position.owner!==input.expectedOwner||input.position.pool!==input.expectedPool)return{kind:'HOLD',reasonCode:'P6_FUNDED_OPEN_POSITION_IDENTITY_CONFLICT'};
+  return{kind:'EXISTS'};
+}
 function planFields(plan: AutonomousOpenPlan) {
   const intent = plan.planPayload.intent as Record<string, unknown> | undefined;
   if (!intent) throw new Error("LPFORGE_P6_PLAN_INTENT_MISSING");
@@ -2754,11 +2775,13 @@ export async function recoverPartialEntryFunding(input: {
     }
     const expectedPositionAddress=plan.positionAddress??nestedGeneratedPositionAddress(row.payload);
     if(expectedPositionAddress){
-      let positionReadFailed=false,positionTruth:Awaited<ReturnType<MeteoraReadAdapter['getPositionV2']>>|undefined;
-      try{positionTruth=await createMeteoraReadAdapter({rpcUrl:input.config.rpcUrl,cluster:'mainnet-beta',programId:input.config.programId,priority:'P1_RECOVERY_CRITICAL'}).getPositionV2(plan.poolAddress,expectedPositionAddress);}catch{positionReadFailed=true;}
-      if(positionReadFailed){results.push({planId,action:'HOLD',reasonCodes:['P6_FUNDED_OPEN_POSITION_RECONCILIATION_UNAVAILABLE']});continue;}
-      if(positionTruth){
-        if(positionTruth.owner!==plan.ownerAddress||positionTruth.pool!==plan.poolAddress){results.push({planId,action:'HOLD',reasonCodes:['P6_FUNDED_OPEN_POSITION_IDENTITY_CONFLICT']});continue;}
+      const connection=createGovernedConnection({rpcUrl:input.config.rpcUrl,priority:'P1_RECOVERY_CRITICAL'});
+      let accountReadSucceeded=true,accountPresent=false,positionReadSucceeded=true,positionTruth:Awaited<ReturnType<MeteoraReadAdapter['getPositionV2']>>|undefined;
+      try{accountPresent=(await connection.getAccountInfo(new PublicKey(expectedPositionAddress),'confirmed'))!==null;}catch{accountReadSucceeded=false;}
+      if(accountReadSucceeded&&accountPresent)try{positionTruth=await createMeteoraReadAdapter({rpcUrl:input.config.rpcUrl,cluster:'mainnet-beta',programId:input.config.programId,priority:'P1_RECOVERY_CRITICAL'}).getPositionV2(plan.poolAddress,expectedPositionAddress);}catch{positionReadSucceeded=false;}
+      const reconciliation=classifyFundedOpenPositionReconciliation({accountReadSucceeded,accountPresent,positionReadSucceeded,...(positionTruth?{position:positionTruth}:{}),expectedOwner:plan.ownerAddress,expectedPool:plan.poolAddress});
+      if(reconciliation.kind==='HOLD'){results.push({planId,action:'HOLD',reasonCodes:[reconciliation.reasonCode!]});continue;}
+      if(reconciliation.kind==='EXISTS'){
         await input.store.upsertPartialEntryRecovery({planId,poolAddress:plan.poolAddress,ownerAddress:plan.ownerAddress,tokenMint:String(row.token_mint),fundingTransactionId:String(row.funding_transaction_id),fundingSignature:String(row.funding_signature),fundedAt:new Date(String(row.funded_at)).toISOString(),pairedTokenAmount:String(row.paired_token_amount),intendedCapitalLamports:BigInt(String(row.intended_capital_lamports)),intendedRange:(row.intended_range??{}) as Record<string,unknown>,state:'RECONCILIATION_REQUIRED',walletTruth:{refreshRequired:true,recoveredPositionAddress:expectedPositionAddress},payload:{partialEntry:true,reasonCodes:['P6_FUNDED_OPEN_POSITION_EXISTS_BEFORE_UNWIND'],positionAddress:expectedPositionAddress},updatedAt:new Date().toISOString()});
         results.push({planId,action:'HOLD',reasonCodes:['P6_FUNDED_OPEN_POSITION_EXISTS_BEFORE_UNWIND']});continue;
       }

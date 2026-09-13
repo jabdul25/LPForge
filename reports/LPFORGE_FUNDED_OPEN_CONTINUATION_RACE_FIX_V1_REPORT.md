@@ -64,3 +64,19 @@ No changes were made to entry strategy selection, P3/P4, max positions, same-poo
 ## Deployment and first-live validation
 
 The immutable release artifact passed all release gates and is ready for production installation. No synthetic economic entry is created; the first normal funded entry must end in either an exact LP open or a bounded attributable unwind, with no repeated funding. Final activation provenance is recorded after the release is installed.
+
+## Follow-up absence-proof correction
+
+The first post-release funded-open recovery exposed a narrow distinction in the
+Meteora SDK: it throws when a generated PositionV2 account is absent, just as
+it does for a transport/decode failure. Recovery must not classify a proven
+absent account as an RPC outage, because that would keep already-funded token
+inventory in a HOLD indefinitely.
+
+Recovery now first performs a governed `getAccountInfo` read for the exact
+generated position. `null` proves absence and permits the already-bound
+deadline/unwind state machine to proceed. RPC-read failure, SDK-decode failure
+for an existing account, and owner/pool mismatch continue to HOLD fail-closed.
+The correction adds no funding path, no new strategy decision, and no
+unbounded probing. Focused regression tests cover absent, unavailable,
+mismatched, and matching position-account outcomes.
