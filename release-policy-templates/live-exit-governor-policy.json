@@ -5,8 +5,8 @@
   "emergencyStopLossFraction": 0.2,
   "profitProtection": {
     "enabled": true,
-    "triggerFraction": 0.08,
-    "maxGivebackFraction": 0.05,
+    "triggerFraction": 0.045,
+    "maxGivebackFraction": 0.01,
     "minRetainedProfitFraction": 0.02
   },
   "profitRetention": {
