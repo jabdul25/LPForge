@@ -69,4 +69,5 @@ test('receipt-confirmed funded unwind terminalizes its parent and cannot remain 
  assert.match(worker,/terminalizeAbortedFundedOpenPlan/);
  assert.match(worker,/recovery:'FUNDED_OPEN_UNWIND_CONFIRMED'/);
  for(const source of [db,terminal])assert.match(source,/r\.state='ABORTED_SOL_SETTLED'/);
+ assert.match(db,/p\.state NOT IN \('RECONCILED','COMPLETED','EXPIRED','FAILED','BLOCKED'\)/);
 });

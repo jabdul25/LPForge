@@ -96,3 +96,9 @@ a safely compensated plan from retaining a global entry block merely because
 bookkeeping is one recovery pass behind. No recovery row is deleted, no new
 economic authority is introduced, and a missing/unconfirmed unwind is never
 treated as terminal.
+
+The recovery reader retains an `ABORTED_SOL_SETTLED` row only when its learning
+outcome or non-terminal original `OPEN` parent still requires reconciliation.
+Consequently, already-settled historic partial entries self-clean their stranded
+parent plan exactly once, then disappear from the recovery worker without being
+revived as an economic action.

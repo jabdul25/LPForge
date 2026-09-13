@@ -4599,9 +4599,21 @@ return 'APPLIED';
       const r = await db.query(
         `SELECT r.* FROM execution.partial_entry_recovery r
          WHERE r.state IN ('ENTRY_FUNDED_NOT_OPEN','RESUME_OPEN','UNWIND_REQUIRED','UNWIND_SUBMITTED','RECONCILIATION_REQUIRED')
-            OR (r.state='ABORTED_SOL_SETTLED' AND NOT EXISTS(
-              SELECT 1 FROM research.live_learning_outcomes o
-              WHERE o.outcome_kind='LIVE_ENTRY_ABORTED_SOL_SETTLED' AND o.entry_plan_id=r.plan_id
+            -- A receipt-confirmed unwind must be retained only while either
+            -- its learning outcome or its original OPEN parent's terminal
+            -- state still needs reconciliation.  This lets P6 clean up a
+            -- historic parent stranded in RECOVERING without ever reviving a
+            -- terminal economic action.
+            OR (r.state='ABORTED_SOL_SETTLED' AND (
+              NOT EXISTS(
+                SELECT 1 FROM research.live_learning_outcomes o
+                WHERE o.outcome_kind='LIVE_ENTRY_ABORTED_SOL_SETTLED' AND o.entry_plan_id=r.plan_id
+              )
+              OR EXISTS(
+                SELECT 1 FROM execution.transaction_plans p
+                WHERE p.plan_id=r.plan_id
+                  AND p.state NOT IN ('RECONCILED','COMPLETED','EXPIRED','FAILED','BLOCKED')
+              )
             ))
          ORDER BY r.updated_at ASC`,
       );
