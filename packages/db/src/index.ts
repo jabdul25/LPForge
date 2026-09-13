@@ -5641,11 +5641,18 @@ return 'APPLIED';
                     -- blocks unrelated entries, but is not generic recovery
                     -- debt for its exact same-plan LP-open continuation.
                     AND NOT EXISTS (
+                      -- Funding confirmation is an immutable child-transaction
+                      -- fact. The parent journal is reused by the LP-open
+                      -- child, so it must not erase this proof.
                       SELECT 1 FROM execution.partial_entry_recovery r
-                      JOIN execution.execution_journal funding
-                        ON funding.plan_id=r.plan_id
-                       AND funding.signature=r.funding_signature
-                       AND funding.state='CONFIRMED'
+                      JOIN execution.submission_attempts funding_attempt
+                        ON funding_attempt.transaction_id=r.funding_transaction_id
+                       AND funding_attempt.signature=r.funding_signature
+                      JOIN execution.confirmations funding_confirmation
+                        ON funding_confirmation.attempt_id=funding_attempt.attempt_id
+                       AND funding_confirmation.signature=r.funding_signature
+                       AND funding_confirmation.status IN ('CONFIRMED','FINALIZED')
+                       AND funding_confirmation.error IS NULL
                       WHERE r.plan_id=p.plan_id
                         AND r.state='ENTRY_FUNDED_NOT_OPEN'
                     ))`,
@@ -5661,10 +5668,17 @@ return 'APPLIED';
              FROM execution.partial_entry_recovery r
              WHERE r.state NOT IN ('RESOLVED','OPEN_RECOVERED','SUPERSEDED_BY_SUCCESSFUL_ENTRY','ABORTED_SOL_SETTLED')
                AND NOT (r.state='ENTRY_FUNDED_NOT_OPEN' AND EXISTS(
-                 SELECT 1 FROM execution.execution_journal funding
-                 WHERE funding.plan_id=r.plan_id
-                   AND funding.signature=r.funding_signature
-                   AND funding.state='CONFIRMED'
+                 -- An exact confirmed funding child is a provisional
+                 -- continuation, not generic recovery debt.
+                 SELECT 1
+                 FROM execution.submission_attempts funding_attempt
+                 JOIN execution.confirmations funding_confirmation
+                   ON funding_confirmation.attempt_id=funding_attempt.attempt_id
+                  AND funding_confirmation.signature=r.funding_signature
+                  AND funding_confirmation.status IN ('CONFIRMED','FINALIZED')
+                  AND funding_confirmation.error IS NULL
+                 WHERE funding_attempt.transaction_id=r.funding_transaction_id
+                   AND funding_attempt.signature=r.funding_signature
                ))`,
           ),
           db.query(
@@ -5672,10 +5686,18 @@ return 'APPLIED';
                     r.funded_at,r.intended_capital_lamports,r.intended_range,r.payload,
                     p.state AS plan_state,p.expires_at,
                     EXISTS(
-                      SELECT 1 FROM execution.execution_journal funding
-                      WHERE funding.plan_id=r.plan_id
-                        AND funding.signature=r.funding_signature
-                        AND funding.state='CONFIRMED'
+                      -- The execution journal advances to the LP-open child.
+                      -- Canonical confirmation remains bound to the funding
+                      -- transaction ID and its exact signature.
+                      SELECT 1
+                      FROM execution.submission_attempts funding_attempt
+                      JOIN execution.confirmations funding_confirmation
+                        ON funding_confirmation.attempt_id=funding_attempt.attempt_id
+                       AND funding_confirmation.signature=r.funding_signature
+                       AND funding_confirmation.status IN ('CONFIRMED','FINALIZED')
+                       AND funding_confirmation.error IS NULL
+                      WHERE funding_attempt.transaction_id=r.funding_transaction_id
+                        AND funding_attempt.signature=r.funding_signature
                     ) AS funding_confirmed,
                     EXISTS(
                       SELECT 1 FROM execution.owned_positions o

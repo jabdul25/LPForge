@@ -361,11 +361,17 @@ async function loadHealth(pool: Pool, runtimeId: string, rpcKeys: { production?:
                 WHERE r.plan_id=p.plan_id AND r.state='ABORTED_SOL_SETTLED'
               )
               AND NOT EXISTS (
+                -- Keep the terminal aligned with P7's immutable
+                -- funding-confirmation authority.
                 SELECT 1 FROM execution.partial_entry_recovery r
-                JOIN execution.execution_journal funding
-                  ON funding.plan_id=r.plan_id
-                 AND funding.signature=r.funding_signature
-                 AND funding.state='CONFIRMED'
+                JOIN execution.submission_attempts funding_attempt
+                  ON funding_attempt.transaction_id=r.funding_transaction_id
+                 AND funding_attempt.signature=r.funding_signature
+                JOIN execution.confirmations funding_confirmation
+                  ON funding_confirmation.attempt_id=funding_attempt.attempt_id
+                 AND funding_confirmation.signature=r.funding_signature
+                 AND funding_confirmation.status IN ('CONFIRMED','FINALIZED')
+                 AND funding_confirmation.error IS NULL
                 WHERE r.plan_id=p.plan_id AND r.state='ENTRY_FUNDED_NOT_OPEN'
               ))) AS recovery_queue,
       (SELECT count(*)::int FROM execution.execution_journal WHERE state='UNKNOWN_SUBMISSION') AS unknown_journal,
@@ -375,10 +381,15 @@ async function loadHealth(pool: Pool, runtimeId: string, rpcKeys: { production?:
        FROM execution.partial_entry_recovery r
        WHERE r.state<>ALL($3::text[])
          AND NOT (r.state='ENTRY_FUNDED_NOT_OPEN' AND EXISTS(
-           SELECT 1 FROM execution.execution_journal funding
-           WHERE funding.plan_id=r.plan_id
-             AND funding.signature=r.funding_signature
-             AND funding.state='CONFIRMED'
+           SELECT 1
+           FROM execution.submission_attempts funding_attempt
+           JOIN execution.confirmations funding_confirmation
+             ON funding_confirmation.attempt_id=funding_attempt.attempt_id
+            AND funding_confirmation.signature=r.funding_signature
+            AND funding_confirmation.status IN ('CONFIRMED','FINALIZED')
+            AND funding_confirmation.error IS NULL
+           WHERE funding_attempt.transaction_id=r.funding_transaction_id
+             AND funding_attempt.signature=r.funding_signature
          ))) AS partial_entry_count,
       (SELECT count(*)::int FROM operations.phase7_incident_states WHERE status IN ('OPEN','ACKNOWLEDGED')) AS incident_count,
       (SELECT status FROM execution.phase7_telegram_alert_outbox ORDER BY updated_at DESC LIMIT 1) AS telegram_status,

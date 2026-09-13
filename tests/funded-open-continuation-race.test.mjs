@@ -44,6 +44,17 @@ test('P7 emits a continuation only for confirmed, unexpired, non-conflicting sam
  assert.equal(expired[0].allowed,false);assert.ok(expired[0].reasonCodes.includes('P7_FUNDED_OPEN_CONTINUATION_EXPIRED'));
 });
 
+test('a second funded plan is an unrelated continuation conflict, but canonical funding remains immutable',()=>{
+ const row={plan_id:'plan-funded',owner_address:'owner',pool_address:'pool',token_mint:'mint',funding_signature:'funding-signature',intended_capital_lamports:'30000000',funded_at:fundedAt,intended_range:{lowerBinId:-667,upperBinId:-595},payload:{},plan_state:'RECOVERING',funding_confirmed:true,position_open:false};
+ const conflict=deriveFundedOpenContinuationControlFacts({rows:[row,{...row,plan_id:'plan-other',funding_signature:'other-signature'}],now,deadlineSeconds:60,baseControlAllowsContinuation:true,recoveryQueueCount:0,unknownSubmissionCount:0,unresolvedReconciliationDebt:0,partialEntryRecoveryCount:0});
+ assert.ok(conflict.every(value=>value.reasonCodes.includes('P7_FUNDED_OPEN_UNRELATED_RECOVERY_PENDING')));
+ const db=fs.readFileSync('packages/db/src/index.ts','utf8'),terminal=fs.readFileSync('apps/terminal/src/main.ts','utf8');
+ for(const source of [db,terminal]){
+   assert.match(source,/funding_attempt\.transaction_id=r\.funding_transaction_id/);
+   assert.match(source,/funding_confirmation\.status IN \('CONFIRMED','FINALIZED'\)/);
+ }
+});
+
 test('a funded continuation blocks unrelated new entries without becoming generic recovery debt',()=>{
  const clean={recoveryQueueCount:0,unknownSubmissionCount:0,unresolvedReconciliationDebt:0,partialEntryRecoveryCount:0,fundedOpenContinuations:[]};
  assert.equal(phase7RecoveryBlocksNewEntries(clean),false);
