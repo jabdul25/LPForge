@@ -42,6 +42,8 @@ test('P7 emits a continuation only for confirmed, unexpired, non-conflicting sam
  assert.equal(debt[0].allowed,false);assert.ok(debt[0].reasonCodes.includes('P7_FUNDED_OPEN_UNRELATED_RECOVERY_PENDING'));
  const expired=deriveFundedOpenContinuationControlFacts({rows:[row],now:'2026-09-13T05:23:10.000Z',deadlineSeconds:60,baseControlAllowsContinuation:true,recoveryQueueCount:0,unknownSubmissionCount:0,unresolvedReconciliationDebt:0,partialEntryRecoveryCount:0});
  assert.equal(expired[0].allowed,false);assert.ok(expired[0].reasonCodes.includes('P7_FUNDED_OPEN_CONTINUATION_EXPIRED'));
+ const unresolvedOpen=deriveFundedOpenContinuationControlFacts({rows:[{...row,open_submission_unresolved:true}],now,deadlineSeconds:60,baseControlAllowsContinuation:true,recoveryQueueCount:0,unknownSubmissionCount:0,unresolvedReconciliationDebt:0,partialEntryRecoveryCount:0});
+ assert.equal(unresolvedOpen[0].allowed,false);assert.ok(unresolvedOpen[0].reasonCodes.includes('P7_FUNDED_OPEN_SUBMISSION_UNRESOLVED'));
 });
 
 test('a second funded plan is an unrelated continuation conflict, but canonical funding remains immutable',()=>{
@@ -53,6 +55,8 @@ test('a second funded plan is an unrelated continuation conflict, but canonical 
    assert.match(source,/funding_attempt\.transaction_id=r\.funding_transaction_id/);
    assert.match(source,/funding_confirmation\.status IN \('CONFIRMED','FINALIZED'\)/);
  }
+ assert.match(db,/opening\.kind IN \('METEORA_OPEN','METEORA_OPEN_CHUNK'\)/);
+ assert.match(db,/open_submission_unresolved/);
 });
 
 test('a funded continuation blocks unrelated new entries without becoming generic recovery debt',()=>{

@@ -5700,6 +5700,24 @@ return 'APPLIED';
                         AND funding_attempt.signature=r.funding_signature
                     ) AS funding_confirmed,
                     EXISTS(
+                      -- A known LP-open child is never replaced while its
+                      -- exact chain truth is unresolved. This protects the
+                      -- no-duplicate-open invariant independently of the
+                      -- funding continuation authority.
+                      SELECT 1
+                      FROM execution.transaction_steps opening
+                      JOIN execution.submission_attempts opening_attempt
+                        ON opening_attempt.transaction_id=opening.transaction_id
+                      WHERE opening.plan_id=r.plan_id
+                        AND opening.kind IN ('METEORA_OPEN','METEORA_OPEN_CHUNK')
+                        AND opening_attempt.state IN ('PREPARED','SENT','UNKNOWN')
+                        AND NOT EXISTS(
+                          SELECT 1 FROM execution.confirmations opening_confirmation
+                          WHERE opening_confirmation.attempt_id=opening_attempt.attempt_id
+                            AND opening_confirmation.status IN ('CONFIRMED','FINALIZED','FAILED','EXPIRED')
+                        )
+                    ) AS open_submission_unresolved,
+                    EXISTS(
                       SELECT 1 FROM execution.owned_positions o
                       WHERE o.entry_plan_id=r.plan_id
                         AND o.owner_address=r.owner_address

@@ -37,6 +37,11 @@ is no longer counted as generic partial-entry recovery debt.  Separate recovery
 debt, unknown submissions, reconciliation debt, and a second funded plan still
 deny continuation.
 
+An already-submitted LP-open child with unresolved exact chain truth also denies
+continuation.  Its original signature must become terminally confirmed, failed,
+or expired before P6 can take any next recovery action; P6 never constructs a
+replacement LP-open while that first child is unresolved.
+
 ## Safety invariants retained
 
 - P7 still blocks all unrelated new entries while any funded continuation is
