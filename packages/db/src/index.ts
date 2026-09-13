@@ -1496,6 +1496,9 @@ export interface Phase1Store {
     updatedAt: string;
   }): Promise<void>;
   loadPartialEntryRecoveries(): Promise<Record<string, unknown>[]>;
+  /** Session-scoped, plan-specific recovery serialization. Process death releases it. */
+  tryClaimFundedOpenContinuation(planId: string): Promise<boolean>;
+  releaseFundedOpenContinuation(planId: string): Promise<void>;
   /** Direct lookup is needed only for close-time attribution of a terminal
    * OPEN_RECOVERED row; the recurring entry-recovery queue intentionally
    * excludes that terminal state. */
@@ -1943,6 +1946,8 @@ export interface Phase1Store {
     unresolvedReconciliationDebt: number;
     supersededReconciliationHistoryCount: number;
     partialEntryRecoveryCount: number;
+    /** Candidate same-plan continuations; P7 applies control safety before emitting authority. */
+    fundedOpenContinuations: Array<Record<string, unknown>>;
   }>;
   loadPhase7EvidenceFacts(runtimeId: string): Promise<{
     latestHealthStatus?: string;
@@ -4602,6 +4607,13 @@ return 'APPLIED';
       );
       return r.rows;
     },
+    async tryClaimFundedOpenContinuation(planId) {
+      const r=await db.query("SELECT pg_try_advisory_lock(hashtext($1)) AS acquired",[`lpforge:funded-open-continuation:${planId}`]);
+      return r.rows[0]?.acquired===true;
+    },
+    async releaseFundedOpenContinuation(planId) {
+      await db.query("SELECT pg_advisory_unlock(hashtext($1))",[`lpforge:funded-open-continuation:${planId}`]);
+    },
     async loadPartialEntryRecovery(planId) {
       const r = await db.query(
         `SELECT * FROM execution.partial_entry_recovery WHERE plan_id=$1`,
@@ -5580,7 +5592,7 @@ return 'APPLIED';
       };
     },
     async loadPhase7RecoveryFacts(runtimeId) {
-      const [cycles, actions, queue, unknown, recon, partial] =
+      const [cycles, actions, queue, unknown, recon, partial, continuations] =
         await Promise.all([
           db.query(
             `SELECT cycle_key FROM operations.phase7_runtime_cycles WHERE runtime_id=$1 ORDER BY observed_at DESC LIMIT 500`,
@@ -5602,6 +5614,19 @@ return 'APPLIED';
                       SELECT 1 FROM execution.partial_entry_recovery r
                       WHERE r.plan_id=p.plan_id
                         AND r.state='ABORTED_SOL_SETTLED'
+                    )
+                    -- A confirmed funding child represented by the durable
+                    -- provisional row is tracked separately below. It still
+                    -- blocks unrelated entries, but is not generic recovery
+                    -- debt for its exact same-plan LP-open continuation.
+                    AND NOT EXISTS (
+                      SELECT 1 FROM execution.partial_entry_recovery r
+                      JOIN execution.execution_journal funding
+                        ON funding.plan_id=r.plan_id
+                       AND funding.signature=r.funding_signature
+                       AND funding.state='CONFIRMED'
+                      WHERE r.plan_id=p.plan_id
+                        AND r.state='ENTRY_FUNDED_NOT_OPEN'
                     ))`,
           ),
           db.query(
@@ -5611,7 +5636,38 @@ return 'APPLIED';
             phase7ReconciliationDebtQuery,
           ),
           db.query(
-            `SELECT count(*)::int AS n FROM execution.partial_entry_recovery WHERE state NOT IN ('RESOLVED','OPEN_RECOVERED','SUPERSEDED_BY_SUCCESSFUL_ENTRY','ABORTED_SOL_SETTLED')`,
+            `SELECT count(*)::int AS n
+             FROM execution.partial_entry_recovery r
+             WHERE r.state NOT IN ('RESOLVED','OPEN_RECOVERED','SUPERSEDED_BY_SUCCESSFUL_ENTRY','ABORTED_SOL_SETTLED')
+               AND NOT (r.state='ENTRY_FUNDED_NOT_OPEN' AND EXISTS(
+                 SELECT 1 FROM execution.execution_journal funding
+                 WHERE funding.plan_id=r.plan_id
+                   AND funding.signature=r.funding_signature
+                   AND funding.state='CONFIRMED'
+               ))`,
+          ),
+          db.query(
+            `SELECT r.plan_id,r.pool_address,r.owner_address,r.token_mint,r.funding_signature,
+                    r.funded_at,r.intended_capital_lamports,r.intended_range,r.payload,
+                    p.state AS plan_state,p.expires_at,
+                    EXISTS(
+                      SELECT 1 FROM execution.execution_journal funding
+                      WHERE funding.plan_id=r.plan_id
+                        AND funding.signature=r.funding_signature
+                        AND funding.state='CONFIRMED'
+                    ) AS funding_confirmed,
+                    EXISTS(
+                      SELECT 1 FROM execution.owned_positions o
+                      WHERE o.entry_plan_id=r.plan_id
+                        AND o.owner_address=r.owner_address
+                        AND o.pool_address=r.pool_address
+                        AND o.lifecycle_state='OPEN'
+                        AND o.reconciliation_status='MATCH'
+                    ) AS position_open
+             FROM execution.partial_entry_recovery r
+             JOIN execution.transaction_plans p ON p.plan_id=r.plan_id
+             WHERE r.state='ENTRY_FUNDED_NOT_OPEN'
+             ORDER BY r.funded_at ASC,r.plan_id ASC`,
           ),
         ]);
       return {
@@ -5624,6 +5680,7 @@ return 'APPLIED';
         unresolvedReconciliationDebt: Number(recon.rows[0]?.blocking_debt ?? 0),
         supersededReconciliationHistoryCount: Number(recon.rows[0]?.superseded_history ?? 0),
         partialEntryRecoveryCount: Number(partial.rows[0]?.n ?? 0),
+        fundedOpenContinuations: continuations.rows,
       };
     },
     async loadPhase7EvidenceFacts(runtimeId) {
@@ -5925,6 +5982,8 @@ export function createMemoryStore(): Phase1Store {
     async loadPartialEntryRecoveries() {
       return [];
     },
+    async tryClaimFundedOpenContinuation() { return true; },
+    async releaseFundedOpenContinuation() {},
     async loadPartialEntryRecovery() { return undefined; },
     async supersedePartialEntryRecoveryIfSuccessfulOpen() { return false; },
     async upsertOpenChunkDisposition() {},
@@ -6060,6 +6119,7 @@ export function createMemoryStore(): Phase1Store {
         unresolvedReconciliationDebt: 0,
         supersededReconciliationHistoryCount: 0,
         partialEntryRecoveryCount: 0,
+        fundedOpenContinuations: [],
       };
     },
     async loadPhase7EvidenceFacts() {

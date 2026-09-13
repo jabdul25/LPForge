@@ -344,11 +344,35 @@ async function loadHealth(pool: Pool, runtimeId: string, rpcKeys: { production?:
       (SELECT safety_mode FROM operations.phase7_control_decisions WHERE runtime_id=$1 ORDER BY observed_at DESC LIMIT 1) AS safety_mode,
       (SELECT daemon_plan FROM operations.phase7_control_decisions WHERE runtime_id=$1 ORDER BY observed_at DESC LIMIT 1) AS daemon_plan,
       (SELECT new_economic_action_allowed FROM operations.phase7_control_decisions WHERE runtime_id=$1 ORDER BY observed_at DESC LIMIT 1) AS new_economic_action_allowed,
-      (SELECT count(*)::int FROM execution.execution_journal WHERE state IN ('SIGNED','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILIATION_REQUIRED')) AS recovery_queue,
+      (SELECT count(*)::int
+       FROM execution.transaction_plans p
+       LEFT JOIN execution.execution_journal j ON j.plan_id=p.plan_id
+       WHERE p.state IN ('RECOVERING','RECONCILIATION_REQUIRED')
+          OR (j.state IN ('SIGNED','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED')
+              AND NOT EXISTS (
+                SELECT 1 FROM execution.partial_entry_recovery r
+                WHERE r.plan_id=p.plan_id AND r.state='ABORTED_SOL_SETTLED'
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM execution.partial_entry_recovery r
+                JOIN execution.execution_journal funding
+                  ON funding.plan_id=r.plan_id
+                 AND funding.signature=r.funding_signature
+                 AND funding.state='CONFIRMED'
+                WHERE r.plan_id=p.plan_id AND r.state='ENTRY_FUNDED_NOT_OPEN'
+              ))) AS recovery_queue,
       (SELECT count(*)::int FROM execution.execution_journal WHERE state='UNKNOWN_SUBMISSION') AS unknown_journal,
       (SELECT max(updated_at) FROM execution.execution_journal WHERE state IN ('SIGNED','SUBMITTED','UNKNOWN_SUBMISSION','CONFIRMED','RECONCILIATION_REQUIRED')) AS p6_observed_at,
       (SELECT count(*)::int FROM execution.transaction_plans WHERE state=ANY($2::text[])) AS active_plans,
-      (SELECT count(*)::int FROM execution.partial_entry_recovery WHERE state<>ALL($3::text[])) AS partial_entry_count,
+      (SELECT count(*)::int
+       FROM execution.partial_entry_recovery r
+       WHERE r.state<>ALL($3::text[])
+         AND NOT (r.state='ENTRY_FUNDED_NOT_OPEN' AND EXISTS(
+           SELECT 1 FROM execution.execution_journal funding
+           WHERE funding.plan_id=r.plan_id
+             AND funding.signature=r.funding_signature
+             AND funding.state='CONFIRMED'
+         ))) AS partial_entry_count,
       (SELECT count(*)::int FROM operations.phase7_incident_states WHERE status IN ('OPEN','ACKNOWLEDGED')) AS incident_count,
       (SELECT status FROM execution.phase7_telegram_alert_outbox ORDER BY updated_at DESC LIMIT 1) AS telegram_status,
       (SELECT observed_at FROM execution.phase7_telegram_alert_outbox ORDER BY updated_at DESC LIMIT 1) AS telegram_observed_at,

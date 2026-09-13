@@ -66,7 +66,7 @@ import {
   loadAutonomousEntryPolicy,
   readJupiterMetisQuote,
 } from "../../phase6-swap-quote/src/index.js";
-import { P6_CURRENT_CONTROL_MAX_AGE_MS, phase7ExecutionControlFromRow, validateFreshOpenPhase7Safety } from "../../phase6-claim-guard/src/index.js";
+import { P6_CURRENT_CONTROL_MAX_AGE_MS, phase7ExecutionControlFromRow, validateFreshFundedOpenContinuation, validateFreshOpenPhase7Safety, type FundedOpenContinuationIdentity } from "../../phase6-claim-guard/src/index.js";
 import { createGovernedConnection, createMeteoraReadAdapter, type MeteoraReadAdapter } from "../../meteora/src/index.js";
 import { createMeteoraDataApi } from "../../data-api/src/index.js";
 import type { ControlledCanaryDeploymentPolicy } from "../../deployment-policy/src/index.js";
@@ -113,6 +113,8 @@ export interface LiveWorkerConfig {
   maxFeeFraction: number;
   simulationFreshnessMs: number;
   riskPermitTtlMs: number;
+  /** Policy-bounded duration measured from canonical funding confirmation. */
+  fundedOpenContinuationDeadlineSeconds?: number;
   /** Final, fresh chain-state guard; values come from deployment config. */
   maxPresignActiveBinDriftBins: number;
   maxPresignReferenceDivergenceBps: number;
@@ -264,6 +266,7 @@ type EntryFundingMeasurement={
   pairedTokenRawBeforeFunding:bigint;
   pairedTokenRawBeforeOpen:bigint;
   fundingSignature:string;
+  fundedAt:string;
 };
 /**
  * Persists one immutable entry-basis version after a confirmed OPEN.  Every
@@ -397,7 +400,7 @@ function nestedGeneratedPositionAddress(value:unknown):string|undefined{
  if(!value||typeof value!=="object")return undefined;
  const row=value as Record<string,unknown>,direct=row.generatedPositionAddress??row.positionAddress;
  if(typeof direct==='string'&&direct.trim())return direct;
- for(const key of ["autonomous_dispatch","open","prepared","payload","metadata"]){const found=nestedGeneratedPositionAddress(row[key]);if(found)return found;}
+ for(const key of ["autonomous_dispatch","open","prepared","payload","metadata","fundedOpenContinuation"]){const found=nestedGeneratedPositionAddress(row[key]);if(found)return found;}
  return undefined;
 }
 function planFields(plan: AutonomousOpenPlan) {
@@ -411,6 +414,20 @@ function planFields(plan: AutonomousOpenPlan) {
   if (capital <= 0n || !Number.isInteger(lower) || !Number.isInteger(upper)||!Number.isInteger(plannedActiveBinId)||!Number.isInteger(binStep)||binStep<=0)
     throw new Error("LPFORGE_P6_PLAN_FIELDS_INVALID");
   return { capital, lower, upper, plannedActiveBinId, binStep };
+}
+function fundedOpenContinuationDeadlineSeconds(config:Pick<LiveWorkerConfig,'fundedOpenContinuationDeadlineSeconds'>):number{
+ const raw=config.fundedOpenContinuationDeadlineSeconds;
+ if(raw===undefined||!Number.isInteger(raw)||raw<15||raw>120)throw new Error('LPFORGE_P6_FUNDED_OPEN_CONTINUATION_POLICY_INVALID');
+ const value=raw;
+ return value;
+}
+function fundedOpenContinuationIdentity(input:{plan:AutonomousOpenPlan;fields:ReturnType<typeof planFields>;funding:EntryFundingMeasurement;positionAddress?:string;config:Pick<LiveWorkerConfig,'fundedOpenContinuationDeadlineSeconds'>}):FundedOpenContinuationIdentity{
+ const deadlineSeconds=fundedOpenContinuationDeadlineSeconds(input.config),fundedAt=new Date(input.funding.fundedAt).toISOString();
+ return{planId:input.plan.planId,ownerAddress:input.plan.ownerAddress,poolAddress:input.plan.poolAddress,tokenMint:input.funding.tokenMint,fundingSignature:input.funding.fundingSignature,capitalLamports:input.fields.capital,lowerBinId:input.fields.lower,upperBinId:input.fields.upper,fundedAt,expiresAt:new Date(Date.parse(fundedAt)+deadlineSeconds*1_000).toISOString(),...(input.positionAddress?{generatedPositionAddress:input.positionAddress}:{})};
+}
+function fundedOpenContinuationIdentityFromRecovery(input:{row:Record<string,unknown>;plan:AutonomousOpenPlan;fields:ReturnType<typeof planFields>;config:Pick<LiveWorkerConfig,'fundedOpenContinuationDeadlineSeconds'>}):FundedOpenContinuationIdentity{
+ const payload=input.row.payload&&typeof input.row.payload==='object'?input.row.payload as Record<string,unknown>:{},saved=payload.fundedOpenContinuation&&typeof payload.fundedOpenContinuation==='object'?payload.fundedOpenContinuation as Record<string,unknown>:{},fundedAt=new Date(String(input.row.funded_at)).toISOString(),expiresAt=new Date(Date.parse(fundedAt)+fundedOpenContinuationDeadlineSeconds(input.config)*1_000).toISOString(),positionAddress=typeof saved.generatedPositionAddress==='string'&&saved.generatedPositionAddress.trim()?saved.generatedPositionAddress.trim():undefined;
+ return{planId:input.plan.planId,ownerAddress:input.plan.ownerAddress,poolAddress:input.plan.poolAddress,tokenMint:String(input.row.token_mint),fundingSignature:String(input.row.funding_signature),capitalLamports:input.fields.capital,lowerBinId:input.fields.lower,upperBinId:input.fields.upper,fundedAt,expiresAt,...(positionAddress?{generatedPositionAddress:positionAddress}:{})};
 }
 export function assertControlledCanaryOpen(config:LiveWorkerConfig,capital:bigint):void{
   const canary=config.controlledCanary;
@@ -680,14 +697,14 @@ async function requeueUnsignedStaleControlOpen(input:{store:Phase1Store;plan:Aut
   await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'PLANNED',at:new Date().toISOString(),reasonCodes:[retryCode],payload:{stage:input.stage,retryDisposition:'AWAIT_FRESH_P7_CONTROL',priorReason:input.reason,noChainEffect:true}});
   return{status:'AWAITING_FRESH_P7_CONTROL',planId:input.plan.planId,reasonCodes:[reasonCode],transactionSubmitted:false};
 }
-export async function loadFreshExecutionSafetyFacts(input:{store:Pick<Phase1Store,'loadLatestPhase7ControlDecision'|'loadPhase7ControlDecision'|'loadPhase7PortfolioFacts'>;plan:AutonomousOpenPlan;config:Pick<LiveWorkerConfig,'rpcUrl'|'programId'|'maxOpenPositions'|'controlledCanary'>;connection?:Pick<Connection,'getLatestBlockhash'>;now?:string;phase7RuntimeId?:string;protocolCompatibility?:()=>Promise<boolean>;staleControlReloadDelayMs?:number;preFundingControlFreshnessBudgetMs?:number}):Promise<FreshExecutionSafetyFacts>{
+export async function loadFreshExecutionSafetyFacts(input:{store:Pick<Phase1Store,'loadLatestPhase7ControlDecision'|'loadPhase7ControlDecision'|'loadPhase7PortfolioFacts'>;plan:AutonomousOpenPlan;config:Pick<LiveWorkerConfig,'rpcUrl'|'programId'|'maxOpenPositions'|'controlledCanary'>;connection?:Pick<Connection,'getLatestBlockhash'>;now?:string;phase7RuntimeId?:string;protocolCompatibility?:()=>Promise<boolean>;staleControlReloadDelayMs?:number;preFundingControlFreshnessBudgetMs?:number;fundedOpenContinuation?:FundedOpenContinuationIdentity}):Promise<FreshExecutionSafetyFacts>{
   const now=input.now??new Date().toISOString(),reasons:string[]=[],runtimeId=input.phase7RuntimeId??(process.env.LPFORGE_P7_RUNTIME_ID??'lpforge-production').trim(),provenance=planRecord(input.plan.planPayload.provenance),binding=planRecord(provenance.phase7Control),boundDecisionId=String(binding.decisionId??'');
   let portfolio:Awaited<ReturnType<Phase1Store['loadPhase7PortfolioFacts']>>|undefined,current;
   try{
     const readPhase7=async(at:string)=>{
       const [currentRow,boundRow,facts]=await Promise.all([input.store.loadLatestPhase7ControlDecision(runtimeId),boundDecisionId?input.store.loadPhase7ControlDecision(runtimeId,boundDecisionId):Promise.resolve(undefined),input.store.loadPhase7PortfolioFacts(input.plan.ownerAddress)]);
       const fresh=phase7ExecutionControlFromRow(currentRow),bound=phase7ExecutionControlFromRow(boundRow);
-      const reasonCodes=validateFreshOpenPhase7Safety({plan:input.plan as unknown as AutonomousPlan,current:fresh,bound,now:at,controlledCanary:controlledCanaryAuthorization(input.plan),maxConcurrentPositions:input.config.maxOpenPositions});
+      const reasonCodes=input.fundedOpenContinuation?validateFreshFundedOpenContinuation({current:fresh,identity:input.fundedOpenContinuation,now:at}):validateFreshOpenPhase7Safety({plan:input.plan as unknown as AutonomousPlan,current:fresh,bound,now:at,controlledCanary:controlledCanaryAuthorization(input.plan),maxConcurrentPositions:input.config.maxOpenPositions});
       const budget=Math.max(0,Math.floor(input.preFundingControlFreshnessBudgetMs??0));
       if(reasonCodes.length===0&&budget>0&&p7ControlFreshnessBudgetInsufficient({observedAt:fresh?.observedAt,now:at,budgetMs:budget}))reasonCodes.push('P6_CLAIM_P7_CONTROL_FRESHNESS_BUDGET_INSUFFICIENT');
       return{current:fresh,portfolio:facts,reasonCodes};
@@ -704,23 +721,27 @@ export async function loadFreshExecutionSafetyFacts(input:{store:Pick<Phase1Stor
   }catch{reasons.push('P6_FRESH_EXECUTION_SAFETY_P7_OR_PORTFOLIO_UNAVAILABLE');}
   const portfolioTruth=portfolio===undefined?undefined:assessFreshOpenPortfolioTruth({...portfolio,maxOpenPositions:input.config.maxOpenPositions});
   const portfolioClean=portfolioTruth?.clean===true;
-  if(!portfolioClean)reasons.push("P6_FRESH_EXECUTION_PORTFOLIO_NOT_CLEAN",...(portfolioTruth?.reasonCodes??[]));
+  // P7's exact continuation fact already proves the expected funded inventory
+  // for this same plan.  It may therefore be temporarily non-clean under the
+  // generic new-entry portfolio rule without authorizing another entry.
+  const continuationPortfolioException=Boolean(input.fundedOpenContinuation)&&!reasons.some(code=>code.startsWith('P6_CLAIM_P7_'));
+  if(!portfolioClean&&!continuationPortfolioException)reasons.push("P6_FRESH_EXECUTION_PORTFOLIO_NOT_CLEAN",...(portfolioTruth?.reasonCodes??[]));
   let rpcHealthy=false;
   try{const connection=input.connection??createGovernedConnection({rpcUrl:input.config.rpcUrl,priority:'P0_EXECUTION_CRITICAL'});await connection.getLatestBlockhash('confirmed');rpcHealthy=true;}catch{reasons.push('P6_FRESH_EXECUTION_RPC_UNHEALTHY');}
   let protocolCompatible=false;
   try{protocolCompatible=input.protocolCompatibility?await input.protocolCompatibility():(await createMeteoraReadAdapter({rpcUrl:input.config.rpcUrl,cluster:'mainnet-beta',programId:input.config.programId,priority:'P0_EXECUTION_CRITICAL'}).verifyCompatibility(input.plan.poolAddress)).state==='VERIFIED';if(!protocolCompatible)reasons.push('P6_FRESH_EXECUTION_PROTOCOL_INCOMPATIBLE');}catch{reasons.push('P6_FRESH_EXECUTION_PROTOCOL_UNAVAILABLE');}
-  return{walletTruthConsistent:portfolioClean,protocolCompatible,rpcHealthy,reconciliationRequired:!portfolioClean,globalKillSwitch:reasons.some(code=>code.startsWith('P6_CANARY_')||code.startsWith('P6_CLAIM_P7_')),reasonCodes:[...new Set(reasons)].sort()};
+  return{walletTruthConsistent:portfolioClean||continuationPortfolioException,protocolCompatible,rpcHealthy,reconciliationRequired:!portfolioClean&&!continuationPortfolioException,globalKillSwitch:reasons.some(code=>code.startsWith('P6_CANARY_')||code.startsWith('P6_CLAIM_P7_')),reasonCodes:[...new Set(reasons)].sort()};
 }
 /** Lightweight check after local signing and before transmission. It deliberately
  * avoids market re-simulation while still rejecting a new hard revocation. */
-export async function checkFreshOpenSubmissionSafety(input:{store:Pick<Phase1Store,'loadLatestPhase7ControlDecision'|'loadPhase7ControlDecision'|'loadPhase7PortfolioFacts'>;plan:AutonomousOpenPlan;config:Pick<LiveWorkerConfig,'maxOpenPositions'|'controlledCanary'>;permitExpiresAt:string;now?:string;phase7RuntimeId?:string}):Promise<{approved:boolean;reasonCodes:string[]}>{
+export async function checkFreshOpenSubmissionSafety(input:{store:Pick<Phase1Store,'loadLatestPhase7ControlDecision'|'loadPhase7ControlDecision'|'loadPhase7PortfolioFacts'>;plan:AutonomousOpenPlan;config:Pick<LiveWorkerConfig,'maxOpenPositions'|'controlledCanary'>;permitExpiresAt:string;now?:string;phase7RuntimeId?:string;fundedOpenContinuation?:FundedOpenContinuationIdentity}):Promise<{approved:boolean;reasonCodes:string[]}>{
   const now=input.now??new Date().toISOString(),reasons:string[]=[],runtimeId=input.phase7RuntimeId??(process.env.LPFORGE_P7_RUNTIME_ID??'lpforge-production').trim(),provenance=planRecord(input.plan.planPayload.provenance),binding=planRecord(provenance.phase7Control),boundDecisionId=String(binding.decisionId??'');
   if(!Number.isFinite(Date.parse(input.permitExpiresAt))||Date.parse(input.permitExpiresAt)<=Date.parse(now))reasons.push('P6_PRESUBMISSION_RISK_PERMIT_EXPIRED');
-  try{const [currentRow,boundRow,portfolio]=await Promise.all([input.store.loadLatestPhase7ControlDecision(runtimeId),boundDecisionId?input.store.loadPhase7ControlDecision(runtimeId,boundDecisionId):Promise.resolve(undefined),input.store.loadPhase7PortfolioFacts(input.plan.ownerAddress)]);reasons.push(...validateFreshOpenPhase7Safety({plan:input.plan as unknown as AutonomousPlan,current:phase7ExecutionControlFromRow(currentRow),bound:phase7ExecutionControlFromRow(boundRow),now,controlledCanary:controlledCanaryAuthorization(input.plan),maxConcurrentPositions:input.config.maxOpenPositions}));if(!assessFreshOpenPortfolioTruth({...portfolio,maxOpenPositions:input.config.maxOpenPositions}).clean)reasons.push("P6_PRESUBMISSION_RECONCILIATION_OR_PORTFOLIO_BLOCK");}catch{reasons.push("P6_PRESUBMISSION_SAFETY_UNAVAILABLE");}
+  try{const [currentRow,boundRow,portfolio]=await Promise.all([input.store.loadLatestPhase7ControlDecision(runtimeId),boundDecisionId?input.store.loadPhase7ControlDecision(runtimeId,boundDecisionId):Promise.resolve(undefined),input.store.loadPhase7PortfolioFacts(input.plan.ownerAddress)]),current=phase7ExecutionControlFromRow(currentRow),p7Reasons=input.fundedOpenContinuation?validateFreshFundedOpenContinuation({current,identity:input.fundedOpenContinuation,now}):validateFreshOpenPhase7Safety({plan:input.plan as unknown as AutonomousPlan,current,bound:phase7ExecutionControlFromRow(boundRow),now,controlledCanary:controlledCanaryAuthorization(input.plan),maxConcurrentPositions:input.config.maxOpenPositions});reasons.push(...p7Reasons);if(!assessFreshOpenPortfolioTruth({...portfolio,maxOpenPositions:input.config.maxOpenPositions}).clean&&!(input.fundedOpenContinuation&&p7Reasons.length===0))reasons.push("P6_PRESUBMISSION_RECONCILIATION_OR_PORTFOLIO_BLOCK");}catch{reasons.push("P6_PRESUBMISSION_SAFETY_UNAVAILABLE");}
   return{approved:reasons.length===0,reasonCodes:[...new Set(reasons)].sort()};
 }
-async function governFreshOpenRisk(input:{store:Pick<Phase1Store,'loadLatestPhase7ControlDecision'|'loadPhase7ControlDecision'|'loadPhase7PortfolioFacts'>;plan:AutonomousOpenPlan;config:LiveWorkerConfig;connection?:Pick<Connection,'getLatestBlockhash'>;simulation:{ok:boolean;simulationFreshUntil:string};costApproved:boolean;fields:ReturnType<typeof planFields>;preFundingControlFreshnessBudgetMs?:number}):Promise<ReturnType<typeof governExecutionRisk>>{
-  const [market,safety]=await Promise.all([readOpenPresignMarketFacts({rpcUrl:input.config.rpcUrl,programId:input.config.programId,poolAddress:input.plan.poolAddress,plannedActiveBinId:input.fields.plannedActiveBinId,plannedBinStep:input.fields.binStep,lowerBinId:input.fields.lower,upperBinId:input.fields.upper}),loadFreshExecutionSafetyFacts({store:input.store,plan:input.plan,config:input.config,...(input.connection?{connection:input.connection}:{}),...(input.preFundingControlFreshnessBudgetMs!==undefined?{preFundingControlFreshnessBudgetMs:input.preFundingControlFreshnessBudgetMs}:{})})]);
+async function governFreshOpenRisk(input:{store:Pick<Phase1Store,'loadLatestPhase7ControlDecision'|'loadPhase7ControlDecision'|'loadPhase7PortfolioFacts'>;plan:AutonomousOpenPlan;config:LiveWorkerConfig;connection?:Pick<Connection,'getLatestBlockhash'>;simulation:{ok:boolean;simulationFreshUntil:string};costApproved:boolean;fields:ReturnType<typeof planFields>;preFundingControlFreshnessBudgetMs?:number;fundedOpenContinuation?:FundedOpenContinuationIdentity}):Promise<ReturnType<typeof governExecutionRisk>>{
+  const [market,safety]=await Promise.all([readOpenPresignMarketFacts({rpcUrl:input.config.rpcUrl,programId:input.config.programId,poolAddress:input.plan.poolAddress,plannedActiveBinId:input.fields.plannedActiveBinId,plannedBinStep:input.fields.binStep,lowerBinId:input.fields.lower,upperBinId:input.fields.upper}),loadFreshExecutionSafetyFacts({store:input.store,plan:input.plan,config:input.config,...(input.connection?{connection:input.connection}:{}),...(input.preFundingControlFreshnessBudgetMs!==undefined?{preFundingControlFreshnessBudgetMs:input.preFundingControlFreshnessBudgetMs}:{}),...(input.fundedOpenContinuation?{fundedOpenContinuation:input.fundedOpenContinuation}:{})})]);
   const risk=governExecutionRisk({action:'OPEN',planId:input.plan.planId,now:new Date().toISOString(),thesisExpiresAt:input.plan.expiresAt,planExpiresAt:input.plan.expiresAt,simulationOk:input.simulation.ok,simulationFreshUntil:input.simulation.simulationFreshUntil,walletTruthConsistent:safety.walletTruthConsistent,protocolCompatible:safety.protocolCompatible,rpcHealthy:safety.rpcHealthy,referenceDivergenceBps:market.referenceDivergenceBps,activeBinId:market.activeBinId,intendedCenterBinId:input.fields.plannedActiveBinId,costApproved:input.costApproved,reconciliationRequired:safety.reconciliationRequired,globalKillSwitch:safety.globalKillSwitch,liquidityCollapse:market.outsidePlannedRange},{maxReferenceDivergenceBps:input.config.maxPresignReferenceDivergenceBps,maxActiveBinDriftBins:input.config.maxPresignActiveBinDriftBins,approvalTtlMs:input.config.riskPermitTtlMs,allowEmergencyCostOverride:false});
   return safety.reasonCodes.length?{...risk,reasonCodes:[...new Set([...risk.reasonCodes,...safety.reasonCodes])].sort()}:risk;
 }
@@ -1226,7 +1247,7 @@ async function executeRequiredJupiterSwap(input: {
  * A post-extension interruption is never retried blindly: the plan remains in
  * reconciliation-required state with its exact completed step/signature.
  */
-async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:AutonomousOpenPlan;signer:MainnetSignerBackend;config:LiveWorkerConfig;connection:Connection;pool:MeteoraOpenAddPoolLike;prepared:PreparedAutonomousOpen;fields:ReturnType<typeof planFields>;entryFundingMeasurement?:EntryFundingMeasurement}):Promise<LiveWorkerResult>{
+async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:AutonomousOpenPlan;signer:MainnetSignerBackend;config:LiveWorkerConfig;connection:Connection;pool:MeteoraOpenAddPoolLike;prepared:PreparedAutonomousOpen;fields:ReturnType<typeof planFields>;entryFundingMeasurement?:EntryFundingMeasurement;fundedOpenContinuation?:FundedOpenContinuationIdentity}):Promise<LiveWorkerResult>{
   let submittedAny=false,submissionStatusUnknown=false,lastSignature='',confirmedEntrySlot:bigint|undefined,completedSteps:Array<{transactionId:string;kind:string;signature:string;estimatedFeeLamports:bigint}>=[],currentStep:{transactionId:string;sequence:number;kind:string;lastValidBlockHeight?:bigint;signature?:string;submitted:boolean}|undefined,confirmedLiquiditySolAssetOut=0n;
   try{
     for(const [stepIndex,step] of input.prepared.steps.entries()){
@@ -1234,14 +1255,22 @@ async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:Auto
       await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'PENDING',observedAt:new Date().toISOString(),payload:{chunked:true,metadata:step.metadata}});
       const simulatedAt=new Date().toISOString(),simulation=await simulateExecutionTransaction({authority:authority('MAINNET_BUILD_SIMULATE',simulatedAt,input.config.riskPermitTtlMs),transactionId:step.transactionId,transaction:step.transaction,transport:createWeb3SimulationTransport(input.connection),simulatedAt,freshnessMs:input.config.simulationFreshnessMs});
       await input.store.insertExecutionSimulation({transactionId:step.transactionId,simulatedAt:simulation.simulatedAt,freshUntil:simulation.simulationFreshUntil,ok:simulation.ok,...(simulation.unitsConsumed!==undefined?{unitsConsumed:simulation.unitsConsumed}:{}),logs:simulation.logs,...(simulation.error?{error:simulation.error}:{}),payload:{planId:input.plan.planId,positionAddress:input.prepared.positionSigner.publicKeyAddress,operation:step.kind,chunked:true}});
-      const fee=estimateExecutionFee({signatureCount:step.requiredSignerAddresses.length,computeUnitLimit:simulation.recommendedComputeUnitLimit??0,computeUnitPriceMicroLamports:0n}),cost=assessExecutionCost(fee,input.fields.capital,{maxAbsoluteFeeLamports:input.config.maxFeeLamports,maxFeeFractionOfCapital:input.config.maxFeeFraction}),risk=await governFreshOpenRisk({store:input.store,plan:input.plan,config:input.config,connection:input.connection,simulation,costApproved:cost.approved,fields:input.fields});
-      if(risk.decision!=='APPROVE'||!risk.permitId||!risk.expiresAt)throw new Error(`LPFORGE_P6_CHUNK_SIMULATE_RISK:${risk.reasonCodes.join(',')}`);
+      const fee=estimateExecutionFee({signatureCount:step.requiredSignerAddresses.length,computeUnitLimit:simulation.recommendedComputeUnitLimit??0,computeUnitPriceMicroLamports:0n}),cost=assessExecutionCost(fee,input.fields.capital,{maxAbsoluteFeeLamports:input.config.maxFeeLamports,maxFeeFractionOfCapital:input.config.maxFeeFraction}),risk=await governFreshOpenRisk({store:input.store,plan:input.plan,config:input.config,connection:input.connection,simulation,costApproved:cost.approved,fields:input.fields,...(input.fundedOpenContinuation?{fundedOpenContinuation:input.fundedOpenContinuation}:{})});
+      if(risk.decision!=='APPROVE'||!risk.permitId||!risk.expiresAt){
+        if(input.entryFundingMeasurement&&input.fundedOpenContinuation){
+          const awaitContinuation=risk.reasonCodes.some(code=>code==='P6_CLAIM_P7_FUNDED_CONTINUATION_NOT_AUTHORIZED'||code==='P6_CLAIM_P7_CONTROL_STALE'),state=awaitContinuation?'ENTRY_FUNDED_NOT_OPEN' as const:'UNWIND_REQUIRED' as const,reasonCodes=awaitContinuation?['P6_FUNDED_OPEN_CONTINUATION_AWAITING_P7_AUTHORITY',...risk.reasonCodes]:['P6_FUNDED_OPEN_CONTINUATION_UNSAFE',...risk.reasonCodes];
+          await input.store.upsertPartialEntryRecovery({planId:input.plan.planId,poolAddress:input.plan.poolAddress,ownerAddress:input.plan.ownerAddress,tokenMint:input.entryFundingMeasurement.tokenMint,fundingTransactionId:input.plan.swapTransactionId??'P6_CHUNKABLE_OPEN',fundingSignature:input.entryFundingMeasurement.fundingSignature,fundedAt:input.entryFundingMeasurement.fundedAt,pairedTokenAmount:input.entryFundingMeasurement.pairedTokenReceivedRaw.toString(),intendedCapitalLamports:input.fields.capital,intendedRange:{lowerBinId:input.fields.lower,upperBinId:input.fields.upper},state,walletTruth:{refreshRequired:true},payload:{partialEntry:true,reasonCodes,fundedOpenContinuation:{...input.fundedOpenContinuation,reasonCodes}},updatedAt:new Date().toISOString()});
+          await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECOVERING',at:new Date().toISOString(),reasonCodes,payload:{stage:'FUNDED_OPEN_CONTINUATION_CHUNK',continuationState:state}});
+          return{status:'UNKNOWN',planId:input.plan.planId,reasonCodes,transactionSubmitted:true};
+        }
+        throw new Error(`LPFORGE_P6_CHUNK_SIMULATE_RISK:${risk.reasonCodes.join(',')}`);
+      }
       await input.store.insertExecutionRiskPermit({permitId:`${risk.permitId}:${step.transactionId}`,planId:input.plan.planId,decision:risk.decision,issuedAt:risk.issuedAt,expiresAt:risk.expiresAt,reasonCodes:risk.reasonCodes,payload:{autonomous:true,transactionId:step.transactionId,chunked:true,feeLamports:fee.totalFeeLamports.toString()}});
       const latest=await input.connection.getLatestBlockhash('confirmed');currentStep!.lastValidBlockHeight=BigInt(latest.lastValidBlockHeight);step.transaction.recentBlockhash=latest.blockhash;step.transaction.lastValidBlockHeight=latest.lastValidBlockHeight;step.transaction.feePayer=new PublicKey(input.plan.ownerAddress);const submittedAt=new Date().toISOString(),openTicket=ticket(input.plan as unknown as AutonomousPlan,input.fields.capital,submittedAt,input.config.riskPermitTtlMs,executionMaxOpenPositions(input.config),"OPEN"),openAuthority={phase:'P6' as const,cluster:'mainnet-beta' as const,level:'MAINNET_CANARY_OPEN' as const,liveExecution:true,canaryOnly:true,issuedAt:submittedAt,expiresAt:openTicket.expiresAt,ticketId:openTicket.ticketId,reasonCodes:['P6_AUTONOMOUS_CHUNK_FINAL_REVALIDATION',step.kind]};
       await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SIGNING',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata});
       const economicChunk=step.kind==='METEORA_OPEN'||step.kind==='METEORA_OPEN_CHUNK';
       await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'SIGNING',lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:submittedAt,payload:{chunked:true}});
-      const submitted=await executeMainnetCanaryOpen({authority:openAuthority,ticket:openTicket,transactionId:step.transactionId,idempotencyKey:`${input.plan.idempotencyKey}:${step.transactionId}`,requiredSignerAddresses:step.requiredSignerAddresses,backend:input.signer,auxiliaryBackends:auxiliaryPositionSignersForOpenStep(step,input.prepared.positionSigner),envelope:step.envelope,phase5RiskDecision:risk,lease:latest,ledger:ledger(input.store),transport:createWeb3SubmissionTransport(input.connection),submittedAt,beforeSubmit:async()=>{const finalSafety=await checkFreshOpenSubmissionSafety({store:input.store,plan:input.plan,config:input.config,permitExpiresAt:risk.expiresAt!});if(!finalSafety.approved)throw new Error("LPFORGE_P6_PRESUBMISSION_SAFETY_BLOCKED:"+finalSafety.reasonCodes.join(","));},onSigned:async({signerBackendId})=>{await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SIGNED',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata,signerBackendId});await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'SIGNED',lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true,signerBackendId}});},onSubmissionUnknown:async({error,signature})=>{submissionStatusUnknown=true;if(signature){lastSignature=signature;currentStep!.signature=signature;}currentStep!.submitted=true;await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'UNKNOWN_SUBMISSION',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata,error},signature);await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'UNKNOWN_SUBMISSION',...(signature?{signature}:{}),lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true,error}});}});submittedAny=true;currentStep!.signature=submitted.signature;currentStep!.submitted=true;lastSignature=submitted.signature;await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SUBMITTED',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata},submitted.signature);await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'SUBMITTED',signature:submitted.signature,lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true}});
+      const submitted=await executeMainnetCanaryOpen({authority:openAuthority,ticket:openTicket,transactionId:step.transactionId,idempotencyKey:`${input.plan.idempotencyKey}:${step.transactionId}`,requiredSignerAddresses:step.requiredSignerAddresses,backend:input.signer,auxiliaryBackends:auxiliaryPositionSignersForOpenStep(step,input.prepared.positionSigner),envelope:step.envelope,phase5RiskDecision:risk,lease:latest,ledger:ledger(input.store),transport:createWeb3SubmissionTransport(input.connection),submittedAt,beforeSubmit:async()=>{const finalSafety=await checkFreshOpenSubmissionSafety({store:input.store,plan:input.plan,config:input.config,permitExpiresAt:risk.expiresAt!,...(input.fundedOpenContinuation?{fundedOpenContinuation:input.fundedOpenContinuation}:{})});if(!finalSafety.approved)throw new Error("LPFORGE_P6_PRESUBMISSION_SAFETY_BLOCKED:"+finalSafety.reasonCodes.join(","));},onSigned:async({signerBackendId})=>{await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SIGNED',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata,signerBackendId});await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'SIGNED',lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true,signerBackendId}});},onSubmissionUnknown:async({error,signature})=>{submissionStatusUnknown=true;if(signature){lastSignature=signature;currentStep!.signature=signature;}currentStep!.submitted=true;await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'UNKNOWN_SUBMISSION',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata,error},signature);await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'UNKNOWN_SUBMISSION',...(signature?{signature}:{}),lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true,error}});}});submittedAny=true;currentStep!.signature=submitted.signature;currentStep!.submitted=true;lastSignature=submitted.signature;await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'SUBMITTED',{action:'OPEN',transactionId:step.transactionId,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,step:step.metadata},submitted.signature);await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:step.transactionId,sequence:stepIndex+1,kind:step.kind,disposition:'SUBMITTED',signature:submitted.signature,lastValidBlockHeight:BigInt(latest.lastValidBlockHeight),observedAt:new Date().toISOString(),payload:{chunked:true}});
       let confirmed=false,unknownObservationCount=0,rebroadcastCount=0;
       for(let attempt=0;attempt<input.config.confirmAttempts;attempt++){
         await new Promise(resolve=>setTimeout(resolve,input.config.confirmPollMs));
@@ -1305,7 +1334,7 @@ async function executeChunkableAutonomousOpen(input:{store:Phase1Store;plan:Auto
     await supersedeProvisionalPartialEntryRecovery({store:input.store,plan:input.plan,positionAddress:input.prepared.positionSigner.publicKeyAddress,at:new Date().toISOString()});
     await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'RECONCILED',at:new Date().toISOString(),payload:{signature:lastSignature,positionAddress:input.prepared.positionSigner.publicKeyAddress,chunked:true,entryBasisState:entryBasis.basisState,entryBasisId:`${input.plan.planId}:entry-basis:v1`}});
     return{status:'RECONCILED',planId:input.plan.planId,reasonCodes:[],transactionSubmitted:true,positionAddress:input.prepared.positionSigner.publicKeyAddress};
-  }catch(error){const reason=error instanceof Error?error.message:'LPFORGE_P6_CHUNKABLE_OPEN_UNKNOWN',fundingSubmitted=input.entryFundingMeasurement!==undefined,effectiveLastSignature=lastSignature||input.entryFundingMeasurement?.fundingSignature||'';if(currentStep&&!currentStep.submitted&&!reason.startsWith('LPFORGE_P6_PRESUBMISSION_SAFETY_BLOCKED:'))await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:currentStep.transactionId,sequence:currentStep.sequence,kind:currentStep.kind,disposition:'FAILED_PRE_SIGN',...(currentStep.lastValidBlockHeight!==undefined?{lastValidBlockHeight:currentStep.lastValidBlockHeight}:{}),observedAt:new Date().toISOString(),payload:{chunked:true,error:reason}});if(currentStep?.submitted&&currentStep.signature&&reason==='LPFORGE_P6_CHUNK_CONFIRMATION_PENDING')await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:currentStep.transactionId,sequence:currentStep.sequence,kind:currentStep.kind,disposition:'UNKNOWN_SUBMISSION',signature:currentStep.signature,...(currentStep.lastValidBlockHeight!==undefined?{lastValidBlockHeight:currentStep.lastValidBlockHeight}:{}),observedAt:new Date().toISOString(),payload:{chunked:true,error:reason}});if(submittedAny||submissionStatusUnknown||fundingSubmitted){if(input.entryFundingMeasurement){await input.store.upsertPartialEntryRecovery({planId:input.plan.planId,poolAddress:input.plan.poolAddress,ownerAddress:input.plan.ownerAddress,tokenMint:input.entryFundingMeasurement.tokenMint,fundingTransactionId:input.plan.swapTransactionId??'P6_CHUNKABLE_OPEN',fundingSignature:input.entryFundingMeasurement.fundingSignature,fundedAt:new Date().toISOString(),pairedTokenAmount:input.entryFundingMeasurement.pairedTokenReceivedRaw.toString(),intendedCapitalLamports:input.fields.capital,intendedRange:{lowerBinId:input.fields.lower,upperBinId:input.fields.upper},state:'RECONCILIATION_REQUIRED',walletTruth:{refreshRequired:true,confirmedLiquiditySolAssetOutLamports:confirmedLiquiditySolAssetOut.toString(),entryFundingMeasurement:{tokenMint:input.entryFundingMeasurement.tokenMint,pairedTokenReceivedRaw:input.entryFundingMeasurement.pairedTokenReceivedRaw.toString(),pairedTokenRawBeforeFunding:input.entryFundingMeasurement.pairedTokenRawBeforeFunding.toString(),pairedTokenRawBeforeOpen:input.entryFundingMeasurement.pairedTokenRawBeforeOpen.toString(),fundingSignature:input.entryFundingMeasurement.fundingSignature}},payload:{partialEntry:true,reasonCodes:['P6_PARTIAL_OPEN_CHUNK_DISPOSITION_REQUIRED',...(fundingSubmitted?['P6_CONFIRMED_FUNDING_PARTIAL_ENTRY']:[]),reason],positionAddress:input.prepared.positionSigner.publicKeyAddress},updatedAt:new Date().toISOString()});}await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'RECONCILIATION_REQUIRED',{action:'OPEN',chunked:true,error:reason,positionAddress:input.prepared.positionSigner.publicKeyAddress,lastSignature:effectiveLastSignature,postSubmission:true},effectiveLastSignature||undefined);await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECONCILIATION_REQUIRED',at:new Date().toISOString(),reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',...(fundingSubmitted?['P6_CONFIRMED_FUNDING_PARTIAL_ENTRY']:[]),reason],payload:{stage:'CHUNKABLE_OPEN',error:reason,positionAddress:input.prepared.positionSigner.publicKeyAddress,lastSignature:effectiveLastSignature,partialEntry:true}});return{status:'UNKNOWN',planId:input.plan.planId,reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',...(fundingSubmitted?['P6_CONFIRMED_FUNDING_PARTIAL_ENTRY']:[]),reason],transactionSubmitted:true};}if(reason.startsWith('LPFORGE_P6_PRESUBMISSION_SAFETY_BLOCKED:'))await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'FAILED',{action:'OPEN',stage:'PRESUBMISSION_SAFETY',error:reason,chunked:true,positionAddress:input.prepared.positionSigner.publicKeyAddress});await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'BLOCKED',at:new Date().toISOString(),payload:{stage:'CHUNKABLE_OPEN',error:reason}});return{status:'BLOCKED',planId:input.plan.planId,reasonCodes:[reason],transactionSubmitted:false};}
+  }catch(error){const reason=error instanceof Error?error.message:'LPFORGE_P6_CHUNKABLE_OPEN_UNKNOWN',fundingSubmitted=input.entryFundingMeasurement!==undefined,effectiveLastSignature=lastSignature||input.entryFundingMeasurement?.fundingSignature||'';if(currentStep&&!currentStep.submitted&&!reason.startsWith('LPFORGE_P6_PRESUBMISSION_SAFETY_BLOCKED:'))await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:currentStep.transactionId,sequence:currentStep.sequence,kind:currentStep.kind,disposition:'FAILED_PRE_SIGN',...(currentStep.lastValidBlockHeight!==undefined?{lastValidBlockHeight:currentStep.lastValidBlockHeight}:{}),observedAt:new Date().toISOString(),payload:{chunked:true,error:reason}});if(currentStep?.submitted&&currentStep.signature&&reason==='LPFORGE_P6_CHUNK_CONFIRMATION_PENDING')await input.store.upsertOpenChunkDisposition({planId:input.plan.planId,transactionId:currentStep.transactionId,sequence:currentStep.sequence,kind:currentStep.kind,disposition:'UNKNOWN_SUBMISSION',signature:currentStep.signature,...(currentStep.lastValidBlockHeight!==undefined?{lastValidBlockHeight:currentStep.lastValidBlockHeight}:{}),observedAt:new Date().toISOString(),payload:{chunked:true,error:reason}});if(submittedAny||submissionStatusUnknown||fundingSubmitted){if(input.entryFundingMeasurement){await input.store.upsertPartialEntryRecovery({planId:input.plan.planId,poolAddress:input.plan.poolAddress,ownerAddress:input.plan.ownerAddress,tokenMint:input.entryFundingMeasurement.tokenMint,fundingTransactionId:input.plan.swapTransactionId??'P6_CHUNKABLE_OPEN',fundingSignature:input.entryFundingMeasurement.fundingSignature,fundedAt:input.entryFundingMeasurement.fundedAt,pairedTokenAmount:input.entryFundingMeasurement.pairedTokenReceivedRaw.toString(),intendedCapitalLamports:input.fields.capital,intendedRange:{lowerBinId:input.fields.lower,upperBinId:input.fields.upper},state:'RECONCILIATION_REQUIRED',walletTruth:{refreshRequired:true,confirmedLiquiditySolAssetOutLamports:confirmedLiquiditySolAssetOut.toString(),entryFundingMeasurement:{tokenMint:input.entryFundingMeasurement.tokenMint,pairedTokenReceivedRaw:input.entryFundingMeasurement.pairedTokenReceivedRaw.toString(),pairedTokenRawBeforeFunding:input.entryFundingMeasurement.pairedTokenRawBeforeFunding.toString(),pairedTokenRawBeforeOpen:input.entryFundingMeasurement.pairedTokenRawBeforeOpen.toString(),fundingSignature:input.entryFundingMeasurement.fundingSignature}},payload:{partialEntry:true,reasonCodes:['P6_PARTIAL_OPEN_CHUNK_DISPOSITION_REQUIRED',...(fundingSubmitted?['P6_CONFIRMED_FUNDING_PARTIAL_ENTRY']:[]),reason],positionAddress:input.prepared.positionSigner.publicKeyAddress},updatedAt:new Date().toISOString()});}await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'RECONCILIATION_REQUIRED',{action:'OPEN',chunked:true,error:reason,positionAddress:input.prepared.positionSigner.publicKeyAddress,lastSignature:effectiveLastSignature,postSubmission:true},effectiveLastSignature||undefined);await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECONCILIATION_REQUIRED',at:new Date().toISOString(),reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',...(fundingSubmitted?['P6_CONFIRMED_FUNDING_PARTIAL_ENTRY']:[]),reason],payload:{stage:'CHUNKABLE_OPEN',error:reason,positionAddress:input.prepared.positionSigner.publicKeyAddress,lastSignature:effectiveLastSignature,partialEntry:true}});return{status:'UNKNOWN',planId:input.plan.planId,reasonCodes:['P6_CHUNKABLE_OPEN_RECONCILIATION_REQUIRED',...(fundingSubmitted?['P6_CONFIRMED_FUNDING_PARTIAL_ENTRY']:[]),reason],transactionSubmitted:true};}if(reason.startsWith('LPFORGE_P6_PRESUBMISSION_SAFETY_BLOCKED:'))await recordJournal(input.store,input.plan as unknown as AutonomousPlan,'FAILED',{action:'OPEN',stage:'PRESUBMISSION_SAFETY',error:reason,chunked:true,positionAddress:input.prepared.positionSigner.publicKeyAddress});await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'BLOCKED',at:new Date().toISOString(),payload:{stage:'CHUNKABLE_OPEN',error:reason}});return{status:'BLOCKED',planId:input.plan.planId,reasonCodes:[reason],transactionSubmitted:false};}
 }
 /** Executes one already-claimed plan. A caller must claim from storage before calling this function. */
 export async function executeAutonomousOpen(input: {
@@ -1313,6 +1342,7 @@ export async function executeAutonomousOpen(input: {
   plan: AutonomousOpenPlan;
   signer: MainnetSignerBackend;
   config: LiveWorkerConfig;
+  fundedOpenContinuation?: FundedOpenContinuationIdentity;
 }): Promise<LiveWorkerResult> {
   const now = new Date().toISOString(),
     fields = planFields(input.plan);
@@ -1384,7 +1414,9 @@ export async function executeAutonomousOpen(input: {
         pairedTokenRawBeforeFunding:BigInt(funded.pairedTokenRawBeforeFunding),
         pairedTokenRawBeforeOpen:await readWalletTokenBalance({connection,ownerAddress:input.plan.ownerAddress,mint:funded.tokenMint}),
         fundingSignature:funded.signature,
+        fundedAt:funded.fundedAt,
       };
+      const continuation=fundedOpenContinuationIdentity({plan:input.plan,fields,funding:entryFundingMeasurement,config:input.config});
       await input.store.upsertPartialEntryRecovery({
         planId: input.plan.planId,
         poolAddress: input.plan.poolAddress,
@@ -1404,7 +1436,8 @@ export async function executeAutonomousOpen(input: {
         walletTruth: { refreshRequired: true,entryFundingMeasurement:{pairedTokenRawBeforeFunding:funded.pairedTokenRawBeforeFunding,pairedTokenRawBeforeOpen:entryFundingMeasurement.pairedTokenRawBeforeOpen.toString(),nativeLamportsBefore:funded.nativeLamportsBefore,wsolRawBefore:funded.wsolRawBefore} },
         payload: {
           thesisId: input.plan.thesisId,
-          reasonCodes: ["P6_ENTRY_FUNDED_NOT_OPEN"],
+          reasonCodes: ["P6_ENTRY_FUNDED_NOT_OPEN","P6_FUNDED_OPEN_CONTINUATION_PENDING"],
+          fundedOpenContinuation:{...continuation,reasonCodes:["P6_FUNDED_OPEN_CONTINUATION_PENDING"]},
         },
         updatedAt: funded.fundedAt,
       });
@@ -1414,6 +1447,9 @@ export async function executeAutonomousOpen(input: {
       pool,
       liquiditySlippageBps: input.config.liquiditySlippageBps,
     });
+    const fundedOpenContinuation=entryFundingMeasurement?fundedOpenContinuationIdentity({plan:input.plan,fields,funding:entryFundingMeasurement,positionAddress:prepared.positionSigner.publicKeyAddress,config:input.config}):input.fundedOpenContinuation;
+    if(entryFundingMeasurement&&fundedOpenContinuation)await input.store.upsertPartialEntryRecovery({
+      planId:input.plan.planId,poolAddress:input.plan.poolAddress,ownerAddress:input.plan.ownerAddress,tokenMint:entryFundingMeasurement.tokenMint,fundingTransactionId:input.plan.swapTransactionId!,fundingSignature:entryFundingMeasurement.fundingSignature,fundedAt:entryFundingMeasurement.fundedAt,pairedTokenAmount:entryFundingMeasurement.pairedTokenReceivedRaw.toString(),intendedCapitalLamports:fields.capital,intendedRange:{lowerBinId:fields.lower,upperBinId:fields.upper},state:'ENTRY_FUNDED_NOT_OPEN',walletTruth:{refreshRequired:true,entryFundingMeasurement:{pairedTokenRawBeforeFunding:entryFundingMeasurement.pairedTokenRawBeforeFunding.toString(),pairedTokenRawBeforeOpen:entryFundingMeasurement.pairedTokenRawBeforeOpen.toString(),fundingSignature:entryFundingMeasurement.fundingSignature}},payload:{thesisId:input.plan.thesisId,reasonCodes:['P6_FUNDED_OPEN_CONTINUATION_READY'],fundedOpenContinuation:{...fundedOpenContinuation,reasonCodes:['P6_FUNDED_OPEN_CONTINUATION_READY']}},updatedAt:new Date().toISOString()});
     if (prepared.steps.length > 1)
       return executeChunkableAutonomousOpen({
         store: input.store,
@@ -1425,6 +1461,7 @@ export async function executeAutonomousOpen(input: {
         prepared,
         fields,
         ...(entryFundingMeasurement?{entryFundingMeasurement}:{}),
+        ...(fundedOpenContinuation?{fundedOpenContinuation}:{}),
       });
     // `now` is captured before the route/funding preflight. A confirmed
     // funding swap can consume most of a short permit TTL, so the
@@ -1468,9 +1505,15 @@ export async function executeAutonomousOpen(input: {
         maxAbsoluteFeeLamports: input.config.maxFeeLamports,
         maxFeeFractionOfCapital: input.config.maxFeeFraction,
       });
-    const risk = await governFreshOpenRisk({store:input.store,plan:input.plan,config:input.config,connection,simulation,costApproved:cost.approved,fields});
+    const risk = await governFreshOpenRisk({store:input.store,plan:input.plan,config:input.config,connection,simulation,costApproved:cost.approved,fields,...(fundedOpenContinuation?{fundedOpenContinuation}:{})});
     if (risk.decision !== "APPROVE" || !risk.permitId || !risk.expiresAt) {
       if(isStaleOnlyPreSignP7ControlBlock(risk.reasonCodes))return requeueUnsignedStaleControlOpen({store:input.store,plan:input.plan,reason:risk.reasonCodes.join(','),stage:'SIMULATE_RISK'});
+      if(entryFundingMeasurement&&fundedOpenContinuation){
+        const awaitContinuation=risk.reasonCodes.some(code=>code==='P6_CLAIM_P7_FUNDED_CONTINUATION_NOT_AUTHORIZED'||code==='P6_CLAIM_P7_CONTROL_STALE'),state=awaitContinuation?'ENTRY_FUNDED_NOT_OPEN' as const:'UNWIND_REQUIRED' as const,reasonCodes=awaitContinuation?['P6_FUNDED_OPEN_CONTINUATION_AWAITING_P7_AUTHORITY',...risk.reasonCodes]:['P6_FUNDED_OPEN_CONTINUATION_UNSAFE',...risk.reasonCodes];
+        await input.store.upsertPartialEntryRecovery({planId:input.plan.planId,poolAddress:input.plan.poolAddress,ownerAddress:input.plan.ownerAddress,tokenMint:entryFundingMeasurement.tokenMint,fundingTransactionId:input.plan.swapTransactionId!,fundingSignature:entryFundingMeasurement.fundingSignature,fundedAt:entryFundingMeasurement.fundedAt,pairedTokenAmount:entryFundingMeasurement.pairedTokenReceivedRaw.toString(),intendedCapitalLamports:fields.capital,intendedRange:{lowerBinId:fields.lower,upperBinId:fields.upper},state,walletTruth:{refreshRequired:true,entryFundingMeasurement:{pairedTokenRawBeforeFunding:entryFundingMeasurement.pairedTokenRawBeforeFunding.toString(),pairedTokenRawBeforeOpen:entryFundingMeasurement.pairedTokenRawBeforeOpen.toString(),fundingSignature:entryFundingMeasurement.fundingSignature}},payload:{partialEntry:true,reasonCodes,fundedOpenContinuation:{...fundedOpenContinuation,reasonCodes}},updatedAt:new Date().toISOString()});
+        await input.store.transitionAutonomousPlan({planId:input.plan.planId,state:'RECOVERING',at:new Date().toISOString(),reasonCodes,payload:{stage:'FUNDED_OPEN_CONTINUATION',continuationState:state}});
+        return{status:'UNKNOWN',planId:input.plan.planId,reasonCodes,transactionSubmitted:true};
+      }
       await input.store.completeAutonomousPlan({
         planId: input.plan.planId,
         state: "BLOCKED",
@@ -1547,7 +1590,7 @@ export async function executeAutonomousOpen(input: {
       transport: createWeb3SubmissionTransport(connection),
       submittedAt: signedAt,
       beforeSubmit: async () => {
-        const finalSafety=await checkFreshOpenSubmissionSafety({store:input.store,plan:input.plan,config:input.config,permitExpiresAt:risk.expiresAt!});
+        const finalSafety=await checkFreshOpenSubmissionSafety({store:input.store,plan:input.plan,config:input.config,permitExpiresAt:risk.expiresAt!,...(fundedOpenContinuation?{fundedOpenContinuation}:{})});
         if(!finalSafety.approved)throw new Error(`LPFORGE_P6_PRESUBMISSION_SAFETY_BLOCKED:${finalSafety.reasonCodes.join(',')}`);
       },
       onSigned: async ({ signerBackendId }) =>
@@ -2419,7 +2462,7 @@ async function reconcileRecoveredChunkedOpen(input:{
       payload:{source:input.partial?'P6_OPEN_RECOVERED_TERMINAL_MISSING_CHUNK':'P6_RECOVERED_CHUNKED_OPEN_CONFIRMED',fundingSignature,pairedTokenRawBeforeFunding:pairedTokenRawBeforeFunding.toString(),pairedTokenReceivedRaw:pairedTokenReceivedRaw.toString()},
     });
   }
-  const funding:EntryFundingMeasurement={tokenMint,pairedTokenReceivedRaw,pairedTokenRawBeforeFunding,pairedTokenRawBeforeOpen:BigInt(String(measurement.pairedTokenRawBeforeOpen??pairedTokenRawBeforeFunding)),fundingSignature};
+  const funding:EntryFundingMeasurement={tokenMint,pairedTokenReceivedRaw,pairedTokenRawBeforeFunding,pairedTokenRawBeforeOpen:BigInt(String(measurement.pairedTokenRawBeforeOpen??pairedTokenRawBeforeFunding)),fundingSignature,fundedAt:new Date(String(input.row.funded_at)).toISOString()};
   const open=openPlan(input.plan);
   const observedAt=new Date().toISOString(),intent=(input.plan.planPayload.intent??{}) as Record<string,unknown>,entryFunding=(input.plan.intentPayload.entryFunding??{}) as Record<string,unknown>;
   const entryBasis=await persistReceiptBackedEntryBasis({store:input.store,connection,plan:open,positionAddress,requestedLiquidityCapitalLamports:capital,funding,confirmedSteps:confirmed.map(step=>({transactionId:step.transactionId,kind:step.kind,signature:step.signature!})),observedAt});
@@ -2504,8 +2547,13 @@ export async function recoverPartialEntryFunding(input: {
     reasonCodes: string[];
   }> = [];
   for (const row of rows) {
-    const planId = String(row.plan_id),
-      state = String(row.state);
+    const planId = String(row.plan_id);
+    if(!await input.store.tryClaimFundedOpenContinuation(planId)){
+      results.push({planId,action:'HOLD',reasonCodes:['P6_FUNDED_OPEN_CONTINUATION_CLAIM_HELD']});
+      continue;
+    }
+    try {
+    const state = String(row.state);
     if (state === "ABORTED_SOL_SETTLED") {
       const outcome = await input.store.createLiveEntryAbortedLearningOutcome({
         planId,
@@ -2704,7 +2752,19 @@ export async function recoverPartialEntryFunding(input: {
       });
       continue;
     }
-    if (Date.parse(plan.expiresAt) <= Date.now()) {
+    const expectedPositionAddress=plan.positionAddress??nestedGeneratedPositionAddress(row.payload);
+    if(expectedPositionAddress){
+      let positionReadFailed=false,positionTruth:Awaited<ReturnType<MeteoraReadAdapter['getPositionV2']>>|undefined;
+      try{positionTruth=await createMeteoraReadAdapter({rpcUrl:input.config.rpcUrl,cluster:'mainnet-beta',programId:input.config.programId,priority:'P1_RECOVERY_CRITICAL'}).getPositionV2(plan.poolAddress,expectedPositionAddress);}catch{positionReadFailed=true;}
+      if(positionReadFailed){results.push({planId,action:'HOLD',reasonCodes:['P6_FUNDED_OPEN_POSITION_RECONCILIATION_UNAVAILABLE']});continue;}
+      if(positionTruth){
+        if(positionTruth.owner!==plan.ownerAddress||positionTruth.pool!==plan.poolAddress){results.push({planId,action:'HOLD',reasonCodes:['P6_FUNDED_OPEN_POSITION_IDENTITY_CONFLICT']});continue;}
+        await input.store.upsertPartialEntryRecovery({planId,poolAddress:plan.poolAddress,ownerAddress:plan.ownerAddress,tokenMint:String(row.token_mint),fundingTransactionId:String(row.funding_transaction_id),fundingSignature:String(row.funding_signature),fundedAt:new Date(String(row.funded_at)).toISOString(),pairedTokenAmount:String(row.paired_token_amount),intendedCapitalLamports:BigInt(String(row.intended_capital_lamports)),intendedRange:(row.intended_range??{}) as Record<string,unknown>,state:'RECONCILIATION_REQUIRED',walletTruth:{refreshRequired:true,recoveredPositionAddress:expectedPositionAddress},payload:{partialEntry:true,reasonCodes:['P6_FUNDED_OPEN_POSITION_EXISTS_BEFORE_UNWIND'],positionAddress:expectedPositionAddress},updatedAt:new Date().toISOString()});
+        results.push({planId,action:'HOLD',reasonCodes:['P6_FUNDED_OPEN_POSITION_EXISTS_BEFORE_UNWIND']});continue;
+      }
+    }
+    const continuationExpired=Date.parse(String(row.funded_at))+fundedOpenContinuationDeadlineSeconds(input.config)*1_000<=Date.now(),unwindRequired=state==='UNWIND_REQUIRED';
+    if (Date.parse(plan.expiresAt) <= Date.now() || continuationExpired || unwindRequired) {
       const priorUnwindPayload=(row.payload??{}) as Record<string,unknown>;
       let priorStatus:{err?:unknown;confirmationStatus?:string|null}|null|undefined,statusReadSucceeded=true;
       if(typeof priorUnwindPayload.unwindSignature==='string'&&priorUnwindPayload.unwindSignature.length>0){
@@ -2748,7 +2808,7 @@ export async function recoverPartialEntryFunding(input: {
         // and handed to the submission ledger.
         state: "UNWIND_REQUIRED",
         walletTruth: { refreshRequired: true },
-        payload: { reasonCodes: ["P6_PARTIAL_THESIS_OR_PLAN_EXPIRED"] },
+        payload: { reasonCodes: [unwindRequired?"P6_FUNDED_OPEN_CONTINUATION_UNSAFE":continuationExpired?"P6_FUNDED_OPEN_CONTINUATION_EXPIRED":"P6_PARTIAL_THESIS_OR_PLAN_EXPIRED"] },
         updatedAt: new Date().toISOString(),
       });
       const unwind = await unwindPartialEntry({
@@ -2829,7 +2889,7 @@ export async function recoverPartialEntryFunding(input: {
       });
       continue;
     }
-    const open = openPlan(plan);
+    const open = openPlan(plan),continuation=fundedOpenContinuationIdentityFromRecovery({row,plan:open,fields:planFields(open),config:input.config});
     delete open.swapTransactionId;
     delete open.swapTransactionMetadata;
     await input.store.upsertPartialEntryRecovery({
@@ -2856,6 +2916,7 @@ export async function recoverPartialEntryFunding(input: {
       plan: open,
       signer: input.signer,
       config: input.config,
+      fundedOpenContinuation: continuation,
     });
     if (result.status === "RECONCILED")
       await input.store.upsertPartialEntryRecovery({
@@ -2882,6 +2943,9 @@ export async function recoverPartialEntryFunding(input: {
       action: result.status === "RECONCILED" ? "RESUME_OPEN" : "HOLD",
       reasonCodes: result.reasonCodes,
     });
+    } finally {
+      await input.store.releaseFundedOpenContinuation(planId);
+    }
   }
   return results;
 }

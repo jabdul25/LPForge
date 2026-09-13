@@ -16,12 +16,18 @@ export interface DiscoveryAdmissionAudit {winnerBindingVerified:boolean;winnerOb
 const WSOL_MINT='So11111111111111111111111111111111111111112';
 /** The hard P6 authority window applied at claim and signing boundaries. */
 export const P6_CURRENT_CONTROL_MAX_AGE_MS=60_000;
-export interface Phase7ExecutionControl {decisionId?:string;cycleKey?:string;authorityMode:string;healthStatus:string;driftStatus:string;safetyMode:string;newEconomicActionAllowed:boolean;observedAt:string;poolDrift?:Record<string,string>;blockedPools?:string[];activeIncidentIds?:string[];releaseIntegrityValid?:boolean;portfolioValid?:boolean;revokedApprovalIds?:string[];}
+/**
+ * This is deliberately not a general entry permit.  It is emitted by P7 only
+ * after a funding transaction has been confirmed and can authorize one exact
+ * LP-open child for that already-funded plan.
+ */
+export interface FundedOpenContinuationAuthority {planId:string;ownerAddress:string;poolAddress:string;tokenMint:string;fundingSignature:string;capitalLamports:string;lowerBinId:number;upperBinId:number;fundedAt:string;expiresAt:string;generatedPositionAddress?:string;allowed:boolean;reasonCodes:string[];}
+export interface Phase7ExecutionControl {decisionId?:string;cycleKey?:string;authorityMode:string;healthStatus:string;driftStatus:string;safetyMode:string;newEconomicActionAllowed:boolean;observedAt:string;poolDrift?:Record<string,string>;blockedPools?:string[];activeIncidentIds?:string[];releaseIntegrityValid?:boolean;portfolioValid?:boolean;revokedApprovalIds?:string[];fundedOpenContinuations?:FundedOpenContinuationAuthority[];}
 /** Canonical projection used by both claim-time and execution-time P7 checks. */
 export function phase7ExecutionControlFromRow(controlRow:Record<string,unknown>|undefined):Phase7ExecutionControl|undefined{
  if(!controlRow)return undefined;
- const payload=record(controlRow.payload),rawPoolDrift=Array.isArray(payload.poolDrift)?payload.poolDrift:[],releaseIdentity=record(payload.releaseIdentity),portfolio=record(payload.portfolio),strings=(value:unknown)=>Array.isArray(value)?value.map(String).filter(Boolean):[];
- return{decisionId:String(controlRow.decision_id),cycleKey:String(controlRow.cycle_key),authorityMode:String(controlRow.authority_mode),healthStatus:String(controlRow.health_status),driftStatus:String(controlRow.drift_status),safetyMode:String(controlRow.safety_mode),newEconomicActionAllowed:Boolean(controlRow.new_economic_action_allowed),observedAt:new Date(String(controlRow.observed_at)).toISOString(),poolDrift:Object.fromEntries(rawPoolDrift.filter(row=>row&&typeof row==="object").map(row=>{const value=row as Record<string,unknown>;return[String(value.poolAddress??""),String(value.rawStatus??value.status??"")]}).filter(([pool])=>Boolean(pool))),blockedPools:strings(payload.blockedPools),activeIncidentIds:strings(payload.activeIncidentIds),releaseIntegrityValid:releaseIdentity.valid===true,portfolioValid:portfolio.valid===true,revokedApprovalIds:strings(payload.controlledCanaryRevokedApprovalIds)};
+ const payload=record(controlRow.payload),rawPoolDrift=Array.isArray(payload.poolDrift)?payload.poolDrift:[],releaseIdentity=record(payload.releaseIdentity),portfolio=record(payload.portfolio),strings=(value:unknown)=>Array.isArray(value)?value.map(String).filter(Boolean):[],continuations=Array.isArray(payload.fundedOpenContinuations)?payload.fundedOpenContinuations.map(raw=>{const value=record(raw),lowerBinId=Number(value.lowerBinId),upperBinId=Number(value.upperBinId),reasonCodes=strings(value.reasonCodes);if(!String(value.planId??'')||!String(value.ownerAddress??'')||!String(value.poolAddress??'')||!String(value.tokenMint??'')||!String(value.fundingSignature??'')||!String(value.capitalLamports??'')||!Number.isInteger(lowerBinId)||!Number.isInteger(upperBinId)||!validTimestamp(value.fundedAt)||!validTimestamp(value.expiresAt))return undefined;return{planId:String(value.planId),ownerAddress:String(value.ownerAddress),poolAddress:String(value.poolAddress),tokenMint:String(value.tokenMint),fundingSignature:String(value.fundingSignature),capitalLamports:String(value.capitalLamports),lowerBinId,upperBinId,fundedAt:new Date(String(value.fundedAt)).toISOString(),expiresAt:new Date(String(value.expiresAt)).toISOString(),...(String(value.generatedPositionAddress??'').trim()?{generatedPositionAddress:String(value.generatedPositionAddress).trim()}:{}),allowed:value.allowed===true,reasonCodes};}).filter((value):value is FundedOpenContinuationAuthority=>value!==undefined):[];
+ return{decisionId:String(controlRow.decision_id),cycleKey:String(controlRow.cycle_key),authorityMode:String(controlRow.authority_mode),healthStatus:String(controlRow.health_status),driftStatus:String(controlRow.drift_status),safetyMode:String(controlRow.safety_mode),newEconomicActionAllowed:Boolean(controlRow.new_economic_action_allowed),observedAt:new Date(String(controlRow.observed_at)).toISOString(),poolDrift:Object.fromEntries(rawPoolDrift.filter(row=>row&&typeof row==="object").map(row=>{const value=row as Record<string,unknown>;return[String(value.poolAddress??""),String(value.rawStatus??value.status??"")]}).filter(([pool])=>Boolean(pool))),blockedPools:strings(payload.blockedPools),activeIncidentIds:strings(payload.activeIncidentIds),releaseIntegrityValid:releaseIdentity.valid===true,portfolioValid:portfolio.valid===true,revokedApprovalIds:strings(payload.controlledCanaryRevokedApprovalIds),fundedOpenContinuations:continuations};
 }
 export function validateFreshPhase7ExecutionControl(control:Phase7ExecutionControl|undefined,now:string,maxAgeMs=P6_CURRENT_CONTROL_MAX_AGE_MS):string[]{
  if(!control)return ['P6_CLAIM_P7_CONTROL_MISSING'];
@@ -29,6 +35,37 @@ export function validateFreshPhase7ExecutionControl(control:Phase7ExecutionContr
  if(control.authorityMode!=='PRODUCTION')reasons.push('P6_CLAIM_P7_AUTHORITY_NOT_PRODUCTION');if(control.healthStatus!=='HEALTHY')reasons.push('P6_CLAIM_P7_HEALTH_NOT_HEALTHY');if(control.driftStatus==='BLOCK')reasons.push('P6_CLAIM_P7_DRIFT_BLOCK');if(control.safetyMode!=='NORMAL')reasons.push('P6_CLAIM_P7_SAFETY_NOT_NORMAL');if(!control.newEconomicActionAllowed)reasons.push('P6_CLAIM_P7_NEW_ACTION_BLOCKED');
  if(!Number.isFinite(age)||age<0||age>maxAgeMs)reasons.push('P6_CLAIM_P7_CONTROL_STALE');
  return reasons.sort();
+}
+/** The non-economic portion of the ordinary P7 gate. */
+function validateFreshPhase7ContinuationBase(control:Phase7ExecutionControl|undefined,now:string,maxAgeMs=P6_CURRENT_CONTROL_MAX_AGE_MS):string[]{
+ if(!control)return ['P6_CLAIM_P7_CONTROL_MISSING'];
+ const reasons:string[]=[];const age=Date.parse(now)-Date.parse(control.observedAt);
+ if(control.authorityMode!=='PRODUCTION')reasons.push('P6_CLAIM_P7_AUTHORITY_NOT_PRODUCTION');if(control.healthStatus!=='HEALTHY')reasons.push('P6_CLAIM_P7_HEALTH_NOT_HEALTHY');if(control.driftStatus==='BLOCK')reasons.push('P6_CLAIM_P7_DRIFT_BLOCK');if(control.safetyMode!=='NORMAL')reasons.push('P6_CLAIM_P7_SAFETY_NOT_NORMAL');
+ if(!Number.isFinite(age)||age<0||age>maxAgeMs)reasons.push('P6_CLAIM_P7_CONTROL_STALE');
+ return reasons.sort();
+}
+export interface FundedOpenContinuationIdentity {planId:string;ownerAddress:string;poolAddress:string;tokenMint:string;fundingSignature:string;capitalLamports:bigint;lowerBinId:number;upperBinId:number;fundedAt:string;expiresAt:string;generatedPositionAddress?:string;}
+function sameFundedOpenContinuation(authority:FundedOpenContinuationAuthority,identity:FundedOpenContinuationIdentity):boolean{
+ return authority.planId===identity.planId&&authority.ownerAddress===identity.ownerAddress&&authority.poolAddress===identity.poolAddress&&authority.tokenMint===identity.tokenMint&&authority.fundingSignature===identity.fundingSignature&&authority.capitalLamports===identity.capitalLamports.toString()&&authority.lowerBinId===identity.lowerBinId&&authority.upperBinId===identity.upperBinId&&authority.fundedAt===new Date(identity.fundedAt).toISOString()&&authority.expiresAt===new Date(identity.expiresAt).toISOString()&&(!authority.generatedPositionAddress||authority.generatedPositionAddress===identity.generatedPositionAddress);
+}
+/**
+ * A funded continuation preserves every current P7 hard safety condition but
+ * deliberately does not require `newEconomicActionAllowed`: funding is an
+ * irrevocable prior effect, not a new entry decision.  If P7 has not yet
+ * observed the provisional row, a still-current ordinary entry-authorizing
+ * control is sufficient.  Once P7 blocks new entries, an exact identity-bound
+ * continuation record is mandatory.
+ */
+export function validateFreshFundedOpenContinuation(input:{current:Phase7ExecutionControl|undefined;identity:FundedOpenContinuationIdentity;now:string}):string[]{
+ const reasons=validateFreshPhase7ContinuationBase(input.current,input.now);
+ const current=input.current;
+ if(!current)return reasons;
+ if(!validTimestamp(input.identity.fundedAt)||!validTimestamp(input.identity.expiresAt)||Date.parse(input.identity.expiresAt)<=Date.parse(input.now))reasons.push('P6_CLAIM_P7_FUNDED_CONTINUATION_EXPIRED');
+ if(current.newEconomicActionAllowed)return reasons;
+ const match=(current.fundedOpenContinuations??[]).find(authority=>sameFundedOpenContinuation(authority,input.identity));
+ if(!match)reasons.push('P6_CLAIM_P7_FUNDED_CONTINUATION_NOT_AUTHORIZED');
+ else {if(!match.allowed)reasons.push('P6_CLAIM_P7_FUNDED_CONTINUATION_DENIED');if(Date.parse(match.expiresAt)<=Date.parse(input.now))reasons.push('P6_CLAIM_P7_FUNDED_CONTINUATION_EXPIRED');}
+ return [...new Set(reasons)].sort();
 }
 /**
  * A P7-control freshness miss has no chain effect: it occurs before capital
