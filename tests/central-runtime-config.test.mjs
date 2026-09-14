@@ -98,6 +98,8 @@ test('deployment promotes every validated canonical policy template to the centr
   assert.match(installer,/LPFORGE_RUNTIME_POLICY_TEMPLATE_HASH_MISMATCH/);
   assert.match(installer,/runtime_policy_files/);
   assert.match(installer,/mv -f "\$policy_stage_dir\/\$policy_name" "\$lpforge_home\/policy\/\$policy_name"/);
+  assert.match(installer,/terminal-current/);
+  assert.match(installer,/mv -Tf "\$terminal_link_stage" "\$terminal_link"/);
   assert.doesNotMatch(launcher,/cp .*live-execution-policy/);
   assert.doesNotMatch(launcher,/mv .*live-execution-policy/);
 });

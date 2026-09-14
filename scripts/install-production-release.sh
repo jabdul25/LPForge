@@ -68,5 +68,12 @@ if ! LPFORGE_HOME="$lpforge_home" LPFORGE_RUNTIME_CONFIG_ENFORCED=true bash "$st
   exit 1
 fi
 mv "$stage" "$target"
+# The operator terminal is an on-demand immutable consumer, not a PM2 daemon.
+# Keep its stable selector release-bound so a policy promotion can never leave
+# `lpforge-terminal` executing a stale verifier from an earlier release.
+terminal_link="$lpforge_home/releases/terminal-current"
+terminal_link_stage="$lpforge_home/releases/.terminal-current.${source_sha}.$$"
+ln -s "$target" "$terminal_link_stage"
+mv -Tf "$terminal_link_stage" "$terminal_link"
 trap - EXIT
 printf '%s\n' "$target"
