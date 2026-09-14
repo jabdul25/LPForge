@@ -171,12 +171,17 @@ export function buildTransactionPlan(r: PlanRequest): TransactionPlan {
     // A close drains liquidity, swaps the token-X proceeds into the SOL-side
     // token, then closes the drained position. The unwind prevents untracked
     // wallet inventory from being stranded by a close.
+    const closeExecution=r.metadata?.closeExecution;
+    const closeExecutionMode=closeExecution&&typeof closeExecution==='object'&&!Array.isArray(closeExecution)
+      ? (closeExecution as Record<string,unknown>).mode
+      : r.action==='EMERGENCY_CLOSE'?'EMERGENCY_CLOSE':'NORMAL_CLOSE';
     transactions.push(
       tx("METEORA_REMOVE", 1, r.ownerAddress, r.positionAddress, {
         bps: 10_000,
         claimAndClose: false,
         unwindStage: "CLOSE_TOKEN_X_UNWIND",
         emergency: r.action === "EMERGENCY_CLOSE",
+        closeExecutionMode,
       }),
     );
     transactions.push(
@@ -184,6 +189,7 @@ export function buildTransactionPlan(r: PlanRequest): TransactionPlan {
         unwindStage: "CLOSE_TOKEN_X_UNWIND",
         provider: "JUPITER_METIS",
         emergency: r.action === "EMERGENCY_CLOSE",
+        closeExecutionMode,
       }),
     );
     transactions.push(
@@ -191,6 +197,7 @@ export function buildTransactionPlan(r: PlanRequest): TransactionPlan {
         bps: 10_000,
         claimAndClose: true,
         emergency: r.action === "EMERGENCY_CLOSE",
+        closeExecutionMode,
       }),
     );
   }

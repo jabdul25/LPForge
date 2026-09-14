@@ -208,7 +208,15 @@ async function loadActivePools(pool: Pool): Promise<TerminalPosition[]> {
       es.lp_mtm_net_return_fraction AS live_control_return_fraction,
       es.lp_mtm_peak_return_fraction AS live_control_peak_return_fraction,
       es.last_reason_codes,es.payload AS exit_payload,
-      oor.lifecycle_state AS oor_lifecycle_state,oor.direction AS oor_direction,oor.inventory_classification,oor.fee_value_lamports
+      oor.lifecycle_state AS oor_lifecycle_state,oor.direction AS oor_direction,oor.inventory_classification,oor.fee_value_lamports,
+      CASE
+        WHEN es.lp_mtm_evidence_state='AVAILABLE' AND es.lp_mtm_net_return_fraction<=-0.10 THEN 'RED'
+        WHEN obs.active_bin_id< p.lower_bin_id THEN 'RED'
+        WHEN obs.active_bin_id= p.lower_bin_id THEN 'ORANGE'
+        WHEN obs.active_bin_id BETWEEN p.lower_bin_id AND p.upper_bin_id
+          AND (p.upper_bin_id=p.lower_bin_id OR (obs.active_bin_id-p.lower_bin_id)::numeric/(p.upper_bin_id-p.lower_bin_id)::numeric<=1.0/3.0) THEN 'YELLOW'
+        ELSE 'GREEN'
+      END AS health_state
     FROM execution.owned_positions p
     LEFT JOIN protocol.pools proto ON proto.address=p.pool_address
     LEFT JOIN protocol.tokens tx ON tx.mint=proto.token_x_mint
@@ -231,7 +239,7 @@ async function loadActivePools(pool: Pool): Promise<TerminalPosition[]> {
       lifecycleState: text(row, 'lifecycle_state') || 'UNKNOWN', reconciliationStatus: text(row, 'reconciliation_status') || 'UNKNOWN',
       ...(integer(row, 'lower_bin_id') !== undefined ? { lowerBinId: integer(row, 'lower_bin_id') } : {}), ...(integer(row, 'upper_bin_id') !== undefined ? { upperBinId: integer(row, 'upper_bin_id') } : {}), ...(integer(row, 'active_bin_id') !== undefined ? { activeBinId: integer(row, 'active_bin_id') } : {}), ...(text(row, 'range_state') ? { rangeState: text(row, 'range_state') } : {}),
       ...(liveControlAvailable && number(row, 'live_control_return_fraction') !== undefined ? { liveControlReturnFraction: number(row, 'live_control_return_fraction') } : {}), ...(liveControlAvailable && number(row, 'live_control_peak_return_fraction') !== undefined ? { liveControlPeakReturnFraction: number(row, 'live_control_peak_return_fraction') } : {}), ...(lamports(row, 'fee_value_lamports') !== undefined ? { feeLamports: lamports(row, 'fee_value_lamports') } : {}),
-      ...(text(row, 'valuation_state') ? { valuationState: text(row, 'valuation_state') } : {}), ...(text(row, 'oor_lifecycle_state') ? { oorLifecycleState: text(row, 'oor_lifecycle_state') } : {}), ...(text(row, 'oor_direction') ? { oorDirection: text(row, 'oor_direction') } : {}), ...(text(row, 'inventory_classification') ? { inventoryClassification: text(row, 'inventory_classification') } : {}), protection: terminalProtection(row)
+      ...(text(row, 'valuation_state') ? { valuationState: text(row, 'valuation_state') } : {}), ...(text(row, 'oor_lifecycle_state') ? { oorLifecycleState: text(row, 'oor_lifecycle_state') } : {}), ...(text(row, 'oor_direction') ? { oorDirection: text(row, 'oor_direction') } : {}), ...(text(row, 'inventory_classification') ? { inventoryClassification: text(row, 'inventory_classification') } : {}), ...(text(row,'health_state')&&['GREEN','YELLOW','ORANGE','RED'].includes(text(row,'health_state')!)?{healthState:text(row,'health_state') as TerminalPosition['healthState']}:{}), protection: terminalProtection(row)
     };
   });
 }
@@ -245,6 +253,7 @@ async function loadRecentPositions(pool: Pool, active: TerminalPosition[]): Prom
     SELECT l.lifecycle_id,l.position_address,l.pool_address,l.created_at,latest.settled_at,latest.realized_sol_pnl_lamports,
       COALESCE(re.entry_capital_lamports,o.initial_capital_lamports) AS capital_lamports,
       re.gross_lp_fee_lamports,COALESCE(summary.terminal_reason,re.close_reason) AS exit_reason,
+      timing.decision_at,timing.submission_at,timing.confirmation_at,
       p.token_x_mint,p.token_y_mint,tx.symbol AS token_x_symbol,ty.symbol AS token_y_symbol,
       registry.paired_token_mint,registry.paired_token_symbol
     FROM latest
@@ -252,6 +261,18 @@ async function loadRecentPositions(pool: Pool, active: TerminalPosition[]): Prom
     LEFT JOIN execution.owned_positions o ON o.position_address=l.position_address
     LEFT JOIN execution.position_realized_economics re ON re.lifecycle_id=l.lifecycle_id
     LEFT JOIN execution.position_management_summaries summary ON summary.lifecycle_id=l.lifecycle_id
+    LEFT JOIN LATERAL (
+      SELECT min(i.observed_at) AS decision_at,
+             min(s.submitted_at) FILTER(WHERE s.submitted_at IS NOT NULL) AS submission_at,
+             min(c.observed_at) FILTER(WHERE c.status IN ('CONFIRMED','FINALIZED')) AS confirmation_at
+      FROM execution.lifecycle_plan_links link
+      JOIN execution.transaction_plans close_plan ON close_plan.plan_id=link.plan_id
+      JOIN execution.intents i ON i.intent_id=close_plan.intent_id
+      LEFT JOIN execution.transaction_steps step ON step.plan_id=close_plan.plan_id
+      LEFT JOIN execution.submission_attempts s ON s.transaction_id=step.transaction_id
+      LEFT JOIN execution.confirmations c ON c.attempt_id=s.attempt_id
+      WHERE link.lifecycle_id=l.lifecycle_id AND link.role='CLOSE'
+    ) timing ON true
     LEFT JOIN protocol.pools p ON p.address=l.pool_address
     LEFT JOIN protocol.tokens tx ON tx.mint=p.token_x_mint
     LEFT JOIN protocol.tokens ty ON ty.mint=p.token_y_mint
@@ -265,7 +286,7 @@ async function loadRecentPositions(pool: Pool, active: TerminalPosition[]): Prom
     const settledAt = iso(row.settled_at) || new Date(0).toISOString();
     return {
       lifecycleId: text(row, 'lifecycle_id') || 'unknown', positionAddress: text(row, 'position_address') || 'unknown', poolAddress: text(row, 'pool_address') || 'unknown', poolDisplay: displayPool(row), state: 'CLOSED' as const, observedAt: settledAt,
-      ...(value !== undefined && capital !== undefined && capital > 0n ? { realizedReturnFraction: Number(value) / Number(capital) } : {}), ...(lamports(row, 'gross_lp_fee_lamports') !== undefined ? { feeLamports: lamports(row, 'gross_lp_fee_lamports') } : {}), ...(openedAt ? { holdSeconds: Math.max(0, Math.floor((Date.parse(settledAt) - Date.parse(openedAt)) / 1000)) } : {}), ...(text(row, 'exit_reason') ? { exitReason: text(row, 'exit_reason') } : {})
+      ...(value !== undefined && capital !== undefined && capital > 0n ? { realizedReturnFraction: Number(value) / Number(capital) } : {}), ...(lamports(row, 'gross_lp_fee_lamports') !== undefined ? { feeLamports: lamports(row, 'gross_lp_fee_lamports') } : {}), ...(openedAt ? { holdSeconds: Math.max(0, Math.floor((Date.parse(settledAt) - Date.parse(openedAt)) / 1000)) } : {}), ...(text(row, 'exit_reason') ? { exitReason: text(row, 'exit_reason') } : {}), ...(iso(row.decision_at)?{closeDecisionAt:iso(row.decision_at)!}:{}), ...(iso(row.submission_at)?{closeSubmissionAt:iso(row.submission_at)!}:{}), ...(iso(row.confirmation_at)?{closeConfirmationAt:iso(row.confirmation_at)!}:{}), closeSettlementAt:settledAt
     };
   });
   const open = active.map(position => ({

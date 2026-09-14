@@ -3,6 +3,7 @@ import { createMeteoraDataApi, type DataApiPool, type MeteoraPositionPnl } from 
 import {
   createPostgresStore,
   type Phase1Store,
+  type PositionHealthEventType,
 } from "../../../packages/db/src/index.js";
 import {
   createMeteoraReadAdapter,
@@ -35,6 +36,9 @@ import {
   type OorInventoryClassification,
   type OorLifecyclePriorState,
   type OwnedLivePosition,
+  assessPositionHealth,
+  type PositionHealthAssessment,
+  type PositionMonitoringTier,
 } from "../../../packages/live-position-management/src/index.js";
 import {
   assessLiveExit,
@@ -90,6 +94,50 @@ async function queueLifecycleAlert(alert:Phase7Alert):Promise<void>{
 }
 const pct=(value:number|null|undefined)=>value===undefined||value===null||!Number.isFinite(value)?'N/A':`${(value*100).toFixed(2)}%`;
 const lamportsToSol = (value: bigint) => Number(value) / 1_000_000_000;
+const healthEventKey=(positionAddress:string,eventType:PositionHealthEventType)=>`position-health:${positionAddress}:${eventType}`;
+const healthEventTypes=(value:readonly PositionHealthEventType[])=>new Set<PositionHealthEventType>(value);
+/** Health events are a compact index, not a duplicate decision audit payload. */
+const compactHealthReasonCodes=(value:readonly string[])=>[...new Set(value.filter(code=>typeof code==='string'&&code.length>0&&code.length<=160))].sort().slice(0,16);
+function priorLiveControlReturn(payload:Record<string,unknown>):number|undefined{
+  const control=payload.liveControlPnl;
+  if(!control||typeof control!=="object"||Array.isArray(control))return undefined;
+  const value=Number((control as Record<string,unknown>).netReturnFraction);
+  return Number.isFinite(value)?value:undefined;
+}
+type CloseExecutionMode="NORMAL_CLOSE"|"HARD_STOP_CLOSE"|"EMERGENCY_CLOSE";
+function closeExecutionMode(input:{action:string;reasonCodes:readonly string[]}):CloseExecutionMode|undefined{
+  if(input.action!=="CLOSE"&&input.action!=="EMERGENCY_CLOSE")return undefined;
+  if(input.action==="EMERGENCY_CLOSE"||input.reasonCodes.includes("EXIT_EMERGENCY_STOP_LOSS"))return "EMERGENCY_CLOSE";
+  return input.reasonCodes.includes("EXIT_HARD_POSITION_STOP_LOSS")?"HARD_STOP_CLOSE":"NORMAL_CLOSE";
+}
+/**
+ * Position-health events are intentionally advisory and bounded.  Failure to
+ * persist or alert can never affect a close/hold/plan decision.
+ */
+async function persistPositionHealthEvent(input:{
+  store:Phase1Store; position:OwnedLivePosition; eventType:PositionHealthEventType;
+  observedAt:string; health:PositionHealthAssessment; livePnlFraction?:number; activeBinId?:number;
+  reasonCodes:string[];
+}):Promise<boolean>{
+  try{
+    return await input.store.insertPositionHealthEvent({
+      eventKey:healthEventKey(input.position.positionAddress,input.eventType),
+      positionAddress:input.position.positionAddress,
+      lpforgePositionId:input.position.lpforgePositionId,
+      poolAddress:input.position.poolAddress,
+      eventType:input.eventType,
+      observedAt:input.observedAt,
+      ...(input.livePnlFraction===undefined?{}:{livePnlFraction:input.livePnlFraction}),
+      ...(input.activeBinId===undefined?{}:{activeBinId:input.activeBinId}),
+      rangeState:input.health.rangeState,
+      healthState:input.health.healthState,
+      reasonCodes:compactHealthReasonCodes(input.reasonCodes),
+    });
+  }catch(error){
+    console.error(json({event:"lpforge_position_health_event_persist_failed",position:input.position.positionAddress,eventType:input.eventType,error:error instanceof Error?error.message:String(error)}));
+    return false;
+  }
+}
 function candidateUniverseRetentionHours():number{
  const value=Number(process.env.LPFORGE_CANDIDATE_UNIVERSE_RETENTION_HOURS??168);
  return Number.isFinite(value)?Math.max(24,Math.min(336,Math.floor(value))):168;
@@ -500,7 +548,7 @@ async function observeAndPlanOwnedPositions(input: {
   protectiveOnly?: boolean;
   swapQuoteProvider?: { quote(request:{inputMint:string;outputMint:string;inputAmount:bigint;requiredOutputAmount:bigint}):Promise<{status:string;quote?:{outAmount:bigint}}> };
 }) {
-  if (!input.ownerAddress) return { observed: 0, planned: 0 };
+  if (!input.ownerAddress) return { observed: 0, planned: 0, skippedNoMatchingContext: 0, monitoringTier: "NORMAL" as PositionMonitoringTier };
   const deployment=loadDeploymentPolicyFile(resolveLiveExecutionPolicyPath());
   if(!deployment.feeClaim)throw new Error('LPFORGE_FEE_CLAIM_POLICY_MISSING');
   const policy = {...loadLivePositionManagementPolicy(
@@ -517,7 +565,9 @@ async function observeAndPlanOwnedPositions(input: {
     ),
     positions = await input.store.loadOwnedPositions(input.ownerAddress);
   let planned = 0,
-    skippedNoMatchingContext = 0;
+    skippedNoMatchingContext = 0,
+    monitoringTier:PositionMonitoringTier="NORMAL";
+  const monitoringRank=(tier:PositionMonitoringTier)=>tier==="CRITICAL"?2:tier==="DANGER"?1:0;
   for (const row of positions) {
     const position = owned(row);
     let fact;
@@ -589,6 +639,17 @@ async function observeAndPlanOwnedPositions(input: {
     const closeCostLamports=fact&&apiPool?await estimateExpectedCloseCostLamports(fact,apiPool,input.swapQuoteProvider):undefined;
     const currentForwardEv=continuation?Number(continuation.continuationEvLamports)/1_000_000_000:undefined;
     const priorPayload=(priorExitRow?.payload&&typeof priorExitRow.payload==="object"?priorExitRow.payload:{}) as Record<string,unknown>;
+    // Health is a monitoring/presentation classification only.  It does not
+    // participate in assessLiveExit and cannot create an economic action.
+    const previousLiveControlReturnFraction=priorLiveControlReturn(priorPayload);
+    const health=assessPositionHealth({
+      activeBinId,
+      lowerBinId:fact?.lowerBinId??position.lowerBinId,
+      upperBinId:fact?.upperBinId??position.upperBinId,
+      ...(liveControlPnl.netReturnFraction===undefined?{}:{liveControlReturnFraction:liveControlPnl.netReturnFraction}),
+      ...(previousLiveControlReturnFraction===undefined?{}:{previousLiveControlReturnFraction}),
+    });
+    if(monitoringRank(health.monitoringTier)>monitoringRank(monitoringTier))monitoringTier=health.monitoringTier;
     const priorConfirmation=Number(priorPayload.continuationConfirmationCount??0);
     const storedMarketConfirmation=priorPayload.marketExitConfirmation;
     const marketConfirmation:MarketExitConfirmationState={families:{}};
@@ -731,6 +792,30 @@ async function observeAndPlanOwnedPositions(input: {
     if(oorAlertTransition)await queueLifecycleAlert({...alertBase,...oorAlertTransition,transitionKey:`${priorLifecycleState??'UNOBSERVED'}->${oor.state}`,reasonCodes:oor.reasonCodes,details:{Direction:oor.direction??'N/A',Status:oor.state,'LPForge action':oor.action,'Out of range':`${oor.continuousOorDurationSeconds}s`,'Active bin':activeBinId,Range:`${position.lowerBinId} → ${position.upperBinId}`,Inventory:oor.inventoryClassification}});
     const priorLpPeak=priorLpProfitHighWater?.peakNetReturnFraction??0,currentLpReturn=liveControlPnl.netReturnFraction;
     const confirmedLpPeak=exitDecision.lpProfitHighWater?.peakNetReturnFraction;
+    // Persist no high-frequency stream: exactly one record for each
+    // lifecycle milestone.  The current event set is read only for durable
+    // transition de-duplication; a telemetry failure is isolated below.
+    let recordedHealthEvents=new Set<PositionHealthEventType>();
+    try{recordedHealthEvents=healthEventTypes(await input.store.loadPositionHealthEventTypes(position.positionAddress));}
+    catch(error){console.error(json({event:'lpforge_position_health_event_read_failed',position:position.positionAddress,error:error instanceof Error?error.message:String(error)}));}
+    const healthEventCandidates:PositionHealthEventType[]=[];
+    if(!recordedHealthEvents.has('POSITION_ENTERED'))healthEventCandidates.push('POSITION_ENTERED');
+    if(exitPolicy.profitProtection.enabled&&confirmedLpPeak!==undefined&&confirmedLpPeak>=exitPolicy.profitProtection.triggerFraction&&!recordedHealthEvents.has('PEAK_MFE_REACHED'))healthEventCandidates.push('PEAK_MFE_REACHED');
+    if(health.rangeState==='LOWER_THIRD'&&!recordedHealthEvents.has('LOWER_THIRD_ENTERED'))healthEventCandidates.push('LOWER_THIRD_ENTERED');
+    if(health.rangeState==='LOWER_EDGE'&&!recordedHealthEvents.has('LOWER_EDGE_ENTERED'))healthEventCandidates.push('LOWER_EDGE_ENTERED');
+    if(health.rangeState==='BELOW_MIN'&&!recordedHealthEvents.has('BELOW_MIN_ENTERED'))healthEventCandidates.push('BELOW_MIN_ENTERED');
+    const reclaimReturnedInside=priorOor?.rangeState==='OUT_OF_RANGE'&&priorOor.direction==='BELOW_MIN'&&health.rangeState!=='BELOW_MIN'&&health.rangeState!=='UNKNOWN';
+    if(reclaimReturnedInside&&!recordedHealthEvents.has('RECLAIM_STARTED'))healthEventCandidates.push('RECLAIM_STARTED');
+    if(recordedHealthEvents.has('RECLAIM_STARTED')&&!recordedHealthEvents.has('RECLAIM_CONFIRMED')&&health.rangeState==='IN_RANGE')healthEventCandidates.push('RECLAIM_CONFIRMED');
+    if(recordedHealthEvents.has('RECLAIM_STARTED')&&!recordedHealthEvents.has('RECLAIM_CONFIRMED')&&health.rangeState==='BELOW_MIN'&&priorOor?.rangeState==='IN_RANGE')healthEventCandidates.push('RECLAIM_FAILED');
+    if(exitDecision.reasonCodes.includes('EXIT_HARD_POSITION_STOP_LOSS')&&!recordedHealthEvents.has('HARD_STOP_TRIGGERED'))healthEventCandidates.push('HARD_STOP_TRIGGERED');
+    if(exitDecision.reasonCodes.includes('EXIT_EMERGENCY_STOP_LOSS')&&!recordedHealthEvents.has('EMERGENCY_STOP_TRIGGERED'))healthEventCandidates.push('EMERGENCY_STOP_TRIGGERED');
+    for(const eventType of healthEventCandidates){
+      const inserted=await persistPositionHealthEvent({store:input.store,position,eventType,observedAt:input.observedAt,health,...(currentLpReturn===undefined?{}:{livePnlFraction:currentLpReturn}),...(activeBinId===undefined?{}:{activeBinId}),reasonCodes:[...health.reasonCodes,...exitDecision.reasonCodes]});
+      if(!inserted)continue;
+      if(eventType==='LOWER_EDGE_ENTERED')await queueLifecycleAlert({...alertBase,severity:'WARNING',code:'POSITION_HEALTH_LOWER_EDGE',title:'LPForge position warning',message:'The position reached the lower edge of its configured range. LPForge is monitoring it more closely; this alert does not request or submit a close.\nAction needed: none right now.',transitionKey:'POSITION_HEALTH->LOWER_EDGE',topic:'RISK',reasonCodes:health.reasonCodes,details:{State:'LOWER_EDGE','Live PnL':pct(currentLpReturn),'Active bin':activeBinId,Range:`${position.lowerBinId} → ${position.upperBinId}`,Action:'Monitoring'}});
+      if(eventType==='BELOW_MIN_ENTERED')await queueLifecycleAlert({...alertBase,severity:'CRITICAL',code:'POSITION_HEALTH_BELOW_MIN',title:'LPForge position critical',message:'The position moved below the lower boundary of its configured range. LPForge is evaluating existing protective rules; this alert does not itself authorize a close.\nAction needed: none right now.',transitionKey:'POSITION_HEALTH->BELOW_MIN',topic:'RISK',reasonCodes:health.reasonCodes,details:{State:'BELOW_MIN','Live PnL':pct(currentLpReturn),'Active bin':activeBinId,Range:`${position.lowerBinId} → ${position.upperBinId}`,Action:'Protection evaluation'}});
+    }
     if(exitPolicy.profitProtection.enabled&&currentLpReturn!==undefined&&confirmedLpPeak!==undefined&&priorLpPeak<exitPolicy.profitProtection.triggerFraction&&confirmedLpPeak>=exitPolicy.profitProtection.triggerFraction)queueLifecycleAlert({...alertBase,severity:'INFO',code:'POSITION_PROFIT_PROTECTION_ARMED',title:'Profit protection armed',message:'The Meteora-comparable LP high-water return crossed the configured profit-protection trigger.',transitionKey:'NOT_ARMED->ARMED',topic:'TRADES',details:{'LP return':pct(currentLpReturn),'LP peak return':pct(confirmedLpPeak),'Trigger':pct(exitPolicy.profitProtection.triggerFraction),'Max giveback':pct(exitPolicy.profitProtection.maxGivebackFraction),'Retained floor':pct(exitPolicy.profitProtection.minRetainedProfitFraction),'Range':isOor?'OUT OF RANGE':'IN RANGE'}});
     for(const milestone of telegramLifecycleConfig.returnMilestones)if(currentLpReturn!==undefined&&confirmedLpPeak!==undefined&&priorLpPeak<milestone&&confirmedLpPeak>=milestone)queueLifecycleAlert({...alertBase,severity:'INFO',code:'POSITION_RETURN_MILESTONE',title:'Position LP return milestone reached',message:'Meteora-comparable LP return crossed a configured Telegram-only milestone.',transitionKey:`LP_RETURN<${milestone}->LP_RETURN>=${milestone}`,topic:'TRADES',details:{Milestone:pct(milestone),'LP return':pct(currentLpReturn),'LP peak return':pct(confirmedLpPeak)}});
     if((decision.action==='CLOSE'||decision.action==='EMERGENCY_CLOSE')&&priorExitRow?.last_action!==decision.action)await queueLifecycleAlert({...alertBase,severity:decision.action==='EMERGENCY_CLOSE'?'CRITICAL':'WARNING',code:decision.action==='EMERGENCY_CLOSE'?'POSITION_EMERGENCY_CLOSE_TRIGGERED':'POSITION_CLOSE_TRIGGERED',title:decision.action==='EMERGENCY_CLOSE'?'Emergency close requested':'Position close requested',message:'LPForge’s existing position-risk rules requested a close. This alert does not mean a transaction has been sent yet; execution will recheck live chain and safety facts first.\nAction needed: none right now.',transitionKey:`${priorExitRow?.last_action??'HOLD'}->${decision.action}`,topic:decision.action==='EMERGENCY_CLOSE'?'RISK':'TRADES',reasonCodes:decision.reasonCodes,details:{Trigger:exitDecision.reasonFamily,'Requested action':decision.action,Urgency:exitDecision.urgency,'LP return':pct(currentLpReturn),'LP peak return':pct(confirmedLpPeak),'LP peak giveback':pct(exitDecision.lpProfitGivebackFraction),Range:isOor?'OUT OF RANGE':'IN RANGE'}});
@@ -821,6 +906,7 @@ async function observeAndPlanOwnedPositions(input: {
         Date.parse(input.observedAt) + policy.planTtlMs,
       ).toISOString(),
       replacement = decision.replacementRange;
+    const executionMode=closeExecutionMode({action:planAction,reasonCodes:exitDecision.reasonCodes});
     const plan = buildTransactionPlan({
       action: planAction,
       cluster: "mainnet-beta",
@@ -861,6 +947,7 @@ async function observeAndPlanOwnedPositions(input: {
         orientation: position.orientation,
         entryFunding: { rebuildFromRemovedPosition: true },
         exitGovernor: { reasonFamily: exitDecision.reasonFamily, reasonCodes: exitDecision.reasonCodes, economics: exitDecision.economics, highWater: exitDecision.highWater, peakGivebackFraction: exitDecision.peakGivebackFraction },
+        ...(executionMode?{closeExecution:{mode:executionMode,decisionAt:input.observedAt,reasonCodes:exitDecision.reasonCodes}}:{}),
       },
     });
     const serializedProtectiveClose=terminalProtectiveClose&&['CLOSE','EMERGENCY_CLOSE'].includes(planAction);
@@ -873,7 +960,7 @@ async function observeAndPlanOwnedPositions(input: {
     if(telegramCloseRequest)await input.store.markTelegramOperatorCloseRequest({requestId:String(telegramCloseRequest.request_id),status:'PLANNED',at:input.observedAt,planId:plan.planId,payload:{positionAddress:position.positionAddress,poolAddress:position.poolAddress,canonicalPlanCreated:true}});
     planned++;
   }
-  return { observed: positions.length, planned, skippedNoMatchingContext };
+  return { observed: positions.length, planned, skippedNoMatchingContext, monitoringTier };
 }
 function shadowPayloadForPersistence(shadow:NonNullable<OperationalCycleResult['shadow']>):Record<string,unknown>{
  const {candidateUniverseEvidence,...persistent}=shadow;
@@ -1601,6 +1688,51 @@ async function manageOwnedPositionsProtectiveOnce() {
     await store.close();
   }
 }
+/**
+ * Fast, read-only health probe used only while an owned position is already
+ * in a danger tier. It writes no observation, metric, event, plan, or alert.
+ * If a numeric stop is observed, the P7 parent invokes the existing canonical
+ * protective-management probe rather than trusting this lightweight reader to
+ * construct an action.
+ */
+async function positionHealthProbeOnce(){
+  const cfg=loadPhase1Config();
+  if(cfg.dataMode!=="LIVE_READ_ONLY")throw new Error("LPFORGE_OPERATOR_REQUIRES_LIVE_READ_ONLY");
+  const ownerAddress=process.env.LPFORGE_OPERATOR_OWNER_ADDRESS?.trim();
+  // This child is consumed by P7 as a compact machine summary.  Keep it on
+  // one line (unlike the human-facing operator JSON) so the parent can never
+  // mistake an indented property line for a complete result.
+  if(!ownerAddress){console.log(JSON.stringify({event:"lpforge_position_health_probe",operationalCycleComplete:true,observedPositions:0,availableLiveMarks:0,monitoringTier:"NORMAL",numericStopObserved:false,emergencyStopObserved:false}));return;}
+  const store=await createPostgresStore(cfg.databaseUrl);
+  try{
+    const [positions,exitPolicy]=await Promise.all([
+      store.loadOwnedPositions(ownerAddress),
+      Promise.resolve(loadLiveExitGovernorPolicy(process.env.LPFORGE_LIVE_EXIT_POLICY_PATH??"release-policy-templates/live-exit-governor-policy.json")),
+    ]);
+    const adapter=createMeteoraReadAdapter({rpcUrl:cfg.solanaRpcHttpUrl,cluster:cfg.cluster,programId:cfg.programId,expectedSdkVersion:cfg.expectedSdkVersion,rpcTimeoutMs:cfg.rpcTimeoutMs});
+    const api=createMeteoraDataApi({baseUrl:cfg.meteoraDataApiUrl,maxRps:cfg.dataApiMaxRps,timeoutMs:cfg.httpTimeoutMs,priority:"P0_POSITION_PROTECTION"});
+    let monitoringTier:PositionMonitoringTier="NORMAL",numericStopObserved=false,emergencyStopObserved=false,availableLiveMarks=0;
+    const rank=(tier:PositionMonitoringTier)=>tier==="CRITICAL"?2:tier==="DANGER"?1:0;
+    for(const row of positions){
+      const position=owned(row);
+      let activeBinId:number|undefined,meteoraPositionPnl:MeteoraPositionPnl|undefined;
+      try{activeBinId=(await adapter.getPool(position.poolAddress)).activeBinId;}catch{}
+      try{meteoraPositionPnl=(await api.getOpenPositionPnl(position.poolAddress,position.ownerAddress)).find(value=>value.positionAddress===position.positionAddress);}catch{}
+      const live=deriveMeteoraComparableLpPositionMarkToMarket({...(meteoraPositionPnl?{positionPnl:meteoraPositionPnl}:{}),observedAt:new Date().toISOString(),expectedPositionAddress:position.positionAddress});
+      const previous=await store.loadPositionExitState(position.lpforgePositionId);
+      const priorPayload=(previous?.payload&&typeof previous.payload==="object"&&!Array.isArray(previous.payload)?previous.payload:{}) as Record<string,unknown>;
+      const previousLiveControlReturnFraction=priorLiveControlReturn(priorPayload);
+      const health=assessPositionHealth({...(activeBinId===undefined?{}:{activeBinId}),lowerBinId:position.lowerBinId,upperBinId:position.upperBinId,...(live.netReturnFraction===undefined?{}:{liveControlReturnFraction:live.netReturnFraction}),...(previousLiveControlReturnFraction===undefined?{}:{previousLiveControlReturnFraction})});
+      if(rank(health.monitoringTier)>rank(monitoringTier))monitoringTier=health.monitoringTier;
+      if(live.evidenceState==="AVAILABLE"&&live.netReturnFraction!==undefined){
+        availableLiveMarks++;
+        if(live.netReturnFraction<=-exitPolicy.hardStopLossFraction)numericStopObserved=true;
+        if(live.netReturnFraction<=-exitPolicy.emergencyStopLossFraction)emergencyStopObserved=true;
+      }
+    }
+    console.log(JSON.stringify({event:"lpforge_position_health_probe",operationalCycleComplete:true,observedPositions:positions.length,availableLiveMarks,monitoringTier,numericStopObserved,emergencyStopObserved,transactionsScanned:0,decodedSwapEvents:0,eventDecodeWarnings:0}));
+  }finally{await store.close();}
+}
 async function liveRun() {
   const interval = Math.max(
     5000,
@@ -1633,5 +1765,9 @@ else if (cmd === "manage-owned-positions-protective") {
   await manageOwnedPositionsProtectiveOnce();
   process.exit(0);
 }
+else if(cmd === "position-health-probe"){
+  await positionHealthProbeOnce();
+  process.exit(0);
+}
 else if (cmd === "live-run") await liveRun();
-else throw new Error("Usage: operator fixture-once|live-once|observe-owned-positions|live-run");
+else throw new Error("Usage: operator fixture-once|live-once|observe-owned-positions|manage-owned-positions-protective|position-health-probe|live-run");

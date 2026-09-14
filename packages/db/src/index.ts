@@ -454,6 +454,26 @@ export type AutonomousPlanAction =
   | "REBALANCE"
   | "CLOSE"
   | "EMERGENCY_CLOSE";
+export type PositionHealthEventType =
+  | "POSITION_ENTERED"
+  | "PEAK_MFE_REACHED"
+  | "LOWER_THIRD_ENTERED"
+  | "LOWER_EDGE_ENTERED"
+  | "BELOW_MIN_ENTERED"
+  | "RECLAIM_STARTED"
+  | "RECLAIM_CONFIRMED"
+  | "RECLAIM_FAILED"
+  | "HARD_STOP_TRIGGERED"
+  | "EMERGENCY_STOP_TRIGGERED"
+  | "SETTLED";
+export type PositionHealthRangeState =
+  | "IN_RANGE"
+  | "LOWER_THIRD"
+  | "LOWER_EDGE"
+  | "BELOW_MIN"
+  | "OOR_UPSIDE"
+  | "UNKNOWN";
+export type PositionHealthState = "GREEN" | "YELLOW" | "ORANGE" | "RED";
 export interface AutonomousPlanStep {
   transactionId: string;
   sequence: number;
@@ -1364,6 +1384,19 @@ export interface Phase1Store {
     staleData: boolean;
     payload: Record<string, unknown>;
   }): Promise<void>;
+  /**
+   * Bounded lifecycle telemetry. The deterministic event key makes repeated
+   * runtime checks idempotent and prevents this table becoming an observation
+   * stream. A caller may omit identity fields only for a terminal P6 event;
+   * the store then resolves them from the existing owned position row.
+   */
+  insertPositionHealthEvent(value:{
+    eventKey:string; positionAddress:string; eventType:PositionHealthEventType;
+    observedAt:string; livePnlFraction?:number; activeBinId?:number;
+    rangeState:PositionHealthRangeState; healthState:PositionHealthState;
+    reasonCodes:string[]; lpforgePositionId?:string; poolAddress?:string;
+  }):Promise<boolean>;
+  loadPositionHealthEventTypes(positionAddress:string):Promise<PositionHealthEventType[]>;
   loadLatestPositionManagementMetrics(lpforgePositionId:string): Promise<Record<string,unknown>|null>;
   insertPositionManagementMetrics(value:{
     lpforgePositionId:string; observedAt:string; policyVersion:string;
@@ -4082,6 +4115,26 @@ return 'APPLIED';
         ],
       );
     },
+    async insertPositionHealthEvent(v) {
+      const r=await db.query(
+        `INSERT INTO execution.position_health_events(event_key,position_address,lpforge_position_id,pool_address,observed_at,event_type,live_pnl_fraction,active_bin_id,range_state,health_state,reason_codes)
+           SELECT $1,$2,COALESCE($3,o.lpforge_position_id),COALESCE($4,o.pool_address),$5,$6,$7,$8,$9,$10,$11::jsonb
+             FROM execution.owned_positions o
+            WHERE o.position_address=$2
+           ON CONFLICT(event_key) DO NOTHING
+        RETURNING event_key`,
+        [v.eventKey,v.positionAddress,v.lpforgePositionId??null,v.poolAddress??null,v.observedAt,v.eventType,v.livePnlFraction??null,v.activeBinId??null,v.rangeState,v.healthState,json(v.reasonCodes)],
+      );
+      return r.rows.length===1;
+    },
+    async loadPositionHealthEventTypes(positionAddress) {
+      const r=await db.query(
+        `SELECT event_type FROM execution.position_health_events WHERE position_address=$1 ORDER BY observed_at ASC,event_key ASC`,
+        [positionAddress],
+      );
+      const allowed=new Set<PositionHealthEventType>(["POSITION_ENTERED","PEAK_MFE_REACHED","LOWER_THIRD_ENTERED","LOWER_EDGE_ENTERED","BELOW_MIN_ENTERED","RECLAIM_STARTED","RECLAIM_CONFIRMED","RECLAIM_FAILED","HARD_STOP_TRIGGERED","EMERGENCY_STOP_TRIGGERED","SETTLED"]);
+      return r.rows.map(row=>String(row.event_type)).filter((value):value is PositionHealthEventType=>allowed.has(value as PositionHealthEventType));
+    },
     async loadLatestPositionManagementMetrics(lpforgePositionId) {
       const r=await db.query("SELECT * FROM execution.position_management_metrics WHERE lpforge_position_id=$1 ORDER BY observed_at DESC LIMIT 1",[lpforgePositionId]);
       return (r.rows[0] as Record<string,unknown>|undefined)??null;
@@ -5986,6 +6039,8 @@ export function createMemoryStore(): Phase1Store {
     async reconcileRecoveredChunkedOpenPlan() {},
     async upsertOwnedPosition() {},
     async insertPositionObservation() {},
+    async insertPositionHealthEvent() { return true; },
+    async loadPositionHealthEventTypes() { return []; },
     async loadLatestPositionManagementMetrics() { return null; },
     async insertPositionManagementMetrics() {},
     async loadPositionOorLifecycleState() { return null; },

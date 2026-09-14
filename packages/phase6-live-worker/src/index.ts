@@ -104,6 +104,30 @@ function queuePositionSettledAlert(report:CanonicalPostTradeReport){
   void enqueueAndDispatchPhase7Alert({databaseUrl:process.env.DATABASE_URL,config:telegramOpenConfig,alert:postTradeSettlementAlert(report)}).catch(()=>{});
 }
 
+/** Immutable P7 close-plan annotation; it never relaxes a P6 safety gate. */
+export type CloseExecutionMode = "NORMAL_CLOSE" | "HARD_STOP_CLOSE" | "EMERGENCY_CLOSE";
+export function deriveCloseExecutionMode(plan:Pick<AutonomousPlan,"action"|"intentPayload">):CloseExecutionMode {
+  if(plan.action==="EMERGENCY_CLOSE")return "EMERGENCY_CLOSE";
+  const closeExecution=plan.intentPayload.closeExecution;
+  const annotated=closeExecution&&typeof closeExecution==="object"&&!Array.isArray(closeExecution)
+    ? (closeExecution as Record<string,unknown>).mode
+    : undefined;
+  const reasons=Array.isArray(plan.intentPayload.managementReasonCodes)
+    ? plan.intentPayload.managementReasonCodes.filter((value):value is string=>typeof value==="string")
+    : [];
+  // The immutable reason code is authoritative. An untrusted/legacy mode can
+  // never promote an ordinary close into a stop-priority close by itself.
+  if(reasons.includes("EXIT_HARD_POSITION_STOP_LOSS"))return "HARD_STOP_CLOSE";
+  if(annotated==="EMERGENCY_CLOSE"&&reasons.includes("EXIT_EMERGENCY_STOP_LOSS"))return "EMERGENCY_CLOSE";
+  return "NORMAL_CLOSE";
+}
+/** Faster confirmation polling advances an already-sent stop close; it does
+ * not alter simulation, signatures, attempts, UNKNOWN handling, or retries. */
+export function closeConfirmationPollMs(mode:CloseExecutionMode,normalPollMs:number):number {
+  if(!Number.isInteger(normalPollMs)||normalPollMs<1)throw new Error("LPFORGE_P6_CONFIRM_POLL_INVALID");
+  return mode==="NORMAL_CLOSE"?normalPollMs:Math.max(250,Math.min(normalPollMs,500));
+}
+
 export interface LiveWorkerConfig {
   rpcUrl: string;
   programId: string;
@@ -2107,6 +2131,7 @@ async function executeJupiterUnwindStep(input: {
   /** SOL-denominated current position basis; never raw token-X units. */
   economicReferenceLamports: bigint;
   action: "CLOSE" | "EMERGENCY_CLOSE";
+  executionMode?: CloseExecutionMode;
   transactionId: string;
   idempotencyKey: string;
   stage: "PARTIAL_ENTRY_UNWIND" | "CLOSE_TOKEN_X_UNWIND" | "CLOSE_RECOVERED_OPEN_RESIDUAL_UNWIND";
@@ -2308,7 +2333,7 @@ async function executeJupiterUnwindStep(input: {
       idempotencyKey: input.idempotencyKey,
       signature: record.signature,
       lease: record,
-      pollMs: input.config.confirmPollMs,
+      pollMs: input.executionMode?closeConfirmationPollMs(input.executionMode,input.config.confirmPollMs):input.config.confirmPollMs,
       attempts: input.config.confirmAttempts,
     }))
   )
@@ -3301,6 +3326,12 @@ async function executeMeteoraMutation(input: {
     connection = createGovernedConnection({rpcUrl:input.config.rpcUrl,priority:'P0_EXECUTION_CRITICAL'}),
     capital = mutationCapital(input.plan),
     now = new Date().toISOString();
+  const executionMode=(input.action==="CLOSE"||input.action==="EMERGENCY_CLOSE")?deriveCloseExecutionMode(input.plan):undefined;
+  const confirmationPollMs=executionMode?closeConfirmationPollMs(executionMode,input.config.confirmPollMs):input.config.confirmPollMs;
+  const closeExecution=input.plan.intentPayload.closeExecution;
+  const stopDecisionAt=closeExecution&&typeof closeExecution==="object"&&!Array.isArray(closeExecution)&&typeof (closeExecution as Record<string,unknown>).decisionAt==="string"
+    ? String((closeExecution as Record<string,unknown>).decisionAt)
+    : undefined;
   // From this point onward a submission may have reached the cluster.  A
   // later local/database/reconciliation error must never rewrite that fact as
   // FAILED/transactionSubmitted=false.
@@ -3312,7 +3343,7 @@ async function executeMeteoraMutation(input: {
       planId: input.plan.planId,
       state: "BUILDING",
       at: now,
-      payload: { action: input.action, builder: input.built.builder },
+      payload: { action: input.action, builder: input.built.builder, ...(executionMode?{closeExecutionMode:executionMode,stopDecisionAt:stopDecisionAt??null}: {}) },
     });
     const lease = await connection.getLatestBlockhash("confirmed");
     transaction.recentBlockhash = lease.blockhash;
@@ -3538,7 +3569,7 @@ async function executeMeteoraMutation(input: {
         idempotencyKey: input.plan.idempotencyKey,
         signature: submitted.signature,
         lease,
-        pollMs: input.config.confirmPollMs,
+        pollMs: confirmationPollMs,
         attempts: input.config.confirmAttempts,
       });
     if (!confirmation)
@@ -4608,6 +4639,11 @@ async function executeCloseSettlement(input: {
 }): Promise<LiveWorkerResult> {
   const closeAction: "CLOSE" | "EMERGENCY_CLOSE" =
     input.plan.action === "EMERGENCY_CLOSE" ? "EMERGENCY_CLOSE" : "CLOSE";
+  const executionMode=deriveCloseExecutionMode(input.plan);
+  const closeExecution=input.plan.intentPayload.closeExecution;
+  const stopDecisionAt=closeExecution&&typeof closeExecution==="object"&&!Array.isArray(closeExecution)&&typeof (closeExecution as Record<string,unknown>).decisionAt==="string"
+    ? String((closeExecution as Record<string,unknown>).decisionAt)
+    : undefined;
   const removeStep =
       input.plan.steps.find((candidate) => candidate.kind === "METEORA_REMOVE") ??
       input.plan.steps[0],
@@ -4639,7 +4675,7 @@ async function executeCloseSettlement(input: {
         // Completed stage transitions clear any previous child submission
         // marker. A callback that records a new pending child overrides these
         // nulls in the same durable document.
-        payload: { stage, tokenXMint: poolFact.tokenXMint, pendingStage: null, pendingSignature: null, ...payload },
+        payload: { stage, tokenXMint: poolFact.tokenXMint, pendingStage: null, pendingSignature: null, closeExecutionMode:executionMode, stopDecisionAt:stopDecisionAt??null, ...payload },
       });
 
   // A CLOSE has parent-level chain truth. Once a child stage has been sent,
@@ -4945,6 +4981,7 @@ async function executeCloseSettlement(input: {
         amount: attributableTokenX,
         economicReferenceLamports: mutationCapital(input.plan),
         action: closeAction,
+        executionMode,
         transactionId: unwindTransactionId,
         idempotencyKey: `${input.plan.idempotencyKey}:${unwindTransactionId}`,
         stage: "CLOSE_TOKEN_X_UNWIND",
@@ -5048,6 +5085,7 @@ async function executeCloseSettlement(input: {
           amount:recoveredOpenResidual.rawAmount,
           economicReferenceLamports:mutationCapital(input.plan),
           action:closeAction,
+          executionMode,
           transactionId,
           idempotencyKey:`${input.plan.idempotencyKey}:${transactionId}`,
           stage:"CLOSE_RECOVERED_OPEN_RESIDUAL_UNWIND",
@@ -5291,6 +5329,20 @@ async function finalizeClosedPositionSettlement(input:{store:Phase1Store;plan:Au
   }
   const migrationHead=runtimeMigrationHead();
   const persisted=await input.store.persistLifecycleSolSettlement({assessment,input:{...settlementInput,positionAbsent:true,positionCheckedAt,positionCheckedSlot},...(process.env.LPFORGE_SOURCE_COMMIT?{sourceCommit:process.env.LPFORGE_SOURCE_COMMIT}:{}),...(process.env.LPFORGE_P7_POLICY_HASH?{policyHash:process.env.LPFORGE_P7_POLICY_HASH}:{}),...(migrationHead?{migrationHead}:{}),...(process.env.LPFORGE_BUILD_ID?{buildId:process.env.LPFORGE_BUILD_ID}:{}),at});
+  // Event telemetry is best effort and strictly post-settlement.  A telemetry
+  // fault can neither undo a canonical settlement nor hold the executor.
+  try{
+    const mode=deriveCloseExecutionMode(input.plan);
+    await input.store.insertPositionHealthEvent({
+      eventKey:`position-health:${input.positionAddress}:SETTLED`,
+      positionAddress:input.positionAddress,
+      eventType:"SETTLED",
+      observedAt:at,
+      rangeState:"UNKNOWN",
+      healthState:mode==="NORMAL_CLOSE"?"GREEN":"RED",
+      reasonCodes:["POSITION_CANONICAL_SOL_SETTLED",`CLOSE_EXECUTION_MODE_${mode}`],
+    });
+  }catch(error){console.error(JSON.stringify({event:"lpforge_position_health_settlement_event_failed",position:input.positionAddress,error:error instanceof Error?error.message:String(error)}));}
   const rootClosePlanId=typeof dispatch.terminalRootClosePlanId==='string'?dispatch.terminalRootClosePlanId:input.plan.planId,
     claimSignatures=confirmedTerminalClaimTransactions(settlementInput.transactions)
       .filter(transaction=>transaction.planId===rootClosePlanId)

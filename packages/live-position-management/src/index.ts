@@ -36,6 +36,106 @@ export type OorLifecycleAction =
   | "CLOSE_AND_REEVALUATE"
   | "HOLD_CHAIN_RECONCILIATION";
 
+/**
+ * Presentation and runtime-monitoring state only.  These values never grant
+ * an entry, change a range, or create a close decision.  Existing exit
+ * evaluators remain the sole authority for economic actions.
+ */
+export type PositionHealthState = "GREEN" | "YELLOW" | "ORANGE" | "RED";
+export type PositionMonitoringTier = "NORMAL" | "DANGER" | "CRITICAL";
+export type PositionHealthRangeState =
+  | "IN_RANGE"
+  | "LOWER_THIRD"
+  | "LOWER_EDGE"
+  | "BELOW_MIN"
+  | "OOR_UPSIDE"
+  | "UNKNOWN";
+export interface PositionHealthAssessment {
+  healthState: PositionHealthState;
+  monitoringTier: PositionMonitoringTier;
+  rangeState: PositionHealthRangeState;
+  oorDirection?: OorDirection;
+  rangeFraction?: number;
+  rapidNegativeMove: boolean;
+  reasonCodes: string[];
+}
+
+/**
+ * A compact, deterministic health classification for the existing owned
+ * position monitor.  It intentionally has no action field: callers may use
+ * it to select a faster read cadence and to emit a bounded lifecycle event,
+ * but cannot use it as a new exit policy.
+ */
+export function assessPositionHealth(input: {
+  activeBinId?: number;
+  lowerBinId?: number;
+  upperBinId?: number;
+  liveControlReturnFraction?: number;
+  previousLiveControlReturnFraction?: number;
+  /** Default is a 3pp adverse move between independent usable marks. */
+  rapidNegativeMoveFraction?: number;
+}): PositionHealthAssessment {
+  const finite = (value: number | undefined): value is number =>
+    typeof value === "number" && Number.isFinite(value);
+  const rapidThreshold = input.rapidNegativeMoveFraction ?? 0.03;
+  if (!Number.isFinite(rapidThreshold) || rapidThreshold <= 0 || rapidThreshold > 1)
+    throw new Error("LPFORGE_POSITION_HEALTH_RAPID_MOVE_INVALID");
+  const reasonCodes: string[] = [];
+  let rangeState: PositionHealthRangeState = "UNKNOWN";
+  let oorDirection: OorDirection | undefined;
+  let rangeFraction: number | undefined;
+  const geometry =
+    Number.isInteger(input.activeBinId) &&
+    Number.isInteger(input.lowerBinId) &&
+    Number.isInteger(input.upperBinId) &&
+    input.lowerBinId! <= input.upperBinId!;
+  if (!geometry) reasonCodes.push("POSITION_HEALTH_RANGE_UNAVAILABLE");
+  else if (input.activeBinId! < input.lowerBinId!) {
+    rangeState = "BELOW_MIN";
+    oorDirection = "BELOW_MIN";
+    reasonCodes.push("POSITION_HEALTH_BELOW_MIN");
+  } else if (input.activeBinId! > input.upperBinId!) {
+    rangeState = "OOR_UPSIDE";
+    oorDirection = "ABOVE_MAX";
+    reasonCodes.push("POSITION_HEALTH_OOR_UPSIDE");
+  } else if (input.activeBinId! === input.lowerBinId!) {
+    rangeState = "LOWER_EDGE";
+    rangeFraction = 0;
+    reasonCodes.push("POSITION_HEALTH_LOWER_EDGE");
+  } else {
+    const width = input.upperBinId! - input.lowerBinId!;
+    rangeFraction = width === 0 ? 1 : (input.activeBinId! - input.lowerBinId!) / width;
+    if (rangeFraction <= 1 / 3) {
+      rangeState = "LOWER_THIRD";
+      reasonCodes.push("POSITION_HEALTH_LOWER_THIRD");
+    } else rangeState = "IN_RANGE";
+  }
+  const rapidNegativeMove =
+    finite(input.liveControlReturnFraction) &&
+    finite(input.previousLiveControlReturnFraction) &&
+    input.liveControlReturnFraction - input.previousLiveControlReturnFraction <= -rapidThreshold;
+  if (rapidNegativeMove) reasonCodes.push("POSITION_HEALTH_RAPID_NEGATIVE_MOVE");
+  const criticalPnl = finite(input.liveControlReturnFraction) && input.liveControlReturnFraction <= -0.1;
+  const dangerPnl = finite(input.liveControlReturnFraction) && input.liveControlReturnFraction <= -0.06;
+  if (criticalPnl) reasonCodes.push("POSITION_HEALTH_LIVE_PNL_CRITICAL");
+  else if (dangerPnl) reasonCodes.push("POSITION_HEALTH_LIVE_PNL_DANGER");
+  const criticalRange = rangeState === "LOWER_EDGE" || rangeState === "BELOW_MIN";
+  const dangerRange = rangeState === "LOWER_THIRD";
+  const monitoringTier: PositionMonitoringTier = criticalPnl || criticalRange
+    ? "CRITICAL"
+    : dangerPnl || dangerRange || rapidNegativeMove
+      ? "DANGER"
+      : "NORMAL";
+  const healthState: PositionHealthState = rangeState === "BELOW_MIN" || criticalPnl
+    ? "RED"
+    : rangeState === "LOWER_EDGE"
+      ? "ORANGE"
+      : rangeState === "LOWER_THIRD" || dangerPnl || rapidNegativeMove
+        ? "YELLOW"
+        : "GREEN";
+  return { healthState, monitoringTier, rangeState, ...(oorDirection ? { oorDirection } : {}), ...(rangeFraction === undefined ? {} : { rangeFraction }), rapidNegativeMove, reasonCodes: [...new Set(reasonCodes)].sort() };
+}
+
 export interface OorLifecyclePolicy {
   schemaVersion: 2;
   policyVersion: "oor-lifecycle-v2";
