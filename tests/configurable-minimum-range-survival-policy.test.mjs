@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { generateRangeUniverse, generateStrategyCandidates, resolveFinalRangeWidthBins } from '../.build/packages/rangeforge/src/index.js';
-import { parseDeploymentPolicy } from '../.build/packages/deployment-policy/src/index.js';
+import { initialIncludedBinCountWithinPolicy, parseDeploymentPolicy, requireInitialRangeConstructionPolicy } from '../.build/packages/deployment-policy/src/index.js';
 
 const context={horizons:{'15m':{absoluteBins:4,returnPct:0},'1h':{absoluteBins:5,binVelocityPerMinute:.1,returnPct:0}}};
 const structure={volatilityState:'LOW',trendDirection:0,trendEfficiency:0};
@@ -45,4 +45,27 @@ test('final width is the maximum of policy, volatility, and survival requirement
   assert.equal(resolve(60,30,47),60);
   assert.equal(resolve(60,20,25),60);
   assert.throws(()=>resolve(60,110,38),/RANGE_REQUIRED_WIDTH_EXCEEDS_MAXIMUM/);
+});
+
+test('RangeForge, deployment validation, and P6-bound geometry obey arbitrary supplied min/max policy',()=>{
+  for(const [minimumIncludedBins,maximumIncludedBins] of [[35,100],[60,100],[65,100],[75,90]]){
+    const policy=parseDeploymentPolicy({schemaVersion:1,policyId:'fixture',status:'DISABLED',approvalTtlMs:5000,minDevnetConfirmedRuns:1,maxActionsPerDay:1,maxOpenPositions:1,pools:[],range:{minimumIncludedBins},positionConstruction:{maxInitialPositionWidthBins:maximumIncludedBins,maxPositionAccountRentSol:'0.01',requirePreinitializedBinArrays:true,liquiditySlippageBps:100}});
+    const bounds=requireInitialRangeConstructionPolicy(policy);
+    const valid=width=>initialIncludedBinCountWithinPolicy({lowerBinId:100,upperBinId:100+width-1,minimumIncludedBins:bounds.minimumIncludedBins,maximumIncludedBins:bounds.maximumIncludedBins});
+    assert.equal(valid(minimumIncludedBins-1),false,`min ${minimumIncludedBins}`);
+    assert.equal(valid(minimumIncludedBins),true,`min ${minimumIncludedBins}`);
+    assert.equal(valid(maximumIncludedBins),true,`max ${maximumIncludedBins}`);
+    assert.equal(valid(maximumIncludedBins+1),false,`max ${maximumIncludedBins}`);
+    assert.equal(resolveFinalRangeWidthBins({minimumIncludedBins:bounds.minimumIncludedBins,volatilityRequiredWidthBins:1,survivalHorizonRequiredWidthBins:1,maximumWidthBins:bounds.maximumIncludedBins}),minimumIncludedBins);
+  }
+});
+
+test('policy-fixture simulations prove 60 to 65 and 100 to 95 require no engine constant change',()=>{
+  const min65={minimumIncludedBins:65,maximumIncludedBins:100};
+  assert.equal(initialIncludedBinCountWithinPolicy({lowerBinId:0,upperBinId:63,...min65}),false);
+  assert.equal(initialIncludedBinCountWithinPolicy({lowerBinId:0,upperBinId:64,...min65}),true);
+  const max95={minimumIncludedBins:60,maximumIncludedBins:95};
+  assert.equal(resolveFinalRangeWidthBins({minimumIncludedBins:max95.minimumIncludedBins,volatilityRequiredWidthBins:95,survivalHorizonRequiredWidthBins:95,maximumWidthBins:max95.maximumIncludedBins}),95);
+  assert.equal(initialIncludedBinCountWithinPolicy({lowerBinId:0,upperBinId:95,...max95}),false);
+  assert.equal(initialIncludedBinCountWithinPolicy({lowerBinId:0,upperBinId:94,...max95}),true);
 });

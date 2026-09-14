@@ -60,7 +60,7 @@ import {
   fixturePool,
   fixtureSwaps,
 } from "../../../packages/test-fixtures/src/index.js";
-import { loadDeploymentPolicyFile } from "../../../packages/deployment-policy/src/index.js";
+import { loadDeploymentPolicyFile, requireInitialRangeConstructionPolicy } from "../../../packages/deployment-policy/src/index.js";
 import { assessProductionOpenPlanCapacity } from "../../../packages/production-entry-capacity/src/index.js";
 import { assessPostEntryAuthority } from "../../../packages/phase7-post-entry-authority/src/index.js";
 import { assessOorLifecycleAlertTransition, enqueueAndDispatchPhase7Alert, loadPhase7TelegramConfig, type Phase7Alert } from "../../../packages/phase7-alerting/src/index.js";
@@ -263,7 +263,7 @@ function loadProductionCapitalEnvelope(poolAddress: string) {
   if (!maxPoolLamports)
     throw new Error("LPFORGE_PRODUCTION_CAPITAL_POOL_LIMIT_REQUIRED");
   const capital = deployment.productionCapital;
-  const construction = deployment.positionConstruction;
+  const construction = requireInitialRangeConstructionPolicy(deployment);
   return {
     productionCapitalPolicy: {
       id: `${deployment.policyId}:production-capital-v1`,
@@ -275,8 +275,8 @@ function loadProductionCapitalEnvelope(poolAddress: string) {
       minInitialPosition: lamportsToSol(capital.minInitialPositionLamports),
     },
     productionPoolCapital: lamportsToSol(maxPoolLamports),
-    ...(construction ? { maxRangeWidthBins: construction.maxInitialPositionWidthBins } : {}),
-    ...(deployment.range ? { minRangeWidthBins: deployment.range.minimumIncludedBins } : {}),
+    maxRangeWidthBins: construction.maximumIncludedBins,
+    minRangeWidthBins: construction.minimumIncludedBins,
   };
 }
 async function loadLiveOpenPlanCapacity(input: {
@@ -1235,7 +1235,7 @@ async function liveOnce() {
     if (compat.state !== "VERIFIED")
       throw new Error("LPFORGE_PROTOCOL_COMPATIBILITY_HOLD");
     const deploymentPolicy=loadDeploymentPolicyFile(resolveLiveExecutionPolicyPath());
-    const evidenceWidth=derivePhase3EvidenceWidthRequirement(deploymentPolicy.positionConstruction?.maxInitialPositionWidthBins ?? 100);
+    const evidenceWidth=derivePhase3EvidenceWidthRequirement(requireInitialRangeConstructionPolicy(deploymentPolicy).maximumIncludedBins);
     const [pool, bins] = await Promise.all([
       adapter.getPool(cfg.smokePoolAddress),
       adapter.getBinsAroundActive(cfg.smokePoolAddress, evidenceWidth.requiredEvidenceRadius),

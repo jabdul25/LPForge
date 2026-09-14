@@ -55,12 +55,18 @@ for policy_name in "${runtime_policy_files[@]}"; do
   install -m 0644 "$template" "$staged_policy"
   validate_policy "$policy_name" "$staged_policy" || { echo "LPFORGE_RUNTIME_POLICY_SCHEMA_INVALID:${policy_name}" >&2; exit 1; }
 done
+runtime_identity_stage="$policy_stage_dir/runtime-release-identity.json"
+node "$stage/scripts/write-runtime-release-identity.mjs" "$stage/RELEASE_MANIFEST.json" "$runtime_identity_stage"
 for policy_name in "${runtime_policy_files[@]}"; do
   mv -f "$policy_stage_dir/$policy_name" "$lpforge_home/policy/$policy_name"
   expected_hash="$(node -e "const m=require(process.argv[1]),h=m.runtimePolicyTemplateHashes?.[process.argv[2]];process.stdout.write(String(h??''))" "$stage/RELEASE_MANIFEST.json" "$policy_name")"
   [[ "$(sha256sum "$lpforge_home/policy/$policy_name" | awk '{print $1}')" == "$expected_hash" ]] || { echo "LPFORGE_RUNTIME_POLICY_PROMOTION_HASH_MISMATCH:${policy_name}" >&2; exit 1; }
 done
-LPFORGE_HOME="$lpforge_home" LPFORGE_RUNTIME_CONFIG_ENFORCED=true bash "$stage/scripts/verify-release-integrity.sh" "$stage"
+mv -f "$runtime_identity_stage" "$lpforge_home/policy/runtime-release-identity.json"
+if ! LPFORGE_HOME="$lpforge_home" LPFORGE_RUNTIME_CONFIG_ENFORCED=true bash "$stage/scripts/verify-release-integrity.sh" "$stage" >&2; then
+  echo 'LPFORGE_RUNTIME_RELEASE_IDENTITY_PROMOTION_FAILED' >&2
+  exit 1
+fi
 mv "$stage" "$target"
 trap - EXIT
 printf '%s\n' "$target"

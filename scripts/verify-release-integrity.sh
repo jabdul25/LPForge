@@ -90,7 +90,9 @@ NODE
 [[ "$manifest_build" =~ ^[0-9a-f]{64}$ ]] || fail "manifest build identity invalid"
 [[ "$manifest_lock" =~ ^[0-9a-f]{64}$ ]] || fail "manifest lockfile hash invalid"
 
-if [[ "${LPFORGE_RUNTIME_CONFIG_ENFORCED:-false}" == "true" ]]; then
+runtime_policy_consumer="${LPFORGE_RUNTIME_POLICY_CONSUMER:-true}"
+[[ "$runtime_policy_consumer" == "true" || "$runtime_policy_consumer" == "false" ]] || fail "LPFORGE_RUNTIME_POLICY_CONSUMER must be true or false"
+if [[ "${LPFORGE_RUNTIME_CONFIG_ENFORCED:-false}" == "true" && "$runtime_policy_consumer" == "true" ]]; then
   config_root="${LPFORGE_HOME:-/root/systems/LPForge}"
   [[ "$config_root" == /* ]] || fail "LPFORGE_HOME must be absolute"
   policy="$config_root/policy/live-execution-policy.json"
@@ -102,14 +104,28 @@ fi
 [[ -f "$policy" ]] || fail "canonical execution policy missing"
 actual_policy=$(sha256sum "$policy" | awk '{print $1}')
 [[ "$actual_policy" == "$manifest_policy" ]] || fail "policy hash mismatch"
-if [[ "${LPFORGE_RUNTIME_CONFIG_ENFORCED:-false}" == "true" ]]; then
+if [[ "${LPFORGE_RUNTIME_CONFIG_ENFORCED:-false}" == "true" && "$runtime_policy_consumer" == "true" ]]; then
+  runtime_identity="$config_root/policy/runtime-release-identity.json"
+  [[ -f "$runtime_identity" ]] || fail "runtime release identity missing"
+  runtime_identity_manifest="$config_root/releases/$manifest_source/RELEASE_MANIFEST.json"
+  [[ -f "$runtime_identity_manifest" ]] || runtime_identity_manifest="RELEASE_MANIFEST.json"
+  node - "$runtime_identity" "$runtime_identity_manifest" "$actual_policy" <<'NODE' || fail "runtime release identity mismatch"
+const fs=require('fs');
+const [identityPath,manifestPath,policyHash]=process.argv.slice(2);
+const identity=JSON.parse(fs.readFileSync(identityPath,'utf8'));
+const manifestBytes=fs.readFileSync(manifestPath);
+const manifest=JSON.parse(manifestBytes);
+const crypto=require('crypto');
+const manifestHash=crypto.createHash('sha256').update(manifestBytes).digest('hex');
+if(identity.schemaVersion!==1||identity.sourceCommit!==manifest.sourceCommit||identity.buildIdentity!==manifest.buildIdentity||identity.liveExecutionPolicySha256!==policyHash||identity.liveExecutionPolicySha256!==manifest.policyHash||identity.releaseManifestSha256!==manifestHash)process.exit(1);
+NODE
   exit_policy="$config_root/policy/live-exit-governor-policy.json"
   [[ -f "$exit_policy" ]] || fail "canonical live exit policy missing"
   actual_exit_policy=$(sha256sum "$exit_policy" | awk '{print $1}')
 fi
 for runtime_policy in "${manifest_runtime_policies[@]}"; do
   IFS='|' read -r runtime_policy_name runtime_policy_hash <<< "$runtime_policy"
-  if [[ "${LPFORGE_RUNTIME_CONFIG_ENFORCED:-false}" == "true" ]]; then
+  if [[ "${LPFORGE_RUNTIME_CONFIG_ENFORCED:-false}" == "true" && "$runtime_policy_consumer" == "true" ]]; then
     runtime_policy_path="$config_root/policy/$runtime_policy_name"
   else
     runtime_policy_path="release-policy-templates/$runtime_policy_name"
@@ -130,10 +146,11 @@ command -v pnpm >/dev/null 2>&1 || fail "pnpm is required by this runtime releas
 actual_pnpm=$(pnpm --version)
 node -e 'const expected=process.argv[1],actual=process.argv[2];const norm=v=>{const m=/^v?(\d+)\.(\d+)\.(\d+)$/.exec(v);return m?m.slice(1).join("."):""};if(!norm(expected)||norm(expected)!==norm(actual))process.exit(1);' "$manifest_pnpm" "$actual_pnpm" || fail "runtime pnpm version mismatch expected=${manifest_pnpm} actual=${actual_pnpm}"
 
-# Legacy values are compatibility assertions only. They never supply identity.
+# Source/build assertions remain optional compatibility diagnostics. Policy
+# identity is release-bound at install time and must never depend on mutable
+# environment state.
 [[ -z "${LPFORGE_SOURCE_COMMIT:-}" || "$LPFORGE_SOURCE_COMMIT" == "$REV" ]] || fail "LPFORGE_SOURCE_COMMIT assertion mismatch"
 [[ -z "${LPFORGE_BUILD_ID:-}" || "$LPFORGE_BUILD_ID" == "$manifest_build" ]] || fail "LPFORGE_BUILD_ID assertion mismatch"
-[[ -z "${LPFORGE_P7_POLICY_HASH:-}" || "$LPFORGE_P7_POLICY_HASH" == "$actual_policy" ]] || fail "LPFORGE_P7_POLICY_HASH assertion mismatch"
 if [[ -n "${LPFORGE_APPROVED_RELEASE_IDENTITY_PATH:-}" ]]; then
   node - "$LPFORGE_APPROVED_RELEASE_IDENTITY_PATH" <<'NODE' || fail "approved release identity assertion mismatch"
 const fs=require('fs');

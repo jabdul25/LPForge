@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
@@ -99,6 +100,17 @@ test('deployment promotes every validated canonical policy template to the centr
   assert.match(installer,/mv -f "\$policy_stage_dir\/\$policy_name" "\$lpforge_home\/policy\/\$policy_name"/);
   assert.doesNotMatch(launcher,/cp .*live-execution-policy/);
   assert.doesNotMatch(launcher,/mv .*live-execution-policy/);
+});
+
+test('targeted PM2 activation validates only explicit known LPForge services', () => {
+  const restart = readFileSync('scripts/pm2-restart.sh', 'utf8');
+  assert.match(restart, /LPFORGE_PM2_SERVICE_UNKNOWN/);
+  assert.match(restart, /lpforge-discovery-learning/);
+  assert.match(restart, /Telegram is an operator-intent transport/);
+  assert.deepEqual(execFileSync('bash',['scripts/pm2-restart.sh','--validate','production','execution'],{encoding:'utf8'}).trim().split('\n'),['production','execution']);
+  const invalid=spawnSync('bash',['scripts/pm2-restart.sh','--validate','not-a-service'],{encoding:'utf8'});
+  assert.notEqual(invalid.status,0);
+  assert.match(invalid.stderr,/LPFORGE_PM2_SERVICE_UNKNOWN:not-a-service/);
 });
 
 test('nested immutable release layout is required for activation and installation', () => {

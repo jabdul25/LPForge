@@ -13,6 +13,7 @@ source scripts/runtime-config-paths.sh
 env_args=(--env-file="$LPFORGE_RUNTIME_ENV_SOURCE")
 case "$service" in
   production)
+    export LPFORGE_RUNTIME_POLICY_CONSUMER=true
     # Node's --env-file intentionally does not overwrite inherited values.
     # PM2 can retain an old environment across release replacement, so an
     # inherited P7 value must not mask the canonical central runtime value.
@@ -30,6 +31,7 @@ case "$service" in
     target='.build/apps/production/src/main.js'
     ;;
   discovery)
+    export LPFORGE_RUNTIME_POLICY_CONSUMER=true
     # PM2 may retain environment values from a prior execution process.  The
     # discovery collector is read-only and must never inherit a signing mode
     # or signer material merely because it shares the PM2 daemon.
@@ -38,12 +40,17 @@ case "$service" in
     target='.build/apps/discovery/src/main.js'
     ;;
   discovery-learning)
+    # Research learning does not enforce the live execution policy. Keeping
+    # this explicit permits a targeted policy rollout without coupling an
+    # unrelated research worker to a new policy release.
+    export LPFORGE_RUNTIME_POLICY_CONSUMER=false
     # Learning has the same observation-only contract as discovery.
     unset LIVE_SIGNING LPFORGE_LIVE_SIGNING PRIVATE_KEY SEED_PHRASE WALLET_SECRET WALLET_PRIVATE_KEY SIGNER_KEYPAIR
     export LPFORGE_RPC_ROLE=DISCOVERY
     target='.build/apps/discovery-learning/src/main.js'
     ;;
   execution)
+    export LPFORGE_RUNTIME_POLICY_CONSUMER=true
     execution_env="$LPFORGE_RUNTIME_EXECUTION_ENV_SOURCE"
     [[ -r "$execution_env" ]] || { echo 'LPFORGE_EXECUTION_ENV_REQUIRED' >&2; exit 1; }
     # Execution authority is deliberately defined by the central
@@ -83,6 +90,10 @@ case "$service" in
     target='.build/apps/execution/src/main.js'
     ;;
   telegram-operator)
+    # Telegram carries operator intent but has no trading-policy authority.
+    # It still verifies its immutable artifact; it need not restart solely
+    # because a live execution policy was promoted for P7/P6.
+    export LPFORGE_RUNTIME_POLICY_CONSUMER=false
     # This process receives operator intent only.  It never imports signer
     # material or execution transport, and it is safe to run disabled until
     # the explicit allowlist is configured in the external runtime env.
@@ -91,6 +102,7 @@ case "$service" in
     target='.build/apps/telegram-operator/src/main.js'
     ;;
   terminal)
+    export LPFORGE_RUNTIME_POLICY_CONSUMER=false
     # The shell Decision Terminal is an on-demand observer, not a daemon. It
     # receives the shared runtime facts and policy provenance but never the
     # P6 execution overlay or signer material.

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {execFileSync,spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
-import {mkdtempSync,mkdirSync,readdirSync,readFileSync,rmSync,writeFileSync} from 'node:fs';
+import {copyFileSync,mkdtempSync,mkdirSync,readdirSync,readFileSync,rmSync,writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -38,6 +38,7 @@ function createFixture(t){
   t.after(()=>rmSync(root,{recursive:true,force:true}));
   write(root,'scripts/verify-release-integrity.sh',readFileSync(path.resolve('scripts/verify-release-integrity.sh')));
   write(root,'scripts/verify-runtime-release-identity.mjs',readFileSync(path.resolve('scripts/verify-runtime-release-identity.mjs')));
+  write(root,'scripts/write-runtime-release-identity.mjs',readFileSync(path.resolve('scripts/write-runtime-release-identity.mjs')));
   write(root,'.build/runtime.js','immutable compiled output\n');
   for(const name of runtimePolicyNames)write(root,`release-policy-templates/${name}`,`{"policy":"${name}"}\n`);
   write(root,'pnpm-lock.yaml','lockfileVersion: 9.0\n');
@@ -49,6 +50,14 @@ function createFixture(t){
 }
 function resealChecksums(root){checksum(root);}
 function run(root,env={}){return spawnSync(process.execPath,['scripts/verify-runtime-release-identity.mjs'],{cwd:root,env:{...process.env,...env},encoding:'utf8'});}
+function runtimeConfig(t,root){
+  const home=mkdtempSync(path.join(tmpdir(),'lpforge-runtime-policy-'));
+  t.after(()=>rmSync(home,{recursive:true,force:true}));
+  for(const name of runtimePolicyNames){mkdirSync(path.join(home,'policy'),{recursive:true});copyFileSync(path.join(root,'release-policy-templates',name),path.join(home,'policy',name));}
+  execFileSync(process.execPath,['scripts/write-runtime-release-identity.mjs',path.join(root,'RELEASE_MANIFEST.json'),path.join(home,'policy','runtime-release-identity.json')],{cwd:root});
+  return home;
+}
+function runEnforced(root,home,env={}){return spawnSync('bash',['scripts/verify-release-integrity.sh'],{cwd:root,env:{...process.env,LPFORGE_RUNTIME_CONFIG_ENFORCED:'true',LPFORGE_HOME:home,...env},encoding:'utf8'});}
 function passes(result){assert.equal(result.status,0,`${result.stderr}\n${result.stdout}`);}
 function fails(result){assert.notEqual(result.status,0,'runtime identity verification unexpectedly passed');}
 
@@ -67,6 +76,24 @@ test('IDENTITY-010 policy mutation fails canonical policy verification',t=>{cons
 test('IDENTITY-011 / 012 migration head and count mismatch fail',t=>{const root=createFixture(t);write(root,'packages/db/migrations/M0002_next.sql','select 2;\n');resealChecksums(root);fails(run(root));});
 test('IDENTITY-013 checksum member omission fails closed',t=>{const root=createFixture(t),lines=readFileSync(path.join(root,'SHA256SUMS.txt'),'utf8').trim().split('\n');write(root,'SHA256SUMS.txt',`${lines.filter(line=>!line.endsWith(' ./.build/runtime.js')).join('\n')}\n`);fails(run(root));});
 test('IDENTITY-014 corrupted checksum fails closed',t=>{const root=createFixture(t);const lines=readFileSync(path.join(root,'SHA256SUMS.txt'),'utf8').split('\n');lines[0]=`f${lines[0].slice(1)}`;write(root,'SHA256SUMS.txt',lines.join('\n'));fails(run(root));});
+test('IDENTITY-016 release-bound runtime policy identity is automatic, ignores stale env policy hash, and fails closed on mismatch',t=>{
+  const root=createFixture(t),home=runtimeConfig(t,root);
+  passes(runEnforced(root,home,{LPFORGE_P7_POLICY_HASH:'f'.repeat(64)}));
+  const identityPath=path.join(home,'policy','runtime-release-identity.json'),identity=JSON.parse(readFileSync(identityPath,'utf8'));
+  assert.equal(identity.liveExecutionPolicySha256,manifestFor(root).policyHash);
+  identity.liveExecutionPolicySha256='f'.repeat(64);writeFileSync(identityPath,`${JSON.stringify(identity)}\n`);
+  fails(runEnforced(root,home));
+});
+test('IDENTITY-017 a changed canonical policy produces a changed release-bound identity without an env edit',t=>{
+  const root=createFixture(t),before=manifestFor(root).policyHash;
+  write(root,'release-policy-templates/live-execution-policy.json','{"policy":"live-execution-policy.json","minimumIncludedBins":65}\n');
+  const manifest=manifestFor(root),after=manifest.policyHash;
+  assert.notEqual(after,before);
+  write(root,'RELEASE_MANIFEST.json',`${JSON.stringify(manifest,null,2)}\n`);checksum(root);
+  const home=runtimeConfig(t,root),identity=JSON.parse(readFileSync(path.join(home,'policy','runtime-release-identity.json'),'utf8'));
+  assert.equal(identity.liveExecutionPolicySha256,after);
+  passes(runEnforced(root,home,{LPFORGE_P7_POLICY_HASH:'0'.repeat(64)}));
+});
 test('PM2 startup and production runtime invoke the immutable gate',()=>{
   const ecosystem=readFileSync('ecosystem.config.cjs','utf8'),pm2Start=readFileSync('scripts/pm2-start.sh','utf8'),discoveryStart=readFileSync('scripts/pm2-start-discovery.sh','utf8'),production=readFileSync('apps/production/src/main.ts','utf8');
   assert.match(ecosystem,/scripts\/start-lpforge-service\.sh production/);assert.match(ecosystem,/scripts\/start-lpforge-service\.sh discovery/);assert.match(pm2Start,/verify-runtime-release-identity\.mjs/);assert.match(discoveryStart,/verify-runtime-release-identity\.mjs/);assert.match(discoveryStart,/pm2 delete lpforge-discovery/);assert.match(discoveryStart,/pm2 delete lpforge-discovery-learning/);assert.match(production,/requireVerifiedRuntimeArtifactIdentity/);assert.match(production,/artifactBoundEnvironment/);

@@ -7,7 +7,7 @@ import { createMeteoraReadAdapter, createSolanaRpcClient, rpcProviderKey, type R
 import { DEFAULT_DISCOVERY_RUNTIME_POLICY, deriveDiscoveryLifecycleState, runDeepDiscoveryCycle, selectDeepScreenSlice } from '../../../packages/discovery-runtime/src/index.js';
 import { collectActiveCandidateEvidence, completionAwareCollectorDelayMs, type EvidenceCollectionScope } from '../../../packages/active-candidate-evidence/src/index.js';
 import { discoverUniverse, parseDiscoveryPolicy, type DiscoveryPolicy, type RankedDiscoveryPool } from '../../../packages/pool-discovery/src/index.js';
-import { loadDeploymentPolicyFile } from '../../../packages/deployment-policy/src/index.js';
+import { loadDeploymentPolicyFile, requireInitialRangeConstructionPolicy } from '../../../packages/deployment-policy/src/index.js';
 import { derivePhase3EvidenceWidthRequirement } from '../../../packages/rangeforge/src/index.js';
 import { enqueueAndDispatchPhase7Alert, loadPhase7TelegramConfig, RpcQuotaAlertObserver, type Phase7Alert } from '../../../packages/phase7-alerting/src/index.js';
 
@@ -64,7 +64,7 @@ function collectorNumber(name:string,fallback:number,min:number,max:number){cons
 async function collect(observedPoolCollectionMs?:number,scope:EvidenceCollectionScope='ACTIVE',priority:RpcPriority='P3_DISCOVERY'){
  const cfg=loadPhase1Config();if(cfg.dataMode!=='LIVE_READ_ONLY')throw new Error('LPFORGE_DISCOVERY_COLLECTOR_REQUIRES_LIVE_READ_ONLY');
  const store=await createPostgresStore(env('DATABASE_URL'));try{
-  const deployment=loadDeploymentPolicyFile(resolveLiveExecutionPolicyPath()),maxExecutableRangeWidthBins=deployment.positionConstruction?.maxInitialPositionWidthBins??100,evidenceWidth=derivePhase3EvidenceWidthRequirement(maxExecutableRangeWidthBins);
+  const deployment=loadDeploymentPolicyFile(resolveLiveExecutionPolicyPath()),maxExecutableRangeWidthBins=requireInitialRangeConstructionPolicy(deployment).maximumIncludedBins,evidenceWidth=derivePhase3EvidenceWidthRequirement(maxExecutableRangeWidthBins);
   const rpcInterval=Math.max(cfg.rpcMinIntervalMs,collectorNumber('LPFORGE_ACTIVE_COLLECTOR_RPC_MIN_INTERVAL_MS',400,100,10_000));
   const api=createMeteoraDataApi({baseUrl:cfg.meteoraDataApiUrl,maxRps:Math.max(1,Math.min(cfg.dataApiMaxRps,collectorNumber('LPFORGE_ACTIVE_COLLECTOR_DATA_API_MAX_RPS',2,1,10))),timeoutMs:cfg.httpTimeoutMs,priority:'P2_DISCOVERY_CURRENT'});
   const adapter=createMeteoraReadAdapter({rpcUrl:cfg.solanaRpcHttpUrl,cluster:cfg.cluster,programId:cfg.programId,expectedSdkVersion:cfg.expectedSdkVersion,rpcTimeoutMs:cfg.rpcTimeoutMs,rpcMinIntervalMs:rpcInterval,rpcMaxRetries:cfg.rpcMaxRetries,retryBaseDelayMs:cfg.rpcRetryBaseDelayMs,retryMaxDelayMs:cfg.rpcRetryMaxDelayMs,priority});

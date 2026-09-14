@@ -39,6 +39,16 @@ test('shell terminal filters loaded events and position rows locally', () => {
   assert.doesNotMatch(execution, /LIVE CONTROL MARK/);
 });
 
+test('fills/recent positions keeps every live position above newer closed history', () => {
+  const source = snapshot();
+  source.recentPositions = [
+    { lifecycleId: 'closed-new', positionAddress: 'closed-new', poolAddress: 'closed-new', poolDisplay: 'CLOSED/SOL', state: 'CLOSED', observedAt: '2026-09-11T11:59:00.000Z', realizedReturnFraction: .01, holdSeconds: 60, exitReason: 'SETTLED' },
+    { ...source.recentPositions[0], observedAt: '2026-09-11T10:00:00.000Z' },
+  ];
+  const output = terminal.renderDecisionTerminal(source, { columns: 180, color: false, positionFilter: 'ALL' });
+  assert.ok(output.indexOf('TOKEN/SOL') < output.indexOf('CLOSED/SOL'));
+});
+
 test('header keeps P7 health, entry authority, recovery, watch pools, and RPC status distinct', () => {
   const source = snapshot();
   source.health = { ...source.health, newEconomicActionAllowed: false, entryControlReasonCodes: ['P7_PORTFOLIO_DAILY_DRAWDOWN'], recoveryQueueCount: 3, unknownSubmissionCount: 1 };

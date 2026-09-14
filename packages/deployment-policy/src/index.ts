@@ -43,5 +43,7 @@ export function loadDeploymentPolicyFile(path:string):MainnetCanaryDeploymentPol
 /** Initial OPEN validation uses the same inclusive bin convention as RangeForge.
  * It is intentionally separate from management/reconciliation geometry. */
 export function initialIncludedBinCountWithinPolicy(input:{lowerBinId:number;upperBinId:number;minimumIncludedBins:number;maximumIncludedBins:number}):boolean{const {lowerBinId,upperBinId,minimumIncludedBins,maximumIncludedBins}=input;if(![lowerBinId,upperBinId,minimumIncludedBins,maximumIncludedBins].every(Number.isInteger)||minimumIncludedBins<1||maximumIncludedBins<minimumIncludedBins||upperBinId<lowerBinId)return false;const included=upperBinId-lowerBinId+1;return included>=minimumIncludedBins&&included<=maximumIncludedBins;}
+/** Live-entry callers must receive both limits from the canonical policy. */
+export function requireInitialRangeConstructionPolicy(policy:MainnetCanaryDeploymentPolicy){const minimumIncludedBins=policy.range?.minimumIncludedBins,maximumIncludedBins=policy.positionConstruction?.maxInitialPositionWidthBins;if(minimumIncludedBins===undefined||maximumIncludedBins===undefined||!Number.isInteger(minimumIncludedBins)||!Number.isInteger(maximumIncludedBins)||minimumIncludedBins<1||maximumIncludedBins<minimumIncludedBins)throw new Error('LPFORGE_PRODUCTION_RANGE_CONSTRUCTION_POLICY_REQUIRED');return{minimumIncludedBins,maximumIncludedBins};}
 export const parseMainnetCanaryDeploymentPolicy=parseDeploymentPolicy;
 export const loadMainnetCanaryDeploymentPolicyFile=loadDeploymentPolicyFile;

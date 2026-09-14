@@ -439,8 +439,13 @@ function engineLines(snapshot: TerminalSnapshot, width: number, color: boolean):
   const head = `${pad('ENGINE', 13)} ${pad('STATUS', 14)} ${pad('AGE', 8)} INFO`;
   return [paint(head, 'muted', color), ...snapshot.engines.map(engine => `${pad(engine.name, 13)} ${pad(state(engine.status, color), 14)} ${pad(formatAge(engine.observedAt), 8)} ${clip(engine.detail || '—', Math.max(8, width - 39))}`)];
 }
+function orderedRecentPositions(snapshot: TerminalSnapshot, filter: TerminalRenderOptions['positionFilter']): TerminalRecentPosition[] {
+  return snapshot.recentPositions
+    .filter(row => !filter || filter === 'ALL' || row.state === filter)
+    .sort((a,b) => (a.state === b.state ? Date.parse(b.observedAt) - Date.parse(a.observedAt) : a.state === 'OPEN' ? -1 : 1));
+}
 function recentPositionLines(snapshot: TerminalSnapshot, width: number, filter: TerminalRenderOptions['positionFilter'], color: boolean): string[] {
-  const rows = snapshot.recentPositions.filter(row => !filter || filter === 'ALL' || row.state === filter).slice(0, 8);
+  const rows = orderedRecentPositions(snapshot, filter).slice(0, 8);
   if (!rows.length) return [paint('No matching canonical lifecycle.', 'muted', color)];
   const head = `${pad('TIME', 8)} ${pad('POOL', 12)} ${pad('POSITION', 12)} ${pad('STATE', 7)} ${pad('SETTLED/LIVE', 12)} ${pad('AGE', 8)} REASON`;
   return [paint(head, 'muted', color), ...rows.map(row => {
@@ -544,7 +549,7 @@ function compactEventLines(snapshot: TerminalSnapshot, width: number, filter: Te
 }
 
 function compactRecentPositionLines(snapshot: TerminalSnapshot, width: number, filter: TerminalRenderOptions['positionFilter'], color: boolean, limit: number): string[] {
-  const positions = snapshot.recentPositions.filter(position => !filter || filter === 'ALL' || position.state === filter).slice(0, Math.max(1, limit));
+  const positions = orderedRecentPositions(snapshot, filter).slice(0, Math.max(1, limit));
   if (!positions.length) return [paint('No matching positions.', 'muted', color)];
   return positions.map(position => {
     const coloured = position.state === 'OPEN' ? signedPercent(position.liveControlReturnFraction, color) : signedPercent(position.realizedReturnFraction, color);

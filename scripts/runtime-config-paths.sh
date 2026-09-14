@@ -22,6 +22,7 @@ export LPFORGE_AUTONOMOUS_ENTRY_POLICY_PATH="$LPFORGE_HOME/policy/autonomous-ent
 export LPFORGE_LIVE_MANAGEMENT_POLICY_PATH="$LPFORGE_HOME/policy/live-position-management-policy.json"
 export LPFORGE_OOR_LIFECYCLE_POLICY_PATH="$LPFORGE_HOME/policy/oor-lifecycle-policy.json"
 export LPFORGE_LIVE_EXIT_POLICY_PATH="$LPFORGE_HOME/policy/live-exit-governor-policy.json"
+export LPFORGE_RUNTIME_RELEASE_IDENTITY_PATH="$LPFORGE_HOME/policy/runtime-release-identity.json"
 
 # Immutable runtime artifacts must live below the stable home. This prevents a
 # future activation from silently restoring the deprecated sibling layout.
@@ -36,3 +37,4 @@ esac
 for lpforge_policy in "$LPFORGE_DISCOVERY_POLICY_PATH" "$LPFORGE_AUTONOMOUS_ENTRY_POLICY_PATH" "$LPFORGE_LIVE_MANAGEMENT_POLICY_PATH" "$LPFORGE_OOR_LIFECYCLE_POLICY_PATH" "$LPFORGE_LIVE_EXIT_POLICY_PATH"; do
   [[ -f "$lpforge_policy" ]] || { echo "LPFORGE_RUNTIME_POLICY_REQUIRED:${lpforge_policy}" >&2; exit 1; }
 done
+[[ -f "$LPFORGE_RUNTIME_RELEASE_IDENTITY_PATH" ]] || { echo "LPFORGE_RUNTIME_RELEASE_IDENTITY_REQUIRED:${LPFORGE_RUNTIME_RELEASE_IDENTITY_PATH}" >&2; exit 1; }

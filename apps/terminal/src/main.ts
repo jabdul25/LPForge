@@ -293,7 +293,9 @@ async function loadRecentPositions(pool: Pool, active: TerminalPosition[]): Prom
     lifecycleId: `open:${position.positionAddress}`, positionAddress: position.positionAddress, poolAddress: position.poolAddress, poolDisplay: position.poolDisplay, state: 'OPEN' as const, observedAt: position.enteredAt,
     ...(position.liveControlReturnFraction !== undefined ? { liveControlReturnFraction: position.liveControlReturnFraction } : {}), ...(position.feeLamports !== undefined ? { feeLamports: position.feeLamports } : {}), holdSeconds: Math.max(0, Math.floor((Date.now() - Date.parse(position.enteredAt)) / 1000)), exitReason: 'LIVE CONTROL MARK'
   }));
-  return [...open, ...closed].sort((a, b) => Date.parse(b.observedAt) - Date.parse(a.observedAt)).slice(0, 12);
+  // Live positions are operationally more important than a newer settlement:
+  // keep them at the top of the combined fills/recent-position view.
+  return [...open.sort((a,b)=>Date.parse(b.observedAt)-Date.parse(a.observedAt)), ...closed].slice(0, 12);
 }
 
 async function loadEvents(pool: Pool): Promise<TerminalEvent[]> {
