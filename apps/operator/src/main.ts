@@ -743,12 +743,23 @@ async function observeAndPlanOwnedPositions(input: {
     if(telegramCloseRequest){
       decision={...decision,action:'CLOSE',reasonCodes:[...new Set([...decision.reasonCodes,'P7_TELEGRAM_OPERATOR_CLOSE_REQUEST'])].sort()};
     }
+    const legacyProfitProtectionClose =
+      decision.action === "CLOSE" &&
+      exitDecision.reasonCodes.includes("EXIT_LP_POSITION_PROFIT_GIVEBACK_LIMIT");
+    const contextTerminalProtectiveClose =
+      decision.action === "CLOSE" &&
+      (exitDecision.reasonCodes.includes("EXIT_HARD_POSITION_STOP_LOSS") ||
+        decision.reasonCodes.includes('PROFIT_RETENTION_TS5_CONFIRMED') ||
+        decision.reasonCodes.includes('PROFIT_RETENTION_OOR_P4_CONFIRMED') ||
+        decision.reasonCodes.includes("POSITION_OOR_TOKEN_RISK") ||
+        decision.reasonCodes.includes("POSITION_OOR_STALE_CAPITAL"));
     const managementContext = assessLiveManagementContext({
       positionPoolAddress: position.poolAddress,
       ...(current ? { managementPoolAddress: current.poolAddress } : {}),
       action: decision.action,
       terminalProtectiveClose:
-        decision.action === "CLOSE" && (exitDecision.reasonCodes.includes("EXIT_HARD_POSITION_STOP_LOSS")||decision.reasonCodes.includes('PROFIT_RETENTION_TS5_CONFIRMED')||decision.reasonCodes.includes('PROFIT_RETENTION_OOR_P4_CONFIRMED')),
+        contextTerminalProtectiveClose,
+      profitProtectionClose: legacyProfitProtectionClose,
       oorLifecycleClose: decision.reasonCodes.includes("POSITION_OOR_STALE_CAPITAL") || decision.reasonCodes.includes("POSITION_OOR_TOKEN_RISK"),
     });
     const exitStateUpdate={
@@ -878,19 +889,21 @@ async function observeAndPlanOwnedPositions(input: {
     // Recovery must not strand an already-owned position, but it is not a
     // general management lane: fee claims, reductions, reshapes and ordinary
     // discretionary/time closes remain paused until recovery is clean.
-    const terminalProtectiveClose =
+    const plannedTerminalProtectiveClose =
       planAction === "EMERGENCY_CLOSE" ||
       (planAction === "CLOSE" &&
-      (exitDecision.reasonFamily === "EMERGENCY" ||
-        exitDecision.reasonCodes.includes("EXIT_HARD_POSITION_STOP_LOSS") ||
-        decision.reasonCodes.includes('PROFIT_RETENTION_TS5_CONFIRMED') ||
-        decision.reasonCodes.includes('PROFIT_RETENTION_OOR_P4_CONFIRMED') ||
-        decision.reasonCodes.includes("POSITION_OOR_TOKEN_RISK") ||
-        decision.reasonCodes.includes("POSITION_OOR_STALE_CAPITAL")));
+        (exitDecision.reasonFamily === "EMERGENCY" ||
+          exitDecision.reasonCodes.includes("EXIT_HARD_POSITION_STOP_LOSS") ||
+          decision.reasonCodes.includes('PROFIT_RETENTION_TS5_CONFIRMED') ||
+          decision.reasonCodes.includes('PROFIT_RETENTION_OOR_P4_CONFIRMED') ||
+          exitDecision.reasonCodes.includes("EXIT_LP_POSITION_PROFIT_GIVEBACK_LIMIT") ||
+          decision.reasonCodes.includes("POSITION_OOR_TOKEN_RISK") ||
+          decision.reasonCodes.includes("POSITION_OOR_STALE_CAPITAL")));
+    const plannedPositionBoundProtectiveClose = plannedTerminalProtectiveClose || legacyProfitProtectionClose;
     const managementPlanAllowed=managementContext.planAllowed||Boolean(telegramCloseRequest);
     if (
       decision.action === "HOLD" ||
-      (input.protectiveOnly && !terminalProtectiveClose) ||
+      (input.protectiveOnly && !plannedPositionBoundProtectiveClose) ||
       !managementPlanAllowed ||
       (planRiskIncreasing
         ? !input.allowRiskIncreasingPlans
@@ -950,7 +963,7 @@ async function observeAndPlanOwnedPositions(input: {
         ...(executionMode?{closeExecution:{mode:executionMode,decisionAt:input.observedAt,reasonCodes:exitDecision.reasonCodes}}:{}),
       },
     });
-    const serializedProtectiveClose=terminalProtectiveClose&&['CLOSE','EMERGENCY_CLOSE'].includes(planAction);
+    const serializedProtectiveClose=plannedPositionBoundProtectiveClose&&['CLOSE','EMERGENCY_CLOSE'].includes(planAction);
     const persisted=await persistTransactionPlan(input.store, plan,{serializedProtectiveClose,...(profitRetentionConfirmed?{profitRetentionTransition:{lpforgePositionId:position.lpforgePositionId,observedAt:input.observedAt,watch:profitRetention.watch}}:{})});
     // The watch itself was already committed with a newly created protective
     // intent. This full projection preserves all normal MFE/economics fields

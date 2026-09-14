@@ -277,12 +277,18 @@ export function assessLiveManagementContext(input: {
    * fresh discretionary discovery-pool context is unavailable.
    */
   terminalProtectiveClose?: boolean;
+  /**
+   * A fresh, position-bound live-control profit-retention confirmation is a
+   * capital-protection close.  It has no dependency on a discretionary
+   * discovery/forward-EV result for the same pool.
+   */
+  profitProtectionClose?: boolean;
   /** Fresh chain-backed stale-capital close is a terminal lifecycle action,
    * never a replacement OPEN and therefore does not need a stale candidate. */
   oorLifecycleClose?: boolean;
 }) {
   const matchingPoolContext = input.managementPoolAddress === input.positionPoolAddress;
-  const independentlyProtective = input.action === "EMERGENCY_CLOSE" || input.terminalProtectiveClose === true || input.oorLifecycleClose === true;
+  const independentlyProtective = input.action === "EMERGENCY_CLOSE" || input.terminalProtectiveClose === true || input.profitProtectionClose === true || input.oorLifecycleClose === true;
   const normalManagementAllowed = matchingPoolContext && input.action !== "HOLD";
   const protectiveManagementAllowed = independentlyProtective;
   return {
@@ -295,7 +301,7 @@ export function assessLiveManagementContext(input: {
     reasonCodes: matchingPoolContext
       ? ["LIVE_MANAGEMENT_CONTEXT_POOL_MATCH"]
       : independentlyProtective
-        ? [input.oorLifecycleClose?"LIVE_MANAGEMENT_CONTEXT_OOR_LIFECYCLE_INDEPENDENT":input.terminalProtectiveClose?"LIVE_MANAGEMENT_CONTEXT_HARD_STOP_INDEPENDENT":"LIVE_MANAGEMENT_CONTEXT_EMERGENCY_INDEPENDENT"]
+        ? [input.oorLifecycleClose?"LIVE_MANAGEMENT_CONTEXT_OOR_LIFECYCLE_INDEPENDENT":input.terminalProtectiveClose?"LIVE_MANAGEMENT_CONTEXT_HARD_STOP_INDEPENDENT":input.profitProtectionClose?"LIVE_MANAGEMENT_CONTEXT_PROFIT_PROTECTION_INDEPENDENT":"LIVE_MANAGEMENT_CONTEXT_EMERGENCY_INDEPENDENT"]
         : ["LIVE_MANAGEMENT_CONTEXT_POOL_MISMATCH"],
   };
 }
