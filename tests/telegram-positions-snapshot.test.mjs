@@ -81,6 +81,7 @@ test('telegram operator uses the bounded DB summary reader for /positions',async
   assert.match(source,/await persist\('ACCEPTED','Command accepted\.'/);
   assert.match(db,/telegram_operator_commands\.status='ACCEPTED' AND EXCLUDED\.status IN \('ACCEPTED','COMPLETED','FAILED'\)/);
   assert.match(db,/FROM operations\.telegram_operator_commands WHERE status<>'ACCEPTED'/);
+  assert.match(db,/jsonb_build_object\('telegramResumedBy',\$2::text,'telegramResumedAt',\$1::timestamptz\)/,'/resume binds the operator identity as text for PostgreSQL JSON construction');
   // The summary projection reads persisted receipt/control-PnL diagnostics from
   // the latest observation. Keep that JSON column in the LATERAL projection:
   // otherwise PostgreSQL rejects the presentation-only /positions query.

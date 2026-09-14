@@ -5362,7 +5362,7 @@ return 'APPLIED';
       return r.rows;
     },
     async resolveTelegramOperatorControlIncidents(v) {
-      const r=await db.query(`UPDATE operations.phase7_incident_states SET status='RESOLVED',resolved_at=$1,observed_at=$1,reason_codes=reason_codes||'["P7_TELEGRAM_OPERATOR_RESUMED"]'::jsonb,payload=payload||jsonb_build_object('telegramResumedBy',$2,'telegramResumedAt',$1::timestamptz) WHERE status<>'RESOLVED' AND payload->>'telegramOperator'='true' AND incident_id IN ('telegram:pause','telegram:stop')`,[v.at,v.operatorId]);
+      const r=await db.query(`UPDATE operations.phase7_incident_states SET status='RESOLVED',resolved_at=$1,observed_at=$1,reason_codes=reason_codes||'["P7_TELEGRAM_OPERATOR_RESUMED"]'::jsonb,payload=payload||jsonb_build_object('telegramResumedBy',$2::text,'telegramResumedAt',$1::timestamptz) WHERE status<>'RESOLVED' AND payload->>'telegramOperator'='true' AND incident_id IN ('telegram:pause','telegram:stop')`,[v.at,v.operatorId]);
       return Number((r as unknown as {rowCount?:number}).rowCount??0);
     },
     async upsertPhase7RuntimeLease(v) {
