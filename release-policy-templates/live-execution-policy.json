@@ -32,7 +32,7 @@
     "liquiditySlippageBps": 100
   },
   "range": {
-    "minimumIncludedBins": 35
+    "minimumIncludedBins": 60
   },
   "feeClaim": {
     "minimumClaimValueUsd": 0.50
