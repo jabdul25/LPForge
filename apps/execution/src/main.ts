@@ -19,7 +19,7 @@ import { PublicKey } from "@solana/web3.js";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { EXPECTED_DLMM_PROGRAM_ID, rpcProviderKey } from "../../../packages/meteora/src/index.js";
-import { loadDeploymentPolicyFile } from "../../../packages/deployment-policy/src/index.js";
+import { initialIncludedBinCountWithinPolicy, loadDeploymentPolicyFile } from "../../../packages/deployment-policy/src/index.js";
 import { resolveLiveExecutionPolicyPath } from "../../../packages/config/src/index.js";
 import { mayRequeueStaleOnlyOpenClaim, validateClaimedPlan, type Phase7ExecutionControl } from "../../../packages/phase6-claim-guard/src/index.js";
 import { createGovernedConnection, createMeteoraReadAdapter } from "../../../packages/meteora/src/index.js";
@@ -332,7 +332,8 @@ async function dispatchOne(options?: { protectiveOnly?: boolean }) {
       const walletLamports=BigInt(await createGovernedConnection({rpcUrl:config.rpcUrl,priority:'P0_EXECUTION_CRITICAL'}).getBalance(new PublicKey(plan.ownerAddress),'confirmed'));
       if(plan.action==='OPEN'){
         const construction=staticPolicy.positionConstruction,intent=(plan.planPayload.intent??{}) as Record<string,unknown>,lower=Number(intent.lowerBinId),upper=Number(intent.upperBinId),width=upper-lower+1;
-        if(!construction||!Number.isInteger(lower)||!Number.isInteger(upper)||width<3||width>construction.maxInitialPositionWidthBins){await store.transitionAutonomousPlan({planId:plan.planId,state:'BLOCKED',at:now,reasonCodes:['P6_POSITION_CONSTRUCTION_POLICY_BLOCK'],payload:{stage:'POSITION_CONSTRUCTION',widthBins:width}});return{service:'lpforge-execution',status:'BLOCKED',planId:plan.planId,reasonCodes:['P6_POSITION_CONSTRUCTION_POLICY_BLOCK'],transactionSubmitted:false};}
+        const minimumIncludedBins=staticPolicy.range?.minimumIncludedBins;
+        if(!construction||minimumIncludedBins===undefined||!initialIncludedBinCountWithinPolicy({lowerBinId:lower,upperBinId:upper,minimumIncludedBins,maximumIncludedBins:construction.maxInitialPositionWidthBins})){await store.transitionAutonomousPlan({planId:plan.planId,state:'BLOCKED',at:now,reasonCodes:['P6_POSITION_CONSTRUCTION_POLICY_BLOCK'],payload:{stage:'POSITION_CONSTRUCTION',widthBins:width,minimumIncludedBins}});return{service:'lpforge-execution',status:'BLOCKED',planId:plan.planId,reasonCodes:['P6_POSITION_CONSTRUCTION_POLICY_BLOCK'],transactionSubmitted:false};}
         // This is a balance-availability preflight only. The refundable
         // PositionV2 deposit is intentionally excluded from LP EV/PnL.
         if(walletLamports<capital+deployment.reserveLamports+construction.maxPositionAccountRentLamports){await store.transitionAutonomousPlan({planId:plan.planId,state:'BLOCKED',at:now,reasonCodes:['P6_POSITION_ACCOUNT_RENT_WALLET_INSUFFICIENT'],payload:{stage:'POSITION_CONSTRUCTION',capitalLamports:capital.toString(),refundablePositionRentLamports:construction.maxPositionAccountRentLamports.toString()}});return{service:'lpforge-execution',status:'BLOCKED',planId:plan.planId,reasonCodes:['P6_POSITION_ACCOUNT_RENT_WALLET_INSUFFICIENT'],transactionSubmitted:false};}

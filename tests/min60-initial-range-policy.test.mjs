@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { generateRangeUniverse, generateStrategyCandidates, resolveFinalRangeWidthBins } from '../.build/packages/rangeforge/src/index.js';
-import { parseDeploymentPolicy } from '../.build/packages/deployment-policy/src/index.js';
+import { initialIncludedBinCountWithinPolicy, parseDeploymentPolicy } from '../.build/packages/deployment-policy/src/index.js';
 
 const maximum=100;
 const resolve=derived=>resolveFinalRangeWidthBins({minimumIncludedBins:60,volatilityRequiredWidthBins:derived,survivalHorizonRequiredWidthBins:derived,maximumWidthBins:maximum});
@@ -35,4 +35,11 @@ test('released policy and construction ceiling agree on MIN60/MAX100',()=>{
   assert.equal(parsed.range.minimumIncludedBins,60);
   assert.equal(parsed.positionConstruction.maxInitialPositionWidthBins,100);
   assert.ok(parsed.range.minimumIncludedBins<=parsed.positionConstruction.maxInitialPositionWidthBins);
+});
+
+test('execution-side initial OPEN validation rejects below-60 geometry without affecting the 60-100 band',()=>{
+  const valid=width=>initialIncludedBinCountWithinPolicy({lowerBinId:100,upperBinId:100+width-1,minimumIncludedBins:60,maximumIncludedBins:100});
+  for(const width of [35,45,59]) assert.equal(valid(width),false);
+  for(const width of [60,61,80,100]) assert.equal(valid(width),true);
+  assert.equal(valid(101),false);
 });
