@@ -995,7 +995,7 @@ export interface Phase1Store {
   recordLiveEvidenceCollectionOutcome(value:{poolAddress:string;observedAt:string;success:boolean;eventPathEstimate?:boolean;phase3CurrentLiveReady?:boolean;poolReadStartedAt?:string;poolReadCompletedAt?:string;poolReadElapsedMs?:number;serviceGapMs?:number}):Promise<void>;
   recordEvidenceContinuityCollectionOutcome(value:{poolAddress:string;observedAt:string;success:boolean;poolReadStartedAt?:string;poolReadCompletedAt?:string;poolReadElapsedMs?:number;serviceGapMs?:number}):Promise<void>;
   recordRawReplayCollectionOutcome(value:{poolAddress:string;observedAt:string;success:boolean;poolReadStartedAt?:string;poolReadCompletedAt?:string;poolReadElapsedMs?:number;serviceGapMs?:number}):Promise<void>;
-  loadActiveCandidateEvidenceCollectorTiming?():Promise<{p95PoolCollectionMs?:number}|undefined>;
+  loadActiveCandidateEvidenceCollectorTiming?():Promise<{p95PoolCollectionMs?:number;observedAt?:string}|undefined>;
   recordActiveCandidateEvidenceCollectorPass?(value:{observedAt:string;completedAt:string;elapsedMs:number;collectionSliceSize:number;effectivePoolCollectionMs:number;measuredP95PoolCollectionMs:number;projectedRevisitMs:number;capacityViolation:boolean;maxServiceGapMs:number;activePoolCount:number;successfulPoolCount:number;continuityPoolCount?:number;economicProjectedRevisitMs?:number;continuityProjectedRevisitMs?:number;economicTargetViolation?:boolean}):Promise<void>;
   recordPostEvidenceEvaluationOutcome(value:{poolAddress:string;observedAt:string;phase3Status:string;reasonCodes?:readonly string[]}):Promise<void>;
   markDiscoveryPoolsStale(cutoff: string, observedAt: string): Promise<number>;
@@ -2876,8 +2876,8 @@ export async function createPostgresStore(
       } catch(error) {try{await tx.query('ROLLBACK');}catch{} throw error;}
     },
     async loadActiveCandidateEvidenceCollectorTiming() {
-      const r=await db.query(`SELECT payload->'collectorPass' AS pass FROM market.active_candidate_evidence_capacity_observations WHERE payload ? 'collectorPass' ORDER BY observed_at DESC LIMIT 1`),pass=r.rows[0]?.pass as Record<string,unknown>|undefined,p95=Number(pass?.measuredP95PoolCollectionMs);
-      return Number.isFinite(p95)&&p95>0?{p95PoolCollectionMs:p95}:undefined;
+      const r=await db.query(`SELECT observed_at,payload->'collectorPass' AS pass FROM market.active_candidate_evidence_capacity_observations WHERE payload ? 'collectorPass' AND COALESCE((payload->'collectorPass'->>'activePoolCount')::int,0)>0 ORDER BY observed_at DESC LIMIT 1`),pass=r.rows[0]?.pass as Record<string,unknown>|undefined,p95=Number(pass?.measuredP95PoolCollectionMs),observedAt=r.rows[0]?.observed_at instanceof Date?r.rows[0].observed_at.toISOString():String(r.rows[0]?.observed_at??'');
+      return Number.isFinite(p95)&&p95>0?{p95PoolCollectionMs:p95,...(observedAt?{observedAt}:{})}:undefined;
     },
     async reconcileRawReplayTracking(v) {
       const capacity=Math.max(0,Math.floor(v.capacity));
