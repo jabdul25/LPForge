@@ -421,11 +421,20 @@ function discoveryQueueLines(snapshot: TerminalSnapshot, width: number, color: b
   const gateWidth = Math.max(7, width - fixed);
   const head = `${pad('POOL', poolWidth)} ${pad('P3/P4', stateWidth)} ${pad('RANK', rankWidth)} NEXT GATE`;
   const maxRows = Math.max(1, Math.min(6, pools.length));
-  const rows = pools.slice(0, maxRows).map(pool => {
+  // A queue can contain many WARMING pools. Preserve the highest-priority
+  // order, but surface one representative of each meaningful P3/P4 state so
+  // a current NO_TRADE result never disappears below the panel fold.
+  const visiblePools: TerminalCandidate[] = [];
+  for (const stateName of ['ENTRY_READY', 'WARMING', 'NO_TRADE']) {
+    const pool = pools.find(value => value.operationalState === stateName);
+    if (pool) visiblePools.push(pool);
+  }
+  for (const pool of pools) if (!visiblePools.includes(pool) && visiblePools.length < maxRows) visiblePools.push(pool);
+  const rows = visiblePools.map(pool => {
     const rank = pool.rank === undefined ? '—' : String(pool.rank);
     return `${pad(pool.poolDisplay, poolWidth)} ${pad(state(pool.operationalState, color), stateWidth)} ${pad(rank, rankWidth)} ${clip(state(nextWatchGate(pool), color), gateWidth)}`;
   });
-  if (pools.length > maxRows) rows.push(paint(`+${pools.length - maxRows} more qualified/warming pools`, 'muted', color));
+  if (pools.length > visiblePools.length) rows.push(paint(`+${pools.length - visiblePools.length} more qualified/warming pools`, 'muted', color));
   return [paint(head, 'muted', color), ...rows];
 }
 

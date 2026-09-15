@@ -258,12 +258,15 @@ test('entry watch pools are a distinct display cohort and retain unavailable evi
 test('empty entry watch set remains intentional and has no fabricated observation progress', () => {
   const source = snapshot();
   source.entryWatchPools = [];
-  source.discoveryQueue = [{ poolAddress: 'warming', poolDisplay: 'WARM/SOL', operationalState: 'WARMING', phase4State: 'WARMING', rank: 2, reasonCodes: ['ENTRY_LIVE_CONFIRMATION_PENDING'], registryState: 'QUALIFIED' }, { poolAddress: 'notrade', poolDisplay: 'NOPE/SOL', operationalState: 'NO_TRADE', phase4State: 'NO_TRADE', rank: 3, reasonCodes: ['NO_TRADE_EVIDENCE_NON_ACTIONABLE'], registryState: 'QUALIFIED' }];
+  source.discoveryQueue = [
+    ...Array.from({ length: 7 }, (_, index) => ({ poolAddress: `warming-${index}`, poolDisplay: `WARM${index}/SOL`, operationalState: 'WARMING', phase4State: 'WARMING', rank: index + 2, reasonCodes: ['ENTRY_LIVE_CONFIRMATION_PENDING'], registryState: 'QUALIFIED' })),
+    { poolAddress: 'notrade', poolDisplay: 'NOPE/SOL', operationalState: 'NO_TRADE', phase4State: 'NO_TRADE', rank: 99, reasonCodes: ['NO_TRADE_EVIDENCE_NON_ACTIONABLE'], registryState: 'QUALIFIED' }
+  ];
   const output = terminal.renderDecisionTerminal(source, { columns: 180, rows: 50, color: false });
   assert.match(output, /WATCH 0/);
-  assert.match(output, /DISC 2/);
-  assert.match(output, /DISCOVERY QUEUE \(2; WATCH 0\)/);
-  assert.match(output, /WARM\/SOL.*WARMING.*MORE DATA/);
+  assert.match(output, /DISC 8/);
+  assert.match(output, /DISCOVERY QUEUE \(8; WATCH 0\)/);
+  assert.match(output, /WARM0\/SOL.*WARMING.*MORE DATA/);
   assert.match(output, /NOPE\/SOL.*NO_TRADE.*NO_TRADE_EVIDE/);
   assert.doesNotMatch(output, /No Tier-A pools are currently queued\./);
 });
