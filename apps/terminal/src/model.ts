@@ -117,6 +117,22 @@ export interface TerminalRecentPosition {
   exitReason?: string | undefined;
 }
 
+/**
+ * The fills panel is an operational queue, not a pure timestamp feed. Keep
+ * every live lifecycle visible before settled history, then retain newest
+ * first ordering within each group. This is deliberately pure so a caller's
+ * snapshot ordering is never mutated during rendering.
+ */
+export function orderTerminalRecentPositions(rows: TerminalRecentPosition[]): TerminalRecentPosition[] {
+  return [...rows].sort((left, right) => {
+    const stateOrder = Number(right.state === 'OPEN') - Number(left.state === 'OPEN');
+    if (stateOrder !== 0) return stateOrder;
+    const observedOrder = Date.parse(right.observedAt) - Date.parse(left.observedAt);
+    if (Number.isFinite(observedOrder) && observedOrder !== 0) return observedOrder;
+    return left.lifecycleId.localeCompare(right.lifecycleId);
+  });
+}
+
 export interface TerminalEngine {
   name: string;
   status: string;

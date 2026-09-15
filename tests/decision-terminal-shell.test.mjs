@@ -39,6 +39,17 @@ test('shell terminal filters loaded events and position rows locally', () => {
   assert.doesNotMatch(execution, /LIVE CONTROL MARK/);
 });
 
+test('recent-position ordering always keeps live positions before newer settled fills', () => {
+  const source = snapshot();
+  const live = source.recentPositions[0];
+  const closed = source.recentPositions[1];
+  const newerClosed = { ...closed, lifecycleId: 'closed:newer', observedAt: '2026-09-11T12:30:00.000Z' };
+  const ordered = terminal.orderTerminalRecentPositions([newerClosed, live, closed]);
+
+  assert.deepEqual(ordered.map(position => position.lifecycleId), [live.lifecycleId, newerClosed.lifecycleId, closed.lifecycleId]);
+  assert.deepEqual(source.recentPositions.map(position => position.lifecycleId), [live.lifecycleId, closed.lifecycleId]);
+});
+
 test('header keeps P7 health, entry authority, recovery, watch pools, and RPC status distinct', () => {
   const source = snapshot();
   source.health = { ...source.health, newEconomicActionAllowed: false, entryControlReasonCodes: ['P7_PORTFOLIO_DAILY_DRAWDOWN'], recoveryQueueCount: 3, unknownSubmissionCount: 1 };
