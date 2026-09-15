@@ -65,6 +65,12 @@ test('header keeps P7 health, entry authority, recovery, watch pools, and RPC st
   assert.match(output, /q quit  h\/l candidate/);
 });
 
+test('terminal exposes the data-snapshot refresh marker before constrained header fields', () => {
+  const output = terminal.renderDecisionTerminal(snapshot(), { columns: 100, rows: 30, color: false, interactive: true });
+  assert.match(output, /UPDATED 12:00:00/);
+  for (const rendered of output.split('\n')) assert.ok(rendered.length <= 100, rendered);
+});
+
 test('header explains an entry block caused by the open-position limit', () => {
   const source = snapshot();
   source.health = { ...source.health, newEconomicActionAllowed: false, entryControlReasonCodes: ['P7_PORTFOLIO_POSITION_LIMIT'] };

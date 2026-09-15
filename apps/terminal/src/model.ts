@@ -634,7 +634,7 @@ function renderMobileDecisionTerminal(snapshot: TerminalSnapshot, options: Termi
     `${paint('P7', 'muted', color)} ${state(health.healthStatus, color)}  ${paint('SAFE', 'muted', color)} ${state(health.safetyMode, color)}`,
     `${paint('ENTRY', 'muted', color)} ${state(health.newEconomicActionAllowed ? 'ALLOWED' : 'BLOCKED', color)}  ${paint('POS', 'muted', color)} ${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'}`,
     `${paint(`WATCH ${snapshot.entryWatchPools.length}`, 'amber', color)}  ${paint(`DISC ${snapshot.discoveryQueue.length}`, 'cyan', color)}  ${paint(`CAND ${snapshot.candidates.length}`, 'cyan', color)}  ${paint(`REC ${health.recoveryQueueCount}`, health.recoveryQueueCount ? 'amber' : 'muted', color)}`,
-    `${state(rpcSummary(snapshot), color)}  ${paint(new Date().toISOString().slice(11, 19), 'muted', color)}`
+    `${paint(`UPDATED ${snapshot.generatedAt.slice(11, 19)}`, 'cyan', color)}  ${state(rpcSummary(snapshot), color)}`
   ].map(value => clip(value, width));
   const footer = options.interactive
     ? clip(paint(`q quit | m ${mobileView === 'OVERVIEW' ? 'activity' : 'overview'} | h/l candidate | r refresh`, 'muted', color), width)
@@ -672,10 +672,14 @@ export function renderDecisionTerminal(snapshot: TerminalSnapshot, options: Term
   const watch = `WATCH ${snapshot.entryWatchPools.length}`;
   const discovery = `DISC ${snapshot.discoveryQueue.length}`;
   const rpc = rpcSummary(snapshot);
+  // Keep the data-snapshot timestamp at the start of the constrained header.
+  // The old far-right UTC marker was clipped at normal terminal widths, making
+  // a healthy screen look frozen when no decision facts had changed.
+  const updated = `UPDATED ${snapshot.generatedAt.slice(11, 19)}`;
   const recoveryState = paint(recovery, health.recoveryQueueCount > 0 ? 'amber' : 'muted', color);
   const header = [
     `${paint('LPFORGE DECISION TERMINAL', 'lime', color)}  ${state(health.authorityMode === 'PRODUCTION' ? 'PROD' : health.authorityMode || 'UNKNOWN', color)} | ${state(`P7 ${headerStatus}`, color)} | ${state(`SAFETY ${health.safetyMode || 'UNKNOWN'}`, color)} | ${state(entry, color)}`,
-    `${paint(`POS ${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'}`, 'cyan', color)} | ${paint(watch, 'amber', color)} | ${paint(discovery, 'cyan', color)} | ${paint(`CAND ${snapshot.candidates.length}`, 'cyan', color)} | ${recoveryState} | ${state(rpc, color)} | ${paint('REFRESH 2s', 'muted', color)} | ${paint(`UTC ${new Date().toISOString().slice(11, 19)}`, 'cyan', color)}`
+    `${paint(updated, 'cyan', color)} | ${paint('REFRESH 2s', 'muted', color)} | ${paint(`POS ${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'}`, 'cyan', color)} | ${paint(watch, 'amber', color)} | ${paint(discovery, 'cyan', color)} | ${paint(`CAND ${snapshot.candidates.length}`, 'cyan', color)} | ${recoveryState} | ${state(rpc, color)}`
   ].map(value => clip(value, width));
   const divider = paint('═'.repeat(width), 'muted', color);
   const panelRows = Math.max(25, rows - header.length - 2);
