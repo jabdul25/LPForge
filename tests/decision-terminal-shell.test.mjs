@@ -27,7 +27,16 @@ test('shell terminal renders the operator-intelligence panels from bounded read-
   assert.match(output, /OBSERVED LOSS PATH/);
   assert.match(output, /TS-5/);
   assert.match(output, /NET PNL/);
+  for (const field of ['P7 MODE', 'P7 HEALTH', 'SAFETY', 'NEW ENTRIES', 'RPC PRODUCTION', 'RPC DISCOVERY', 'RPC EXECUTION', 'RECOVERY QUEUE', 'UNKNOWN TX', 'ACTIVE PLANS', 'PARTIAL ENTRY', 'INCIDENTS', 'TELEGRAM', 'RELEASE SHA']) assert.match(output, new RegExp(field));
   assert.doesNotMatch(output, /portfolio|equity chart|order book/i);
+});
+
+test('top status uses operator wording while the event stream retains the raw PnL status', () => {
+  const source = snapshot();
+  source.events = [{ ...source.events[0], event: 'POSITION_LIVE_CONTROL_PNL_UNAVAILABLE' }];
+  const output = terminal.renderDecisionTerminal(source, { columns: 220, rows: 50, color: false, showCanonicalEventCodes: true });
+  assert.match(output, /LAST ACTION WAITING - LIVE PNL REFRESH/);
+  assert.match(output, /POSITION_LIVE_CONTROL_PNL/);
 });
 
 test('shell terminal filters loaded events and position rows locally', () => {

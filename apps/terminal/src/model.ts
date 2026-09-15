@@ -717,25 +717,46 @@ function entryBlockSummary(health: TerminalHealth): string | undefined {
   }).join(', ');
 }
 
-function healthLines(snapshot: TerminalSnapshot, color: boolean): string[] {
+/**
+ * Complete health facts arranged for the terminal's status column. This is a
+ * presentation-only compaction: every value remains sourced from the same
+ * bounded health snapshot and no control state is inferred or altered.
+ */
+function healthLines(snapshot: TerminalSnapshot, width: number, color: boolean): string[] {
   const health = snapshot.health;
   const entryBlock = entryBlockSummary(health);
   return [
-    `${paint('P7 MODE', 'muted', color)}        ${state(health.authorityMode, color)}`,
-    `${paint('P7 HEALTH', 'muted', color)}      ${state(health.healthStatus, color)}`,
-    `${paint('SAFETY', 'muted', color)}         ${state(health.safetyMode, color)}`,
-    `${paint('NEW ENTRIES', 'muted', color)}    ${state(health.newEconomicActionAllowed ? 'ALLOWED' : 'BLOCKED', color)}`,
-    ...(entryBlock ? [`${paint('ENTRY BLOCK', 'muted', color)}    ${state(entryBlock, color)}`] : []),
+    `${paint('P7 MODE', 'muted', color)} ${state(health.authorityMode, color)} | ${paint('P7 HEALTH', 'muted', color)} ${state(health.healthStatus, color)}`,
+    `${paint('SAFETY', 'muted', color)} ${state(health.safetyMode, color)} | ${paint('NEW ENTRIES', 'muted', color)} ${state(health.newEconomicActionAllowed ? 'ALLOWED' : 'BLOCKED', color)}`,
+    ...(entryBlock ? [`${paint('ENTRY BLOCK', 'muted', color)} ${state(entryBlock, color)}`] : []),
     ...rpcLines(snapshot, color),
-    `${paint('RECOVERY QUEUE', 'muted', color)} ${state(String(health.recoveryQueueCount), color)}`,
-    `${paint('UNKNOWN TX', 'muted', color)}     ${state(String(health.unknownSubmissionCount), color)}`,
-    `${paint('ACTIVE PLANS', 'muted', color)}   ${state(String(health.activeManagementPlans), color)}`,
-    `${paint('PARTIAL ENTRY', 'muted', color)}  ${state(String(health.partialEntryRecoveryCount), color)}`,
-    `${paint('INCIDENTS', 'muted', color)}      ${state(String(health.activeIncidentCount), color)}`,
-    `${paint('TELEGRAM', 'muted', color)}       ${state(health.telegramStatus, color)}`,
-    `${paint('RELEASE', 'muted', color)}        ${paint(short(snapshot.runtime.releaseSha), 'cyan', color)}`,
-    `${paint('POLICY', 'muted', color)}         ${paint(short(snapshot.runtime.policyHash), 'cyan', color)}`
-  ];
+    `${paint('RECOVERY QUEUE', 'muted', color)} ${state(String(health.recoveryQueueCount), color)} | ${paint('UNKNOWN TX', 'muted', color)} ${state(String(health.unknownSubmissionCount), color)}`,
+    `${paint('ACTIVE PLANS', 'muted', color)} ${state(String(health.activeManagementPlans), color)} | ${paint('PARTIAL ENTRY', 'muted', color)} ${state(String(health.partialEntryRecoveryCount), color)}`,
+    `${paint('INCIDENTS', 'muted', color)} ${state(String(health.activeIncidentCount), color)} | ${paint('TELEGRAM', 'muted', color)} ${state(health.telegramStatus, color)}`,
+    `${paint('RELEASE SHA', 'muted', color)} ${paint(short(snapshot.runtime.releaseSha), 'cyan', color)} | ${paint('POLICY', 'muted', color)} ${paint(short(snapshot.runtime.policyHash), 'cyan', color)}`,
+    ...(entryBlock ? [`${paint('ENTRY BLOCK', 'muted', color)} ${state(entryBlock, color)}`] : [])
+  ].map(line => clip(line, width));
+}
+
+function compactDailyPerformanceLines(snapshot: TerminalSnapshot, width: number, color: boolean): string[] {
+  const daily = snapshot.dailyPerformance;
+  if (!daily) return [paint('No daily aggregate available.', 'muted', color)];
+  return [
+    `${paint('NET PNL', 'muted', color)} ${formatSolLamports(daily.netPnlLamports)} | ${paint('TRADES', 'muted', color)} ${daily.trades} | ${paint('WIN', 'muted', color)} ${daily.wins} | ${paint('LOSS', 'muted', color)} ${daily.losses} | ${paint('WIN RATE', 'muted', color)} ${daily.trades ? `${((daily.wins / daily.trades) * 100).toFixed(0)}%` : '—'}`,
+    `${paint('FEES', 'muted', color)} ${formatSolLamports(daily.feeLamports)} | ${paint('BEST', 'muted', color)} ${daily.bestPool ? short(daily.bestPool) : '—'} ${formatPercent(daily.bestReturnFraction)} | ${paint('WORST', 'muted', color)} ${daily.worstPool ? short(daily.worstPool) : '—'} ${formatPercent(daily.worstReturnFraction)}`
+  ].map(line => clip(line, width));
+}
+
+function operatorLastAction(event: TerminalEvent | undefined): string {
+  if (!event) return 'WAITING - DISCOVERY';
+  const code = event.event.toUpperCase();
+  if (/PNL_UNAVAILABLE/.test(code)) return 'WAITING - LIVE PNL REFRESH';
+  if (/RECOVERY|RECONCIL/.test(code)) return 'WAITING - RECOVERY CHECK';
+  if (/P4|ECONOMIC|NO_TRADE|CANDIDATE|ENTRY_/.test(code)) return 'WAITING - ECONOMIC VALIDATION';
+  if (/POSITION_OPENED/.test(code)) return 'POSITION OPENED';
+  if (/POSITION_SETTLED|POSITION_CLOSED/.test(code)) return 'POSITION CLOSED';
+  if (/CLOSE_TRIGGERED|PROTECTION/.test(code)) return 'PROTECTIVE CLOSE';
+  return displayEventCode(event.event);
 }
 
 function mobileSection(title: string, content: string[], width: number, color: boolean): string[] {
@@ -852,13 +873,13 @@ function renderMobileDecisionTerminal(snapshot: TerminalSnapshot, options: Termi
     append(`■ ENTRY WATCH (${snapshot.entryWatchPools.length})`, compactWatchLines(snapshot, width, color, bodyBudget >= 20 ? 3 : 2), 3);
     append(`■ OPEN POSITIONS (${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'})`, compactOpenPositionLines(snapshot, width, color, 2), 2);
     append('▥ CANDIDATE PIPELINE', [...compactPipelineLines(snapshot, width, color), ...topBlockerLines(snapshot, width, color)], 2);
-    append('♥ SYSTEM HEALTH', compactSystemLines(snapshot, width, color, bodyBudget >= 20 ? 4 : 3), 3);
+    append('♥ SYSTEM HEALTH', healthLines(snapshot, width, color), health.newEconomicActionAllowed === false ? 13 : 12);
   } else {
     append(`● LIVE EVENTS ${options.eventFilter || 'ALL'}`, compactEventLines(snapshot, width, options.eventFilter, color, bodyBudget >= 20 ? 6 : 4, options.showCanonicalEventCodes), 5);
     append(`▤ RECENT POSITIONS ${options.positionFilter || 'ALL'}`, compactRecentPositionLines(snapshot, width, options.positionFilter, color, bodyBudget >= 20 ? 5 : 3), 4);
     append('⚙ ENGINE DESK', compactEngineLines(snapshot, width, color, 3), 3);
     append('◫ RANGE MONITOR', rangeMonitorLines(snapshot, width, color), 2);
-    append('♥ SYSTEM HEALTH', compactSystemLines(snapshot, width, color, 3), 3);
+    append('♥ SYSTEM HEALTH', healthLines(snapshot, width, color), health.newEconomicActionAllowed === false ? 13 : 12);
   }
   return [...header, paint('─'.repeat(width), 'muted', color), ...body.slice(0, bodyBudget), footer].join('\n');
 }
@@ -870,14 +891,14 @@ export function renderDecisionTerminal(snapshot: TerminalSnapshot, options: Term
   const rows = Math.max(30, Math.min(80, Math.floor(options.rows ?? 50)));
   const health = snapshot.health;
   const terminalStatus = health.newEconomicActionAllowed === false ? 'PAUSED' : snapshot.activePools.length ? 'MANAGING' : snapshot.candidates.length || snapshot.entryWatchPools.length ? 'SEARCHING' : 'ACTIVE';
-  const lastAction = snapshot.events[0] ? displayEventCode(snapshot.events[0].event) : 'NO ACTION';
+  const lastAction = operatorLastAction(snapshot.events[0]);
   const header = [
     `${paint('LPFORGE DECISION TERMINAL', 'lime', color)}  ${paint('MODE', 'muted', color)} ${state(health.authorityMode || 'UNKNOWN', color)}  ${paint('STATUS', 'muted', color)} ${state(terminalStatus, color)}  ${paint('SAFETY', 'muted', color)} ${state(health.safetyMode || 'UNKNOWN', color)}  ${paint('ENTRY', 'muted', color)} ${state(health.newEconomicActionAllowed === false ? 'DISABLED' : 'ENABLED', color)}`,
     `${paint(`OPEN POSITIONS ${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'}`, 'cyan', color)}  ${paint(`WATCH POOLS ${snapshot.entryWatchPools.length}`, 'amber', color)}  ${paint(`CANDIDATES ${snapshot.candidates.length}`, 'cyan', color)}  ${paint('LAST ACTION', 'muted', color)} ${state(lastAction, color)}  ${state(rpcSummary(snapshot), color)}  ${paint(`UTC ${new Date().toISOString().slice(11, 19)}`, 'muted', color)}`
   ].map(value => clip(value, width));
   const divider = paint('═'.repeat(width), 'muted', color);
   const panelRows = Math.max(25, rows - header.length - 2);
-  const topHeight = Math.max(10, Math.floor(panelRows * .30));
+  const topHeight = Math.max(10, Math.floor(panelRows * .30) - 1);
   const middleHeight = Math.max(9, Math.floor(panelRows * .25));
   const openPanelHeight = Math.max(6, snapshot.activePools.length + 4);
   const bottomHeight = Math.max(10, panelRows - topHeight - middleHeight - openPanelHeight);
@@ -898,7 +919,7 @@ export function renderDecisionTerminal(snapshot: TerminalSnapshot, options: Term
       ...panel(`■ OPEN POSITIONS (${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'})`, width, openPanelHeight, activePoolLines(snapshot, width - 2, color), color),
       ...panel('▤ FILLS / RECENT POSITIONS', width, bottomHeight, recentPositionLines(snapshot, width - 2, options.positionFilter, color), color, options.positionFilter || 'ALL'),
       ...panel(`● EVENT STREAM ${options.eventFilter || 'ALL'}`, width, 10, eventRows(snapshot, width - 2, options.eventFilter, color, options.showCanonicalEventCodes), color),
-      ...panel('♥ SYSTEM HEALTH', width, 12, healthLines(snapshot, color), color)
+      ...panel('♥ SYSTEM HEALTH', width, health.newEconomicActionAllowed === false ? 13 : 12, healthLines(snapshot, width - 2, color), color)
     ];
     return [...header, divider, ...narrow, footer].join('\n');
   }
@@ -927,11 +948,12 @@ export function renderDecisionTerminal(snapshot: TerminalSnapshot, options: Term
   const eventWidth = Math.floor((width - gap * 2) * .24);
   const fillsWidth = Math.floor((width - gap * 2) * .53);
   const sideWidth = width - eventWidth - fillsWidth - gap * 2;
-  const dailyHeight = Math.max(7, Math.min(9, bottomHeight - 8));
+  const systemHealthHeight = health.newEconomicActionAllowed === false ? 13 : 12;
+  const dailyHeight = Math.max(4, bottomHeight - systemHealthHeight);
   const bottom = joinPanels([
     panel(`● EVENT STREAM ${options.eventFilter || 'ALL'}`, eventWidth, bottomHeight, eventRows(snapshot, eventWidth - 2, options.eventFilter, color, options.showCanonicalEventCodes), color),
     panel('▤ FILLS / RECENT POSITIONS', fillsWidth, bottomHeight, recentPositionLines(snapshot, fillsWidth - 2, options.positionFilter, color), color, options.positionFilter || 'ALL'),
-    [...panel('▣ TODAY', sideWidth, dailyHeight, dailyPerformanceLines(snapshot, sideWidth - 2, color), color), ...panel('♥ SYSTEM HEALTH', sideWidth, Math.max(4, bottomHeight - dailyHeight), healthLines(snapshot, color), color, health.healthStatus || 'UNKNOWN')]
+    [...panel('▣ TODAY', sideWidth, dailyHeight, compactDailyPerformanceLines(snapshot, sideWidth - 2, color), color), ...panel('♥ SYSTEM HEALTH', sideWidth, systemHealthHeight, healthLines(snapshot, sideWidth - 2, color), color, health.healthStatus || 'UNKNOWN')]
   ]);
   return [...header, divider, ...top, ...middle, ...openPositions, ...bottom, footer].join('\n');
 }
