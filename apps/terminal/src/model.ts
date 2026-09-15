@@ -908,9 +908,9 @@ export function renderDecisionTerminal(snapshot: TerminalSnapshot, options: Term
       ...panel('▥ CANDIDATE PIPELINE / TOP BLOCKERS', width, 9, [...pipelineLines(snapshot, width - 2, color), ...topBlockerLines(snapshot, width - 2, color)], color),
       ...panel('◫ RANGE MONITOR', width, 9, rangeMonitorLines(snapshot, width - 2, color), color),
       ...panel(`■ OPEN POSITIONS (${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'})`, width, openPanelHeight, activePoolLines(snapshot, width - 2, color), color),
-      ...panel('♥ POSITION HEALTH', width, 9, positionHealthLines(snapshot, width - 2, color), color),
+      ...panel('♥ SYSTEM HEALTH', width, health.newEconomicActionAllowed === false ? 13 : 12, healthLines(snapshot, width - 2, color), color),
       ...panel('▤ FILLS / RECENT POSITIONS', width, bottomHeight, recentPositionLines(snapshot, width - 2, options.positionFilter, color), color, options.positionFilter || 'ALL'),
-      ...panel('♥ SYSTEM HEALTH', width, health.newEconomicActionAllowed === false ? 13 : 12, healthLines(snapshot, width - 2, color), color)
+      ...panel('♥ POSITION HEALTH', width, 9, positionHealthLines(snapshot, width - 2, color), color)
     ];
     return [...header, divider, ...narrow, footer].join('\n');
   }
@@ -939,12 +939,12 @@ export function renderDecisionTerminal(snapshot: TerminalSnapshot, options: Term
   const positionHealthWidth = Math.floor((width - gap * 2) * .24);
   const fillsWidth = Math.floor((width - gap * 2) * .53);
   const sideWidth = width - positionHealthWidth - fillsWidth - gap * 2;
-  const systemHealthHeight = health.newEconomicActionAllowed === false ? 13 : 12;
-  const dailyHeight = Math.max(4, bottomHeight - systemHealthHeight);
+  const positionHealthHeight = Math.min(9, bottomHeight);
+  const dailyHeight = Math.max(4, bottomHeight - positionHealthHeight);
   const bottom = joinPanels([
-    panel('♥ POSITION HEALTH', positionHealthWidth, Math.min(9, bottomHeight), positionHealthLines(snapshot, positionHealthWidth - 2, color), color),
+    panel('♥ SYSTEM HEALTH', positionHealthWidth, bottomHeight, healthLines(snapshot, positionHealthWidth - 2, color), color, health.healthStatus || 'UNKNOWN'),
     panel('▤ FILLS / RECENT POSITIONS', fillsWidth, bottomHeight, recentPositionLines(snapshot, fillsWidth - 2, options.positionFilter, color), color, options.positionFilter || 'ALL'),
-    [...panel('▣ TODAY', sideWidth, dailyHeight, compactDailyPerformanceLines(snapshot, sideWidth - 2, color), color), ...panel('♥ SYSTEM HEALTH', sideWidth, systemHealthHeight, healthLines(snapshot, sideWidth - 2, color), color, health.healthStatus || 'UNKNOWN')]
+    [...panel('▣ TODAY', sideWidth, dailyHeight, compactDailyPerformanceLines(snapshot, sideWidth - 2, color), color), ...panel('♥ POSITION HEALTH', sideWidth, positionHealthHeight, positionHealthLines(snapshot, sideWidth - 2, color), color)]
   ]);
   return [...header, divider, ...top, ...middle, ...openPositions, ...bottom, footer].join('\n');
 }

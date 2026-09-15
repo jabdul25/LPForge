@@ -37,11 +37,14 @@ test('desktop hierarchy expands Event Stream and moves compact Position Health b
   const decision = output.indexOf('DECISION PIPELINE');
   const open = output.lastIndexOf('OPEN POSITIONS');
   const health = output.indexOf('POSITION HEALTH');
+  const system = output.indexOf('SYSTEM HEALTH');
+  const fills = output.indexOf('FILLS / RECENT POSITIONS');
 
   assert.ok(event >= 0);
   assert.ok(decision > event, 'Decision Pipeline should follow the upper Event Stream row');
   assert.ok(open > decision, 'Open Positions should retain its own full-width row');
   assert.ok(health > open, 'Position Health should occupy the former lower Event Stream area');
+  assert.ok(system > open && system < fills, 'System Health should occupy the lower-left Position Health slot');
   assert.match(output, /DISCOVERED 1\s+FILTERED 1\s+WATCHING 1/);
   assert.match(output, /BELOW_MIN 0\s+ABOVE_MAX 0/);
 });
