@@ -31,6 +31,21 @@ test('shell terminal renders the operator-intelligence panels from bounded read-
   assert.doesNotMatch(output, /portfolio|equity chart|order book/i);
 });
 
+test('desktop hierarchy expands Event Stream and moves compact Position Health below open positions', () => {
+  const output = terminal.renderDecisionTerminal(snapshot(), { columns: 220, rows: 50, color: false });
+  const event = output.indexOf('EVENT STREAM ALL');
+  const decision = output.indexOf('DECISION PIPELINE');
+  const open = output.lastIndexOf('OPEN POSITIONS');
+  const health = output.indexOf('POSITION HEALTH');
+
+  assert.ok(event >= 0);
+  assert.ok(decision > event, 'Decision Pipeline should follow the upper Event Stream row');
+  assert.ok(open > decision, 'Open Positions should retain its own full-width row');
+  assert.ok(health > open, 'Position Health should occupy the former lower Event Stream area');
+  assert.match(output, /DISCOVERED 1\s+FILTERED 1\s+WATCHING 1/);
+  assert.match(output, /BELOW_MIN 0\s+ABOVE_MAX 0/);
+});
+
 test('top status uses operator wording while the event stream retains the raw PnL status', () => {
   const source = snapshot();
   source.events = [{ ...source.events[0], event: 'POSITION_LIVE_CONTROL_PNL_UNAVAILABLE' }];

@@ -413,25 +413,17 @@ function pipelineLines(snapshot: TerminalSnapshot, width: number, color: boolean
   const totals = new Map<string, number>();
   for (const candidate of snapshot.candidates) totals.set(candidate.operationalState, (totals.get(candidate.operationalState) || 0) + 1);
   if (!totals.size && !snapshot.entryWatchPools.length) return [paint('No current candidate-cycle facts.', 'muted', color)];
-  const max = Math.max(...totals.values());
   const filtered = snapshot.candidates.filter(candidate => candidate.operationalState !== 'REJECTED').length;
   const armed = snapshot.candidates.filter(candidate => candidate.phase4State === 'WAIT' || candidate.phase4State === 'ENTRY_READY').length;
   const ready = snapshot.candidates.filter(candidate => candidate.operationalState === 'ENTRY_READY' && candidate.phase4State === 'ENTRY_READY').length;
   const noTrade = snapshot.candidates.filter(candidate => candidate.operationalState === 'NO_TRADE').length;
-  const summary = [
-    `${paint('DISCOVERED', 'muted', color)}  ${snapshot.candidates.length}`,
-    `${paint('FILTERED', 'muted', color)}    ${filtered}`,
-    `${paint('WATCHING', 'muted', color)}    ${snapshot.entryWatchPools.length}`,
-    `${paint('ARMED', 'muted', color)}       ${armed}`,
-    `${paint('ENTRY READY', 'muted', color)} ${ready}`,
-    `${paint('NO TRADE', 'muted', color)}    ${noTrade}`
-  ];
-  const states = [...totals.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([name, count]) => {
-    const barWidth = Math.max(6, Math.min(16, width - 20));
-    const used = Math.max(1, Math.round((count / max) * barWidth));
-    return `${pad(state(name, color), 14)} ${right(String(count), 3)} ${paint('█'.repeat(used), stateColor(name), color)}${paint('░'.repeat(barWidth - used), 'muted', color)}`;
-  });
-  return [...summary, ...states];
+  // This is deliberately a compact funnel rather than a bar chart. The
+  // desktop panel is a decision summary; detailed candidate rows remain
+  // available through the existing navigation and event views.
+  return [
+    `${paint('DISCOVERED', 'muted', color)} ${snapshot.candidates.length}  ${paint('FILTERED', 'muted', color)} ${filtered}  ${paint('WATCHING', 'muted', color)} ${snapshot.entryWatchPools.length}`,
+    `${paint('ARMED', 'muted', color)} ${armed}  ${paint('ENTRY READY', 'muted', color)} ${ready}  ${paint('NO TRADE', 'muted', color)} ${noTrade}`
+  ].map(value => clip(value, width));
 }
 
 /** Compact display-only synopsis of durable current candidate reasons. */
@@ -490,8 +482,7 @@ function decisionPipelineLines(snapshot: TerminalSnapshot, width: number, color:
   const ev = candidate.riskAdjustedExpectedNetEv ?? candidate.predictedNetEv;
   return [
     `${paint('POOL', 'muted', color)}        ${state(candidate.poolDisplay, color)}`,
-    `${paint('STATUS', 'muted', color)}      ${state(candidate.operationalState === 'WARMING' ? 'OBSERVING' : candidate.operationalState, color)}`,
-    `${paint('PHASE', 'muted', color)}       ${state(candidate.phase4State === 'ENTRY_READY' ? 'P4 ECONOMIC VALIDATION' : 'P3 DISCOVERY', color)} → ${state(candidate.phase4State, color)}`,
+    `${paint('STATUS', 'muted', color)}      ${state(candidate.operationalState === 'WARMING' ? 'OBSERVING' : candidate.operationalState, color)}  ${paint('PHASE', 'muted', color)} ${state(candidate.phase4State === 'ENTRY_READY' ? 'P4' : 'P3', color)} → ${state(candidate.phase4State, color)}`,
     `${paint('NEXT GATE', 'muted', color)}   ${state(nextWatchGate(candidate), color)}`,
     `${paint('BLOCKER', 'muted', color)}     ${clip(explainReason(code), Math.max(8, width - 14))}`,
     `${paint('OBS', 'muted', color)}         ${candidate.liveObservationCount ?? '—'} live / ${candidate.marketObservationCount ?? '—'} market${candidate.liveConfirmationState ? ` (${candidate.liveConfirmationState})` : ''}`,
@@ -622,13 +613,10 @@ function rangeMonitorLines(snapshot: TerminalSnapshot, width: number, color: boo
     .sort((left, right) => right[1] - left[1])[0]?.[0] || 'NO CLOSED LOSS CLASS';
   return [
     `${paint('ACTIVE POLICY', 'muted', color)} ${snapshot.runtime.minimumIncludedBins ?? '—'}–${snapshot.runtime.maximumIncludedBins ?? '—'} bins`,
-    `${paint('LAST CLOSED', 'muted', color)}   ${rows.length} (bounded recent history)`,
-    `${paint('AVG RANGE USED', 'muted', color)} ${average(ranges) === undefined ? '—' : `${average(ranges)!.toFixed(1)} bins`}`,
-    `${paint('BELOW_MIN', 'muted', color)}     ${below}`,
-    `${paint('ABOVE_MAX', 'muted', color)}     ${above}`,
-    `${paint('NO OBSERVED OOR', 'muted', color)} ${inRange}/${rows.length || '—'}`,
+    `${paint('LAST CLOSED', 'muted', color)} ${rows.length}  ${paint('AVG RANGE', 'muted', color)} ${average(ranges) === undefined ? '—' : `${average(ranges)!.toFixed(1)} bins`}`,
+    `${paint('BELOW_MIN', 'muted', color)} ${below}  ${paint('ABOVE_MAX', 'muted', color)} ${above}  ${paint('NO OBSERVED OOR', 'muted', color)} ${inRange}/${rows.length || '—'}`,
     `${paint('OBSERVED LOSS PATH', 'muted', color)} ${clip(mostCommon, Math.max(8, width - 22))}`
-  ];
+  ].map(value => clip(value, width));
 }
 
 function positionHealthLines(snapshot: TerminalSnapshot, width: number, color: boolean): string[] {
@@ -898,8 +886,11 @@ export function renderDecisionTerminal(snapshot: TerminalSnapshot, options: Term
   ].map(value => clip(value, width));
   const divider = paint('═'.repeat(width), 'muted', color);
   const panelRows = Math.max(25, rows - header.length - 2);
-  const topHeight = Math.max(10, Math.floor(panelRows * .30) - 1);
-  const middleHeight = Math.max(9, Math.floor(panelRows * .25));
+  // Keep the intelligence panels concise. Their detail is intentionally
+  // available through candidate navigation and the expanded event stream,
+  // rather than consuming the operator's entire viewport.
+  const topHeight = Math.max(9, Math.floor(panelRows * .20));
+  const middleHeight = Math.max(9, Math.floor(panelRows * .20));
   const openPanelHeight = Math.max(6, snapshot.activePools.length + 4);
   const bottomHeight = Math.max(10, panelRows - topHeight - middleHeight - openPanelHeight);
   const help = 'q quit  h/l candidate  e events  f fills  r refresh';
@@ -910,15 +901,15 @@ export function renderDecisionTerminal(snapshot: TerminalSnapshot, options: Term
     : paint(identity, 'muted', color);
   if (width < 190) {
     const narrow = [
-      ...panel('◎ DECISION PIPELINE', width, 11, decisionPipelineLines(snapshot, width - 2, color), color),
-      ...panel('! CURRENT BLOCKER', width, 8, currentBlockerLines(snapshot, width - 2, color), color),
-      ...panel('✦ OPERATOR EXPLANATION', width, 7, operatorExplanationLines(snapshot, width - 2, color), color),
+      ...panel(`● EVENT STREAM ${options.eventFilter || 'ALL'}`, width, 9, eventRows(snapshot, width - 2, options.eventFilter, color, options.showCanonicalEventCodes), color),
+      ...panel('◎ DECISION PIPELINE', width, 9, decisionPipelineLines(snapshot, width - 2, color), color),
+      ...panel('! CURRENT BLOCKER / OPERATOR EXPLANATION', width, 9, currentBlockerLines(snapshot, width - 2, color), color),
+      ...panel('⚙ ECONOMIC ENGINE', width, 9, economicEngineLines(snapshot, width - 2, color), color),
       ...panel('▥ CANDIDATE PIPELINE / TOP BLOCKERS', width, 9, [...pipelineLines(snapshot, width - 2, color), ...topBlockerLines(snapshot, width - 2, color)], color),
       ...panel('◫ RANGE MONITOR', width, 9, rangeMonitorLines(snapshot, width - 2, color), color),
-      ...panel('♥ POSITION HEALTH', width, 9, positionHealthLines(snapshot, width - 2, color), color),
       ...panel(`■ OPEN POSITIONS (${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'})`, width, openPanelHeight, activePoolLines(snapshot, width - 2, color), color),
+      ...panel('♥ POSITION HEALTH', width, 9, positionHealthLines(snapshot, width - 2, color), color),
       ...panel('▤ FILLS / RECENT POSITIONS', width, bottomHeight, recentPositionLines(snapshot, width - 2, options.positionFilter, color), color, options.positionFilter || 'ALL'),
-      ...panel(`● EVENT STREAM ${options.eventFilter || 'ALL'}`, width, 10, eventRows(snapshot, width - 2, options.eventFilter, color, options.showCanonicalEventCodes), color),
       ...panel('♥ SYSTEM HEALTH', width, health.newEconomicActionAllowed === false ? 13 : 12, healthLines(snapshot, width - 2, color), color)
     ];
     return [...header, divider, ...narrow, footer].join('\n');
@@ -932,26 +923,26 @@ export function renderDecisionTerminal(snapshot: TerminalSnapshot, options: Term
   const center = Math.floor((width - gap * 2) * .32);
   const rightWidth = width - left - center - gap * 2;
   const top = joinPanels([
-    panel('◎ DECISION PIPELINE', decisionWidth, topHeight, decisionPipelineLines(snapshot, decisionWidth - 2, color), color),
+    panel(`● EVENT STREAM ${options.eventFilter || 'ALL'}`, decisionWidth, topHeight, eventRows(snapshot, decisionWidth - 2, options.eventFilter, color, options.showCanonicalEventCodes), color),
     panel('! CURRENT BLOCKER / OPERATOR EXPLANATION', blockerWidth, topHeight, currentBlockerLines(snapshot, blockerWidth - 2, color), color),
     panel('⚙ ECONOMIC ENGINE', economicWidth, topHeight, economicEngineLines(snapshot, economicWidth - 2, color), color)
   ]);
   const middle = joinPanels([
-    panel('▥ CANDIDATE PIPELINE', left, middleHeight, [...pipelineLines(snapshot, left - 2, color), ...topBlockerLines(snapshot, left - 2, color)], color),
-    panel('◫ RANGE MONITOR', center, middleHeight, rangeMonitorLines(snapshot, center - 2, color), color),
-    panel('♥ POSITION HEALTH', rightWidth, middleHeight, positionHealthLines(snapshot, rightWidth - 2, color), color)
+    panel('◎ DECISION PIPELINE', left, middleHeight, decisionPipelineLines(snapshot, left - 2, color), color),
+    panel('▥ CANDIDATE PIPELINE / TOP BLOCKERS', center, middleHeight, [...pipelineLines(snapshot, center - 2, color), ...topBlockerLines(snapshot, center - 2, color)], color),
+    panel('◫ RANGE MONITOR', rightWidth, middleHeight, rangeMonitorLines(snapshot, rightWidth - 2, color), color)
   ]);
   const openPositions = panel(`■ OPEN POSITIONS (${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'})`, width, openPanelHeight, activePoolLines(snapshot, width - 2, color), color);
   // The fills table carries authority labels. Give it enough width to show
   // LIVE-CONTROL PEAK rather than collapsing the source name into a generic
   // historical "MAX" label.
-  const eventWidth = Math.floor((width - gap * 2) * .24);
+  const positionHealthWidth = Math.floor((width - gap * 2) * .24);
   const fillsWidth = Math.floor((width - gap * 2) * .53);
-  const sideWidth = width - eventWidth - fillsWidth - gap * 2;
+  const sideWidth = width - positionHealthWidth - fillsWidth - gap * 2;
   const systemHealthHeight = health.newEconomicActionAllowed === false ? 13 : 12;
   const dailyHeight = Math.max(4, bottomHeight - systemHealthHeight);
   const bottom = joinPanels([
-    panel(`● EVENT STREAM ${options.eventFilter || 'ALL'}`, eventWidth, bottomHeight, eventRows(snapshot, eventWidth - 2, options.eventFilter, color, options.showCanonicalEventCodes), color),
+    panel('♥ POSITION HEALTH', positionHealthWidth, Math.min(9, bottomHeight), positionHealthLines(snapshot, positionHealthWidth - 2, color), color),
     panel('▤ FILLS / RECENT POSITIONS', fillsWidth, bottomHeight, recentPositionLines(snapshot, fillsWidth - 2, options.positionFilter, color), color, options.positionFilter || 'ALL'),
     [...panel('▣ TODAY', sideWidth, dailyHeight, compactDailyPerformanceLines(snapshot, sideWidth - 2, color), color), ...panel('♥ SYSTEM HEALTH', sideWidth, systemHealthHeight, healthLines(snapshot, sideWidth - 2, color), color, health.healthStatus || 'UNKNOWN')]
   ]);
