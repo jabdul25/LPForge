@@ -150,7 +150,7 @@ export function createSolanaRpcClient(opts:SolanaRpcClientOptions):SolanaRpcClie
       } finally {clearTimeout(timer);}
     }
   }
-  return { call, async getSlot(){return BigInt(await call<number>('getSlot',[{commitment:'confirmed'}]));}, async getSignaturesForAddress(address,limit,before){return call('getSignaturesForAddress',[address,{limit,...(before?{before}:{}),commitment:'confirmed'}]);}, async getTransaction(signature){return call('getTransaction',[signature,{encoding:'json',commitment:'confirmed',maxSupportedTransactionVersion:0}]);} };
+  return { call, async getSlot(){return BigInt(await call<number>('getSlot',[{commitment:'confirmed'}]));}, async getSignaturesForAddress(address,limit,before){return call('getSignaturesForAddress',[address,{limit,...(before?{before}:{}),commitment:'confirmed'}]);}, async getTransaction(signature){return call('getTransaction',[signature,{encoding:'json',commitment:'confirmed',maxSupportedTransactionVersion:1}]);} };
 }
 
 function field(obj: unknown, ...paths: string[][]): unknown {
