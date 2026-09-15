@@ -59,6 +59,10 @@ export interface TerminalCandidate {
   registryState?: string | undefined;
   /** Canonical Discovery rank; it is display ordering only. */
   rank?: number | undefined;
+  /** Bounded, persisted evidence maturity facts; terminal display only. */
+  marketObservationCount?: number | undefined;
+  liveObservationCount?: number | undefined;
+  liveConfirmationState?: string | undefined;
   reasonCodes: string[];
 }
 
@@ -118,8 +122,10 @@ export interface TerminalRecentPosition {
   holdSeconds?: number | undefined;
   exitReason?: string | undefined;
   entryRange?: string | undefined;
-  maxProfitFraction?: number | undefined;
-  givebackFraction?: number | undefined;
+  /** Confirmed Meteora-compatible high-water mark; never managed NAV. */
+  liveControlPeakReturnFraction?: number | undefined;
+  /** Live-control peak less canonical final settlement return; display-only. */
+  liveControlPeakGivebackFraction?: number | undefined;
   lossClass?: string | undefined;
   protectionUsed?: string | undefined;
 }
@@ -354,15 +360,25 @@ export function displayEventCode(eventCode: string): string { return EVENT_DISPL
 function eventRows(snapshot: TerminalSnapshot, width: number, filter: TerminalRenderOptions['eventFilter'], color: boolean, showCanonical = false): string[] {
   const rows = snapshot.events.filter(e => !filter || filter === 'ALL' || eventCategory(e) === filter).slice(0, 18);
   if (!rows.length) return [paint('No canonical events in the current bounded window.', 'muted', color)];
+  // Plain --once output is the diagnostic path. Preserve the complete stored
+  // event identity there even when the visual dashboard reserves its width
+  // for friendly description and entity context.
+  if (showCanonical) {
+    const eventWidth = Math.max(8, width - 9 - 1 - 5 - 1);
+    return [paint(`${pad('TIME', 9)} ${pad('LVL', 5)} EVENT`, 'muted', color), ...rows.map(row => {
+      const time = new Date(row.observedAt).toISOString().slice(11, 19);
+      return `${pad(time, 9)} ${pad(state(row.level, color), 5)} ${clip(row.event, eventWidth)}`;
+    })];
+  }
   const entityWidth = Math.max(8, Math.min(10, Math.floor(width / 7)));
-  const eventCap = showCanonical ? 38 : 21;
+  const eventCap = 21;
   const eventWidth = Math.min(eventCap, Math.max(14, width - 9 - 1 - 5 - 1 - entityWidth - 1 - 18 - 1));
   const head = `${pad('TIME', 9)} ${pad('LVL', 5)} ${pad('EVENT', eventWidth)} ${pad('ENTITY', entityWidth)} MESSAGE`;
   const messageWidth = Math.max(12, width - 9 - 1 - 5 - 1 - eventWidth - 1 - entityWidth - 1);
   return [paint(head, 'muted', color), ...rows.map(row => {
     const time = new Date(row.observedAt).toISOString().slice(11, 19);
     const message = row.message || row.status;
-    const event = showCanonical ? row.event : displayEventCode(row.event);
+    const event = displayEventCode(row.event);
     return `${pad(time, 9)} ${pad(state(row.level, color), 5)} ${pad(state(event, color), eventWidth)} ${pad(short(row.entityId, 5, 3), entityWidth)} ${clip(message, messageWidth)}`;
   })];
 }
@@ -398,10 +414,17 @@ function pipelineLines(snapshot: TerminalSnapshot, width: number, color: boolean
   for (const candidate of snapshot.candidates) totals.set(candidate.operationalState, (totals.get(candidate.operationalState) || 0) + 1);
   if (!totals.size && !snapshot.entryWatchPools.length) return [paint('No current candidate-cycle facts.', 'muted', color)];
   const max = Math.max(...totals.values());
+  const filtered = snapshot.candidates.filter(candidate => candidate.operationalState !== 'REJECTED').length;
+  const armed = snapshot.candidates.filter(candidate => candidate.phase4State === 'WAIT' || candidate.phase4State === 'ENTRY_READY').length;
+  const ready = snapshot.candidates.filter(candidate => candidate.operationalState === 'ENTRY_READY' && candidate.phase4State === 'ENTRY_READY').length;
+  const noTrade = snapshot.candidates.filter(candidate => candidate.operationalState === 'NO_TRADE').length;
   const summary = [
-    `${paint('DISCOVERED', 'muted', color)} ${snapshot.candidates.length}`,
-    `${paint('WATCHING', 'muted', color)} ${snapshot.entryWatchPools.length}`,
-    `${paint('ENTRY READY', 'muted', color)} ${snapshot.candidates.filter(candidate => candidate.operationalState === 'ENTRY_READY' && candidate.phase4State === 'ENTRY_READY').length}`
+    `${paint('DISCOVERED', 'muted', color)}  ${snapshot.candidates.length}`,
+    `${paint('FILTERED', 'muted', color)}    ${filtered}`,
+    `${paint('WATCHING', 'muted', color)}    ${snapshot.entryWatchPools.length}`,
+    `${paint('ARMED', 'muted', color)}       ${armed}`,
+    `${paint('ENTRY READY', 'muted', color)} ${ready}`,
+    `${paint('NO TRADE', 'muted', color)}    ${noTrade}`
   ];
   const states = [...totals.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([name, count]) => {
     const barWidth = Math.max(6, Math.min(16, width - 20));
@@ -453,10 +476,11 @@ function currentBlockerLines(snapshot: TerminalSnapshot, width: number, color: b
   const entryAllowed = snapshot.health.newEconomicActionAllowed !== false;
   return [
     `${paint('ENTRY', 'muted', color)}       ${state(entryAllowed ? 'ENABLED' : 'DISABLED', color)}`,
-    `${paint('STATE', 'muted', color)}       ${state(entryAllowed ? candidate?.operationalState || 'SEARCHING' : 'BLOCKED', color)}`,
-    `${paint('REASON', 'muted', color)}      ${clip(explainReason(code), Math.max(8, width - 13))}`,
-    `${paint('RAW CODE', 'muted', color)}    ${clip(code || 'NO_EXECUTABLE_CANDIDATE', Math.max(8, width - 13))}`,
-    `${paint('NEXT CHECK', 'muted', color)}  next normal evaluation cycle`
+    `${paint('STATE / REASON', 'muted', color)} ${state(entryAllowed ? candidate?.operationalState || 'SEARCHING' : 'BLOCKED', color)} — ${clip(explainReason(code), Math.max(8, width - 25))}`,
+    `${paint('OBSERVATIONS', 'muted', color)} ${candidate?.liveObservationCount ?? '—'} live / ${candidate?.marketObservationCount ?? '—'} market${candidate?.liveConfirmationState ? ` (${candidate.liveConfirmationState})` : ''}`,
+    `${paint('NEXT CHECK', 'muted', color)}   next normal evaluation cycle`,
+    `${paint('RAW CODE', 'muted', color)}     ${clip(code || 'NO_EXECUTABLE_CANDIDATE', Math.max(8, width - 14))}`,
+    `${paint('OPERATOR', 'muted', color)}     ${clip(code ? explainReason(code) : 'Discovery continues observing; no action required.', Math.max(8, width - 14))}`
   ];
 }
 function decisionPipelineLines(snapshot: TerminalSnapshot, width: number, color: boolean): string[] {
@@ -467,11 +491,11 @@ function decisionPipelineLines(snapshot: TerminalSnapshot, width: number, color:
   return [
     `${paint('POOL', 'muted', color)}        ${state(candidate.poolDisplay, color)}`,
     `${paint('STATUS', 'muted', color)}      ${state(candidate.operationalState === 'WARMING' ? 'OBSERVING' : candidate.operationalState, color)}`,
-    `${paint('PHASE', 'muted', color)}       ${state(candidate.phase4State === 'ENTRY_READY' ? 'P4 ECONOMIC VALIDATION' : 'P3 DISCOVERY', color)}`,
+    `${paint('PHASE', 'muted', color)}       ${state(candidate.phase4State === 'ENTRY_READY' ? 'P4 ECONOMIC VALIDATION' : 'P3 DISCOVERY', color)} → ${state(candidate.phase4State, color)}`,
     `${paint('NEXT GATE', 'muted', color)}   ${state(nextWatchGate(candidate), color)}`,
     `${paint('BLOCKER', 'muted', color)}     ${clip(explainReason(code), Math.max(8, width - 14))}`,
-    `${paint('SCORE', 'muted', color)}       ${candidate.confidence === undefined ? '—' : candidate.confidence.toFixed(2)}`,
-    `${paint('UNCERTAINTY', 'muted', color)} ${candidate.uncertainty === undefined ? '—' : candidate.uncertainty.toFixed(2)}`,
+    `${paint('OBS', 'muted', color)}         ${candidate.liveObservationCount ?? '—'} live / ${candidate.marketObservationCount ?? '—'} market${candidate.liveConfirmationState ? ` (${candidate.liveConfirmationState})` : ''}`,
+    `${paint('SCORE / UNCERTAINTY', 'muted', color)} ${candidate.confidence === undefined ? '—' : candidate.confidence.toFixed(2)} / ${candidate.uncertainty === undefined ? '—' : candidate.uncertainty.toFixed(2)}`,
     `${paint('NET EV', 'muted', color)}      ${signedSol(ev, color)}`
   ];
 }
@@ -522,13 +546,39 @@ function entryWatchLines(snapshot: TerminalSnapshot, width: number, color: boole
   return [paint(head, 'muted', color), ...rows];
 }
 
+function rangeLabel(position: TerminalPosition): string {
+  if (position.oorDirection === 'BELOW_MIN' || position.rangeState === 'BELOW_MIN') return 'BELOW_MIN WARNING';
+  if (position.oorDirection === 'ABOVE_MAX' || position.rangeState === 'ABOVE_MAX') return 'ABOVE_MAX';
+  if (position.rangeState === 'LOWER_EDGE') return 'NEAR LOWER EDGE';
+  return position.rangeState === 'IN_RANGE' ? 'IN RANGE' : position.rangeState || 'UNKNOWN';
+}
+function riskLabel(position: TerminalPosition): string {
+  const range = rangeLabel(position);
+  if (/BELOW_MIN|ABOVE_MAX/.test(range) || position.lifecycleState === 'CLOSING') return 'CRITICAL';
+  if (/LOWER EDGE|LOWER_THIRD|RECONCILIATION|UNKNOWN/.test(`${range} ${position.lifecycleState} ${position.valuationState || ''}`)) return 'ELEVATED';
+  return 'NORMAL';
+}
+function nextActionLabel(position: TerminalPosition): string {
+  if (position.lifecycleState === 'CLOSING') return 'CLOSE IN PROGRESS';
+  if (position.reconciliationStatus !== 'MATCH' && position.reconciliationStatus !== 'HEALTHY') return 'RECONCILE';
+  if (position.protection !== 'NONE') return 'MONITOR PROTECTION';
+  return 'WAIT';
+}
 function activePoolLines(snapshot: TerminalSnapshot, width: number, color: boolean): string[] {
   if (!snapshot.activePools.length) return [paint('No open LP positions.', 'muted', color)];
-  const head = `${pad('POOL', 12)} ${pad('POSITION', 12)} ${pad('STATE', 9)} ${pad('LIVE PNL', 10)} ${pad('LIVE PEAK', 10)} ${pad('LP FEES', 12)} ${pad('RANGE', 15)} ALERT`;
-  const alertWidth = Math.max(8, width - 12 - 1 - 12 - 1 - 9 - 1 - 10 - 1 - 10 - 1 - 12 - 1 - 15 - 1);
+  if (width < 145) return snapshot.activePools.flatMap(position => {
+    const range = position.lowerBinId === undefined || position.upperBinId === undefined ? '—' : `${position.lowerBinId}–${position.upperBinId}`;
+    return [
+      `${state(position.poolDisplay, color)}  ${paint('RANGE', 'muted', color)} ${range}  ${paint('BIN', 'muted', color)} ${position.activeBinId ?? '—'}`,
+      `${paint('PNL', 'muted', color)} ${signedPercent(position.liveControlReturnFraction, color)}  ${paint('AGE', 'muted', color)} ${formatAge(position.enteredAt)}  ${state(rangeLabel(position), color)} / ${state(riskLabel(position), color)}`,
+      `${paint('PROTECTION', 'muted', color)} ${state(position.protection, color)}  → ${state(nextActionLabel(position), color)}`
+    ];
+  });
+  const head = `${pad('POOL', 11)} ${pad('ENTRY RANGE', 13)} ${pad('BIN', 7)} ${pad('PNL', 9)} ${pad('AGE', 8)} ${pad('RANGE STATE', 18)} ${pad('RISK', 9)} ${pad('ACTIVE PROTECTION', 19)} NEXT ACTION`;
+  const actionWidth = Math.max(8, width - 11 - 1 - 13 - 1 - 7 - 1 - 9 - 1 - 8 - 1 - 18 - 1 - 9 - 1 - 19 - 1);
   return [paint(head, 'muted', color), ...snapshot.activePools.map(position => {
-    const range = position.lowerBinId === undefined || position.upperBinId === undefined ? '—' : `${position.lowerBinId}:${position.upperBinId} @${position.activeBinId ?? '?'}`;
-    return `${pad(position.poolDisplay, 12)} ${pad(short(position.positionAddress), 12)} ${pad(state(position.lifecycleState, color), 9)} ${pad(signedPercent(position.liveControlReturnFraction, color), 10)} ${pad(signedPercent(position.liveControlPeakReturnFraction, color), 10)} ${pad(formatSolLamports(position.feeLamports), 12)} ${pad(range, 15)} ${clip(state(position.protection, color), alertWidth)}`;
+    const range = position.lowerBinId === undefined || position.upperBinId === undefined ? '—' : `${position.lowerBinId}–${position.upperBinId}`;
+    return `${pad(position.poolDisplay, 11)} ${pad(range, 13)} ${pad(String(position.activeBinId ?? '—'), 7)} ${pad(signedPercent(position.liveControlReturnFraction, color), 9)} ${pad(formatAge(position.enteredAt), 8)} ${pad(state(rangeLabel(position), color), 18)} ${pad(state(riskLabel(position), color), 9)} ${pad(state(position.protection, color), 19)} ${clip(state(nextActionLabel(position), color), actionWidth)}`;
   })];
 }
 
@@ -568,11 +618,11 @@ function rangeMonitorLines(snapshot: TerminalSnapshot, width: number, color: boo
   return [
     `${paint('ACTIVE POLICY', 'muted', color)} ${snapshot.runtime.minimumIncludedBins ?? '—'}–${snapshot.runtime.maximumIncludedBins ?? '—'} bins`,
     `${paint('LAST CLOSED', 'muted', color)}   ${rows.length} (bounded recent history)`,
-    `${paint('AVG RANGE', 'muted', color)}     ${average(ranges) === undefined ? '—' : `${average(ranges)!.toFixed(1)} bins`}`,
+    `${paint('AVG RANGE USED', 'muted', color)} ${average(ranges) === undefined ? '—' : `${average(ranges)!.toFixed(1)} bins`}`,
     `${paint('BELOW_MIN', 'muted', color)}     ${below}`,
     `${paint('ABOVE_MAX', 'muted', color)}     ${above}`,
-    `${paint('IN RANGE', 'muted', color)}      ${inRange}/${rows.length || '—'}`,
-    `${paint('TOP LOSS PATH', 'muted', color)} ${clip(mostCommon, Math.max(8, width - 17))}`
+    `${paint('NO OBSERVED OOR', 'muted', color)} ${inRange}/${rows.length || '—'}`,
+    `${paint('OBSERVED LOSS PATH', 'muted', color)} ${clip(mostCommon, Math.max(8, width - 22))}`
   ];
 }
 
@@ -590,7 +640,7 @@ function positionHealthLines(snapshot: TerminalSnapshot, width: number, color: b
     `${paint('AVERAGE WIN', 'muted', color)}    ${signedPercent(average(winners.map(row => row.realizedReturnFraction!).filter(Number.isFinite)), color)}`,
     `${paint('AVERAGE LOSS', 'muted', color)}   ${signedPercent(average(losers.map(row => row.realizedReturnFraction!).filter(Number.isFinite)), color)}`,
     `${paint('NET', 'muted', color)}            ${formatSolLamports(net)}`,
-    ...(topCause.length ? topCause.map(([cause, count], index) => `${paint(`LOSS ${index + 1}`, 'muted', color)}         ${clip(`${cause} (${count})`, Math.max(8, width - 16))}`) : [paint('No closed losses in the bounded window.', 'muted', color)])
+    ...(topCause.length ? topCause.map(([cause, count], index) => `${paint(`OBSERVED PATH ${index + 1}`, 'muted', color)} ${clip(`${cause} (${count})`, Math.max(8, width - 20))}`) : [paint('No closed losses in the bounded window.', 'muted', color)])
   ];
 }
 
@@ -636,14 +686,16 @@ function recentPositionLines(snapshot: TerminalSnapshot, width: number, filter: 
   if (!rows.length) return [paint('No matching canonical lifecycle.', 'muted', color)];
   const compact = width < 108;
   const head = compact
-    ? `${pad('POOL', 12)} ${pad('RANGE', 13)} ${pad('RETURN', 10)} ${pad('MAX', 9)} ${pad('GIVEBACK', 9)} LOSS / PROTECTION`
-    : `${pad('TIME', 8)} ${pad('POOL', 11)} ${pad('RANGE', 13)} ${pad('EXIT TYPE', 14)} ${pad('RETURN', 10)} ${pad('MAX PROFIT', 11)} ${pad('GIVEBACK', 10)} ${pad('LOSS CLASS', 20)} PROTECTION`;
+    ? `${pad('POOL', 12)} ${pad('RANGE', 13)} ${pad('RETURN', 10)} ${pad('LIVE PEAK', 10)} ${pad('PEAK GAP', 10)} PATH / RECORDED REASON`
+    : `${pad('TIME', 8)} ${pad('POOL', 11)} ${pad('ENTRY RANGE', 13)} ${pad('EXIT TYPE', 14)} ${pad('RETURN', 10)} ${pad('LIVE-CONTROL PEAK', 17)} ${pad('PEAK GIVEBACK', 14)} ${pad('OBSERVED LOSS PATH', 22)} RECORDED EXIT/PROTECTION REASON`;
   return [paint(head, 'muted', color), ...rows.map(row => {
     const value = row.state === 'OPEN' ? signedPercent(row.liveControlReturnFraction, color) : signedPercent(row.realizedReturnFraction, color);
     const range = row.entryRange || '—';
-    if (compact) return `${pad(row.poolDisplay, 12)} ${pad(range, 13)} ${pad(value, 10)} ${pad(signedPercent(row.maxProfitFraction, color), 9)} ${pad(signedPercent(row.givebackFraction, color), 9)} ${clip(row.state === 'OPEN' ? row.protectionUsed || 'LIVE' : `${row.lossClass || '—'} / ${row.protectionUsed || '—'}`, Math.max(8, width - 58))}`;
+    const peak = row.liveControlPeakReturnFraction === undefined ? paint('UNAVAILABLE', 'muted', color) : signedPercent(row.liveControlPeakReturnFraction, color);
+    const gap = row.liveControlPeakGivebackFraction === undefined ? paint('N/A', 'muted', color) : signedPercent(row.liveControlPeakGivebackFraction, color);
+    if (compact) return `${pad(row.poolDisplay, 12)} ${pad(range, 13)} ${pad(value, 10)} ${pad(peak, 10)} ${pad(gap, 10)} ${clip(row.state === 'OPEN' ? row.protectionUsed || 'LIVE' : `${row.lossClass || '—'} / ${row.protectionUsed || '—'}`, Math.max(8, width - 62))}`;
     const time = new Date(row.observedAt).toISOString().slice(5, 16).replace('T', ' ');
-    return `${pad(time, 8)} ${pad(row.poolDisplay, 11)} ${pad(range, 13)} ${pad(row.exitReason || (row.state === 'OPEN' ? 'LIVE' : '—'), 14)} ${pad(value, 10)} ${pad(signedPercent(row.maxProfitFraction, color), 11)} ${pad(signedPercent(row.givebackFraction, color), 10)} ${pad(row.lossClass || '—', 20)} ${clip(row.protectionUsed || '—', Math.max(8, width - 110))}`;
+    return `${pad(time, 8)} ${pad(row.poolDisplay, 11)} ${pad(range, 13)} ${pad(row.exitReason || (row.state === 'OPEN' ? 'LIVE' : '—'), 14)} ${pad(value, 10)} ${pad(peak, 17)} ${pad(gap, 14)} ${pad(row.lossClass || '—', 22)} ${clip(row.protectionUsed || '—', Math.max(8, width - 124))}`;
   })];
 }
 function entryBlockSummary(health: TerminalHealth): string | undefined {
@@ -829,7 +881,7 @@ export function renderDecisionTerminal(snapshot: TerminalSnapshot, options: Term
   const footer = options.interactive
     ? `${paint(helpText, 'muted', color)}${right(paint(identity, 'muted', color), Math.max(0, width - visible(helpText).length))}`
     : paint(identity, 'muted', color);
-  if (width < 135) {
+  if (width < 190) {
     const narrow = [
       ...panel('◎ DECISION PIPELINE', width, 11, decisionPipelineLines(snapshot, width - 2, color), color),
       ...panel('! CURRENT BLOCKER', width, 8, currentBlockerLines(snapshot, width - 2, color), color),
@@ -845,21 +897,30 @@ export function renderDecisionTerminal(snapshot: TerminalSnapshot, options: Term
     return [...header, divider, ...narrow, footer].join('\n');
   }
   const gap = 2;
+  const topAvailable = width - gap * 3;
+  const decisionWidth = Math.floor(topAvailable * .30);
+  const blockerWidth = Math.floor(topAvailable * .24);
+  const openWidth = Math.floor(topAvailable * .29);
+  const economicWidth = topAvailable - decisionWidth - blockerWidth - openWidth;
   const left = Math.floor((width - gap * 2) * .35);
   const center = Math.floor((width - gap * 2) * .32);
   const rightWidth = width - left - center - gap * 2;
   const top = joinPanels([
-    panel('◎ DECISION PIPELINE', left, topHeight, decisionPipelineLines(snapshot, left - 2, color), color),
-    panel('! CURRENT BLOCKER', center, topHeight, currentBlockerLines(snapshot, center - 2, color), color),
-    panel('⚙ ECONOMIC ENGINE', rightWidth, topHeight, economicEngineLines(snapshot, rightWidth - 2, color), color)
+    panel('◎ DECISION PIPELINE', decisionWidth, topHeight, decisionPipelineLines(snapshot, decisionWidth - 2, color), color),
+    panel('! CURRENT BLOCKER / OPERATOR EXPLANATION', blockerWidth, topHeight, currentBlockerLines(snapshot, blockerWidth - 2, color), color),
+    panel(`■ OPEN POSITIONS (${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'})`, openWidth, topHeight, activePoolLines(snapshot, openWidth - 2, color), color),
+    panel('⚙ ECONOMIC ENGINE', economicWidth, topHeight, economicEngineLines(snapshot, economicWidth - 2, color), color)
   ]);
   const middle = joinPanels([
     panel('▥ CANDIDATE PIPELINE', left, middleHeight, [...pipelineLines(snapshot, left - 2, color), ...topBlockerLines(snapshot, left - 2, color)], color),
     panel('◫ RANGE MONITOR', center, middleHeight, rangeMonitorLines(snapshot, center - 2, color), color),
     panel('♥ POSITION HEALTH', rightWidth, middleHeight, positionHealthLines(snapshot, rightWidth - 2, color), color)
   ]);
-  const eventWidth = Math.floor((width - gap * 2) * .32);
-  const fillsWidth = Math.floor((width - gap * 2) * .43);
+  // The fills table carries authority labels. Give it enough width to show
+  // LIVE-CONTROL PEAK rather than collapsing the source name into a generic
+  // historical "MAX" label.
+  const eventWidth = Math.floor((width - gap * 2) * .24);
+  const fillsWidth = Math.floor((width - gap * 2) * .53);
   const sideWidth = width - eventWidth - fillsWidth - gap * 2;
   const dailyHeight = Math.max(7, Math.min(9, bottomHeight - 8));
   const bottom = joinPanels([

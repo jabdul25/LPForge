@@ -95,7 +95,7 @@ function terminalProtection(row: Row): string {
   if (assessment.kind === 'TS5_PROTECTION_CONFIRMED') return 'TS5 CONFIRMED';
   if (assessment.kind === 'OOR_P4_PROTECTION_CONFIRMED') return 'OOR-P4 CONFIRMED';
   const watch = record(payload.profitRetentionWatch);
-  if (watch.state === 'WATCH_ARMED') return 'TS5 WATCH';
+  if (watch.state === 'WATCH_ARMED') return 'TS-5 WATCH';
   if (text(row, 'oor_direction') === 'BELOW_MIN') return 'BELOW_MIN';
   if (text(row, 'inventory_classification') === 'SAFE_OOR_SOL') return 'SAFE OOR';
   if (text(row, 'oor_lifecycle_state') && text(row, 'oor_lifecycle_state') !== 'IN_RANGE') return text(row, 'oor_lifecycle_state') || 'OOR';
@@ -167,7 +167,9 @@ function terminalCandidate(row: Row): TerminalCandidate {
     ...(text(row, 'candidate_id') ? { candidateId: text(row, 'candidate_id') } : {}), ...(text(row, 'strategy') ? { strategy: text(row, 'strategy') } : {}), ...(text(row, 'orientation') ? { orientation: text(row, 'orientation') } : {}),
     ...(integer(row, 'lower_bin_id') !== undefined ? { lowerBinId: integer(row, 'lower_bin_id') } : {}), ...(integer(row, 'upper_bin_id') !== undefined ? { upperBinId: integer(row, 'upper_bin_id') } : {}), ...(integer(row, 'active_bin_id') !== undefined ? { activeBinId: integer(row, 'active_bin_id') } : {}),
     ...(number(row, 'predicted_gross_fees') !== undefined ? { predictedGrossFees: number(row, 'predicted_gross_fees') } : {}), ...(number(row, 'predicted_net_ev') !== undefined ? { predictedNetEv: number(row, 'predicted_net_ev') } : {}), ...(number(row, 'risk_adjusted_expected_net_ev') !== undefined ? { riskAdjustedExpectedNetEv: number(row, 'risk_adjusted_expected_net_ev') } : {}), ...(number(row, 'uncertainty') !== undefined ? { uncertainty: number(row, 'uncertainty') } : {}), ...(number(row, 'confidence') !== undefined ? { confidence: number(row, 'confidence') } : {}), ...(number(row, 'oor_risk') !== undefined ? { oorRisk: number(row, 'oor_risk') } : {}),
-    ...(text(row, 'registry_state') ? { registryState: text(row, 'registry_state') } : {}), ...(integer(row, 'last_rank') !== undefined ? { rank: integer(row, 'last_rank') } : {}), reasonCodes: strings(row.reason_codes)
+    ...(text(row, 'registry_state') ? { registryState: text(row, 'registry_state') } : {}), ...(integer(row, 'last_rank') !== undefined ? { rank: integer(row, 'last_rank') } : {}),
+    ...(integer(row, 'market_observation_count') !== undefined ? { marketObservationCount: integer(row, 'market_observation_count') } : {}), ...(integer(row, 'live_observation_count') !== undefined ? { liveObservationCount: integer(row, 'live_observation_count') } : {}), ...(text(row, 'live_confirmation_state') ? { liveConfirmationState: text(row, 'live_confirmation_state') } : {}),
+    reasonCodes: strings(row.reason_codes)
   };
 }
 
@@ -189,6 +191,9 @@ async function loadCandidates(pool: Pool): Promise<{ candidates: TerminalCandida
         c.predicted_gross_fees,c.predicted_net_ev,c.risk_adjusted_expected_net_ev,c.uncertainty,c.confidence,c.oor_risk,c.reason_codes,
         p.token_x_mint,p.token_y_mint,tx.symbol AS token_x_symbol,ty.symbol AS token_y_symbol,
         registry.paired_token_mint,registry.paired_token_symbol,registry.current_state AS registry_state,registry.last_rank,
+        maturity.market_observation_count,
+        CASE WHEN (maturity.payload->>'phase3RecentLiveObservationCount') ~ '^[0-9]+$' THEN (maturity.payload->>'phase3RecentLiveObservationCount')::int END AS live_observation_count,
+        maturity.payload->>'liveConfirmation' AS live_confirmation_state,
         latest.winner_pool_address
       FROM latest
       JOIN execution.production_global_candidates c ON c.global_cycle_id=latest.global_cycle_id
@@ -196,6 +201,7 @@ async function loadCandidates(pool: Pool): Promise<{ candidates: TerminalCandida
       LEFT JOIN protocol.tokens tx ON tx.mint=p.token_x_mint
       LEFT JOIN protocol.tokens ty ON ty.mint=p.token_y_mint
       LEFT JOIN market.pool_discovery_registry registry ON registry.pool_address=c.pool_address
+      LEFT JOIN market.active_candidate_history_maturity maturity ON maturity.pool_address=c.pool_address
     ), watch_rows AS (
       SELECT 'WATCH'::text AS terminal_source,
         registry.pool_address,
@@ -206,6 +212,9 @@ async function loadCandidates(pool: Pool): Promise<{ candidates: TerminalCandida
         COALESCE(c.reason_codes,registry.reason_codes,'[]'::jsonb) AS reason_codes,
         p.token_x_mint,p.token_y_mint,tx.symbol AS token_x_symbol,ty.symbol AS token_y_symbol,
         registry.paired_token_mint,registry.paired_token_symbol,registry.current_state AS registry_state,registry.last_rank,
+        maturity.market_observation_count,
+        CASE WHEN (maturity.payload->>'phase3RecentLiveObservationCount') ~ '^[0-9]+$' THEN (maturity.payload->>'phase3RecentLiveObservationCount')::int END AS live_observation_count,
+        maturity.payload->>'liveConfirmation' AS live_confirmation_state,
         latest.winner_pool_address
       FROM market.pool_discovery_registry registry
       LEFT JOIN latest ON true
@@ -217,6 +226,7 @@ async function loadCandidates(pool: Pool): Promise<{ candidates: TerminalCandida
       LEFT JOIN protocol.pools p ON p.address=registry.pool_address
       LEFT JOIN protocol.tokens tx ON tx.mint=p.token_x_mint
       LEFT JOIN protocol.tokens ty ON ty.mint=p.token_y_mint
+      LEFT JOIN market.active_candidate_history_maturity maturity ON maturity.pool_address=registry.pool_address
       WHERE registry.current_state='ACTIVE_CANDIDATE'
     )
     SELECT * FROM candidate_rows
@@ -278,7 +288,7 @@ async function loadRecentPositions(pool: Pool, active: TerminalPosition[]): Prom
     SELECT l.lifecycle_id,l.position_address,l.pool_address,l.created_at,latest.settled_at,latest.realized_sol_pnl_lamports,
       COALESCE(re.entry_capital_lamports,o.initial_capital_lamports) AS capital_lamports,
       re.gross_lp_fee_lamports,COALESCE(summary.terminal_reason,re.close_reason) AS exit_reason,
-      o.lower_bin_id,o.upper_bin_id,es.peak_net_return_fraction,
+      o.lower_bin_id,o.upper_bin_id,es.lp_mtm_peak_return_fraction AS live_control_peak_return_fraction,
       COALESCE(path.was_below_min,false) AS was_below_min,
       COALESCE(path.was_above_max,false) AS was_above_max,
       p.token_x_mint,p.token_y_mint,tx.symbol AS token_x_symbol,ty.symbol AS token_y_symbol,
@@ -314,14 +324,14 @@ async function loadRecentPositions(pool: Pool, active: TerminalPosition[]): Prom
       ...(openedAt ? { holdSeconds: Math.max(0, Math.floor((Date.parse(settledAt) - Date.parse(openedAt)) / 1000)) } : {}),
       ...(text(row, 'exit_reason') ? { exitReason: text(row, 'exit_reason') } : {}),
       ...(integer(row, 'lower_bin_id') !== undefined && integer(row, 'upper_bin_id') !== undefined ? { entryRange: `${integer(row, 'lower_bin_id')}–${integer(row, 'upper_bin_id')}` } : {}),
-      ...(number(row, 'peak_net_return_fraction') !== undefined ? { maxProfitFraction: number(row, 'peak_net_return_fraction') } : {}),
-      ...(number(row, 'peak_net_return_fraction') !== undefined && value !== undefined && capital !== undefined && capital > 0n ? { givebackFraction: Math.max(0, number(row, 'peak_net_return_fraction')! - Number(value) / Number(capital)) } : {}),
+      ...(number(row, 'live_control_peak_return_fraction') !== undefined ? { liveControlPeakReturnFraction: number(row, 'live_control_peak_return_fraction') } : {}),
+      ...(number(row, 'live_control_peak_return_fraction') !== undefined && value !== undefined && capital !== undefined && capital > 0n ? { liveControlPeakGivebackFraction: Math.max(0, number(row, 'live_control_peak_return_fraction')! - Number(value) / Number(capital)) } : {}),
       lossClass: terminalLossClass(row, value, capital), protectionUsed: terminalClosedProtection(row)
     };
   });
   const open = active.map(position => ({
     lifecycleId: `open:${position.positionAddress}`, positionAddress: position.positionAddress, poolAddress: position.poolAddress, poolDisplay: position.poolDisplay, state: 'OPEN' as const, observedAt: position.enteredAt,
-    ...(position.liveControlReturnFraction !== undefined ? { liveControlReturnFraction: position.liveControlReturnFraction } : {}), ...(position.liveControlPeakReturnFraction !== undefined ? { maxProfitFraction: position.liveControlPeakReturnFraction } : {}), ...(position.feeLamports !== undefined ? { feeLamports: position.feeLamports } : {}), ...(position.lowerBinId !== undefined && position.upperBinId !== undefined ? { entryRange: `${position.lowerBinId}–${position.upperBinId}` } : {}), holdSeconds: Math.max(0, Math.floor((Date.now() - Date.parse(position.enteredAt)) / 1000)), exitReason: 'LIVE CONTROL MARK', lossClass: 'LIVE', protectionUsed: position.protection
+    ...(position.liveControlReturnFraction !== undefined ? { liveControlReturnFraction: position.liveControlReturnFraction } : {}), ...(position.liveControlPeakReturnFraction !== undefined ? { liveControlPeakReturnFraction: position.liveControlPeakReturnFraction } : {}), ...(position.feeLamports !== undefined ? { feeLamports: position.feeLamports } : {}), ...(position.lowerBinId !== undefined && position.upperBinId !== undefined ? { entryRange: `${position.lowerBinId}–${position.upperBinId}` } : {}), holdSeconds: Math.max(0, Math.floor((Date.now() - Date.parse(position.enteredAt)) / 1000)), exitReason: 'LIVE CONTROL MARK', lossClass: 'LIVE', protectionUsed: position.protection
   }));
   return orderTerminalRecentPositions([...open, ...closed]).slice(0, 20);
 }

@@ -11,8 +11,8 @@ const snapshot = () => ({
   candidates: [{ poolAddress: 'pool', poolDisplay: 'TOKEN/SOL', operationalState: 'ENTRY_READY', phase4State: 'ENTRY_READY', lowerBinId: -667, upperBinId: -595, activeBinId: -610, confidence: .92, uncertainty: .25, oorRisk: .11, riskAdjustedExpectedNetEv: .0012, reasonCodes: ['P4_READY'] }],
   entryWatchPools: [{ poolAddress: 'pool', poolDisplay: 'TOKEN/SOL', operationalState: 'ENTRY_READY', phase4State: 'ENTRY_READY', rank: 1, confidence: .92, riskAdjustedExpectedNetEv: .0012, reasonCodes: ['P4_READY'], registryState: 'ACTIVE_CANDIDATE' }],
   selectedCandidateIndex: 0,
-  activePools: [{ lpforgePositionId: 'position-1', positionAddress: 'position-address', poolAddress: 'pool', poolDisplay: 'TOKEN/SOL', enteredAt: '2026-09-11T10:00:00.000Z', lifecycleState: 'OPEN', reconciliationStatus: 'MATCH', lowerBinId: -667, upperBinId: -595, activeBinId: -610, rangeState: 'IN_RANGE', liveControlReturnFraction: .024, liveControlPeakReturnFraction: .048, feeLamports: 113059n, protection: 'TS5 WATCH' }],
-  recentPositions: [{ lifecycleId: 'open:position-address', positionAddress: 'position-address', poolAddress: 'pool', poolDisplay: 'TOKEN/SOL', state: 'OPEN', observedAt: '2026-09-11T10:00:00.000Z', liveControlReturnFraction: .024, holdSeconds: 7200, exitReason: 'LIVE CONTROL MARK', entryRange: '-667–-595', protectionUsed: 'TS-5 WATCH', lossClass: 'LIVE' }, { lifecycleId: 'closed:position-address', positionAddress: 'closed-position', poolAddress: 'pool2', poolDisplay: 'OTHER/SOL', state: 'CLOSED', observedAt: '2026-09-11T09:00:00.000Z', realizedReturnFraction: -.0137, realizedPnlLamports: -411000n, holdSeconds: 3600, exitReason: 'PROFIT_RETENTION_TS5_CONFIRMED', entryRange: '-344–-285', maxProfitFraction: .0501, givebackFraction: .0638, protectionUsed: 'TS-5', lossClass: 'PROFIT GIVEBACK' }],
+  activePools: [{ lpforgePositionId: 'position-1', positionAddress: 'position-address', poolAddress: 'pool', poolDisplay: 'TOKEN/SOL', enteredAt: '2026-09-11T10:00:00.000Z', lifecycleState: 'OPEN', reconciliationStatus: 'MATCH', lowerBinId: -667, upperBinId: -595, activeBinId: -610, rangeState: 'IN_RANGE', liveControlReturnFraction: .024, liveControlPeakReturnFraction: .048, feeLamports: 113059n, protection: 'TS-5 WATCH' }],
+  recentPositions: [{ lifecycleId: 'open:position-address', positionAddress: 'position-address', poolAddress: 'pool', poolDisplay: 'TOKEN/SOL', state: 'OPEN', observedAt: '2026-09-11T10:00:00.000Z', liveControlReturnFraction: .024, liveControlPeakReturnFraction: .048, holdSeconds: 7200, exitReason: 'LIVE CONTROL MARK', entryRange: '-667–-595', protectionUsed: 'TS-5 WATCH', lossClass: 'LIVE' }, { lifecycleId: 'closed:position-address', positionAddress: 'closed-position', poolAddress: 'pool2', poolDisplay: 'OTHER/SOL', state: 'CLOSED', observedAt: '2026-09-11T09:00:00.000Z', realizedReturnFraction: -.0137, realizedPnlLamports: -411000n, holdSeconds: 3600, exitReason: 'PROFIT_RETENTION_TS5_CONFIRMED', entryRange: '-344–-285', liveControlPeakReturnFraction: .0501, liveControlPeakGivebackFraction: .0638, protectionUsed: 'TS-5', lossClass: 'PROFIT GIVEBACK' }],
   dailyPerformance: { trades: 4, wins: 3, losses: 1, netPnlLamports: 18000000n, feeLamports: 4000000n, bestPool: 'pool', bestReturnFraction: .0304, worstPool: 'pool2', worstReturnFraction: -.1517 },
   engines: [{ name: 'P7 CONTROL', status: 'HEALTHY', observedAt: '2026-09-11T11:59:58.000Z', detail: 'PRODUCTION' }, { name: 'P6 EXECUTION', status: 'READY', detail: '0 active plans' }],
   events: [{ id: 'e1', observedAt: '2026-09-11T11:59:59.000Z', level: 'INFO', event: 'TS5_WATCH_ARMED', entityType: 'POSITION', entityId: 'position-address', status: 'SENT', message: 'Canonical protection watch armed.' }, { id: 'e2', observedAt: '2026-09-11T11:59:58.000Z', level: 'WARN', event: 'P6_EXECUTION_RECOVERY_PENDING', entityType: 'PLAN', entityId: 'plan-1', status: 'SENT', message: 'Recovery is being verified.' }]
@@ -22,8 +22,9 @@ test('shell terminal renders the operator-intelligence panels from bounded read-
   const output = terminal.renderDecisionTerminal(snapshot(), { columns: 220, color: false, eventFilter: 'ALL', positionFilter: 'ALL' });
   for (const heading of ['LPFORGE DECISION TERMINAL', 'DECISION PIPELINE', 'CURRENT BLOCKER', 'ECONOMIC ENGINE', 'CANDIDATE PIPELINE', 'RANGE MONITOR', 'POSITION HEALTH', 'FILLS / RECENT POSITIONS', 'EVENT STREAM', 'TODAY', 'SYSTEM HEALTH']) assert.match(output, new RegExp(heading));
   assert.match(output, /ACTIVE POLICY 60–100 bins/);
-  assert.match(output, /MAX\s+GIVEBACK/);
-  assert.match(output, /GIVEBACK/);
+  assert.match(output, /LIVE-CONTROL PEAK/);
+  assert.match(output, /PEAK GIVEBACK/);
+  assert.match(output, /OBSERVED LOSS PATH/);
   assert.match(output, /TS-5/);
   assert.match(output, /NET PNL/);
   assert.doesNotMatch(output, /portfolio|equity chart|order book/i);
@@ -72,15 +73,15 @@ test('decision pipeline preserves actual zero and renders unavailable values as 
   const zero = snapshot();
   zero.candidates = [{ ...zero.candidates[0], lowerBinId: 0, upperBinId: 0, activeBinId: 0, confidence: 0, uncertainty: 0, oorRisk: 0, riskAdjustedExpectedNetEv: 0 }];
   const zeroOutput = terminal.renderDecisionTerminal(zero, { columns: 180, color: false });
-  assert.match(zeroOutput, /SCORE       0\.00/);
+  assert.match(zeroOutput, /SCORE \/ UNCERTAINTY 0\.00 \/ 0\.00/);
   assert.match(zeroOutput, /NET EV\s+\+0\.000000 SOL/);
 
   const unavailable = snapshot();
   unavailable.candidates = [{ ...unavailable.candidates[0], lowerBinId: undefined, upperBinId: undefined, activeBinId: undefined, confidence: undefined, uncertainty: undefined, oorRisk: undefined, riskAdjustedExpectedNetEv: undefined, predictedNetEv: undefined }];
   const unavailableOutput = terminal.renderDecisionTerminal(unavailable, { columns: 180, color: false });
-  assert.match(unavailableOutput, /SCORE       —/);
+  assert.match(unavailableOutput, /SCORE \/ UNCERTAINTY — \/ —/);
   assert.match(unavailableOutput, /NET EV\s+—/);
-  assert.doesNotMatch(unavailableOutput, /SCORE       \+?0\.00/);
+  assert.doesNotMatch(unavailableOutput, /SCORE \/ UNCERTAINTY \+?0\.00/);
 });
 
 test('terminal hides the deliberate global-selection collection-pass marker but preserves raw canonical reasons', () => {
@@ -191,13 +192,14 @@ test('terminal implementation has no browser, HTTP route, or economic control su
   assert.match(launcher, /terminal\)[\s\S]*node_args=\("\$\{service_args\[@\]\}"\)/);
 });
 
-test('open PnL is sourced from receipt-backed live-control marks and closed peaks are display-only', () => {
+test('open and closed terminal peaks use Meteora-compatible live-control fields, never managed NAV', () => {
   const source = fs.readFileSync('apps/terminal/src/main.ts', 'utf8');
   assert.match(source, /lp_mtm_evidence_state AS live_control_state/);
   assert.match(source, /lp_mtm_net_return_fraction AS live_control_return_fraction/);
   assert.match(source, /lp_mtm_peak_return_fraction AS live_control_peak_return_fraction/);
   assert.doesNotMatch(source, /es\.net_return_fraction AS live_control_return_fraction/);
-  assert.match(source, /es\.peak_net_return_fraction/);
+  assert.match(source, /es\.lp_mtm_peak_return_fraction AS live_control_peak_return_fraction/);
+  assert.doesNotMatch(source, /es\.peak_net_return_fraction/);
 });
 
 test('row number parsing does not turn nullable database evidence into a numeric zero', () => {
@@ -239,7 +241,7 @@ test('entry watch pools are a distinct display cohort and retain unavailable evi
     { poolAddress: 'warming', poolDisplay: 'WARM/SOL', operationalState: 'WARMING', phase4State: 'WARMING', rank: 1, reasonCodes: ['ENTRY_LIVE_CONFIRMATION_INSUFFICIENT_OBSERVATIONS'], registryState: 'ACTIVE_CANDIDATE' }
   ];
   const output = terminal.renderDecisionTerminal(source, { columns: 220, rows: 50, color: false });
-  assert.match(output, /WATCHING 2/);
+  assert.match(output, /WATCHING\s+2/);
   assert.match(output, /CANDIDATE PIPELINE/);
 });
 
@@ -248,7 +250,7 @@ test('empty entry watch set remains intentional and has no fabricated observatio
   source.entryWatchPools = [];
   const output = terminal.renderDecisionTerminal(source, { columns: 180, rows: 50, color: false });
   assert.match(output, /WATCH POOLS 0/);
-  assert.match(output, /WATCHING 0/);
+  assert.match(output, /WATCHING\s+0/);
   assert.doesNotMatch(output, /0\/12/);
 });
 
