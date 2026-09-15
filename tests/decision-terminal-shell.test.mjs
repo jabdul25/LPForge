@@ -128,6 +128,23 @@ test('compact active-pool and empty states remain intentional', () => {
   assert.match(output, /No matching canonical lifecycle\./);
 });
 
+test('open positions use one full-width row per active position with derived edge distances', () => {
+  const source = snapshot();
+  source.activePools.push({
+    ...source.activePools[0],
+    lpforgePositionId: 'position-2', positionAddress: 'position-address-2', poolAddress: 'pool-2', poolDisplay: 'SECOND/SOL',
+    lowerBinId: -720, upperBinId: -660, activeBinId: -718, rangeState: 'LOWER_EDGE', liveControlReturnFraction: -.081, protection: 'HARD STOP ACTIVE'
+  });
+  const output = terminal.renderDecisionTerminal(source, { columns: 220, rows: 50, color: false });
+  assert.match(output, /OPEN POSITIONS \(2\/2\)/);
+  assert.match(output, /CURRENT BIN/);
+  assert.match(output, /DIST TO LOWER \/ UPPER/);
+  assert.match(output, /TOKEN\/SOL/);
+  assert.match(output, /SECOND\/SOL/);
+  assert.match(output, /L 57 \/ U 15/);
+  assert.match(output, /L 2 \/ U 58/);
+});
+
 test('wide, narrow, and phone dimensions do not exceed terminal width', () => {
   for (const [columns, rows] of [[180, 50], [160, 45], [140, 40], [120, 35], [80, 24], [60, 20], [40, 18]]) {
     const output = terminal.renderDecisionTerminal(snapshot(), { columns, rows, color: false, interactive: true });

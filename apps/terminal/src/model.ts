@@ -564,21 +564,26 @@ function nextActionLabel(position: TerminalPosition): string {
   if (position.protection !== 'NONE') return 'MONITOR PROTECTION';
   return 'WAIT';
 }
+/** Existing bin facts expressed as a display-only distance to either range edge. */
+function edgeDistanceLabel(position: TerminalPosition): string {
+  if (position.lowerBinId === undefined || position.upperBinId === undefined || position.activeBinId === undefined) return '—';
+  return `L ${position.activeBinId - position.lowerBinId} / U ${position.upperBinId - position.activeBinId}`;
+}
 function activePoolLines(snapshot: TerminalSnapshot, width: number, color: boolean): string[] {
   if (!snapshot.activePools.length) return [paint('No open LP positions.', 'muted', color)];
-  if (width < 145) return snapshot.activePools.flatMap(position => {
+  if (width < 150) return snapshot.activePools.flatMap(position => {
     const range = position.lowerBinId === undefined || position.upperBinId === undefined ? '—' : `${position.lowerBinId}–${position.upperBinId}`;
     return [
       `${state(position.poolDisplay, color)}  ${paint('RANGE', 'muted', color)} ${range}  ${paint('BIN', 'muted', color)} ${position.activeBinId ?? '—'}`,
-      `${paint('PNL', 'muted', color)} ${signedPercent(position.liveControlReturnFraction, color)}  ${paint('AGE', 'muted', color)} ${formatAge(position.enteredAt)}  ${state(rangeLabel(position), color)} / ${state(riskLabel(position), color)}`,
+      `${paint('PNL', 'muted', color)} ${signedPercent(position.liveControlReturnFraction, color)}  ${paint('AGE', 'muted', color)} ${formatAge(position.enteredAt)}  ${paint('EDGE', 'muted', color)} ${edgeDistanceLabel(position)}  ${state(rangeLabel(position), color)} / ${state(riskLabel(position), color)}`,
       `${paint('PROTECTION', 'muted', color)} ${state(position.protection, color)}  → ${state(nextActionLabel(position), color)}`
     ];
   });
-  const head = `${pad('POOL', 11)} ${pad('ENTRY RANGE', 13)} ${pad('BIN', 7)} ${pad('PNL', 9)} ${pad('AGE', 8)} ${pad('RANGE STATE', 18)} ${pad('RISK', 9)} ${pad('ACTIVE PROTECTION', 19)} NEXT ACTION`;
-  const actionWidth = Math.max(8, width - 11 - 1 - 13 - 1 - 7 - 1 - 9 - 1 - 8 - 1 - 18 - 1 - 9 - 1 - 19 - 1);
+  const head = `${pad('POOL', 14)} ${pad('ENTRY RANGE', 15)} ${pad('CURRENT BIN', 11)} ${pad('CURRENT PNL', 12)} ${pad('AGE', 8)} ${pad('RANGE STATE', 20)} ${pad('DIST TO LOWER / UPPER', 22)} ${pad('RISK STATE', 12)} ${pad('ACTIVE PROTECTION', 21)} NEXT ACTION`;
+  const actionWidth = Math.max(8, width - 14 - 1 - 15 - 1 - 11 - 1 - 12 - 1 - 8 - 1 - 20 - 1 - 22 - 1 - 12 - 1 - 21 - 1);
   return [paint(head, 'muted', color), ...snapshot.activePools.map(position => {
     const range = position.lowerBinId === undefined || position.upperBinId === undefined ? '—' : `${position.lowerBinId}–${position.upperBinId}`;
-    return `${pad(position.poolDisplay, 11)} ${pad(range, 13)} ${pad(String(position.activeBinId ?? '—'), 7)} ${pad(signedPercent(position.liveControlReturnFraction, color), 9)} ${pad(formatAge(position.enteredAt), 8)} ${pad(state(rangeLabel(position), color), 18)} ${pad(state(riskLabel(position), color), 9)} ${pad(state(position.protection, color), 19)} ${clip(state(nextActionLabel(position), color), actionWidth)}`;
+    return `${pad(position.poolDisplay, 14)} ${pad(range, 15)} ${pad(String(position.activeBinId ?? '—'), 11)} ${pad(signedPercent(position.liveControlReturnFraction, color), 12)} ${pad(formatAge(position.enteredAt), 8)} ${pad(state(rangeLabel(position), color), 20)} ${pad(edgeDistanceLabel(position), 22)} ${pad(state(riskLabel(position), color), 12)} ${pad(state(position.protection, color), 21)} ${clip(state(nextActionLabel(position), color), actionWidth)}`;
   })];
 }
 
@@ -874,7 +879,8 @@ export function renderDecisionTerminal(snapshot: TerminalSnapshot, options: Term
   const panelRows = Math.max(25, rows - header.length - 2);
   const topHeight = Math.max(10, Math.floor(panelRows * .30));
   const middleHeight = Math.max(9, Math.floor(panelRows * .25));
-  const bottomHeight = Math.max(10, panelRows - topHeight - middleHeight);
+  const openPanelHeight = Math.max(6, snapshot.activePools.length + 4);
+  const bottomHeight = Math.max(10, panelRows - topHeight - middleHeight - openPanelHeight);
   const help = 'q quit  h/l candidate  e events  f fills  r refresh';
   const identity = 'LPFORGE | SOLANA | METEORA DLMM | READ-ONLY';
   const helpText = clip(help, Math.max(0, width - identity.length - 1));
@@ -889,7 +895,7 @@ export function renderDecisionTerminal(snapshot: TerminalSnapshot, options: Term
       ...panel('▥ CANDIDATE PIPELINE / TOP BLOCKERS', width, 9, [...pipelineLines(snapshot, width - 2, color), ...topBlockerLines(snapshot, width - 2, color)], color),
       ...panel('◫ RANGE MONITOR', width, 9, rangeMonitorLines(snapshot, width - 2, color), color),
       ...panel('♥ POSITION HEALTH', width, 9, positionHealthLines(snapshot, width - 2, color), color),
-      ...panel(`■ OPEN POSITIONS (${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'})`, width, Math.max(5, snapshot.activePools.length + 3), activePoolLines(snapshot, width - 2, color), color),
+      ...panel(`■ OPEN POSITIONS (${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'})`, width, openPanelHeight, activePoolLines(snapshot, width - 2, color), color),
       ...panel('▤ FILLS / RECENT POSITIONS', width, bottomHeight, recentPositionLines(snapshot, width - 2, options.positionFilter, color), color, options.positionFilter || 'ALL'),
       ...panel(`● EVENT STREAM ${options.eventFilter || 'ALL'}`, width, 10, eventRows(snapshot, width - 2, options.eventFilter, color, options.showCanonicalEventCodes), color),
       ...panel('♥ SYSTEM HEALTH', width, 12, healthLines(snapshot, color), color)
@@ -897,18 +903,16 @@ export function renderDecisionTerminal(snapshot: TerminalSnapshot, options: Term
     return [...header, divider, ...narrow, footer].join('\n');
   }
   const gap = 2;
-  const topAvailable = width - gap * 3;
-  const decisionWidth = Math.floor(topAvailable * .30);
-  const blockerWidth = Math.floor(topAvailable * .24);
-  const openWidth = Math.floor(topAvailable * .29);
-  const economicWidth = topAvailable - decisionWidth - blockerWidth - openWidth;
+  const topAvailable = width - gap * 2;
+  const decisionWidth = Math.floor(topAvailable * .38);
+  const blockerWidth = Math.floor(topAvailable * .31);
+  const economicWidth = topAvailable - decisionWidth - blockerWidth;
   const left = Math.floor((width - gap * 2) * .35);
   const center = Math.floor((width - gap * 2) * .32);
   const rightWidth = width - left - center - gap * 2;
   const top = joinPanels([
     panel('◎ DECISION PIPELINE', decisionWidth, topHeight, decisionPipelineLines(snapshot, decisionWidth - 2, color), color),
     panel('! CURRENT BLOCKER / OPERATOR EXPLANATION', blockerWidth, topHeight, currentBlockerLines(snapshot, blockerWidth - 2, color), color),
-    panel(`■ OPEN POSITIONS (${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'})`, openWidth, topHeight, activePoolLines(snapshot, openWidth - 2, color), color),
     panel('⚙ ECONOMIC ENGINE', economicWidth, topHeight, economicEngineLines(snapshot, economicWidth - 2, color), color)
   ]);
   const middle = joinPanels([
@@ -916,6 +920,7 @@ export function renderDecisionTerminal(snapshot: TerminalSnapshot, options: Term
     panel('◫ RANGE MONITOR', center, middleHeight, rangeMonitorLines(snapshot, center - 2, color), color),
     panel('♥ POSITION HEALTH', rightWidth, middleHeight, positionHealthLines(snapshot, rightWidth - 2, color), color)
   ]);
+  const openPositions = panel(`■ OPEN POSITIONS (${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'})`, width, openPanelHeight, activePoolLines(snapshot, width - 2, color), color);
   // The fills table carries authority labels. Give it enough width to show
   // LIVE-CONTROL PEAK rather than collapsing the source name into a generic
   // historical "MAX" label.
@@ -928,7 +933,7 @@ export function renderDecisionTerminal(snapshot: TerminalSnapshot, options: Term
     panel('▤ FILLS / RECENT POSITIONS', fillsWidth, bottomHeight, recentPositionLines(snapshot, fillsWidth - 2, options.positionFilter, color), color, options.positionFilter || 'ALL'),
     [...panel('▣ TODAY', sideWidth, dailyHeight, dailyPerformanceLines(snapshot, sideWidth - 2, color), color), ...panel('♥ SYSTEM HEALTH', sideWidth, Math.max(4, bottomHeight - dailyHeight), healthLines(snapshot, color), color, health.healthStatus || 'UNKNOWN')]
   ]);
-  return [...header, divider, ...top, ...middle, ...bottom, footer].join('\n');
+  return [...header, divider, ...top, ...middle, ...openPositions, ...bottom, footer].join('\n');
 }
 
 export function advanceCandidateIndex(snapshot: TerminalSnapshot, index: number, direction: -1 | 1): number {
