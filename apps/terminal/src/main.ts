@@ -292,8 +292,9 @@ async function refreshTerminalLiveControlMarks(api: MeteoraDataApi, positions: T
   const resolved = new Map<string, PnlRows | undefined>();
   await Promise.all([...byPoolOwner.entries()].map(async ([key, request]) => resolved.set(key, await request)));
   return positions.map(position => {
-    const observedAt = new Date().toISOString();
+    const fetchedAt = new Date().toISOString();
     const row = position.ownerAddress ? resolved.get(`${position.poolAddress}:${position.ownerAddress}`)?.find(value => value.positionAddress === position.positionAddress) : undefined;
+    const observedAt = row ? meteoraPositionPnlObservedAt(row, fetchedAt) : fetchedAt;
     const mark = deriveMeteoraComparableLpPositionMarkToMarket({ ...(row ? { positionPnl: row } : {}), observedAt, expectedPositionAddress: position.positionAddress });
     const feeLamports = row ? liveMeteoraFeeLamports(row) : undefined;
     // Do not fall back to the database's old number: a failed fresh lookup is
@@ -333,6 +334,14 @@ function liveMeteoraFeeLamports(row: MeteoraPositionPnl): bigint | undefined {
   if (claimed === undefined || unclaimedX === undefined || unclaimedY === undefined) return undefined;
   const lamports = Math.round((claimed + unclaimedX + unclaimedY) * 1e9);
   return Number.isSafeInteger(lamports) && lamports >= 0 ? BigInt(lamports) : undefined;
+}
+
+/** The response's update time is source freshness, unlike the terminal redraw time. */
+function meteoraPositionPnlObservedAt(row: MeteoraPositionPnl, fallback: string): string {
+  const raw = row.updatedAt;
+  const numeric = typeof raw === 'number' ? raw : typeof raw === 'string' && raw.trim() ? Number(raw) : NaN;
+  const ms = Number.isFinite(numeric) ? (numeric < 1_000_000_000_000 ? numeric * 1_000 : numeric) : typeof raw === 'string' ? Date.parse(raw) : NaN;
+  return Number.isFinite(ms) && ms > 0 ? new Date(ms).toISOString() : fallback;
 }
 
 async function loadRecentPositions(pool: Pool, active: TerminalPosition[]): Promise<TerminalRecentPosition[]> {

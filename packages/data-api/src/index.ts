@@ -26,6 +26,8 @@ export interface MeteoraDiscoveryPoolsPage { current_page?:number; page_size?:nu
 export interface MeteoraPositionPnlAmount { usd?:number|string; sol?:number|string; amount?:number|string; amountSol?:number|string; }
 export interface MeteoraPositionPnl {
   positionAddress:string;
+  /** Provider-side position-snapshot timestamp, in Unix seconds on Meteora's current API. */
+  updatedAt?:number|string;
   pnlUsd?:number|string;
   pnlPctChange?:number|string;
   pnlSol?:number|string;

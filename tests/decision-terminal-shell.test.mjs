@@ -24,6 +24,7 @@ test('shell terminal renders every required operational region without a portfol
   assert.match(output, /LIVE \+2\.40%/);
   assert.match(output, /LIVE PNL/);
   assert.match(output, /LIVE FEES/);
+  assert.match(output, /MTR AGE/);
   assert.match(output, /0\.00011 SOL/);
   assert.match(output, /POSITION/);
   assert.match(output, /positi…ress/);
@@ -217,6 +218,8 @@ test('open PnL uses a fresh exact-position Meteora control mark and never presen
   assert.match(source, /allTimeFees\?\.total/);
   assert.match(source, /unclaimedFeeTokenX/);
   assert.match(source, /unclaimedFeeTokenY/);
+  assert.match(source, /meteoraPositionPnlObservedAt/);
+  assert.match(source, /row\.updatedAt/);
   assert.match(source, /liveControlReturnFraction: undefined/);
   assert.match(source, /priority: 'P2_DISCOVERY_CURRENT'/);
   assert.doesNotMatch(source, /es\.net_return_fraction/);

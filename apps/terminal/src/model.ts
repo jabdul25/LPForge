@@ -445,12 +445,12 @@ function discoveryQueueLines(snapshot: TerminalSnapshot, width: number, color: b
 
 function activePoolLines(snapshot: TerminalSnapshot, width: number, color: boolean): string[] {
   if (!snapshot.activePools.length) return [paint('No open LP positions.', 'muted', color)];
-  const head = `${pad('POOL', 12)} ${pad('POSITION', 12)} ${pad('STATE', 9)} ${pad('LIVE PNL', 10)} ${pad('LIVE PEAK', 10)} ${pad('LIVE FEES', 12)} ${pad('RANGE', 15)} ${pad('HEALTH', 8)} ALERT`;
-  const alertWidth = Math.max(8, width - 12 - 1 - 12 - 1 - 9 - 1 - 10 - 1 - 10 - 1 - 12 - 1 - 15 - 1 - 8 - 1);
+  const head = `${pad('POOL', 12)} ${pad('POSITION', 12)} ${pad('STATE', 9)} ${pad('LIVE PNL', 10)} ${pad('LIVE PEAK', 10)} ${pad('LIVE FEES', 12)} ${pad('MTR AGE', 7)} ${pad('RANGE', 15)} ${pad('HEALTH', 8)} ALERT`;
+  const alertWidth = Math.max(8, width - 12 - 1 - 12 - 1 - 9 - 1 - 10 - 1 - 10 - 1 - 12 - 1 - 7 - 1 - 15 - 1 - 8 - 1);
   return [paint(head, 'muted', color), ...snapshot.activePools.map(position => {
     const range = position.lowerBinId === undefined || position.upperBinId === undefined ? '—' : `${position.lowerBinId}:${position.upperBinId} @${position.activeBinId ?? '?'}`;
     const alert = position.liveControlState && position.liveControlState !== 'AVAILABLE' ? 'PNL UNAVAILABLE' : position.protection;
-    return `${pad(position.poolDisplay, 12)} ${pad(short(position.positionAddress), 12)} ${pad(state(position.lifecycleState, color), 9)} ${pad(signedPercent(position.liveControlReturnFraction, color), 10)} ${pad(signedPercent(position.liveControlPeakReturnFraction, color), 10)} ${pad(formatSolLamports(position.feeLamports), 12)} ${pad(range, 15)} ${pad(state(position.healthState || 'GREEN', color), 8)} ${clip(state(alert, color), alertWidth)}`;
+    return `${pad(position.poolDisplay, 12)} ${pad(short(position.positionAddress), 12)} ${pad(state(position.lifecycleState, color), 9)} ${pad(signedPercent(position.liveControlReturnFraction, color), 10)} ${pad(signedPercent(position.liveControlPeakReturnFraction, color), 10)} ${pad(formatSolLamports(position.feeLamports), 12)} ${pad(formatAge(position.liveControlObservedAt), 7)} ${pad(range, 15)} ${pad(state(position.healthState || 'GREEN', color), 8)} ${clip(state(alert, color), alertWidth)}`;
   })];
 }
 
@@ -584,7 +584,7 @@ function compactOpenPositionLines(snapshot: TerminalSnapshot, width: number, col
   if (!snapshot.activePools.length) return [paint('No open LP positions.', 'muted', color)];
   return snapshot.activePools.slice(0, Math.max(1, limit)).map(position => {
     const alert = position.liveControlState && position.liveControlState !== 'AVAILABLE' ? 'PNL UNAVAILABLE' : position.protection;
-    return clip(`${state(position.poolDisplay, color)} ${state(position.lifecycleState, color)} ${signedPercent(position.liveControlReturnFraction, color)} ${paint('PK', 'muted', color)} ${signedPercent(position.liveControlPeakReturnFraction, color)} ${paint('FEE', 'muted', color)} ${formatSolLamports(position.feeLamports)} ${state(position.healthState || 'GREEN', color)} ${state(alert, color)}`, width);
+    return clip(`${state(position.poolDisplay, color)} ${state(position.lifecycleState, color)} ${signedPercent(position.liveControlReturnFraction, color)} ${paint('PK', 'muted', color)} ${signedPercent(position.liveControlPeakReturnFraction, color)} ${paint('FEE', 'muted', color)} ${formatSolLamports(position.feeLamports)} ${paint('MTR', 'muted', color)} ${formatAge(position.liveControlObservedAt)} ${state(position.healthState || 'GREEN', color)} ${state(alert, color)}`, width);
   });
 }
 
