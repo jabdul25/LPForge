@@ -23,7 +23,7 @@ test('shell terminal renders every required operational region without a portfol
   for (const heading of ['LPFORGE DECISION TERMINAL', 'LIVE EVENT STREAM', 'DECISION TERMINAL', 'CANDIDATE PIPELINE', 'DISCOVERY QUEUE', 'OPEN POSITIONS', 'AGENT / ENGINE DESK', 'FILLS / RECENT POSITIONS', 'SYSTEM HEALTH']) assert.match(output, new RegExp(heading));
   assert.match(output, /LIVE \+2\.40%/);
   assert.match(output, /LIVE PNL/);
-  assert.match(output, /LP FEES/);
+  assert.match(output, /LIVE FEES/);
   assert.match(output, /0\.00011 SOL/);
   assert.match(output, /POSITION/);
   assert.match(output, /positi…ress/);
@@ -213,6 +213,10 @@ test('open PnL uses a fresh exact-position Meteora control mark and never presen
   assert.match(source, /lp_mtm_peak_return_fraction AS live_control_peak_return_fraction/);
   assert.match(source, /getOpenPositionPnl\(position\.poolAddress, position\.ownerAddress\)/);
   assert.match(source, /deriveMeteoraComparableLpPositionMarkToMarket/);
+  assert.match(source, /liveMeteoraFeeLamports/);
+  assert.match(source, /allTimeFees\?\.total/);
+  assert.match(source, /unclaimedFeeTokenX/);
+  assert.match(source, /unclaimedFeeTokenY/);
   assert.match(source, /liveControlReturnFraction: undefined/);
   assert.match(source, /priority: 'P2_DISCOVERY_CURRENT'/);
   assert.doesNotMatch(source, /es\.net_return_fraction/);

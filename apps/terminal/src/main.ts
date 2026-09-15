@@ -8,7 +8,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { Pool } from 'pg';
 import { loadPhase1Config } from '../../../packages/config/src/index.js';
-import { createMeteoraDataApi, type MeteoraDataApi } from '../../../packages/data-api/src/index.js';
+import { createMeteoraDataApi, type MeteoraDataApi, type MeteoraPositionPnl } from '../../../packages/data-api/src/index.js';
 import { deriveMeteoraComparableLpPositionMarkToMarket } from '../../../packages/live-exit-governor/src/index.js';
 import {
   advanceCandidateIndex,
@@ -295,6 +295,7 @@ async function refreshTerminalLiveControlMarks(api: MeteoraDataApi, positions: T
     const observedAt = new Date().toISOString();
     const row = position.ownerAddress ? resolved.get(`${position.poolAddress}:${position.ownerAddress}`)?.find(value => value.positionAddress === position.positionAddress) : undefined;
     const mark = deriveMeteoraComparableLpPositionMarkToMarket({ ...(row ? { positionPnl: row } : {}), observedAt, expectedPositionAddress: position.positionAddress });
+    const feeLamports = row ? liveMeteoraFeeLamports(row) : undefined;
     // Do not fall back to the database's old number: a failed fresh lookup is
     // an unavailable live mark, not permission to present cached PnL as live.
     return {
@@ -303,9 +304,35 @@ async function refreshTerminalLiveControlMarks(api: MeteoraDataApi, positions: T
       liveControlObservedAt: mark.observedAt,
       ...(mark.evidenceState === 'AVAILABLE' && mark.netReturnFraction !== undefined
         ? { liveControlReturnFraction: mark.netReturnFraction }
-        : { liveControlReturnFraction: undefined })
+        : { liveControlReturnFraction: undefined }),
+      ...(feeLamports === undefined ? { feeLamports: undefined } : { feeLamports })
     };
   });
+}
+
+/**
+ * The terminal labels this value LIVE FEES: Meteora's cumulative claimed fees
+ * plus the two currently unclaimed fee balances, all in SOL. A partial
+ * response is deliberately unavailable rather than blended with an older
+ * durable accounting value.
+ */
+function liveMeteoraFeeLamports(row: MeteoraPositionPnl): bigint | undefined {
+  const sol = (value: unknown): number | undefined => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+    const record = value as Record<string, unknown>;
+    for (const key of ['amountSol', 'sol']) {
+      const raw = record[key];
+      const numberValue = typeof raw === 'number' ? raw : typeof raw === 'string' && raw.trim() ? Number(raw) : NaN;
+      if (Number.isFinite(numberValue) && numberValue >= 0) return numberValue;
+    }
+    return undefined;
+  };
+  const claimed = sol(row.allTimeFees?.total);
+  const unclaimedX = sol(row.unrealizedPnl?.unclaimedFeeTokenX);
+  const unclaimedY = sol(row.unrealizedPnl?.unclaimedFeeTokenY);
+  if (claimed === undefined || unclaimedX === undefined || unclaimedY === undefined) return undefined;
+  const lamports = Math.round((claimed + unclaimedX + unclaimedY) * 1e9);
+  return Number.isSafeInteger(lamports) && lamports >= 0 ? BigInt(lamports) : undefined;
 }
 
 async function loadRecentPositions(pool: Pool, active: TerminalPosition[]): Promise<TerminalRecentPosition[]> {
