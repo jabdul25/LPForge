@@ -162,6 +162,12 @@ export interface TerminalSnapshot {
   candidates: TerminalCandidate[];
   /** Current ACTIVE_CANDIDATE evidence leases, distinct from the P7 cycle. */
   entryWatchPools: TerminalCandidate[];
+  /**
+   * Bounded Tier-A Discovery/P3/P4 backlog.  This is intentionally broader
+   * than an active evidence lease so operators can see warming, replay, and
+   * NO_TRADE work when no pool is presently executable.
+   */
+  discoveryQueue: TerminalCandidate[];
   selectedCandidateIndex: number;
   activePools: TerminalPosition[];
   recentPositions: TerminalRecentPosition[];
@@ -333,7 +339,7 @@ function eventRows(snapshot: TerminalSnapshot, width: number, filter: TerminalRe
 }
 function candidateLines(snapshot: TerminalSnapshot, width: number, color: boolean): string[] {
   const candidate = snapshot.candidates[snapshot.selectedCandidateIndex] || snapshot.candidates[0];
-  if (!candidate) return [paint('No current canonical candidate cycle.', 'muted', color)];
+  if (!candidate) return [paint('No executable P7 candidate; see Discovery Queue.', 'muted', color)];
   const visibleReasons = operatorVisibleCandidateReasonCodes(candidate);
   const range = candidate.lowerBinId === undefined || candidate.upperBinId === undefined ? '—' : `${candidate.lowerBinId} → ${candidate.upperBinId}`;
   const score = metric(candidate.confidence, 2, color, true);
@@ -361,7 +367,7 @@ function candidateLines(snapshot: TerminalSnapshot, width: number, color: boolea
 function pipelineLines(snapshot: TerminalSnapshot, width: number, color: boolean): string[] {
   const totals = new Map<string, number>();
   for (const candidate of snapshot.candidates) totals.set(candidate.operationalState, (totals.get(candidate.operationalState) || 0) + 1);
-  if (!totals.size) return [paint('No current candidate-cycle facts.', 'muted', color)];
+  if (!totals.size) return [paint('No P7 candidate-cycle facts; Discovery Queue is below.', 'muted', color)];
   const max = Math.max(...totals.values());
   return [...totals.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([name, count]) => {
     const barWidth = Math.max(6, Math.min(16, width - 20));
@@ -402,6 +408,24 @@ function entryWatchLines(snapshot: TerminalSnapshot, width: number, color: boole
     return `${pad(candidate.poolDisplay, poolWidth)} ${pad(state(candidate.operationalState, color), stateWidth)} ${pad(score, scoreWidth)}${showEv ? ` ${pad(ev, evWidth)}` : ''} ${clip(state(nextWatchGate(candidate), color), gateWidth)}`;
   });
   if (pools.length > maxRows) rows.push(paint(`+${pools.length - maxRows} more`, 'muted', color));
+  return [paint(head, 'muted', color), ...rows];
+}
+
+function discoveryQueueLines(snapshot: TerminalSnapshot, width: number, color: boolean): string[] {
+  const pools = snapshot.discoveryQueue;
+  if (!pools.length) return [paint('No Tier-A pools are currently queued.', 'muted', color)];
+  const poolWidth = Math.min(12, Math.max(8, Math.floor(width * .25)));
+  const stateWidth = Math.min(12, Math.max(9, Math.floor(width * .25)));
+  const rankWidth = 4;
+  const fixed = poolWidth + 1 + stateWidth + 1 + rankWidth + 1;
+  const gateWidth = Math.max(7, width - fixed);
+  const head = `${pad('POOL', poolWidth)} ${pad('P3/P4', stateWidth)} ${pad('RANK', rankWidth)} NEXT GATE`;
+  const maxRows = Math.max(1, Math.min(6, pools.length));
+  const rows = pools.slice(0, maxRows).map(pool => {
+    const rank = pool.rank === undefined ? '—' : String(pool.rank);
+    return `${pad(pool.poolDisplay, poolWidth)} ${pad(state(pool.operationalState, color), stateWidth)} ${pad(rank, rankWidth)} ${clip(state(nextWatchGate(pool), color), gateWidth)}`;
+  });
+  if (pools.length > maxRows) rows.push(paint(`+${pools.length - maxRows} more qualified/warming pools`, 'muted', color));
   return [paint(head, 'muted', color), ...rows];
 }
 
@@ -532,6 +556,15 @@ function compactWatchLines(snapshot: TerminalSnapshot, width: number, color: boo
   return rows;
 }
 
+function compactDiscoveryQueueLines(snapshot: TerminalSnapshot, width: number, color: boolean, limit: number): string[] {
+  const pools = snapshot.discoveryQueue;
+  if (!pools.length) return [paint('No Tier-A discovery pools.', 'muted', color)];
+  const visiblePools = pools.slice(0, Math.max(1, limit));
+  const rows = visiblePools.map(pool => clip(`${state(pool.poolDisplay, color)} ${state(pool.operationalState, color)} → ${state(nextWatchGate(pool), color)}`, width));
+  if (pools.length > visiblePools.length) rows.push(paint(`+${pools.length - visiblePools.length} more`, 'muted', color));
+  return rows;
+}
+
 function compactOpenPositionLines(snapshot: TerminalSnapshot, width: number, color: boolean, limit: number): string[] {
   if (!snapshot.activePools.length) return [paint('No open LP positions.', 'muted', color)];
   return snapshot.activePools.slice(0, Math.max(1, limit)).map(position => clip(`${state(position.poolDisplay, color)} ${state(position.lifecycleState, color)} ${signedPercent(position.liveControlReturnFraction, color)} ${paint('PK', 'muted', color)} ${signedPercent(position.liveControlPeakReturnFraction, color)} ${paint('FEE', 'muted', color)} ${formatSolLamports(position.feeLamports)} ${state(position.healthState || 'GREEN', color)} ${state(position.protection, color)}`, width));
@@ -591,7 +624,7 @@ function renderMobileDecisionTerminal(snapshot: TerminalSnapshot, options: Termi
     paint(width >= 52 ? 'LPFORGE DECISION TERMINAL' : 'LPFORGE TERMINAL', 'lime', color),
     `${paint('P7', 'muted', color)} ${state(health.healthStatus, color)}  ${paint('SAFE', 'muted', color)} ${state(health.safetyMode, color)}`,
     `${paint('ENTRY', 'muted', color)} ${state(health.newEconomicActionAllowed ? 'ALLOWED' : 'BLOCKED', color)}  ${paint('POS', 'muted', color)} ${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'}`,
-    `${paint(`WATCH ${snapshot.entryWatchPools.length}`, 'amber', color)}  ${paint(`CAND ${snapshot.candidates.length}`, 'cyan', color)}  ${paint(`REC ${health.recoveryQueueCount}`, health.recoveryQueueCount ? 'amber' : 'muted', color)}`,
+    `${paint(`WATCH ${snapshot.entryWatchPools.length}`, 'amber', color)}  ${paint(`DISC ${snapshot.discoveryQueue.length}`, 'cyan', color)}  ${paint(`CAND ${snapshot.candidates.length}`, 'cyan', color)}  ${paint(`REC ${health.recoveryQueueCount}`, health.recoveryQueueCount ? 'amber' : 'muted', color)}`,
     `${state(rpcSummary(snapshot), color)}  ${paint(new Date().toISOString().slice(11, 19), 'muted', color)}`
   ].map(value => clip(value, width));
   const footer = options.interactive
@@ -605,7 +638,7 @@ function renderMobileDecisionTerminal(snapshot: TerminalSnapshot, options: Termi
   };
   if (mobileView === 'OVERVIEW') {
     append(`◎ DECISION ${snapshot.candidates.length ? `${snapshot.selectedCandidateIndex + 1}/${snapshot.candidates.length}` : '0/0'}`, compactCandidateLines(snapshot, width, color), 5);
-    append(`■ ENTRY WATCH (${snapshot.entryWatchPools.length})`, compactWatchLines(snapshot, width, color, bodyBudget >= 20 ? 3 : 2), 3);
+    append(`■ DISCOVERY QUEUE (${snapshot.discoveryQueue.length}; WATCH ${snapshot.entryWatchPools.length})`, compactDiscoveryQueueLines(snapshot, width, color, bodyBudget >= 20 ? 3 : 2), 3);
     append(`■ OPEN POSITIONS (${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'})`, compactOpenPositionLines(snapshot, width, color, 2), 2);
     append('♥ SYSTEM HEALTH', compactSystemLines(snapshot, width, color, bodyBudget >= 20 ? 4 : 3), 3);
     append('▥ CANDIDATE PIPELINE', compactPipelineLines(snapshot, width, color), 2);
@@ -628,11 +661,12 @@ export function renderDecisionTerminal(snapshot: TerminalSnapshot, options: Term
   const entry = health.newEconomicActionAllowed ? 'ENTRY ALLOWED' : 'ENTRY BLOCKED';
   const recovery = health.recoveryQueueCount > 0 ? `RECOVERY ${health.recoveryQueueCount}` : 'RECOVERY 0';
   const watch = `WATCH ${snapshot.entryWatchPools.length}`;
+  const discovery = `DISC ${snapshot.discoveryQueue.length}`;
   const rpc = rpcSummary(snapshot);
   const recoveryState = paint(recovery, health.recoveryQueueCount > 0 ? 'amber' : 'muted', color);
   const header = [
     `${paint('LPFORGE DECISION TERMINAL', 'lime', color)}  ${state(health.authorityMode === 'PRODUCTION' ? 'PROD' : health.authorityMode || 'UNKNOWN', color)} | ${state(`P7 ${headerStatus}`, color)} | ${state(`SAFETY ${health.safetyMode || 'UNKNOWN'}`, color)} | ${state(entry, color)}`,
-    `${paint(`POS ${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'}`, 'cyan', color)} | ${paint(watch, 'amber', color)} | ${paint(`CAND ${snapshot.candidates.length}`, 'cyan', color)} | ${recoveryState} | ${state(rpc, color)} | ${paint('REFRESH 2s', 'muted', color)} | ${paint(`UTC ${new Date().toISOString().slice(11, 19)}`, 'cyan', color)}`
+    `${paint(`POS ${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'}`, 'cyan', color)} | ${paint(watch, 'amber', color)} | ${paint(discovery, 'cyan', color)} | ${paint(`CAND ${snapshot.candidates.length}`, 'cyan', color)} | ${recoveryState} | ${state(rpc, color)} | ${paint('REFRESH 2s', 'muted', color)} | ${paint(`UTC ${new Date().toISOString().slice(11, 19)}`, 'cyan', color)}`
   ].map(value => clip(value, width));
   const divider = paint('═'.repeat(width), 'muted', color);
   const panelRows = Math.max(25, rows - header.length - 2);
@@ -652,7 +686,7 @@ export function renderDecisionTerminal(snapshot: TerminalSnapshot, options: Term
       ...panel('● LIVE EVENT STREAM', width, Math.max(9, Math.min(18, topHeight)), eventRows(snapshot, width - 2, options.eventFilter, color, options.showCanonicalEventCodes), color, options.eventFilter || 'ALL'),
       ...panel('◎ DECISION TERMINAL', width, Math.max(12, Math.min(18, topHeight)), candidateLines(snapshot, width - 2, color), color),
       ...panel('▥ CANDIDATE PIPELINE', width, 8, pipelineLines(snapshot, width - 2, color), color),
-      ...panel(`■ ENTRY WATCH POOLS (${snapshot.entryWatchPools.length})`, width, Math.max(5, Math.min(10, snapshot.entryWatchPools.length + 4)), entryWatchLines(snapshot, width - 2, color), color),
+      ...panel(`■ DISCOVERY QUEUE (${snapshot.discoveryQueue.length}; WATCH ${snapshot.entryWatchPools.length})`, width, Math.max(5, Math.min(10, snapshot.discoveryQueue.length + 4)), discoveryQueueLines(snapshot, width - 2, color), color),
       ...panel(`■ OPEN POSITIONS (${snapshot.activePools.length}/${snapshot.runtime.maxOpenPositions ?? 'n/a'})`, width, activeHeight, activePoolLines(snapshot, width - 2, color), color),
       ...panel('⚙ ENGINE DESK', width, engineHeight, engineLines(snapshot, width - 2, color), color),
       ...panel('▤ FILLS / RECENT POSITIONS', width, bottomHeight, recentPositionLines(snapshot, width - 2, options.positionFilter, color), color, options.positionFilter || 'ALL'),
@@ -669,7 +703,7 @@ export function renderDecisionTerminal(snapshot: TerminalSnapshot, options: Term
   const watchHeight = Math.max(5, topHeight - pipelineHeight);
   const rightTop = [
     ...panel('▥ CANDIDATE PIPELINE', rightWidth, pipelineHeight, rightPipelineLines, color),
-    ...panel(`■ ENTRY WATCH POOLS (${snapshot.entryWatchPools.length})`, rightWidth, watchHeight, entryWatchLines(snapshot, rightWidth - 2, color), color)
+    ...panel(`■ DISCOVERY QUEUE (${snapshot.discoveryQueue.length}; WATCH ${snapshot.entryWatchPools.length})`, rightWidth, watchHeight, discoveryQueueLines(snapshot, rightWidth - 2, color), color)
   ];
   const top = joinPanels([
     panel('● LIVE EVENT STREAM', left, topHeight, eventRows(snapshot, left - 2, options.eventFilter, color, options.showCanonicalEventCodes), color, options.eventFilter || 'ALL'),

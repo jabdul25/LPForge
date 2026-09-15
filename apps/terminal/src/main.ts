@@ -143,7 +143,7 @@ function entryWatchOrder(a: TerminalCandidate, b: TerminalCandidate): number {
   return priority(a) - priority(b) || (a.rank ?? Number.MAX_SAFE_INTEGER) - (b.rank ?? Number.MAX_SAFE_INTEGER) || (b.confidence ?? -Infinity) - (a.confidence ?? -Infinity) || a.poolAddress.localeCompare(b.poolAddress);
 }
 
-async function loadCandidates(pool: Pool): Promise<{ candidates: TerminalCandidate[]; entryWatchPools: TerminalCandidate[] }> {
+async function loadCandidates(pool: Pool): Promise<{ candidates: TerminalCandidate[]; entryWatchPools: TerminalCandidate[]; discoveryQueue: TerminalCandidate[] }> {
   const result = await pool.query<Row>(`
     WITH latest AS (
       SELECT global_cycle_id,winner_pool_address
@@ -185,17 +185,45 @@ async function loadCandidates(pool: Pool): Promise<{ candidates: TerminalCandida
       LEFT JOIN protocol.tokens tx ON tx.mint=p.token_x_mint
       LEFT JOIN protocol.tokens ty ON ty.mint=p.token_y_mint
       WHERE registry.current_state='ACTIVE_CANDIDATE'
+    ), discovery_queue_rows AS (
+      SELECT 'DISCOVERY_QUEUE'::text AS terminal_source,
+        registry.pool_address,
+        COALESCE(c.operational_state,forward.phase3_status,registry.current_state) AS operational_state,
+        COALESCE(c.phase4_state,forward.phase4_status,'UNKNOWN') AS phase4_state,
+        c.candidate_id,c.strategy,c.orientation,c.lower_bin_id,c.upper_bin_id,c.active_bin_id,
+        c.predicted_gross_fees,c.predicted_net_ev,c.risk_adjusted_expected_net_ev,c.uncertainty,c.confidence,c.oor_risk,
+        COALESCE(c.reason_codes,forward.payload->'reasonCodes',registry.reason_codes,'[]'::jsonb) AS reason_codes,
+        p.token_x_mint,p.token_y_mint,tx.symbol AS token_x_symbol,ty.symbol AS token_y_symbol,
+        registry.paired_token_mint,registry.paired_token_symbol,registry.current_state AS registry_state,registry.last_rank,
+        latest.winner_pool_address
+      FROM market.pool_discovery_registry registry
+      LEFT JOIN latest ON true
+      LEFT JOIN execution.production_global_candidates c ON c.global_cycle_id=latest.global_cycle_id AND c.pool_address=registry.pool_address
+      LEFT JOIN LATERAL (
+        SELECT phase3_status,phase4_status,payload FROM operations.forward_cycles
+        WHERE pool_address=registry.pool_address ORDER BY observed_at DESC LIMIT 1
+      ) forward ON true
+      LEFT JOIN protocol.pools p ON p.address=registry.pool_address
+      LEFT JOIN protocol.tokens tx ON tx.mint=p.token_x_mint
+      LEFT JOIN protocol.tokens ty ON ty.mint=p.token_y_mint
+      WHERE registry.current_tier='A' AND registry.current_state IN ('ACTIVE_CANDIDATE','QUALIFIED')
+      ORDER BY CASE WHEN registry.current_state='ACTIVE_CANDIDATE' THEN 0 ELSE 1 END,
+        registry.last_rank NULLS LAST,registry.last_seen_at DESC,registry.pool_address
+      LIMIT 20
     )
     SELECT * FROM candidate_rows
     UNION ALL
     SELECT * FROM watch_rows
+    UNION ALL
+    SELECT * FROM discovery_queue_rows
   `);
   const candidates = result.rows.filter(row => text(row, 'terminal_source') === 'CANDIDATE').sort((a, b) => {
     const rank = (row: Row): number => text(row, 'pool_address') === text(row, 'winner_pool_address') ? 0 : text(row, 'operational_state') === 'ENTRY_READY' ? 1 : text(row, 'operational_state') === 'WARMING' ? 2 : 3;
     return rank(a) - rank(b) || (number(b, 'confidence') ?? -Infinity) - (number(a, 'confidence') ?? -Infinity) || (text(a, 'pool_address') || '').localeCompare(text(b, 'pool_address') || '');
   }).map(terminalCandidate);
   const entryWatchPools = result.rows.filter(row => text(row, 'terminal_source') === 'WATCH').map(terminalCandidate).sort(entryWatchOrder);
-  return { candidates, entryWatchPools };
+  const discoveryQueue = result.rows.filter(row => text(row, 'terminal_source') === 'DISCOVERY_QUEUE').map(terminalCandidate).sort(entryWatchOrder);
+  return { candidates, entryWatchPools, discoveryQueue };
 }
 
 async function loadActivePools(pool: Pool): Promise<TerminalPosition[]> {
@@ -468,7 +496,7 @@ async function loadSnapshot(pool: Pool, runtimeId: string): Promise<TerminalSnap
   const rpcKeys = { production: providerKey(process.env.LPFORGE_PRODUCTION_RPC_URL), discovery: providerKey(process.env.LPFORGE_DISCOVERY_RPC_URL) };
   const [candidateResult, activePools, events, healthResult] = await Promise.all([loadCandidates(pool), loadActivePools(pool), loadEvents(pool), loadHealth(pool, runtimeId, rpcKeys)]);
   const recentPositions = await loadRecentPositions(pool, activePools);
-  return { generatedAt: new Date().toISOString(), runtime: readRuntime(), health: healthResult.health, candidates: candidateResult.candidates, entryWatchPools: candidateResult.entryWatchPools, selectedCandidateIndex: 0, activePools, recentPositions, engines: healthResult.engines, events };
+  return { generatedAt: new Date().toISOString(), runtime: readRuntime(), health: healthResult.health, candidates: candidateResult.candidates, entryWatchPools: candidateResult.entryWatchPools, discoveryQueue: candidateResult.discoveryQueue, selectedCandidateIndex: 0, activePools, recentPositions, engines: healthResult.engines, events };
 }
 
 function arg(name: string): string | undefined {
