@@ -10,7 +10,6 @@ const snapshot = () => ({
   health: { authorityMode: 'PRODUCTION', healthStatus: 'HEALTHY', safetyMode: 'NORMAL', daemonPlan: 'DECISION_CYCLE', newEconomicActionAllowed: true, entryControlReasonCodes: [], recoveryQueueCount: 0, unknownSubmissionCount: 0, activeManagementPlans: 0, partialEntryRecoveryCount: 0, activeIncidentCount: 0, telegramStatus: 'SENT', rpcHealth: [{ role: 'PRODUCTION', state: 'HEALTHY', latencyMs: 42, quotaState: 'OK', observedAt: '2026-09-11T11:59:59.000Z' }, { role: 'DISCOVERY', state: 'HEALTHY', quotaState: 'OK', observedAt: '2026-09-11T11:59:58.000Z' }, { role: 'EXECUTION', state: 'HEALTHY', quotaState: 'OK', observedAt: '2026-09-11T11:59:58.000Z' }] },
   candidates: [{ poolAddress: 'pool', poolDisplay: 'TOKEN/SOL', operationalState: 'ENTRY_READY', phase4State: 'ENTRY_READY', lowerBinId: -667, upperBinId: -595, activeBinId: -610, confidence: .92, uncertainty: .25, oorRisk: .11, riskAdjustedExpectedNetEv: .0012, reasonCodes: ['P4_READY'] }],
   entryWatchPools: [{ poolAddress: 'pool', poolDisplay: 'TOKEN/SOL', operationalState: 'ENTRY_READY', phase4State: 'ENTRY_READY', rank: 1, confidence: .92, riskAdjustedExpectedNetEv: .0012, reasonCodes: ['P4_READY'], registryState: 'ACTIVE_CANDIDATE' }],
-  discoveryQueue: [{ poolAddress: 'pool', poolDisplay: 'TOKEN/SOL', operationalState: 'ENTRY_READY', phase4State: 'ENTRY_READY', rank: 1, confidence: .92, riskAdjustedExpectedNetEv: .0012, reasonCodes: ['P4_READY'], registryState: 'ACTIVE_CANDIDATE' }],
   selectedCandidateIndex: 0,
   activePools: [{ lpforgePositionId: 'position-1', positionAddress: 'position-address', poolAddress: 'pool', poolDisplay: 'TOKEN/SOL', enteredAt: '2026-09-11T10:00:00.000Z', lifecycleState: 'OPEN', reconciliationStatus: 'MATCH', lowerBinId: -667, upperBinId: -595, activeBinId: -610, rangeState: 'IN_RANGE', liveControlReturnFraction: .024, liveControlPeakReturnFraction: .048, feeLamports: 113059n, protection: 'TS5 WATCH' }],
   recentPositions: [{ lifecycleId: 'open:position-address', positionAddress: 'position-address', poolAddress: 'pool', poolDisplay: 'TOKEN/SOL', state: 'OPEN', observedAt: '2026-09-11T10:00:00.000Z', liveControlReturnFraction: .024, holdSeconds: 7200, exitReason: 'LIVE CONTROL MARK' }, { lifecycleId: 'closed:position-address', positionAddress: 'closed-position', poolAddress: 'pool2', poolDisplay: 'OTHER/SOL', state: 'CLOSED', observedAt: '2026-09-11T09:00:00.000Z', realizedReturnFraction: -.0137, holdSeconds: 3600, exitReason: 'PROFIT_RETENTION_TS5_CONFIRMED' }],
@@ -20,11 +19,10 @@ const snapshot = () => ({
 
 test('shell terminal renders every required operational region without a portfolio dashboard', () => {
   const output = terminal.renderDecisionTerminal(snapshot(), { columns: 180, color: false, eventFilter: 'ALL', positionFilter: 'ALL' });
-  for (const heading of ['LPFORGE DECISION TERMINAL', 'LIVE EVENT STREAM', 'DECISION TERMINAL', 'CANDIDATE PIPELINE', 'DISCOVERY QUEUE', 'OPEN POSITIONS', 'AGENT / ENGINE DESK', 'FILLS / RECENT POSITIONS', 'SYSTEM HEALTH']) assert.match(output, new RegExp(heading));
+  for (const heading of ['LPFORGE DECISION TERMINAL', 'LIVE EVENT STREAM', 'DECISION TERMINAL', 'CANDIDATE PIPELINE', 'ENTRY WATCH POOLS', 'OPEN POSITIONS', 'AGENT / ENGINE DESK', 'FILLS / RECENT POSITIONS', 'SYSTEM HEALTH']) assert.match(output, new RegExp(heading));
   assert.match(output, /LIVE \+2\.40%/);
   assert.match(output, /LIVE PNL/);
-  assert.match(output, /LIVE FEES/);
-  assert.match(output, /MTR AGE/);
+  assert.match(output, /LP FEES/);
   assert.match(output, /0\.00011 SOL/);
   assert.match(output, /POSITION/);
   assert.match(output, /positi…ress/);
@@ -41,16 +39,6 @@ test('shell terminal filters loaded events and position rows locally', () => {
   assert.doesNotMatch(execution, /LIVE CONTROL MARK/);
 });
 
-test('fills/recent positions keeps every live position above newer closed history', () => {
-  const source = snapshot();
-  source.recentPositions = [
-    { lifecycleId: 'closed-new', positionAddress: 'closed-new', poolAddress: 'closed-new', poolDisplay: 'CLOSED/SOL', state: 'CLOSED', observedAt: '2026-09-11T11:59:00.000Z', realizedReturnFraction: .01, holdSeconds: 60, exitReason: 'SETTLED' },
-    { ...source.recentPositions[0], observedAt: '2026-09-11T10:00:00.000Z' },
-  ];
-  const output = terminal.renderDecisionTerminal(source, { columns: 180, color: false, positionFilter: 'ALL' });
-  assert.ok(output.indexOf('TOKEN/SOL') < output.indexOf('CLOSED/SOL'));
-});
-
 test('header keeps P7 health, entry authority, recovery, watch pools, and RPC status distinct', () => {
   const source = snapshot();
   source.health = { ...source.health, newEconomicActionAllowed: false, entryControlReasonCodes: ['P7_PORTFOLIO_DAILY_DRAWDOWN'], recoveryQueueCount: 3, unknownSubmissionCount: 1 };
@@ -61,15 +49,8 @@ test('header keeps P7 health, entry authority, recovery, watch pools, and RPC st
   assert.match(output, /ENTRY BLOCK\s+DAILY DRAWDOWN LIMIT/);
   assert.match(output, /RECOVERY 3/);
   assert.match(output, /WATCH 1/);
-  assert.match(output, /DISC 1/);
   assert.match(output, /RPC 3\/3 HEALTHY/);
   assert.match(output, /q quit  h\/l candidate/);
-});
-
-test('terminal exposes the data-snapshot refresh marker before constrained header fields', () => {
-  const output = terminal.renderDecisionTerminal(snapshot(), { columns: 100, rows: 30, color: false, interactive: true });
-  assert.match(output, /UPDATED 12:00:00/);
-  for (const rendered of output.split('\n')) assert.ok(rendered.length <= 100, rendered);
 });
 
 test('header explains an entry block caused by the open-position limit', () => {
@@ -115,6 +96,7 @@ test('terminal hides the deliberate global-selection collection-pass marker but 
   assert.deepEqual(terminal.operatorVisibleCandidateReasonCodes(source.candidates[0]), ['ENTRY_LIVE_CONFIRMATION_PENDING']);
   assert.match(output, /ENTRY_LIVE_CONFIRMATION_PENDING/);
   assert.doesNotMatch(output, /OPERATIONAL_PLAN_DISPATCH_DISABLED/);
+  assert.match(output, /TOKEN\/SOL.*ENTRY_READY.*—/);
 });
 
 test('event aliases are display-only and plain diagnostics retain canonical event identity', () => {
@@ -138,7 +120,7 @@ test('compact active-pool and empty states remain intentional', () => {
   const output = terminal.renderDecisionTerminal(none, { columns: 180, rows: 50, color: false });
   assert.match(output, /OPEN POSITIONS \(0\/2\)/);
   assert.match(output, /No open LP positions\./);
-  assert.match(output, /No executable P7 candidate; see Discovery Queue\./);
+  assert.match(output, /No current canonical candidate cycle\./);
   assert.match(output, /No canonical events in the current bounded window\./);
   assert.match(output, /No matching canonical lifecycle\./);
 });
@@ -155,7 +137,7 @@ test('phone renderer uses a compact overview instead of squeezing the desktop gr
   const output = terminal.renderDecisionTerminal(snapshot(), { columns: 80, rows: 24, color: false, interactive: true, mobileView: 'OVERVIEW' });
   assert.match(output, /LPFORGE DECISION TERMINAL/);
   assert.match(output, /◎ DECISION 1\/1/);
-  assert.match(output, /■ DISCOVERY QUEUE \(1; WATCH 1\)/);
+  assert.match(output, /■ ENTRY WATCH \(1\)/);
   assert.match(output, /■ OPEN POSITIONS \(1\/2\)/);
   assert.match(output, /♥ SYSTEM HEALTH/);
   assert.match(output, /m activity/);
@@ -207,21 +189,11 @@ test('terminal implementation has no browser, HTTP route, or economic control su
   assert.match(launcher, /terminal\)[\s\S]*node_args=\("\$\{service_args\[@\]\}"\)/);
 });
 
-test('open PnL uses a fresh exact-position Meteora control mark and never presents a stale durable mark as live', () => {
+test('open PnL is sourced from receipt-backed live-control marks, never managed economics', () => {
   const source = fs.readFileSync('apps/terminal/src/main.ts', 'utf8');
   assert.match(source, /lp_mtm_evidence_state AS live_control_state/);
   assert.match(source, /lp_mtm_net_return_fraction AS live_control_return_fraction/);
   assert.match(source, /lp_mtm_peak_return_fraction AS live_control_peak_return_fraction/);
-  assert.match(source, /getOpenPositionPnl\(position\.poolAddress, position\.ownerAddress\)/);
-  assert.match(source, /deriveMeteoraComparableLpPositionMarkToMarket/);
-  assert.match(source, /liveMeteoraFeeLamports/);
-  assert.match(source, /allTimeFees\?\.total/);
-  assert.match(source, /unclaimedFeeTokenX/);
-  assert.match(source, /unclaimedFeeTokenY/);
-  assert.match(source, /meteoraPositionPnlObservedAt/);
-  assert.match(source, /row\.updatedAt/);
-  assert.match(source, /liveControlReturnFraction: undefined/);
-  assert.match(source, /priority: 'P2_DISCOVERY_CURRENT'/);
   assert.doesNotMatch(source, /es\.net_return_fraction/);
   assert.doesNotMatch(source, /es\.peak_net_return_fraction/);
 });
@@ -264,28 +236,21 @@ test('entry watch pools are a distinct display cohort and retain unavailable evi
     { poolAddress: 'ready', poolDisplay: 'READY/SOL', operationalState: 'ENTRY_READY', phase4State: 'WAIT', rank: 4, confidence: .31, riskAdjustedExpectedNetEv: .00077, reasonCodes: ['AWAITING_P4_CONFIRMATION'], registryState: 'ACTIVE_CANDIDATE' },
     { poolAddress: 'warming', poolDisplay: 'WARM/SOL', operationalState: 'WARMING', phase4State: 'WARMING', rank: 1, reasonCodes: ['ENTRY_LIVE_CONFIRMATION_INSUFFICIENT_OBSERVATIONS'], registryState: 'ACTIVE_CANDIDATE' }
   ];
-  source.discoveryQueue = source.entryWatchPools;
   const output = terminal.renderDecisionTerminal(source, { columns: 220, rows: 50, color: false });
-  assert.match(output, /DISCOVERY QUEUE \(2; WATCH 2\)/);
-  assert.match(output, /READY\/SOL.*ENTRY_READY.*4.*P4/);
-  assert.match(output, /WARM\/SOL.*WARMING.*1.*MORE DATA/);
+  assert.match(output, /ENTRY WATCH POOLS \(2\)/);
+  assert.match(output, /READY\/SOL.*ENTRY_READY.*0\.31.*\+0\.000770.*P4/);
+  assert.match(output, /WARM\/SOL.*WARMING.*—.*—.*MORE DATA/);
   assert.ok(output.indexOf('READY/SOL') < output.indexOf('WARM/SOL'));
 });
 
 test('empty entry watch set remains intentional and has no fabricated observation progress', () => {
   const source = snapshot();
   source.entryWatchPools = [];
-  source.discoveryQueue = [
-    ...Array.from({ length: 7 }, (_, index) => ({ poolAddress: `warming-${index}`, poolDisplay: `WARM${index}/SOL`, operationalState: 'WARMING', phase4State: 'WARMING', rank: index + 2, reasonCodes: ['ENTRY_LIVE_CONFIRMATION_PENDING'], registryState: 'QUALIFIED' })),
-    { poolAddress: 'notrade', poolDisplay: 'NOPE/SOL', operationalState: 'NO_TRADE', phase4State: 'NO_TRADE', rank: 99, reasonCodes: ['NO_TRADE_EVIDENCE_NON_ACTIONABLE'], registryState: 'QUALIFIED' }
-  ];
   const output = terminal.renderDecisionTerminal(source, { columns: 180, rows: 50, color: false });
   assert.match(output, /WATCH 0/);
-  assert.match(output, /DISC 8/);
-  assert.match(output, /DISCOVERY QUEUE \(8; WATCH 0\)/);
-  assert.match(output, /WARM0\/SOL.*WARMING.*MORE DATA/);
-  assert.match(output, /NOPE\/SOL.*NO_TRADE.*NO_TRADE_EVIDE/);
-  assert.doesNotMatch(output, /No Tier-A pools are currently queued\./);
+  assert.match(output, /ENTRY WATCH POOLS \(0\)/);
+  assert.match(output, /No actively monitored entry pools\./);
+  assert.doesNotMatch(output, /0\/12/);
 });
 
 test('terminal read model uses existing bounded facts and never serializes RPC endpoints or credentials', () => {

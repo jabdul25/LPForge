@@ -1,15 +1,13 @@
 /**
  * LPForge Decision Terminal is deliberately a shell-native, read-only
  * observer.  It owns no policy, signer, transaction, execution, or recovery
- * authority.  Every refresh reads bounded durable facts plus a bounded,
- * exact-position PnL observation, and renders them to the attached TTY only.
+ * authority.  Every refresh reads bounded durable facts and renders them to
+ * the attached TTY only.
  */
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { Pool } from 'pg';
 import { loadPhase1Config } from '../../../packages/config/src/index.js';
-import { createMeteoraDataApi, type MeteoraDataApi, type MeteoraPositionPnl } from '../../../packages/data-api/src/index.js';
-import { deriveMeteoraComparableLpPositionMarkToMarket } from '../../../packages/live-exit-governor/src/index.js';
 import {
   advanceCandidateIndex,
   formatTerminalPoolDisplay,
@@ -145,7 +143,7 @@ function entryWatchOrder(a: TerminalCandidate, b: TerminalCandidate): number {
   return priority(a) - priority(b) || (a.rank ?? Number.MAX_SAFE_INTEGER) - (b.rank ?? Number.MAX_SAFE_INTEGER) || (b.confidence ?? -Infinity) - (a.confidence ?? -Infinity) || a.poolAddress.localeCompare(b.poolAddress);
 }
 
-async function loadCandidates(pool: Pool): Promise<{ candidates: TerminalCandidate[]; entryWatchPools: TerminalCandidate[]; discoveryQueue: TerminalCandidate[] }> {
+async function loadCandidates(pool: Pool): Promise<{ candidates: TerminalCandidate[]; entryWatchPools: TerminalCandidate[] }> {
   const result = await pool.query<Row>(`
     WITH latest AS (
       SELECT global_cycle_id,winner_pool_address
@@ -187,50 +185,22 @@ async function loadCandidates(pool: Pool): Promise<{ candidates: TerminalCandida
       LEFT JOIN protocol.tokens tx ON tx.mint=p.token_x_mint
       LEFT JOIN protocol.tokens ty ON ty.mint=p.token_y_mint
       WHERE registry.current_state='ACTIVE_CANDIDATE'
-    ), discovery_queue_rows AS (
-      SELECT 'DISCOVERY_QUEUE'::text AS terminal_source,
-        registry.pool_address,
-        COALESCE(c.operational_state,forward.phase3_status,registry.current_state) AS operational_state,
-        COALESCE(c.phase4_state,forward.phase4_status,'UNKNOWN') AS phase4_state,
-        c.candidate_id,c.strategy,c.orientation,c.lower_bin_id,c.upper_bin_id,c.active_bin_id,
-        c.predicted_gross_fees,c.predicted_net_ev,c.risk_adjusted_expected_net_ev,c.uncertainty,c.confidence,c.oor_risk,
-        COALESCE(c.reason_codes,forward.payload->'reasonCodes',registry.reason_codes,'[]'::jsonb) AS reason_codes,
-        p.token_x_mint,p.token_y_mint,tx.symbol AS token_x_symbol,ty.symbol AS token_y_symbol,
-        registry.paired_token_mint,registry.paired_token_symbol,registry.current_state AS registry_state,registry.last_rank,
-        latest.winner_pool_address
-      FROM market.pool_discovery_registry registry
-      LEFT JOIN latest ON true
-      LEFT JOIN execution.production_global_candidates c ON c.global_cycle_id=latest.global_cycle_id AND c.pool_address=registry.pool_address
-      LEFT JOIN LATERAL (
-        SELECT phase3_status,phase4_status,payload FROM operations.forward_cycles
-        WHERE pool_address=registry.pool_address ORDER BY observed_at DESC LIMIT 1
-      ) forward ON true
-      LEFT JOIN protocol.pools p ON p.address=registry.pool_address
-      LEFT JOIN protocol.tokens tx ON tx.mint=p.token_x_mint
-      LEFT JOIN protocol.tokens ty ON ty.mint=p.token_y_mint
-      WHERE registry.current_tier='A' AND registry.current_state IN ('ACTIVE_CANDIDATE','QUALIFIED')
-      ORDER BY CASE WHEN registry.current_state='ACTIVE_CANDIDATE' THEN 0 ELSE 1 END,
-        registry.last_rank NULLS LAST,registry.last_seen_at DESC,registry.pool_address
-      LIMIT 20
     )
     SELECT * FROM candidate_rows
     UNION ALL
     SELECT * FROM watch_rows
-    UNION ALL
-    SELECT * FROM discovery_queue_rows
   `);
   const candidates = result.rows.filter(row => text(row, 'terminal_source') === 'CANDIDATE').sort((a, b) => {
     const rank = (row: Row): number => text(row, 'pool_address') === text(row, 'winner_pool_address') ? 0 : text(row, 'operational_state') === 'ENTRY_READY' ? 1 : text(row, 'operational_state') === 'WARMING' ? 2 : 3;
     return rank(a) - rank(b) || (number(b, 'confidence') ?? -Infinity) - (number(a, 'confidence') ?? -Infinity) || (text(a, 'pool_address') || '').localeCompare(text(b, 'pool_address') || '');
   }).map(terminalCandidate);
   const entryWatchPools = result.rows.filter(row => text(row, 'terminal_source') === 'WATCH').map(terminalCandidate).sort(entryWatchOrder);
-  const discoveryQueue = result.rows.filter(row => text(row, 'terminal_source') === 'DISCOVERY_QUEUE').map(terminalCandidate).sort(entryWatchOrder);
-  return { candidates, entryWatchPools, discoveryQueue };
+  return { candidates, entryWatchPools };
 }
 
 async function loadActivePools(pool: Pool): Promise<TerminalPosition[]> {
   const result = await pool.query<Row>(`
-    SELECT p.lpforge_position_id,p.position_address,p.pool_address,p.owner_address,p.entered_at,p.lifecycle_state,p.reconciliation_status,p.lower_bin_id,p.upper_bin_id,
+    SELECT p.lpforge_position_id,p.position_address,p.pool_address,p.entered_at,p.lifecycle_state,p.reconciliation_status,p.lower_bin_id,p.upper_bin_id,
       tx.symbol AS token_x_symbol,ty.symbol AS token_y_symbol,proto.token_x_mint,proto.token_y_mint,
       registry.paired_token_mint,registry.paired_token_symbol,
       obs.active_bin_id,obs.range_state,es.evidence_state AS valuation_state,
@@ -238,15 +208,7 @@ async function loadActivePools(pool: Pool): Promise<TerminalPosition[]> {
       es.lp_mtm_net_return_fraction AS live_control_return_fraction,
       es.lp_mtm_peak_return_fraction AS live_control_peak_return_fraction,
       es.last_reason_codes,es.payload AS exit_payload,
-      oor.lifecycle_state AS oor_lifecycle_state,oor.direction AS oor_direction,oor.inventory_classification,oor.fee_value_lamports,
-      CASE
-        WHEN es.lp_mtm_evidence_state='AVAILABLE' AND es.lp_mtm_net_return_fraction<=-0.10 THEN 'RED'
-        WHEN obs.active_bin_id< p.lower_bin_id THEN 'RED'
-        WHEN obs.active_bin_id= p.lower_bin_id THEN 'ORANGE'
-        WHEN obs.active_bin_id BETWEEN p.lower_bin_id AND p.upper_bin_id
-          AND (p.upper_bin_id=p.lower_bin_id OR (obs.active_bin_id-p.lower_bin_id)::numeric/(p.upper_bin_id-p.lower_bin_id)::numeric<=1.0/3.0) THEN 'YELLOW'
-        ELSE 'GREEN'
-      END AS health_state
+      oor.lifecycle_state AS oor_lifecycle_state,oor.direction AS oor_direction,oor.inventory_classification,oor.fee_value_lamports
     FROM execution.owned_positions p
     LEFT JOIN protocol.pools proto ON proto.address=p.pool_address
     LEFT JOIN protocol.tokens tx ON tx.mint=proto.token_x_mint
@@ -266,82 +228,12 @@ async function loadActivePools(pool: Pool): Promise<TerminalPosition[]> {
     const enteredAt = iso(row.entered_at) || new Date(0).toISOString();
     return {
       lpforgePositionId: text(row, 'lpforge_position_id') || 'unknown', positionAddress: text(row, 'position_address') || 'unknown', poolAddress: text(row, 'pool_address') || 'unknown', poolDisplay: displayPool(row), enteredAt,
-      ...(text(row, 'owner_address') ? { ownerAddress: text(row, 'owner_address') } : {}),
       lifecycleState: text(row, 'lifecycle_state') || 'UNKNOWN', reconciliationStatus: text(row, 'reconciliation_status') || 'UNKNOWN',
       ...(integer(row, 'lower_bin_id') !== undefined ? { lowerBinId: integer(row, 'lower_bin_id') } : {}), ...(integer(row, 'upper_bin_id') !== undefined ? { upperBinId: integer(row, 'upper_bin_id') } : {}), ...(integer(row, 'active_bin_id') !== undefined ? { activeBinId: integer(row, 'active_bin_id') } : {}), ...(text(row, 'range_state') ? { rangeState: text(row, 'range_state') } : {}),
       ...(liveControlAvailable && number(row, 'live_control_return_fraction') !== undefined ? { liveControlReturnFraction: number(row, 'live_control_return_fraction') } : {}), ...(liveControlAvailable && number(row, 'live_control_peak_return_fraction') !== undefined ? { liveControlPeakReturnFraction: number(row, 'live_control_peak_return_fraction') } : {}), ...(lamports(row, 'fee_value_lamports') !== undefined ? { feeLamports: lamports(row, 'fee_value_lamports') } : {}),
-      ...(text(row, 'valuation_state') ? { valuationState: text(row, 'valuation_state') } : {}), ...(text(row, 'oor_lifecycle_state') ? { oorLifecycleState: text(row, 'oor_lifecycle_state') } : {}), ...(text(row, 'oor_direction') ? { oorDirection: text(row, 'oor_direction') } : {}), ...(text(row, 'inventory_classification') ? { inventoryClassification: text(row, 'inventory_classification') } : {}), ...(text(row,'health_state')&&['GREEN','YELLOW','ORANGE','RED'].includes(text(row,'health_state')!)?{healthState:text(row,'health_state') as TerminalPosition['healthState']}:{}), protection: terminalProtection(row)
+      ...(text(row, 'valuation_state') ? { valuationState: text(row, 'valuation_state') } : {}), ...(text(row, 'oor_lifecycle_state') ? { oorLifecycleState: text(row, 'oor_lifecycle_state') } : {}), ...(text(row, 'oor_direction') ? { oorDirection: text(row, 'oor_direction') } : {}), ...(text(row, 'inventory_classification') ? { inventoryClassification: text(row, 'inventory_classification') } : {}), protection: terminalProtection(row)
     };
   });
-}
-
-/**
- * A Decision Terminal frame is a live observer, so it must never relabel an
- * old durable P7 mark as current.  The exact Meteora position-PnL endpoint is
- * the same read-only numerical-control source used by P7.  It is queried per
- * open pool/owner pair and is never persisted or used to authorize an action.
- */
-async function refreshTerminalLiveControlMarks(api: MeteoraDataApi, positions: TerminalPosition[]): Promise<TerminalPosition[]> {
-  type PnlRows = Awaited<ReturnType<MeteoraDataApi['getOpenPositionPnl']>>;
-  const byPoolOwner = new Map<string, Promise<PnlRows | undefined>>();
-  for (const position of positions) {
-    if (!position.ownerAddress) continue;
-    const key = `${position.poolAddress}:${position.ownerAddress}`;
-    if (!byPoolOwner.has(key)) byPoolOwner.set(key, api.getOpenPositionPnl(position.poolAddress, position.ownerAddress).catch(() => undefined));
-  }
-  const resolved = new Map<string, PnlRows | undefined>();
-  await Promise.all([...byPoolOwner.entries()].map(async ([key, request]) => resolved.set(key, await request)));
-  return positions.map(position => {
-    const fetchedAt = new Date().toISOString();
-    const row = position.ownerAddress ? resolved.get(`${position.poolAddress}:${position.ownerAddress}`)?.find(value => value.positionAddress === position.positionAddress) : undefined;
-    const observedAt = row ? meteoraPositionPnlObservedAt(row, fetchedAt) : fetchedAt;
-    const mark = deriveMeteoraComparableLpPositionMarkToMarket({ ...(row ? { positionPnl: row } : {}), observedAt, expectedPositionAddress: position.positionAddress });
-    const feeLamports = row ? liveMeteoraFeeLamports(row) : undefined;
-    // Do not fall back to the database's old number: a failed fresh lookup is
-    // an unavailable live mark, not permission to present cached PnL as live.
-    return {
-      ...position,
-      liveControlState: mark.evidenceState,
-      liveControlObservedAt: mark.observedAt,
-      ...(mark.evidenceState === 'AVAILABLE' && mark.netReturnFraction !== undefined
-        ? { liveControlReturnFraction: mark.netReturnFraction }
-        : { liveControlReturnFraction: undefined }),
-      ...(feeLamports === undefined ? { feeLamports: undefined } : { feeLamports })
-    };
-  });
-}
-
-/**
- * The terminal labels this value LIVE FEES: Meteora's cumulative claimed fees
- * plus the two currently unclaimed fee balances, all in SOL. A partial
- * response is deliberately unavailable rather than blended with an older
- * durable accounting value.
- */
-function liveMeteoraFeeLamports(row: MeteoraPositionPnl): bigint | undefined {
-  const sol = (value: unknown): number | undefined => {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-    const record = value as Record<string, unknown>;
-    for (const key of ['amountSol', 'sol']) {
-      const raw = record[key];
-      const numberValue = typeof raw === 'number' ? raw : typeof raw === 'string' && raw.trim() ? Number(raw) : NaN;
-      if (Number.isFinite(numberValue) && numberValue >= 0) return numberValue;
-    }
-    return undefined;
-  };
-  const claimed = sol(row.allTimeFees?.total);
-  const unclaimedX = sol(row.unrealizedPnl?.unclaimedFeeTokenX);
-  const unclaimedY = sol(row.unrealizedPnl?.unclaimedFeeTokenY);
-  if (claimed === undefined || unclaimedX === undefined || unclaimedY === undefined) return undefined;
-  const lamports = Math.round((claimed + unclaimedX + unclaimedY) * 1e9);
-  return Number.isSafeInteger(lamports) && lamports >= 0 ? BigInt(lamports) : undefined;
-}
-
-/** The response's update time is source freshness, unlike the terminal redraw time. */
-function meteoraPositionPnlObservedAt(row: MeteoraPositionPnl, fallback: string): string {
-  const raw = row.updatedAt;
-  const numeric = typeof raw === 'number' ? raw : typeof raw === 'string' && raw.trim() ? Number(raw) : NaN;
-  const ms = Number.isFinite(numeric) ? (numeric < 1_000_000_000_000 ? numeric * 1_000 : numeric) : typeof raw === 'string' ? Date.parse(raw) : NaN;
-  return Number.isFinite(ms) && ms > 0 ? new Date(ms).toISOString() : fallback;
 }
 
 async function loadRecentPositions(pool: Pool, active: TerminalPosition[]): Promise<TerminalRecentPosition[]> {
@@ -353,7 +245,6 @@ async function loadRecentPositions(pool: Pool, active: TerminalPosition[]): Prom
     SELECT l.lifecycle_id,l.position_address,l.pool_address,l.created_at,latest.settled_at,latest.realized_sol_pnl_lamports,
       COALESCE(re.entry_capital_lamports,o.initial_capital_lamports) AS capital_lamports,
       re.gross_lp_fee_lamports,COALESCE(summary.terminal_reason,re.close_reason) AS exit_reason,
-      timing.decision_at,timing.submission_at,timing.confirmation_at,
       p.token_x_mint,p.token_y_mint,tx.symbol AS token_x_symbol,ty.symbol AS token_y_symbol,
       registry.paired_token_mint,registry.paired_token_symbol
     FROM latest
@@ -361,18 +252,6 @@ async function loadRecentPositions(pool: Pool, active: TerminalPosition[]): Prom
     LEFT JOIN execution.owned_positions o ON o.position_address=l.position_address
     LEFT JOIN execution.position_realized_economics re ON re.lifecycle_id=l.lifecycle_id
     LEFT JOIN execution.position_management_summaries summary ON summary.lifecycle_id=l.lifecycle_id
-    LEFT JOIN LATERAL (
-      SELECT min(i.observed_at) AS decision_at,
-             min(s.submitted_at) FILTER(WHERE s.submitted_at IS NOT NULL) AS submission_at,
-             min(c.observed_at) FILTER(WHERE c.status IN ('CONFIRMED','FINALIZED')) AS confirmation_at
-      FROM execution.lifecycle_plan_links link
-      JOIN execution.transaction_plans close_plan ON close_plan.plan_id=link.plan_id
-      JOIN execution.intents i ON i.intent_id=close_plan.intent_id
-      LEFT JOIN execution.transaction_steps step ON step.plan_id=close_plan.plan_id
-      LEFT JOIN execution.submission_attempts s ON s.transaction_id=step.transaction_id
-      LEFT JOIN execution.confirmations c ON c.attempt_id=s.attempt_id
-      WHERE link.lifecycle_id=l.lifecycle_id AND link.role='CLOSE'
-    ) timing ON true
     LEFT JOIN protocol.pools p ON p.address=l.pool_address
     LEFT JOIN protocol.tokens tx ON tx.mint=p.token_x_mint
     LEFT JOIN protocol.tokens ty ON ty.mint=p.token_y_mint
@@ -386,16 +265,14 @@ async function loadRecentPositions(pool: Pool, active: TerminalPosition[]): Prom
     const settledAt = iso(row.settled_at) || new Date(0).toISOString();
     return {
       lifecycleId: text(row, 'lifecycle_id') || 'unknown', positionAddress: text(row, 'position_address') || 'unknown', poolAddress: text(row, 'pool_address') || 'unknown', poolDisplay: displayPool(row), state: 'CLOSED' as const, observedAt: settledAt,
-      ...(value !== undefined && capital !== undefined && capital > 0n ? { realizedReturnFraction: Number(value) / Number(capital) } : {}), ...(lamports(row, 'gross_lp_fee_lamports') !== undefined ? { feeLamports: lamports(row, 'gross_lp_fee_lamports') } : {}), ...(openedAt ? { holdSeconds: Math.max(0, Math.floor((Date.parse(settledAt) - Date.parse(openedAt)) / 1000)) } : {}), ...(text(row, 'exit_reason') ? { exitReason: text(row, 'exit_reason') } : {}), ...(iso(row.decision_at)?{closeDecisionAt:iso(row.decision_at)!}:{}), ...(iso(row.submission_at)?{closeSubmissionAt:iso(row.submission_at)!}:{}), ...(iso(row.confirmation_at)?{closeConfirmationAt:iso(row.confirmation_at)!}:{}), closeSettlementAt:settledAt
+      ...(value !== undefined && capital !== undefined && capital > 0n ? { realizedReturnFraction: Number(value) / Number(capital) } : {}), ...(lamports(row, 'gross_lp_fee_lamports') !== undefined ? { feeLamports: lamports(row, 'gross_lp_fee_lamports') } : {}), ...(openedAt ? { holdSeconds: Math.max(0, Math.floor((Date.parse(settledAt) - Date.parse(openedAt)) / 1000)) } : {}), ...(text(row, 'exit_reason') ? { exitReason: text(row, 'exit_reason') } : {})
     };
   });
   const open = active.map(position => ({
     lifecycleId: `open:${position.positionAddress}`, positionAddress: position.positionAddress, poolAddress: position.poolAddress, poolDisplay: position.poolDisplay, state: 'OPEN' as const, observedAt: position.enteredAt,
     ...(position.liveControlReturnFraction !== undefined ? { liveControlReturnFraction: position.liveControlReturnFraction } : {}), ...(position.feeLamports !== undefined ? { feeLamports: position.feeLamports } : {}), holdSeconds: Math.max(0, Math.floor((Date.now() - Date.parse(position.enteredAt)) / 1000)), exitReason: 'LIVE CONTROL MARK'
   }));
-  // Live positions are operationally more important than a newer settlement:
-  // keep them at the top of the combined fills/recent-position view.
-  return [...open.sort((a,b)=>Date.parse(b.observedAt)-Date.parse(a.observedAt)), ...closed].slice(0, 12);
+  return [...open, ...closed].sort((a, b) => Date.parse(b.observedAt) - Date.parse(a.observedAt)).slice(0, 12);
 }
 
 async function loadEvents(pool: Pool): Promise<TerminalEvent[]> {
@@ -564,12 +441,11 @@ async function loadHealth(pool: Pool, runtimeId: string, rpcKeys: { production?:
   };
 }
 
-async function loadSnapshot(pool: Pool, runtimeId: string, livePnlApi: MeteoraDataApi): Promise<TerminalSnapshot> {
+async function loadSnapshot(pool: Pool, runtimeId: string): Promise<TerminalSnapshot> {
   const rpcKeys = { production: providerKey(process.env.LPFORGE_PRODUCTION_RPC_URL), discovery: providerKey(process.env.LPFORGE_DISCOVERY_RPC_URL) };
-  const [candidateResult, loadedActivePools, events, healthResult] = await Promise.all([loadCandidates(pool), loadActivePools(pool), loadEvents(pool), loadHealth(pool, runtimeId, rpcKeys)]);
-  const activePools = await refreshTerminalLiveControlMarks(livePnlApi, loadedActivePools);
+  const [candidateResult, activePools, events, healthResult] = await Promise.all([loadCandidates(pool), loadActivePools(pool), loadEvents(pool), loadHealth(pool, runtimeId, rpcKeys)]);
   const recentPositions = await loadRecentPositions(pool, activePools);
-  return { generatedAt: new Date().toISOString(), runtime: readRuntime(), health: healthResult.health, candidates: candidateResult.candidates, entryWatchPools: candidateResult.entryWatchPools, discoveryQueue: candidateResult.discoveryQueue, selectedCandidateIndex: 0, activePools, recentPositions, engines: healthResult.engines, events };
+  return { generatedAt: new Date().toISOString(), runtime: readRuntime(), health: healthResult.health, candidates: candidateResult.candidates, entryWatchPools: candidateResult.entryWatchPools, selectedCandidateIndex: 0, activePools, recentPositions, engines: healthResult.engines, events };
 }
 
 function arg(name: string): string | undefined {
@@ -624,11 +500,7 @@ async function main(): Promise<void> {
     if (refreshing || stopped) return;
     refreshing = true;
     try {
-      // Bound terminal-only API work below P7/P6 protection priority. A slow
-      // or shed read becomes an unavailable mark within this frame rather
-      // than delaying terminal refreshes or competing with a protective read.
-      const livePnlApi = createMeteoraDataApi({ baseUrl: cfg.meteoraDataApiUrl, maxRps: cfg.dataApiMaxRps, timeoutMs: Math.min(2_000, cfg.httpTimeoutMs), maxRetries: 0, priority: 'P2_DISCOVERY_CURRENT', deadlineAt: Date.now() + 1_500 });
-      const snapshot = await loadSnapshot(pool, runtimeId, livePnlApi);
+      const snapshot = await loadSnapshot(pool, runtimeId);
       candidateIndex = snapshot.candidates.length ? candidateIndex % snapshot.candidates.length : 0;
       lastSnapshot = snapshot;
       if (once) io.stdout.write(`${renderDecisionTerminal(snapshot, {
