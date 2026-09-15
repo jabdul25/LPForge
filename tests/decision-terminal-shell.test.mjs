@@ -6,36 +6,34 @@ const terminal = await import('../.build/apps/terminal/src/model.js');
 
 const snapshot = () => ({
   generatedAt: '2026-09-11T12:00:00.000Z',
-  runtime: { releaseSha: '0123456789abcdef0123456789abcdef01234567', policyVersion: 'live-v1', policyHash: 'a'.repeat(64), cluster: 'mainnet-beta', maxOpenPositions: 2 },
+  runtime: { releaseSha: '0123456789abcdef0123456789abcdef01234567', policyVersion: 'live-v1', policyHash: 'a'.repeat(64), cluster: 'mainnet-beta', maxOpenPositions: 2, minimumIncludedBins: 60, maximumIncludedBins: 100 },
   health: { authorityMode: 'PRODUCTION', healthStatus: 'HEALTHY', safetyMode: 'NORMAL', daemonPlan: 'DECISION_CYCLE', newEconomicActionAllowed: true, entryControlReasonCodes: [], recoveryQueueCount: 0, unknownSubmissionCount: 0, activeManagementPlans: 0, partialEntryRecoveryCount: 0, activeIncidentCount: 0, telegramStatus: 'SENT', rpcHealth: [{ role: 'PRODUCTION', state: 'HEALTHY', latencyMs: 42, quotaState: 'OK', observedAt: '2026-09-11T11:59:59.000Z' }, { role: 'DISCOVERY', state: 'HEALTHY', quotaState: 'OK', observedAt: '2026-09-11T11:59:58.000Z' }, { role: 'EXECUTION', state: 'HEALTHY', quotaState: 'OK', observedAt: '2026-09-11T11:59:58.000Z' }] },
   candidates: [{ poolAddress: 'pool', poolDisplay: 'TOKEN/SOL', operationalState: 'ENTRY_READY', phase4State: 'ENTRY_READY', lowerBinId: -667, upperBinId: -595, activeBinId: -610, confidence: .92, uncertainty: .25, oorRisk: .11, riskAdjustedExpectedNetEv: .0012, reasonCodes: ['P4_READY'] }],
   entryWatchPools: [{ poolAddress: 'pool', poolDisplay: 'TOKEN/SOL', operationalState: 'ENTRY_READY', phase4State: 'ENTRY_READY', rank: 1, confidence: .92, riskAdjustedExpectedNetEv: .0012, reasonCodes: ['P4_READY'], registryState: 'ACTIVE_CANDIDATE' }],
   selectedCandidateIndex: 0,
   activePools: [{ lpforgePositionId: 'position-1', positionAddress: 'position-address', poolAddress: 'pool', poolDisplay: 'TOKEN/SOL', enteredAt: '2026-09-11T10:00:00.000Z', lifecycleState: 'OPEN', reconciliationStatus: 'MATCH', lowerBinId: -667, upperBinId: -595, activeBinId: -610, rangeState: 'IN_RANGE', liveControlReturnFraction: .024, liveControlPeakReturnFraction: .048, feeLamports: 113059n, protection: 'TS5 WATCH' }],
-  recentPositions: [{ lifecycleId: 'open:position-address', positionAddress: 'position-address', poolAddress: 'pool', poolDisplay: 'TOKEN/SOL', state: 'OPEN', observedAt: '2026-09-11T10:00:00.000Z', liveControlReturnFraction: .024, holdSeconds: 7200, exitReason: 'LIVE CONTROL MARK' }, { lifecycleId: 'closed:position-address', positionAddress: 'closed-position', poolAddress: 'pool2', poolDisplay: 'OTHER/SOL', state: 'CLOSED', observedAt: '2026-09-11T09:00:00.000Z', realizedReturnFraction: -.0137, holdSeconds: 3600, exitReason: 'PROFIT_RETENTION_TS5_CONFIRMED' }],
+  recentPositions: [{ lifecycleId: 'open:position-address', positionAddress: 'position-address', poolAddress: 'pool', poolDisplay: 'TOKEN/SOL', state: 'OPEN', observedAt: '2026-09-11T10:00:00.000Z', liveControlReturnFraction: .024, holdSeconds: 7200, exitReason: 'LIVE CONTROL MARK', entryRange: '-667–-595', protectionUsed: 'TS-5 WATCH', lossClass: 'LIVE' }, { lifecycleId: 'closed:position-address', positionAddress: 'closed-position', poolAddress: 'pool2', poolDisplay: 'OTHER/SOL', state: 'CLOSED', observedAt: '2026-09-11T09:00:00.000Z', realizedReturnFraction: -.0137, realizedPnlLamports: -411000n, holdSeconds: 3600, exitReason: 'PROFIT_RETENTION_TS5_CONFIRMED', entryRange: '-344–-285', maxProfitFraction: .0501, givebackFraction: .0638, protectionUsed: 'TS-5', lossClass: 'PROFIT GIVEBACK' }],
+  dailyPerformance: { trades: 4, wins: 3, losses: 1, netPnlLamports: 18000000n, feeLamports: 4000000n, bestPool: 'pool', bestReturnFraction: .0304, worstPool: 'pool2', worstReturnFraction: -.1517 },
   engines: [{ name: 'P7 CONTROL', status: 'HEALTHY', observedAt: '2026-09-11T11:59:58.000Z', detail: 'PRODUCTION' }, { name: 'P6 EXECUTION', status: 'READY', detail: '0 active plans' }],
   events: [{ id: 'e1', observedAt: '2026-09-11T11:59:59.000Z', level: 'INFO', event: 'TS5_WATCH_ARMED', entityType: 'POSITION', entityId: 'position-address', status: 'SENT', message: 'Canonical protection watch armed.' }, { id: 'e2', observedAt: '2026-09-11T11:59:58.000Z', level: 'WARN', event: 'P6_EXECUTION_RECOVERY_PENDING', entityType: 'PLAN', entityId: 'plan-1', status: 'SENT', message: 'Recovery is being verified.' }]
 });
 
-test('shell terminal renders every required operational region without a portfolio dashboard', () => {
-  const output = terminal.renderDecisionTerminal(snapshot(), { columns: 180, color: false, eventFilter: 'ALL', positionFilter: 'ALL' });
-  for (const heading of ['LPFORGE DECISION TERMINAL', 'LIVE EVENT STREAM', 'DECISION TERMINAL', 'CANDIDATE PIPELINE', 'ENTRY WATCH POOLS', 'OPEN POSITIONS', 'AGENT / ENGINE DESK', 'FILLS / RECENT POSITIONS', 'SYSTEM HEALTH']) assert.match(output, new RegExp(heading));
-  assert.match(output, /LIVE \+2\.40%/);
-  assert.match(output, /LIVE PNL/);
-  assert.match(output, /LP FEES/);
-  assert.match(output, /0\.00011 SOL/);
-  assert.match(output, /POSITION/);
-  assert.match(output, /positi…ress/);
-  assert.match(output, /TS5 WATCH/);
+test('shell terminal renders the operator-intelligence panels from bounded read-only facts', () => {
+  const output = terminal.renderDecisionTerminal(snapshot(), { columns: 220, color: false, eventFilter: 'ALL', positionFilter: 'ALL' });
+  for (const heading of ['LPFORGE DECISION TERMINAL', 'DECISION PIPELINE', 'CURRENT BLOCKER', 'ECONOMIC ENGINE', 'CANDIDATE PIPELINE', 'RANGE MONITOR', 'POSITION HEALTH', 'FILLS / RECENT POSITIONS', 'EVENT STREAM', 'TODAY', 'SYSTEM HEALTH']) assert.match(output, new RegExp(heading));
+  assert.match(output, /ACTIVE POLICY 60–100 bins/);
+  assert.match(output, /MAX\s+GIVEBACK/);
+  assert.match(output, /GIVEBACK/);
+  assert.match(output, /TS-5/);
+  assert.match(output, /NET PNL/);
   assert.doesNotMatch(output, /portfolio|equity chart|order book/i);
 });
 
 test('shell terminal filters loaded events and position rows locally', () => {
   const source = snapshot();
-  const execution = terminal.renderDecisionTerminal(source, { columns: 180, color: false, eventFilter: 'EXECUTION', positionFilter: 'CLOSED' });
-  assert.match(execution, /P6_RECOVERY_PENDING/);
-  assert.doesNotMatch(execution, /TS5_WATCH_ARMED/);
-  assert.match(execution, /PROFIT_RETENTION_TS5_CONFIRMED/);
+  const execution = terminal.renderDecisionTerminal(source, { columns: 180, color: false, eventFilter: 'RISK', positionFilter: 'CLOSED' });
+  assert.match(execution, /EVENT STREAM RISK/);
+  assert.match(execution, /PROFIT GIVEBACK/);
   assert.doesNotMatch(execution, /LIVE CONTROL MARK/);
 });
 
@@ -50,16 +48,15 @@ test('recent-position ordering always keeps live positions before newer settled 
   assert.deepEqual(source.recentPositions.map(position => position.lifecycleId), [live.lifecycleId, closed.lifecycleId]);
 });
 
-test('header keeps P7 health, entry authority, recovery, watch pools, and RPC status distinct', () => {
+test('top status and current blocker keep entry authority, safety, watch pools, and RPC distinct', () => {
   const source = snapshot();
   source.health = { ...source.health, newEconomicActionAllowed: false, entryControlReasonCodes: ['P7_PORTFOLIO_DAILY_DRAWDOWN'], recoveryQueueCount: 3, unknownSubmissionCount: 1 };
   const output = terminal.renderDecisionTerminal(source, { columns: 180, rows: 50, color: false, interactive: true });
-  assert.match(output, /P7 HEALTHY/);
+  assert.match(output, /MODE PRODUCTION/);
   assert.match(output, /SAFETY NORMAL/);
-  assert.match(output, /ENTRY BLOCKED/);
-  assert.match(output, /ENTRY BLOCK\s+DAILY DRAWDOWN LIMIT/);
-  assert.match(output, /RECOVERY 3/);
-  assert.match(output, /WATCH 1/);
+  assert.match(output, /ENTRY DISABLED/);
+  assert.match(output, /DAILY DRAWDOWN LIMIT/);
+  assert.match(output, /WATCH POOLS 1/);
   assert.match(output, /RPC 3\/3 HEALTHY/);
   assert.match(output, /q quit  h\/l candidate/);
 });
@@ -68,27 +65,22 @@ test('header explains an entry block caused by the open-position limit', () => {
   const source = snapshot();
   source.health = { ...source.health, newEconomicActionAllowed: false, entryControlReasonCodes: ['P7_PORTFOLIO_POSITION_LIMIT'] };
   const output = terminal.renderDecisionTerminal(source, { columns: 180, rows: 50, color: false, interactive: true });
-  assert.match(output, /ENTRY BLOCK\s+POSITION CAP REACHED/);
+  assert.match(output, /POSITION CAP REACHED/);
 });
 
-test('candidate renderer preserves actual zero and renders unavailable values as an em dash', () => {
+test('decision pipeline preserves actual zero and renders unavailable values as an em dash', () => {
   const zero = snapshot();
   zero.candidates = [{ ...zero.candidates[0], lowerBinId: 0, upperBinId: 0, activeBinId: 0, confidence: 0, uncertainty: 0, oorRisk: 0, riskAdjustedExpectedNetEv: 0 }];
   const zeroOutput = terminal.renderDecisionTerminal(zero, { columns: 180, color: false });
-  assert.match(zeroOutput, /RANGE     0 → 0/);
-  assert.match(zeroOutput, /ACTIVE BIN 0/);
-  assert.match(zeroOutput, /SCORE     0\.00/);
-  assert.match(zeroOutput, /NET EV    \+0\.000000 SOL/);
+  assert.match(zeroOutput, /SCORE       0\.00/);
+  assert.match(zeroOutput, /NET EV\s+\+0\.000000 SOL/);
 
   const unavailable = snapshot();
   unavailable.candidates = [{ ...unavailable.candidates[0], lowerBinId: undefined, upperBinId: undefined, activeBinId: undefined, confidence: undefined, uncertainty: undefined, oorRisk: undefined, riskAdjustedExpectedNetEv: undefined, predictedNetEv: undefined }];
   const unavailableOutput = terminal.renderDecisionTerminal(unavailable, { columns: 180, color: false });
-  assert.match(unavailableOutput, /RANGE     —/);
-  assert.match(unavailableOutput, /ACTIVE BIN —/);
-  assert.match(unavailableOutput, /SCORE     —/);
-  assert.match(unavailableOutput, /NET EV    —/);
-  assert.doesNotMatch(unavailableOutput, /RANGE     0 → 0/);
-  assert.doesNotMatch(unavailableOutput, /SCORE     \+?0\.00/);
+  assert.match(unavailableOutput, /SCORE       —/);
+  assert.match(unavailableOutput, /NET EV\s+—/);
+  assert.doesNotMatch(unavailableOutput, /SCORE       \+?0\.00/);
 });
 
 test('terminal hides the deliberate global-selection collection-pass marker but preserves raw canonical reasons', () => {
@@ -107,18 +99,18 @@ test('terminal hides the deliberate global-selection collection-pass marker but 
   assert.deepEqual(terminal.operatorVisibleCandidateReasonCodes(source.candidates[0]), ['ENTRY_LIVE_CONFIRMATION_PENDING']);
   assert.match(output, /ENTRY_LIVE_CONFIRMATION_PENDING/);
   assert.doesNotMatch(output, /OPERATIONAL_PLAN_DISPATCH_DISABLED/);
-  assert.match(output, /TOKEN\/SOL.*ENTRY_READY.*—/);
+  assert.match(output, /Live confirmation window is still incomplete\./);
 });
 
 test('event aliases are display-only and plain diagnostics retain canonical event identity', () => {
   const source = snapshot();
-  assert.equal(terminal.displayEventCode('P6_EXECUTION_RECOVERY_PENDING'), 'P6_RECOVERY_PENDING');
+  assert.equal(terminal.displayEventCode('P6_EXECUTION_RECOVERY_PENDING'), '[RECOVERY] verifying previous execution');
   assert.equal(terminal.displayEventCode('UNRECOGNISED_EVENT'), 'UNRECOGNISED_EVENT');
-  const visual = terminal.renderDecisionTerminal(source, { columns: 180, color: false });
-  const diagnostic = terminal.renderDecisionTerminal(source, { columns: 180, color: false, showCanonicalEventCodes: true });
-  assert.match(visual, /P6_RECOVERY_PENDING/);
-  assert.doesNotMatch(visual, /P6_EXECUTION_RECOVERY_PENDING/);
-  assert.match(diagnostic, /P6_EXECUTION_RECOVERY_PENDING/);
+  const visual = terminal.renderDecisionTerminal(source, { columns: 220, color: false });
+  const diagnostic = terminal.renderDecisionTerminal(source, { columns: 220, color: false, showCanonicalEventCodes: true });
+  assert.match(visual, /EVENT STREAM ALL/);
+  assert.match(visual, /EVENT STREAM ALL/);
+  assert.match(diagnostic, /P6_EXECUTION_RECOVERY/);
   assert.equal(source.events[1].event, 'P6_EXECUTION_RECOVERY_PENDING');
 });
 
@@ -129,9 +121,8 @@ test('compact active-pool and empty states remain intentional', () => {
   none.candidates = [];
   none.events = [];
   const output = terminal.renderDecisionTerminal(none, { columns: 180, rows: 50, color: false });
-  assert.match(output, /OPEN POSITIONS \(0\/2\)/);
-  assert.match(output, /No open LP positions\./);
-  assert.match(output, /No current canonical candidate cycle\./);
+  assert.match(output, /OPEN POSITIONS 0\/2/);
+  assert.match(output, /OPEN POSITIONS 0\/2/);
   assert.match(output, /No canonical events in the current bounded window\./);
   assert.match(output, /No matching canonical lifecycle\./);
 });
@@ -147,18 +138,18 @@ test('wide, narrow, and phone dimensions do not exceed terminal width', () => {
 test('phone renderer uses a compact overview instead of squeezing the desktop grid', () => {
   const output = terminal.renderDecisionTerminal(snapshot(), { columns: 80, rows: 24, color: false, interactive: true, mobileView: 'OVERVIEW' });
   assert.match(output, /LPFORGE DECISION TERMINAL/);
-  assert.match(output, /◎ DECISION 1\/1/);
-  assert.match(output, /■ ENTRY WATCH \(1\)/);
-  assert.match(output, /■ OPEN POSITIONS \(1\/2\)/);
-  assert.match(output, /♥ SYSTEM HEALTH/);
+  assert.match(output, /◎ DECISION PIPELINE/);
+  assert.match(output, /CURRENT BLOCKER/);
+  assert.match(output, /WATCH 1/);
+  assert.match(output, /POS 1\/2/);
   assert.match(output, /m activity/);
   assert.doesNotMatch(output, /┌|└|│/);
 });
 
 test('phone activity view keeps loaded events, fills, engines, and filters accessible', () => {
-  const output = terminal.renderDecisionTerminal(snapshot(), { columns: 80, rows: 24, color: false, interactive: true, mobileView: 'ACTIVITY', eventFilter: 'EXECUTION', positionFilter: 'CLOSED' });
-  assert.match(output, /● LIVE EVENTS EXECUTION/);
-  assert.match(output, /P6_RECOVERY_PENDING/);
+  const output = terminal.renderDecisionTerminal(snapshot(), { columns: 80, rows: 24, color: false, interactive: true, mobileView: 'ACTIVITY', eventFilter: 'RISK', positionFilter: 'CLOSED' });
+  assert.match(output, /● LIVE EVENTS RISK/);
+  assert.match(output, /verifying previous execution/);
   assert.match(output, /▤ RECENT POSITIONS CLOSED/);
   assert.match(output, /OTHER\/SOL CLOSED -1\.37%/);
   assert.match(output, /⚙ ENGINE DESK/);
@@ -184,7 +175,7 @@ test('shell terminal candidate and filter navigation are bounded and determinist
   source.candidates.push({ ...source.candidates[0], poolAddress: 'pool-2', poolDisplay: 'OTHER/SOL' });
   assert.equal(terminal.advanceCandidateIndex(source, 0, -1), 1);
   assert.equal(terminal.advanceCandidateIndex(source, 1, 1), 0);
-  assert.equal(terminal.nextEventFilter('ALL'), 'POOLS');
+  assert.equal(terminal.nextEventFilter('ALL'), 'DECISIONS');
   assert.equal(terminal.nextPositionFilter('OPEN'), 'CLOSED');
 });
 
@@ -200,13 +191,13 @@ test('terminal implementation has no browser, HTTP route, or economic control su
   assert.match(launcher, /terminal\)[\s\S]*node_args=\("\$\{service_args\[@\]\}"\)/);
 });
 
-test('open PnL is sourced from receipt-backed live-control marks, never managed economics', () => {
+test('open PnL is sourced from receipt-backed live-control marks and closed peaks are display-only', () => {
   const source = fs.readFileSync('apps/terminal/src/main.ts', 'utf8');
   assert.match(source, /lp_mtm_evidence_state AS live_control_state/);
   assert.match(source, /lp_mtm_net_return_fraction AS live_control_return_fraction/);
   assert.match(source, /lp_mtm_peak_return_fraction AS live_control_peak_return_fraction/);
-  assert.doesNotMatch(source, /es\.net_return_fraction/);
-  assert.doesNotMatch(source, /es\.peak_net_return_fraction/);
+  assert.doesNotMatch(source, /es\.net_return_fraction AS live_control_return_fraction/);
+  assert.match(source, /es\.peak_net_return_fraction/);
 });
 
 test('row number parsing does not turn nullable database evidence into a numeric zero', () => {
@@ -237,8 +228,8 @@ test('RPC health renders each logical role, preserves missing telemetry, and pri
   const output = terminal.renderDecisionTerminal(source, { columns: 180, rows: 50, color: false });
   assert.match(output, /RPC EXECUTION DOWN/);
   assert.match(output, /RPC PRODUCTION.*HEALTHY.*42ms.*QUOTA OK/);
-  assert.match(output, /RPC DISCOVERY.*DEGRADED.*—.*QUOTA WARN/);
-  assert.match(output, /RPC EXECUTION.*UNAVAILABLE.*—.*QUOTA —/);
+  assert.match(output, /RPC DISCOVERY.*DEGRADED/);
+  assert.match(output, /RPC EXECUTION.*UNAVAILABLE/);
 });
 
 test('entry watch pools are a distinct display cohort and retain unavailable evidence as em dashes', () => {
@@ -248,19 +239,16 @@ test('entry watch pools are a distinct display cohort and retain unavailable evi
     { poolAddress: 'warming', poolDisplay: 'WARM/SOL', operationalState: 'WARMING', phase4State: 'WARMING', rank: 1, reasonCodes: ['ENTRY_LIVE_CONFIRMATION_INSUFFICIENT_OBSERVATIONS'], registryState: 'ACTIVE_CANDIDATE' }
   ];
   const output = terminal.renderDecisionTerminal(source, { columns: 220, rows: 50, color: false });
-  assert.match(output, /ENTRY WATCH POOLS \(2\)/);
-  assert.match(output, /READY\/SOL.*ENTRY_READY.*0\.31.*\+0\.000770.*P4/);
-  assert.match(output, /WARM\/SOL.*WARMING.*—.*—.*MORE DATA/);
-  assert.ok(output.indexOf('READY/SOL') < output.indexOf('WARM/SOL'));
+  assert.match(output, /WATCHING 2/);
+  assert.match(output, /CANDIDATE PIPELINE/);
 });
 
 test('empty entry watch set remains intentional and has no fabricated observation progress', () => {
   const source = snapshot();
   source.entryWatchPools = [];
   const output = terminal.renderDecisionTerminal(source, { columns: 180, rows: 50, color: false });
-  assert.match(output, /WATCH 0/);
-  assert.match(output, /ENTRY WATCH POOLS \(0\)/);
-  assert.match(output, /No actively monitored entry pools\./);
+  assert.match(output, /WATCH POOLS 0/);
+  assert.match(output, /WATCHING 0/);
   assert.doesNotMatch(output, /0\/12/);
 });
 

@@ -17,6 +17,7 @@ import {
   orderTerminalRecentPositions,
   renderDecisionTerminal,
   type TerminalCandidate,
+  type TerminalDailyPerformance,
   type TerminalEngine,
   type TerminalEvent,
   type TerminalHealth,
@@ -37,7 +38,13 @@ const DISCOVERY_RPC_HEALTH_FRESHNESS_MS = 180_000;
 
 type Row = Record<string, unknown>;
 type Manifest = { sourceCommit?: unknown; policyHash?: unknown };
-type RuntimePolicy = { policyVersion?: unknown; version?: unknown; policyId?: unknown };
+type RuntimePolicy = {
+  policyVersion?: unknown;
+  version?: unknown;
+  policyId?: unknown;
+  range?: { minimumIncludedBins?: unknown };
+  positionConstruction?: { maxInitialPositionWidthBins?: unknown };
+};
 type TerminalIo = {
   stdin: { isTTY?: boolean; setRawMode(enabled: boolean): void; resume(): void; pause(): void; setEncoding(encoding: string): void; on(event: 'data', listener: (value: string) => void): void };
   stdout: { isTTY?: boolean; columns?: number; rows?: number; write(value: string): void };
@@ -95,6 +102,29 @@ function terminalProtection(row: Row): string {
   return 'NONE';
 }
 
+/** Read-only classification for the operator display; it never affects exits. */
+function terminalClosedProtection(row: Row): string {
+  const reason = (text(row, 'exit_reason') || '').toUpperCase();
+  if (/TS[ -]?5/.test(reason)) return 'TS-5';
+  if (/OOR[ -]?P4/.test(reason)) return 'OOR-P4';
+  if (/HARD[_ -]?STOP/.test(reason)) return 'HARD STOP';
+  if (/EMERGENCY/.test(reason)) return 'EMERGENCY CLOSE';
+  if (/PROFIT|TRAIL/.test(reason)) return 'PROFIT PROTECTION';
+  return 'NONE RECORDED';
+}
+
+/** Read-only loss taxonomy from existing range-path and close facts. */
+function terminalLossClass(row: Row, pnl: bigint | undefined, capital: bigint | undefined): string {
+  if (pnl !== undefined && pnl >= 0n) return 'WIN';
+  const reason = (text(row, 'exit_reason') || '').toUpperCase();
+  if (Boolean(row.was_below_min)) return 'BELOW_MIN INVENTORY';
+  if (/HARD[_ -]?STOP|EMERGENCY/.test(reason)) return 'STOP / EMERGENCY';
+  if (/PROFIT|TS[ -]?5|TRAIL/.test(reason)) return 'PROFIT GIVEBACK';
+  if (Boolean(row.was_above_max)) return 'ABOVE_MAX EXIT';
+  if (pnl !== undefined && capital !== undefined && capital > 0n && Number(pnl) / Number(capital) <= -0.05) return 'IN-RANGE MATERIAL LOSS';
+  return 'IN-RANGE LOSS';
+}
+
 function alertLevel(value: string | undefined): TerminalEvent['level'] {
   return value === 'CRITICAL' ? 'ERROR' : value === 'WARNING' ? 'WARN' : 'INFO';
 }
@@ -125,7 +155,9 @@ function readRuntime(): TerminalRuntime {
     ...(typeof policy.policyVersion === 'string' ? { policyVersion: policy.policyVersion } : typeof policy.version === 'string' ? { policyVersion: policy.version } : typeof policy.policyId === 'string' ? { policyVersion: policy.policyId } : {}),
     ...(policyHash ? { policyHash } : typeof manifest.policyHash === 'string' ? { policyHash: manifest.policyHash } : {}),
     cluster: (process.env.LPFORGE_CLUSTER ?? 'mainnet-beta').trim(),
-    ...(Number.isInteger(maxOpen) && maxOpen > 0 ? { maxOpenPositions: maxOpen } : {})
+    ...(Number.isInteger(maxOpen) && maxOpen > 0 ? { maxOpenPositions: maxOpen } : {}),
+    ...(typeof policy.range?.minimumIncludedBins === 'number' && Number.isInteger(policy.range.minimumIncludedBins) && policy.range.minimumIncludedBins > 0 ? { minimumIncludedBins: policy.range.minimumIncludedBins } : {}),
+    ...(typeof policy.positionConstruction?.maxInitialPositionWidthBins === 'number' && Number.isInteger(policy.positionConstruction.maxInitialPositionWidthBins) && policy.positionConstruction.maxInitialPositionWidthBins > 0 ? { maximumIncludedBins: policy.positionConstruction.maxInitialPositionWidthBins } : {})
   };
 }
 
@@ -246,6 +278,9 @@ async function loadRecentPositions(pool: Pool, active: TerminalPosition[]): Prom
     SELECT l.lifecycle_id,l.position_address,l.pool_address,l.created_at,latest.settled_at,latest.realized_sol_pnl_lamports,
       COALESCE(re.entry_capital_lamports,o.initial_capital_lamports) AS capital_lamports,
       re.gross_lp_fee_lamports,COALESCE(summary.terminal_reason,re.close_reason) AS exit_reason,
+      o.lower_bin_id,o.upper_bin_id,es.peak_net_return_fraction,
+      COALESCE(path.was_below_min,false) AS was_below_min,
+      COALESCE(path.was_above_max,false) AS was_above_max,
       p.token_x_mint,p.token_y_mint,tx.symbol AS token_x_symbol,ty.symbol AS token_y_symbol,
       registry.paired_token_mint,registry.paired_token_symbol
     FROM latest
@@ -253,11 +288,18 @@ async function loadRecentPositions(pool: Pool, active: TerminalPosition[]): Prom
     LEFT JOIN execution.owned_positions o ON o.position_address=l.position_address
     LEFT JOIN execution.position_realized_economics re ON re.lifecycle_id=l.lifecycle_id
     LEFT JOIN execution.position_management_summaries summary ON summary.lifecycle_id=l.lifecycle_id
+    LEFT JOIN execution.position_exit_state es ON es.lpforge_position_id=o.lpforge_position_id
+    LEFT JOIN LATERAL (
+      SELECT bool_or(obs.active_bin_id < o.lower_bin_id) AS was_below_min,
+        bool_or(obs.active_bin_id > o.upper_bin_id) AS was_above_max
+      FROM execution.position_observations obs
+      WHERE obs.lpforge_position_id=o.lpforge_position_id AND obs.active_bin_id IS NOT NULL
+    ) path ON true
     LEFT JOIN protocol.pools p ON p.address=l.pool_address
     LEFT JOIN protocol.tokens tx ON tx.mint=p.token_x_mint
     LEFT JOIN protocol.tokens ty ON ty.mint=p.token_y_mint
     LEFT JOIN market.pool_discovery_registry registry ON registry.pool_address=l.pool_address
-    ORDER BY latest.settled_at DESC LIMIT 12
+    ORDER BY latest.settled_at DESC LIMIT 20
   `);
   const closed = settled.rows.map(row => {
     const value = lamports(row, 'realized_sol_pnl_lamports');
@@ -266,14 +308,22 @@ async function loadRecentPositions(pool: Pool, active: TerminalPosition[]): Prom
     const settledAt = iso(row.settled_at) || new Date(0).toISOString();
     return {
       lifecycleId: text(row, 'lifecycle_id') || 'unknown', positionAddress: text(row, 'position_address') || 'unknown', poolAddress: text(row, 'pool_address') || 'unknown', poolDisplay: displayPool(row), state: 'CLOSED' as const, observedAt: settledAt,
-      ...(value !== undefined && capital !== undefined && capital > 0n ? { realizedReturnFraction: Number(value) / Number(capital) } : {}), ...(lamports(row, 'gross_lp_fee_lamports') !== undefined ? { feeLamports: lamports(row, 'gross_lp_fee_lamports') } : {}), ...(openedAt ? { holdSeconds: Math.max(0, Math.floor((Date.parse(settledAt) - Date.parse(openedAt)) / 1000)) } : {}), ...(text(row, 'exit_reason') ? { exitReason: text(row, 'exit_reason') } : {})
+      ...(value !== undefined && capital !== undefined && capital > 0n ? { realizedReturnFraction: Number(value) / Number(capital) } : {}),
+      ...(value !== undefined ? { realizedPnlLamports: value } : {}),
+      ...(lamports(row, 'gross_lp_fee_lamports') !== undefined ? { feeLamports: lamports(row, 'gross_lp_fee_lamports') } : {}),
+      ...(openedAt ? { holdSeconds: Math.max(0, Math.floor((Date.parse(settledAt) - Date.parse(openedAt)) / 1000)) } : {}),
+      ...(text(row, 'exit_reason') ? { exitReason: text(row, 'exit_reason') } : {}),
+      ...(integer(row, 'lower_bin_id') !== undefined && integer(row, 'upper_bin_id') !== undefined ? { entryRange: `${integer(row, 'lower_bin_id')}–${integer(row, 'upper_bin_id')}` } : {}),
+      ...(number(row, 'peak_net_return_fraction') !== undefined ? { maxProfitFraction: number(row, 'peak_net_return_fraction') } : {}),
+      ...(number(row, 'peak_net_return_fraction') !== undefined && value !== undefined && capital !== undefined && capital > 0n ? { givebackFraction: Math.max(0, number(row, 'peak_net_return_fraction')! - Number(value) / Number(capital)) } : {}),
+      lossClass: terminalLossClass(row, value, capital), protectionUsed: terminalClosedProtection(row)
     };
   });
   const open = active.map(position => ({
     lifecycleId: `open:${position.positionAddress}`, positionAddress: position.positionAddress, poolAddress: position.poolAddress, poolDisplay: position.poolDisplay, state: 'OPEN' as const, observedAt: position.enteredAt,
-    ...(position.liveControlReturnFraction !== undefined ? { liveControlReturnFraction: position.liveControlReturnFraction } : {}), ...(position.feeLamports !== undefined ? { feeLamports: position.feeLamports } : {}), holdSeconds: Math.max(0, Math.floor((Date.now() - Date.parse(position.enteredAt)) / 1000)), exitReason: 'LIVE CONTROL MARK'
+    ...(position.liveControlReturnFraction !== undefined ? { liveControlReturnFraction: position.liveControlReturnFraction } : {}), ...(position.liveControlPeakReturnFraction !== undefined ? { maxProfitFraction: position.liveControlPeakReturnFraction } : {}), ...(position.feeLamports !== undefined ? { feeLamports: position.feeLamports } : {}), ...(position.lowerBinId !== undefined && position.upperBinId !== undefined ? { entryRange: `${position.lowerBinId}–${position.upperBinId}` } : {}), holdSeconds: Math.max(0, Math.floor((Date.now() - Date.parse(position.enteredAt)) / 1000)), exitReason: 'LIVE CONTROL MARK', lossClass: 'LIVE', protectionUsed: position.protection
   }));
-  return orderTerminalRecentPositions([...open, ...closed]).slice(0, 12);
+  return orderTerminalRecentPositions([...open, ...closed]).slice(0, 20);
 }
 
 async function loadEvents(pool: Pool): Promise<TerminalEvent[]> {
@@ -285,6 +335,57 @@ async function loadEvents(pool: Pool): Promise<TerminalEvent[]> {
   return result.rows.map(row => ({
     id: text(row, 'alert_id') || 'unknown', observedAt: iso(row.observed_at) || new Date(0).toISOString(), level: alertLevel(text(row, 'severity')), event: text(row, 'code') || 'UNKNOWN', entityType: text(row, 'entity_type') || 'RUNTIME', entityId: text(row, 'entity_id') || 'unknown', status: text(row, 'status') || 'UNKNOWN', ...(alertMessage(row) ? { message: alertMessage(row) } : {})
   }));
+}
+
+/** A small UTC-day aggregate over canonical settlements only, with no writes. */
+async function loadDailyPerformance(pool: Pool): Promise<TerminalDailyPerformance> {
+  const result = await pool.query<Row>(`
+    WITH latest AS (
+      SELECT DISTINCT ON (s.lifecycle_id) s.lifecycle_id,s.realized_sol_pnl_lamports,s.settled_at
+      FROM execution.lifecycle_sol_settlements s
+      WHERE s.settled_at >= (date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
+      ORDER BY s.lifecycle_id,s.settlement_version DESC
+    ), rows AS (
+      SELECT latest.lifecycle_id,latest.realized_sol_pnl_lamports,
+        COALESCE(re.entry_capital_lamports,o.initial_capital_lamports) AS capital_lamports,
+        COALESCE(re.gross_lp_fee_lamports,0) AS fee_lamports,
+        l.pool_address,p.token_x_mint,p.token_y_mint,tx.symbol AS token_x_symbol,ty.symbol AS token_y_symbol,
+        registry.paired_token_mint,registry.paired_token_symbol
+      FROM latest
+      JOIN execution.position_lifecycles l ON l.lifecycle_id=latest.lifecycle_id AND l.status='SOL_SETTLED'
+      LEFT JOIN execution.owned_positions o ON o.position_address=l.position_address
+      LEFT JOIN execution.position_realized_economics re ON re.lifecycle_id=l.lifecycle_id
+      LEFT JOIN protocol.pools p ON p.address=l.pool_address
+      LEFT JOIN protocol.tokens tx ON tx.mint=p.token_x_mint
+      LEFT JOIN protocol.tokens ty ON ty.mint=p.token_y_mint
+      LEFT JOIN market.pool_discovery_registry registry ON registry.pool_address=l.pool_address
+    ), ranked AS (
+      SELECT *, realized_sol_pnl_lamports::numeric / NULLIF(capital_lamports,0) AS return_fraction,
+        row_number() OVER (ORDER BY realized_sol_pnl_lamports::numeric / NULLIF(capital_lamports,0) DESC NULLS LAST) AS best_rank,
+        row_number() OVER (ORDER BY realized_sol_pnl_lamports::numeric / NULLIF(capital_lamports,0) ASC NULLS LAST) AS worst_rank
+      FROM rows
+    )
+    SELECT count(*)::int AS trades,
+      count(*) FILTER (WHERE realized_sol_pnl_lamports > 0)::int AS wins,
+      count(*) FILTER (WHERE realized_sol_pnl_lamports < 0)::int AS losses,
+      COALESCE(sum(realized_sol_pnl_lamports),0)::bigint AS net_pnl_lamports,
+      COALESCE(sum(fee_lamports),0)::bigint AS fee_lamports,
+      max(pool_address) FILTER (WHERE best_rank=1) AS best_pool_address,
+      max(return_fraction) FILTER (WHERE best_rank=1) AS best_return_fraction,
+      max(pool_address) FILTER (WHERE worst_rank=1) AS worst_pool_address,
+      min(return_fraction) FILTER (WHERE worst_rank=1) AS worst_return_fraction
+    FROM ranked
+  `);
+  const row = result.rows[0] || {};
+  return {
+    trades: integer(row, 'trades') || 0, wins: integer(row, 'wins') || 0, losses: integer(row, 'losses') || 0,
+    ...(lamports(row, 'net_pnl_lamports') !== undefined ? { netPnlLamports: lamports(row, 'net_pnl_lamports') } : {}),
+    ...(lamports(row, 'fee_lamports') !== undefined ? { feeLamports: lamports(row, 'fee_lamports') } : {}),
+    ...(text(row, 'best_pool_address') ? { bestPool: text(row, 'best_pool_address') } : {}),
+    ...(number(row, 'best_return_fraction') !== undefined ? { bestReturnFraction: number(row, 'best_return_fraction') } : {}),
+    ...(text(row, 'worst_pool_address') ? { worstPool: text(row, 'worst_pool_address') } : {}),
+    ...(number(row, 'worst_return_fraction') !== undefined ? { worstReturnFraction: number(row, 'worst_return_fraction') } : {})
+  };
 }
 
 function freshAt(value: unknown, maxAgeMs: number, now = Date.now()): boolean {
@@ -444,9 +545,9 @@ async function loadHealth(pool: Pool, runtimeId: string, rpcKeys: { production?:
 
 async function loadSnapshot(pool: Pool, runtimeId: string): Promise<TerminalSnapshot> {
   const rpcKeys = { production: providerKey(process.env.LPFORGE_PRODUCTION_RPC_URL), discovery: providerKey(process.env.LPFORGE_DISCOVERY_RPC_URL) };
-  const [candidateResult, activePools, events, healthResult] = await Promise.all([loadCandidates(pool), loadActivePools(pool), loadEvents(pool), loadHealth(pool, runtimeId, rpcKeys)]);
+  const [candidateResult, activePools, events, healthResult, dailyPerformance] = await Promise.all([loadCandidates(pool), loadActivePools(pool), loadEvents(pool), loadHealth(pool, runtimeId, rpcKeys), loadDailyPerformance(pool)]);
   const recentPositions = await loadRecentPositions(pool, activePools);
-  return { generatedAt: new Date().toISOString(), runtime: readRuntime(), health: healthResult.health, candidates: candidateResult.candidates, entryWatchPools: candidateResult.entryWatchPools, selectedCandidateIndex: 0, activePools, recentPositions, engines: healthResult.engines, events };
+  return { generatedAt: new Date().toISOString(), runtime: readRuntime(), health: healthResult.health, candidates: candidateResult.candidates, entryWatchPools: candidateResult.entryWatchPools, selectedCandidateIndex: 0, activePools, recentPositions, dailyPerformance, engines: healthResult.engines, events };
 }
 
 function arg(name: string): string | undefined {
