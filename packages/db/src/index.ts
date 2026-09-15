@@ -5572,8 +5572,26 @@ return 'APPLIED';
     async loadPhase7HealthFacts(poolAddress) {
       const [decision, unknown, recon, journal, canary, portfolio] =
         await Promise.all([
+          // A completed global selection with an empty eligible universe is a
+          // real, durable no-entry decision.  It must keep the DECISION
+          // heartbeat fresh even though there is no per-pool P3/P4 probe to
+          // append a forward cycle.  Do not accept an incomplete selection,
+          // or one that contained/evaluated a candidate: those still require
+          // the normal forward-cycle evidence before any entry can be allowed.
           db.query(
-            `SELECT observed_at FROM operations.forward_cycles ORDER BY observed_at DESC LIMIT 1`,
+            `SELECT observed_at FROM (
+               SELECT observed_at FROM operations.forward_cycles
+               UNION ALL
+               SELECT completed_at AS observed_at
+               FROM execution.production_global_selection_cycles
+               WHERE coverage_state='COMPLETE'
+                 AND outcome='GLOBAL_NO_TRADE'
+                 AND eligible_pool_count=0
+                 AND evaluated_pool_count=0
+                 AND candidate_pool_count=0
+             ) AS completed_decisions
+             ORDER BY observed_at DESC
+             LIMIT 1`,
           ),
           db.query(
             `SELECT count(*)::int AS n FROM execution.submission_attempts WHERE state='UNKNOWN'`,

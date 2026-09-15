@@ -11,11 +11,20 @@ test('P7-R03 recovery-only health retains strict non-decision checks while defer
 
 // The P7 DECISION domain is a producer-daemon heartbeat, not a lease on one
 // rotating candidate. A stale non-selected pool must not revoke production
-// while the producer is durably emitting fresh forward cycles.
-test('P7-R03 decision-health persistence uses the global latest producer cycle, not a rotating pool row',async()=>{
+// while the producer is durably emitting fresh forward cycles. A fully
+// completed, empty global selection is also a real NO_TRADE decision; it is
+// the only zero-candidate selection that may satisfy the heartbeat.
+test('P7-R03 decision-health persistence accepts global forward cycles or a completed empty global NO_TRADE selection, never a partial/candidate-bearing selection',async()=>{
   const fs=await import('node:fs');
   const source=fs.readFileSync(new URL('../packages/db/src/index.ts',import.meta.url),'utf8');
   const method=source.slice(source.indexOf('async loadPhase7HealthFacts(poolAddress)'),source.indexOf('async loadPhase7DriftFacts'));
-  assert.match(method,/SELECT observed_at FROM operations\.forward_cycles ORDER BY observed_at DESC LIMIT 1/);
+  assert.match(method,/SELECT observed_at FROM operations\.forward_cycles/);
+  assert.match(method,/FROM execution\.production_global_selection_cycles/);
+  assert.match(method,/coverage_state='COMPLETE'/);
+  assert.match(method,/outcome='GLOBAL_NO_TRADE'/);
+  assert.match(method,/eligible_pool_count=0/);
+  assert.match(method,/evaluated_pool_count=0/);
+  assert.match(method,/candidate_pool_count=0/);
+  assert.match(method,/UNION ALL/);
   assert.doesNotMatch(method,/FROM operations\.forward_cycles WHERE pool_address=\$1/);
 });
