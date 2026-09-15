@@ -735,13 +735,13 @@ async function observeAndPlanOwnedPositions(input: {
       ...(typeof currentForwardEv==='number'?{currentForwardEv}:{}),
       oor,
     });
-    // Telegram close requests are durable operator intent, not a direct
-    // signing channel.  The owned-position monitor rechecks ownership,
-    // chain truth, P7 protective authority, and active-plan idempotency
-    // before it constructs the ordinary canonical CLOSE plan.
+    // Telegram close requests are durable operator emergency intent, not a
+    // direct signing channel. The owned-position monitor still rechecks
+    // ownership, chain truth, P7 protective authority, and idempotency before
+    // it constructs the existing emergency-close plan and P6 priority lane.
     const telegramCloseRequest=await input.store.loadPendingTelegramOperatorCloseRequest(position.positionAddress);
     if(telegramCloseRequest){
-      decision={...decision,action:'CLOSE',reasonCodes:[...new Set([...decision.reasonCodes,'P7_TELEGRAM_OPERATOR_CLOSE_REQUEST'])].sort()};
+      decision={...decision,action:'EMERGENCY_CLOSE',reasonCodes:[...new Set([...decision.reasonCodes,'P7_TELEGRAM_OPERATOR_EMERGENCY_CLOSE_REQUEST'])].sort()};
     }
     const legacyProfitProtectionClose =
       decision.action === "CLOSE" &&

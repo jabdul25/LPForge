@@ -77,7 +77,9 @@ test('telegram operator uses the bounded DB summary reader for /positions',async
   assert.match(source,/\['\/positions','\/position'\]\.includes\(parsed\.name\)/);
   assert.match(source,/resolveTelegramPositionAddress\(\{target,positions\}\)/);
   assert.match(source,/position <number> — detailed position accounting/);
-  assert.match(source,/close <position number\|all>/);
+  assert.match(source,/close <position number\|all> \[reason\] — emergency protective close/);
+  assert.match(source,/requestType:'EMERGENCY_CLOSE'/);
+  assert.match(source,/Emergency protective close request/);
   assert.match(source,/await persist\('ACCEPTED','Command accepted\.'/);
   assert.match(db,/telegram_operator_commands\.status='ACCEPTED' AND EXCLUDED\.status IN \('ACCEPTED','COMPLETED','FAILED'\)/);
   assert.match(db,/FROM operations\.telegram_operator_commands WHERE status<>'ACCEPTED'/);
@@ -92,4 +94,10 @@ test('telegram operator uses the bounded DB summary reader for /positions',async
   assert.match(db,/LEFT JOIN protocol\.pools proto ON proto\.address=p\.pool_address/);
   assert.match(db,/LEFT JOIN market\.pool_discovery_registry registry ON registry\.pool_address=p\.pool_address/);
   assert.match(db,/registry\.paired_token_mint,registry\.paired_token_symbol/);
+});
+
+test('Telegram close requests are promoted only through the existing P7 emergency-close lane',async()=>{
+  const operator=await readFile('apps/operator/src/main.ts','utf8');
+  assert.match(operator,/action:'EMERGENCY_CLOSE',reasonCodes:\[\.\.\.new Set\(\[\.\.\.decision\.reasonCodes,'P7_TELEGRAM_OPERATOR_EMERGENCY_CLOSE_REQUEST'\]\)\]\.sort\(\)/);
+  assert.match(operator,/ownership, chain truth, P7 protective authority, and idempotency/);
 });
