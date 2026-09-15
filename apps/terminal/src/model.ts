@@ -78,6 +78,8 @@ export interface TerminalPosition {
   lpforgePositionId: string;
   positionAddress: string;
   poolAddress: string;
+  /** Internal read-only lookup key; it is never rendered. */
+  ownerAddress?: string | undefined;
   poolDisplay: string;
   enteredAt: string;
   lifecycleState: string;
@@ -92,6 +94,9 @@ export interface TerminalPosition {
    * have a different valuation basis.
    */
   liveControlReturnFraction?: number | undefined;
+  /** Exact-position Meteora control source state for this terminal frame. */
+  liveControlState?: 'AVAILABLE' | 'UNAVAILABLE' | 'STALE' | 'CONTRADICTORY' | undefined;
+  liveControlObservedAt?: string | undefined;
   liveControlPeakReturnFraction?: number | undefined;
   feeLamports?: bigint | undefined;
   valuationState?: string | undefined;
@@ -444,7 +449,8 @@ function activePoolLines(snapshot: TerminalSnapshot, width: number, color: boole
   const alertWidth = Math.max(8, width - 12 - 1 - 12 - 1 - 9 - 1 - 10 - 1 - 10 - 1 - 12 - 1 - 15 - 1 - 8 - 1);
   return [paint(head, 'muted', color), ...snapshot.activePools.map(position => {
     const range = position.lowerBinId === undefined || position.upperBinId === undefined ? '—' : `${position.lowerBinId}:${position.upperBinId} @${position.activeBinId ?? '?'}`;
-    return `${pad(position.poolDisplay, 12)} ${pad(short(position.positionAddress), 12)} ${pad(state(position.lifecycleState, color), 9)} ${pad(signedPercent(position.liveControlReturnFraction, color), 10)} ${pad(signedPercent(position.liveControlPeakReturnFraction, color), 10)} ${pad(formatSolLamports(position.feeLamports), 12)} ${pad(range, 15)} ${pad(state(position.healthState || 'GREEN', color), 8)} ${clip(state(position.protection, color), alertWidth)}`;
+    const alert = position.liveControlState && position.liveControlState !== 'AVAILABLE' ? 'PNL UNAVAILABLE' : position.protection;
+    return `${pad(position.poolDisplay, 12)} ${pad(short(position.positionAddress), 12)} ${pad(state(position.lifecycleState, color), 9)} ${pad(signedPercent(position.liveControlReturnFraction, color), 10)} ${pad(signedPercent(position.liveControlPeakReturnFraction, color), 10)} ${pad(formatSolLamports(position.feeLamports), 12)} ${pad(range, 15)} ${pad(state(position.healthState || 'GREEN', color), 8)} ${clip(state(alert, color), alertWidth)}`;
   })];
 }
 
@@ -576,7 +582,10 @@ function compactDiscoveryQueueLines(snapshot: TerminalSnapshot, width: number, c
 
 function compactOpenPositionLines(snapshot: TerminalSnapshot, width: number, color: boolean, limit: number): string[] {
   if (!snapshot.activePools.length) return [paint('No open LP positions.', 'muted', color)];
-  return snapshot.activePools.slice(0, Math.max(1, limit)).map(position => clip(`${state(position.poolDisplay, color)} ${state(position.lifecycleState, color)} ${signedPercent(position.liveControlReturnFraction, color)} ${paint('PK', 'muted', color)} ${signedPercent(position.liveControlPeakReturnFraction, color)} ${paint('FEE', 'muted', color)} ${formatSolLamports(position.feeLamports)} ${state(position.healthState || 'GREEN', color)} ${state(position.protection, color)}`, width));
+  return snapshot.activePools.slice(0, Math.max(1, limit)).map(position => {
+    const alert = position.liveControlState && position.liveControlState !== 'AVAILABLE' ? 'PNL UNAVAILABLE' : position.protection;
+    return clip(`${state(position.poolDisplay, color)} ${state(position.lifecycleState, color)} ${signedPercent(position.liveControlReturnFraction, color)} ${paint('PK', 'muted', color)} ${signedPercent(position.liveControlPeakReturnFraction, color)} ${paint('FEE', 'muted', color)} ${formatSolLamports(position.feeLamports)} ${state(position.healthState || 'GREEN', color)} ${state(alert, color)}`, width);
+  });
 }
 
 function compactEventLines(snapshot: TerminalSnapshot, width: number, filter: TerminalRenderOptions['eventFilter'], color: boolean, limit: number, showCanonical = false): string[] {

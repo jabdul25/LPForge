@@ -1,13 +1,15 @@
 /**
  * LPForge Decision Terminal is deliberately a shell-native, read-only
  * observer.  It owns no policy, signer, transaction, execution, or recovery
- * authority.  Every refresh reads bounded durable facts and renders them to
- * the attached TTY only.
+ * authority.  Every refresh reads bounded durable facts plus a bounded,
+ * exact-position PnL observation, and renders them to the attached TTY only.
  */
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { Pool } from 'pg';
 import { loadPhase1Config } from '../../../packages/config/src/index.js';
+import { createMeteoraDataApi, type MeteoraDataApi } from '../../../packages/data-api/src/index.js';
+import { deriveMeteoraComparableLpPositionMarkToMarket } from '../../../packages/live-exit-governor/src/index.js';
 import {
   advanceCandidateIndex,
   formatTerminalPoolDisplay,
@@ -228,7 +230,7 @@ async function loadCandidates(pool: Pool): Promise<{ candidates: TerminalCandida
 
 async function loadActivePools(pool: Pool): Promise<TerminalPosition[]> {
   const result = await pool.query<Row>(`
-    SELECT p.lpforge_position_id,p.position_address,p.pool_address,p.entered_at,p.lifecycle_state,p.reconciliation_status,p.lower_bin_id,p.upper_bin_id,
+    SELECT p.lpforge_position_id,p.position_address,p.pool_address,p.owner_address,p.entered_at,p.lifecycle_state,p.reconciliation_status,p.lower_bin_id,p.upper_bin_id,
       tx.symbol AS token_x_symbol,ty.symbol AS token_y_symbol,proto.token_x_mint,proto.token_y_mint,
       registry.paired_token_mint,registry.paired_token_symbol,
       obs.active_bin_id,obs.range_state,es.evidence_state AS valuation_state,
@@ -264,10 +266,44 @@ async function loadActivePools(pool: Pool): Promise<TerminalPosition[]> {
     const enteredAt = iso(row.entered_at) || new Date(0).toISOString();
     return {
       lpforgePositionId: text(row, 'lpforge_position_id') || 'unknown', positionAddress: text(row, 'position_address') || 'unknown', poolAddress: text(row, 'pool_address') || 'unknown', poolDisplay: displayPool(row), enteredAt,
+      ...(text(row, 'owner_address') ? { ownerAddress: text(row, 'owner_address') } : {}),
       lifecycleState: text(row, 'lifecycle_state') || 'UNKNOWN', reconciliationStatus: text(row, 'reconciliation_status') || 'UNKNOWN',
       ...(integer(row, 'lower_bin_id') !== undefined ? { lowerBinId: integer(row, 'lower_bin_id') } : {}), ...(integer(row, 'upper_bin_id') !== undefined ? { upperBinId: integer(row, 'upper_bin_id') } : {}), ...(integer(row, 'active_bin_id') !== undefined ? { activeBinId: integer(row, 'active_bin_id') } : {}), ...(text(row, 'range_state') ? { rangeState: text(row, 'range_state') } : {}),
       ...(liveControlAvailable && number(row, 'live_control_return_fraction') !== undefined ? { liveControlReturnFraction: number(row, 'live_control_return_fraction') } : {}), ...(liveControlAvailable && number(row, 'live_control_peak_return_fraction') !== undefined ? { liveControlPeakReturnFraction: number(row, 'live_control_peak_return_fraction') } : {}), ...(lamports(row, 'fee_value_lamports') !== undefined ? { feeLamports: lamports(row, 'fee_value_lamports') } : {}),
       ...(text(row, 'valuation_state') ? { valuationState: text(row, 'valuation_state') } : {}), ...(text(row, 'oor_lifecycle_state') ? { oorLifecycleState: text(row, 'oor_lifecycle_state') } : {}), ...(text(row, 'oor_direction') ? { oorDirection: text(row, 'oor_direction') } : {}), ...(text(row, 'inventory_classification') ? { inventoryClassification: text(row, 'inventory_classification') } : {}), ...(text(row,'health_state')&&['GREEN','YELLOW','ORANGE','RED'].includes(text(row,'health_state')!)?{healthState:text(row,'health_state') as TerminalPosition['healthState']}:{}), protection: terminalProtection(row)
+    };
+  });
+}
+
+/**
+ * A Decision Terminal frame is a live observer, so it must never relabel an
+ * old durable P7 mark as current.  The exact Meteora position-PnL endpoint is
+ * the same read-only numerical-control source used by P7.  It is queried per
+ * open pool/owner pair and is never persisted or used to authorize an action.
+ */
+async function refreshTerminalLiveControlMarks(api: MeteoraDataApi, positions: TerminalPosition[]): Promise<TerminalPosition[]> {
+  type PnlRows = Awaited<ReturnType<MeteoraDataApi['getOpenPositionPnl']>>;
+  const byPoolOwner = new Map<string, Promise<PnlRows | undefined>>();
+  for (const position of positions) {
+    if (!position.ownerAddress) continue;
+    const key = `${position.poolAddress}:${position.ownerAddress}`;
+    if (!byPoolOwner.has(key)) byPoolOwner.set(key, api.getOpenPositionPnl(position.poolAddress, position.ownerAddress).catch(() => undefined));
+  }
+  const resolved = new Map<string, PnlRows | undefined>();
+  await Promise.all([...byPoolOwner.entries()].map(async ([key, request]) => resolved.set(key, await request)));
+  return positions.map(position => {
+    const observedAt = new Date().toISOString();
+    const row = position.ownerAddress ? resolved.get(`${position.poolAddress}:${position.ownerAddress}`)?.find(value => value.positionAddress === position.positionAddress) : undefined;
+    const mark = deriveMeteoraComparableLpPositionMarkToMarket({ ...(row ? { positionPnl: row } : {}), observedAt, expectedPositionAddress: position.positionAddress });
+    // Do not fall back to the database's old number: a failed fresh lookup is
+    // an unavailable live mark, not permission to present cached PnL as live.
+    return {
+      ...position,
+      liveControlState: mark.evidenceState,
+      liveControlObservedAt: mark.observedAt,
+      ...(mark.evidenceState === 'AVAILABLE' && mark.netReturnFraction !== undefined
+        ? { liveControlReturnFraction: mark.netReturnFraction }
+        : { liveControlReturnFraction: undefined })
     };
   });
 }
@@ -492,9 +528,10 @@ async function loadHealth(pool: Pool, runtimeId: string, rpcKeys: { production?:
   };
 }
 
-async function loadSnapshot(pool: Pool, runtimeId: string): Promise<TerminalSnapshot> {
+async function loadSnapshot(pool: Pool, runtimeId: string, livePnlApi: MeteoraDataApi): Promise<TerminalSnapshot> {
   const rpcKeys = { production: providerKey(process.env.LPFORGE_PRODUCTION_RPC_URL), discovery: providerKey(process.env.LPFORGE_DISCOVERY_RPC_URL) };
-  const [candidateResult, activePools, events, healthResult] = await Promise.all([loadCandidates(pool), loadActivePools(pool), loadEvents(pool), loadHealth(pool, runtimeId, rpcKeys)]);
+  const [candidateResult, loadedActivePools, events, healthResult] = await Promise.all([loadCandidates(pool), loadActivePools(pool), loadEvents(pool), loadHealth(pool, runtimeId, rpcKeys)]);
+  const activePools = await refreshTerminalLiveControlMarks(livePnlApi, loadedActivePools);
   const recentPositions = await loadRecentPositions(pool, activePools);
   return { generatedAt: new Date().toISOString(), runtime: readRuntime(), health: healthResult.health, candidates: candidateResult.candidates, entryWatchPools: candidateResult.entryWatchPools, discoveryQueue: candidateResult.discoveryQueue, selectedCandidateIndex: 0, activePools, recentPositions, engines: healthResult.engines, events };
 }
@@ -551,7 +588,11 @@ async function main(): Promise<void> {
     if (refreshing || stopped) return;
     refreshing = true;
     try {
-      const snapshot = await loadSnapshot(pool, runtimeId);
+      // Bound terminal-only API work below P7/P6 protection priority. A slow
+      // or shed read becomes an unavailable mark within this frame rather
+      // than delaying terminal refreshes or competing with a protective read.
+      const livePnlApi = createMeteoraDataApi({ baseUrl: cfg.meteoraDataApiUrl, maxRps: cfg.dataApiMaxRps, timeoutMs: Math.min(2_000, cfg.httpTimeoutMs), maxRetries: 0, priority: 'P2_DISCOVERY_CURRENT', deadlineAt: Date.now() + 1_500 });
+      const snapshot = await loadSnapshot(pool, runtimeId, livePnlApi);
       candidateIndex = snapshot.candidates.length ? candidateIndex % snapshot.candidates.length : 0;
       lastSnapshot = snapshot;
       if (once) io.stdout.write(`${renderDecisionTerminal(snapshot, {

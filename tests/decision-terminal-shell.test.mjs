@@ -206,11 +206,15 @@ test('terminal implementation has no browser, HTTP route, or economic control su
   assert.match(launcher, /terminal\)[\s\S]*node_args=\("\$\{service_args\[@\]\}"\)/);
 });
 
-test('open PnL is sourced from receipt-backed live-control marks, never managed economics', () => {
+test('open PnL uses a fresh exact-position Meteora control mark and never presents a stale durable mark as live', () => {
   const source = fs.readFileSync('apps/terminal/src/main.ts', 'utf8');
   assert.match(source, /lp_mtm_evidence_state AS live_control_state/);
   assert.match(source, /lp_mtm_net_return_fraction AS live_control_return_fraction/);
   assert.match(source, /lp_mtm_peak_return_fraction AS live_control_peak_return_fraction/);
+  assert.match(source, /getOpenPositionPnl\(position\.poolAddress, position\.ownerAddress\)/);
+  assert.match(source, /deriveMeteoraComparableLpPositionMarkToMarket/);
+  assert.match(source, /liveControlReturnFraction: undefined/);
+  assert.match(source, /priority: 'P2_DISCOVERY_CURRENT'/);
   assert.doesNotMatch(source, /es\.net_return_fraction/);
   assert.doesNotMatch(source, /es\.peak_net_return_fraction/);
 });
