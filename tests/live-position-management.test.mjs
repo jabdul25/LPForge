@@ -88,12 +88,13 @@ test('only explicitly position-bound protective management may proceed without a
   assert.equal(profitProtection.planAllowed,true);
   assert.deepEqual(profitProtection.reasonCodes,['LIVE_MANAGEMENT_CONTEXT_PROFIT_PROTECTION_INDEPENDENT']);
 });
-test('hard-stop and fresh legacy profit-protection closes are explicitly wired as position-bound protective management',()=>{
+test('hard-stop and every confirmed profit-protection close are explicitly wired to protective emergency management',()=>{
   const src=fs.readFileSync(new URL('../apps/operator/src/main.ts',import.meta.url),'utf8');
   assert.match(src,/terminalProtectiveClose:/);
   assert.match(src,/EXIT_HARD_POSITION_STOP_LOSS/);
   assert.match(src,/EXIT_LP_POSITION_PROFIT_GIVEBACK_LIMIT/);
   assert.match(src,/legacyProfitProtectionClose/);
+  assert.match(src,/if\(profitRetentionConfirmed\)\{[\s\S]{0,500}action:'EMERGENCY_CLOSE'/);
 });
 test('lifecycle worker contains ordered replacement, chain-aware recovery, and token-X attribution',()=>{const src=fs.readFileSync(new URL('../packages/phase6-live-worker/src/index.ts',import.meta.url),'utf8');for(const token of ['REMOVE_OLD','AWAIT_REMOVE_RECONCILIATION','REFRESH_WALLET_TRUTH','BUILD_REPLACEMENT','getSignatureStatus','getPositionV2','P6_SEQUENCE_CHAIN_TRUTH_PENDING','recordPositionTokenXLot','sourceEvent:"FEE_CLAIM"','sourceEvent:"REDUCE_WITHDRAWAL"'])assert.match(src,new RegExp(token));assert.ok(src.indexOf('P6_MANAGEMENT_OLD_POSITION_STILL_EXISTS')<src.indexOf('BUILD_REPLACEMENT'));});
 test("continuation close wiring is geometry-bound and cannot use generic pool EV",()=>{const src=fs.readFileSync(new URL("../apps/operator/src/main.ts",import.meta.url),"utf8");for(const token of ["loadPositionContinuationEconomics","candidate.strategy===position.strategy","candidate.lowerBinId===position.lowerBinId","estimateExpectedCloseCostLamports","forwardEvConfirmationCount","insertPositionManagementDecisionAudit"])assert.match(src,new RegExp(token));});

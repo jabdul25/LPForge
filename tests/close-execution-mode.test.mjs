@@ -8,6 +8,7 @@ test('close execution mode is derived from immutable action/reason facts', () =>
   assert.equal(deriveCloseExecutionMode({...base, action: 'CLOSE'}), 'NORMAL_CLOSE');
   assert.equal(deriveCloseExecutionMode({action: 'CLOSE', intentPayload: {managementReasonCodes: ['EXIT_HARD_POSITION_STOP_LOSS'], closeExecution: {mode: 'HARD_STOP_CLOSE'}}}), 'HARD_STOP_CLOSE');
   assert.equal(deriveCloseExecutionMode({...base, action: 'EMERGENCY_CLOSE'}), 'EMERGENCY_CLOSE');
+  assert.equal(deriveCloseExecutionMode({action: 'EMERGENCY_CLOSE', intentPayload: {managementReasonCodes: ['EXIT_LP_POSITION_PROFIT_GIVEBACK_LIMIT']}}), 'EMERGENCY_CLOSE');
   assert.equal(deriveCloseExecutionMode({action: 'CLOSE', intentPayload: {managementReasonCodes: [], closeExecution: {mode: 'HARD_STOP_CLOSE'}}}), 'NORMAL_CLOSE');
 });
 

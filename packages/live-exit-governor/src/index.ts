@@ -524,7 +524,11 @@ export function assessLiveExit(input:LiveExitGovernorInput):LiveExitGovernorDeci
   if(governed.confirmed)return out('CLOSE','EMERGENCY',governed.reasonCodes,.9,1);
   if(governed.pending)return out('HOLD','EMERGENCY',governed.reasonCodes,.35,0);
   if(p.takeProfitFraction>0&&finite(lpProfitCurrent)&&lpProfitCurrent>=p.takeProfitFraction)return out('CLOSE','PROFIT_PROTECTION',['EXIT_TAKE_PROFIT_TARGET'],.88,1);
-  if(p.profitProtection.enabled&&finite(lpProfitCurrent)&&finite(lpProfitPeak)&&lpProfitPeak>=p.profitProtection.triggerFraction&&lpProfitGiveback!==null&&lpProfitGiveback>=p.profitProtection.maxGivebackFraction&&lpProfitCurrent>=p.profitProtection.minRetainedProfitFraction)return out('CLOSE','PROFIT_PROTECTION',['EXIT_LP_POSITION_PROFIT_GIVEBACK_LIMIT'],.82,1);
+  // A confirmed retained-profit breach is a protective exit, not an
+  // ordinary discretionary close.  Preserve the economic trigger exactly,
+  // but route the resulting close through P6's existing emergency lane so a
+  // giveback is not left behind ordinary close work or normal polling.
+  if(p.profitProtection.enabled&&finite(lpProfitCurrent)&&finite(lpProfitPeak)&&lpProfitPeak>=p.profitProtection.triggerFraction&&lpProfitGiveback!==null&&lpProfitGiveback>=p.profitProtection.maxGivebackFraction&&lpProfitCurrent>=p.profitProtection.minRetainedProfitFraction)return out('EMERGENCY_CLOSE','PROFIT_PROTECTION',['EXIT_LP_POSITION_PROFIT_GIVEBACK_LIMIT'],1,1);
   if(p.closeOnNonPositiveForwardEv&&finite(input.currentForwardEv)){if(input.forwardEvEvidenceAvailable===false)return out('HOLD','NONE',['EXIT_POSITION_CONTINUATION_EVIDENCE_UNAVAILABLE'],.1,0);if(!finite(input.closeCost))return out('HOLD','NONE',['EXIT_CLOSE_COST_UNAVAILABLE'],.1,0);const closeCost=Math.max(0,input.closeCost);if(input.currentForwardEv<=-closeCost){const confirmations=Math.max(0,Math.floor(input.forwardEvConfirmationCount??0));if(confirmations<2)return out('HOLD','FORWARD_EV',['EXIT_FORWARD_EV_CONFIRMATION_PENDING'],.1,0);return out('CLOSE','FORWARD_EV',['EXIT_FORWARD_EV_INFERIOR_TO_CLOSE'],.75,1);}}
   if(p.reduceOnRiskBlock&&input.riskDecision==='BLOCK')return out('REDUCE','RISK',['EXIT_REDUCE_RISK_BLOCK',...(input.riskReasonCodes??[])],.7,p.reduceFraction);
   if(p.maxHoldMinutes>0&&finite(input.positionAgeMinutes)&&input.positionAgeMinutes!>=p.maxHoldMinutes&&(!p.maxHoldRequiresNonPositiveForwardEv||(finite(input.currentForwardEv)&&input.currentForwardEv!<=0)))return out('CLOSE','TIME',['EXIT_MAX_HOLD_REACHED'],.6,1);

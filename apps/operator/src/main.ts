@@ -709,11 +709,12 @@ async function observeAndPlanOwnedPositions(input: {
     });
     // These two exact protective reasons are deliberately evaluated after
     // chain/reconciliation guards but before discretionary market HOLD can
-    // suppress them.  Existing emergency/hard-stop close precedence remains.
+    // suppress them.  They are protective exits and use the existing P6
+    // emergency lane; their eligibility criteria are unchanged.
     const profitRetentionConfirmed=profitRetention.kind==='TS5_PROTECTION_CONFIRMED'||profitRetention.kind==='OOR_P4_PROTECTION_CONFIRMED';
     if(profitRetentionConfirmed){
       const code=profitRetention.kind==='TS5_PROTECTION_CONFIRMED'?'PROFIT_RETENTION_TS5_CONFIRMED':'PROFIT_RETENTION_OOR_P4_CONFIRMED';
-      if(exitDecision.action!=='EMERGENCY_CLOSE')exitDecision={...exitDecision,action:'CLOSE',reasonFamily:'CAPITAL_PROTECTION',urgency:Math.max(exitDecision.urgency,.84),reasonCodes:[...new Set([...exitDecision.reasonCodes,code])].sort()};
+      if(exitDecision.action!=='EMERGENCY_CLOSE')exitDecision={...exitDecision,action:'EMERGENCY_CLOSE',reasonFamily:'CAPITAL_PROTECTION',urgency:1,reasonCodes:[...new Set([...exitDecision.reasonCodes,code])].sort()};
     }
     let priorFeeStart:bigint|undefined;
     try { if(priorOor?.rangeState==='OUT_OF_RANGE'&&storedOor?.fee_value_at_oor_start_lamports!==null&&storedOor?.fee_value_at_oor_start_lamports!==undefined) priorFeeStart=BigInt(String(storedOor.fee_value_at_oor_start_lamports)); } catch {}
