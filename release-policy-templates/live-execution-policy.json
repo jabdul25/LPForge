@@ -34,6 +34,15 @@
   "range": {
     "minimumIncludedBins": 60
   },
+  "stateADeteriorationProtection": {
+    "enabled": true,
+    "action": "CLOSE",
+    "minimumPeakReturnFraction": 0,
+    "givebackFraction": 0.5,
+    "minimumReturnThresholdFraction": 0,
+    "cooldownSeconds": 0,
+    "maximumObservationAgeSeconds": 300
+  },
   "feeClaim": {
     "minimumClaimValueUsd": 0.50
   },

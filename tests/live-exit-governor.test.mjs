@@ -1,10 +1,25 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {assessLiveExit,parseLiveExitGovernorPolicy,derivePositionEconomics,derivePositionMarkToMarket,deriveMeteoraComparableLpPositionMarkToMarket} from '../.build/packages/live-exit-governor/src/index.js';
+import {assessLiveExit,assessStateADeterioration,parseLiveExitGovernorPolicy,derivePositionEconomics,derivePositionMarkToMarket,deriveMeteoraComparableLpPositionMarkToMarket} from '../.build/packages/live-exit-governor/src/index.js';
 const p=parseLiveExitGovernorPolicy({schemaVersion:1,enabled:true,hardStopLossFraction:.12,emergencyStopLossFraction:.20,takeProfitFraction:0,profitProtection:{enabled:true,triggerFraction:.08,maxGivebackFraction:.05,minRetainedProfitFraction:.02},profitRetention:{enabled:true,policyVersion:'profit-retention-ts5-oor-p4-v1',ts5:{enabled:true,mfeActivationFraction:.04,givebackFraction:.02,watchSeconds:300,lowerRangeFraction:1/3,model:'EXPIRE_REARM',previousUsableMaxAgeSeconds:300},oorP4:{enabled:true,mfeActivationFraction:.02,requiresBelowMin:true,requiresTokenExposure:true}},closeOnThesisInvalidated:true,closeOnNonPositiveForwardEv:true,reduceOnRiskBlock:true,reduceFraction:.5,maxHoldMinutes:0,maxHoldRequiresNonPositiveForwardEv:true,toxicityCloseThreshold:.8,toxicityEmergencyThreshold:.95});
 const e=(r)=>({evidenceState:'AVAILABLE',observedAt:'2026-08-13T14:00:00Z',initialCapitalUsd:100,currentEconomicValueUsd:100*(1+r),netPnlUsd:100*r,netReturnFraction:r,feesValueUsd:2,reasonCodes:['EXIT_VALUATION_COMPLETE_MANAGED_NAV']});
 const lp=(r)=>({evidenceState:'AVAILABLE',observedAt:'2026-08-13T14:00:00Z',entryPositionValueUsd:100,currentPositionValueUsd:100*(1+r),netPnlUsd:100*r,netReturnFraction:r,reasonCodes:['LP_POSITION_MARK_TO_MARKET','LP_POSITION_RECEIPT_BACKED_DEPOSIT']});
 const meteoraLp=(r)=>({evidenceState:'AVAILABLE',observedAt:'2026-08-13T14:00:00Z',entryPositionValueUsd:100,currentPositionValueUsd:100*(1+r),netPnlUsd:100*r,netReturnFraction:r,source:'METEORA_POSITION_PNL_API',scope:'LIVE_POSITION_CONTROL',reasonCodes:['LIVE_CONTROL_PNL_AVAILABLE']});
+const stateA={enabled:true,action:'CLOSE',minimumPeakReturnFraction:0,givebackFraction:.5,minimumReturnThresholdFraction:0,cooldownSeconds:0,maximumObservationAgeSeconds:300};
+const assessStateA=(overrides={})=>assessStateADeterioration({policy:stateA,observedAt:'2026-09-16T00:00:00.000Z',liveControlPnl:meteoraLp(-.01),liveControlPnlFresh:true,lpProfitHighWater:{peakNetReturnFraction:.04,peakPositionValueUsd:104,peakObservedAt:'2026-09-15T23:59:00.000Z',pendingPeakConfirmations:0},currentFactsFresh:true,positionOpen:true,reconciliationClean:true,noActiveManagementPlan:true,...overrides});
+test('State A detects a durable positive live-control peak, 50% giveback, and breakeven loss',()=>{const r=assessStateA();assert.equal(r.detected,true);assert.deepEqual(r.reasonCodes,['EXIT_STATE_A_DETERIORATION']);assert.equal(r.peakReturnFraction,.04);assert.equal(r.currentReturnFraction,-.01);assert.equal(r.givebackFraction,.05);});
+test('State A fails closed for no positive peak, insufficient giveback, stale valuation, reconciliation debt, and an active plan',()=>{
+  assert.equal(assessStateA({lpProfitHighWater:{peakNetReturnFraction:0,pendingPeakConfirmations:0}}).detected,false);
+  assert.equal(assessStateA({liveControlPnl:meteoraLp(.01)}).detected,false);
+  assert.equal(assessStateA({currentFactsFresh:false}).detected,false);
+  assert.equal(assessStateA({liveControlPnlFresh:false}).detected,false);
+  assert.equal(assessStateA({reconciliationClean:false}).detected,false);
+  assert.equal(assessStateA({noActiveManagementPlan:false}).detected,false);
+});
+test('State A disabled policy and cooldown prevent a duplicate close candidate',()=>{
+  assert.equal(assessStateA({policy:{...stateA,enabled:false}}).detected,false);
+  assert.equal(assessStateA({policy:{...stateA,cooldownSeconds:60},priorDetectedAt:'2026-09-15T23:59:30.000Z'}).detected,false);
+});
 test('hard stop uses only the fresh Meteora-compatible live control return',()=>{const r=assessLiveExit({policy:p,economics:e(-.13),lpPositionMtm:lp(-.30),lpPositionMtmFresh:true,liveControlPnl:meteoraLp(-.13),liveControlPnlFresh:true});assert.equal(r.action,'CLOSE');assert.ok(r.reasonCodes.includes('EXIT_HARD_POSITION_STOP_LOSS'));});
 test('fresh Meteora-compatible emergency stop overrides ordinary close',()=>{const r=assessLiveExit({policy:p,economics:e(-.21),lpPositionMtm:lp(-.01),lpPositionMtmFresh:true,liveControlPnl:meteoraLp(-.21),liveControlPnlFresh:true});assert.equal(r.action,'EMERGENCY_CLOSE');assert.equal(assessLiveExit({policy:p,economics:e(-.21),lpPositionMtm:lp(-.30),lpPositionMtmFresh:true}).action,'HOLD');});
 test('historical false-stop shape: receipt -12.10% and control -7.93% cannot close',()=>{const r=assessLiveExit({policy:p,economics:e(-.12),lpPositionMtm:lp(-.121),lpPositionMtmFresh:true,liveControlPnl:meteoraLp(-.0793),liveControlPnlFresh:true});assert.equal(r.action,'HOLD');assert.ok(!r.reasonCodes.includes('EXIT_HARD_POSITION_STOP_LOSS'));});

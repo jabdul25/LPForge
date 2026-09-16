@@ -46,6 +46,7 @@ import {
   deriveLpPositionMarkToMarket,
   deriveMeteoraComparableLpPositionMarkToMarket,
   assessProfitRetentionProtection,
+  assessStateADeterioration,
   isManagementFactFreshForObservation,
   parseProfitRetentionWatch,
   loadLiveExitGovernorPolicy,
@@ -551,6 +552,7 @@ async function observeAndPlanOwnedPositions(input: {
   if (!input.ownerAddress) return { observed: 0, planned: 0, skippedNoMatchingContext: 0, monitoringTier: "NORMAL" as PositionMonitoringTier };
   const deployment=loadDeploymentPolicyFile(resolveLiveExecutionPolicyPath());
   if(!deployment.feeClaim)throw new Error('LPFORGE_FEE_CLAIM_POLICY_MISSING');
+  if(!deployment.stateADeteriorationProtection)throw new Error('LPFORGE_STATE_A_POLICY_MISSING');
   const policy = {...loadLivePositionManagementPolicy(
       process.env.LPFORGE_LIVE_MANAGEMENT_POLICY_PATH ??
         "release-policy-templates/live-position-management-policy.json",
@@ -563,6 +565,7 @@ async function observeAndPlanOwnedPositions(input: {
       process.env.LPFORGE_LIVE_EXIT_POLICY_PATH ??
         "release-policy-templates/live-exit-governor-policy.json",
     ),
+    stateAPolicy=deployment.stateADeteriorationProtection,
     positions = await input.store.loadOwnedPositions(input.ownerAddress);
   let planned = 0,
     skippedNoMatchingContext = 0,
@@ -677,13 +680,29 @@ async function observeAndPlanOwnedPositions(input: {
       marketEvidence,marketConfirmation,...(lpMtm?{lpPositionMtm:lpMtm,lpPositionMtmFresh}:{}),liveControlPnl,liveControlPnlFresh,...(priorLpProfitHighWater?{lpProfitHighWater:priorLpProfitHighWater}:{}),
       ...(position.enteredAt&&Number.isFinite(Date.parse(position.enteredAt))?{positionAgeMinutes:Math.max(0,(Date.parse(input.observedAt)-Date.parse(position.enteredAt))/60000)}:{}),
     });
-    const claimExpectedValueLamports=fact&&apiPool?claimValueLamports({feeX:fact.feeX,feeY:fact.feeY,pool:apiPool}):undefined;
-    const claimExpectedValueUsd=apiPool?claimValueUsd({feeValueLamports:claimExpectedValueLamports,pool:apiPool}):undefined;
     const activePlans=await input.store.loadActiveAutonomousPlansForPosition(position.positionAddress);
     const activePlanForPosition=activePlans.length>0;
     const isOor=fact!==undefined&&(activeBinId<fact.lowerBinId||activeBinId>fact.upperBinId);
     const direction=isOor?(activeBinId>fact!.upperBinId?'ABOVE_MAX':'BELOW_MIN'):undefined;
     const inventoryClassification=fact?classifyOorInventory({fact,...(apiPool?{pool:apiPool}:{}),...(direction?{direction}:{})}):'INVENTORY_UNAVAILABLE';
+    const stateADeterioration=assessStateADeterioration({
+      policy:stateAPolicy,
+      observedAt:input.observedAt,
+      liveControlPnl,
+      liveControlPnlFresh,
+      ...(exitDecision.lpProfitHighWater?{lpProfitHighWater:exitDecision.lpProfitHighWater}:{}),
+      currentFactsFresh:Boolean(fact&&activeBinChainFresh&&apiPool&&isManagementFactFreshForObservation({observationObservedAt:input.observedAt,factObservedAt:fact.stamp.observedAt,maxAgeSeconds:stateAPolicy.maximumObservationAgeSeconds})),
+      positionOpen:!['CLOSED','SOL_SETTLED','ABORTED'].includes(String(row.lifecycle_state??'')),
+      reconciliationClean:Boolean(fact)&&String(row.reconciliation_status??'MATCH')==='MATCH',
+      noActiveManagementPlan:!activePlanForPosition,
+      ...(typeof priorPayload.state_a_detected_at==='string'?{priorDetectedAt:priorPayload.state_a_detected_at}:{}),
+    });
+    // Existing emergency, hard-stop, market, and legacy-profit decisions keep
+    // their authority. State A only turns an otherwise non-terminal decision
+    // into its explicitly configured CLOSE action.
+    if(stateADeterioration.detected&&exitDecision.action!=='CLOSE'&&exitDecision.action!=='EMERGENCY_CLOSE')exitDecision={...exitDecision,action:'CLOSE',reasonFamily:'STATE_A_DETERIORATION',urgency:.85,reduceFraction:1,reasonCodes:['EXIT_STATE_A_DETERIORATION']};
+    const claimExpectedValueLamports=fact&&apiPool?claimValueLamports({feeX:fact.feeX,feeY:fact.feeY,pool:apiPool}):undefined;
+    const claimExpectedValueUsd=apiPool?claimValueUsd({feeValueLamports:claimExpectedValueLamports,pool:apiPool}):undefined;
     const storedOor=(await input.store.loadPositionOorLifecycleState(position.positionAddress))??await input.store.reconstructPositionOorLifecycleState(position.positionAddress);
     const priorOor=oorPrior(storedOor);
     const oor=assessOorLifecycle({policy:oorPolicy,...(priorOor?{prior:priorOor}:{}),observation:{observedAt:input.observedAt,rangeState:isOor?'OUT_OF_RANGE':'IN_RANGE',activeBinId,lowerBinId:position.lowerBinId,upperBinId:position.upperBinId,chainTruthFresh:Boolean(fact&&activeBinChainFresh),reconciliationClean:Boolean(fact)&&String(row.reconciliation_status??'MATCH')==='MATCH',noActiveManagementPlan:!activePlanForPosition,inventoryClassification,...(claimExpectedValueLamports===undefined?{}:{feeValueLamports:claimExpectedValueLamports})}});
@@ -750,6 +769,7 @@ async function observeAndPlanOwnedPositions(input: {
     const contextTerminalProtectiveClose =
       decision.action === "CLOSE" &&
       (exitDecision.reasonCodes.includes("EXIT_HARD_POSITION_STOP_LOSS") ||
+        exitDecision.reasonCodes.includes('EXIT_STATE_A_DETERIORATION') ||
         decision.reasonCodes.includes('PROFIT_RETENTION_TS5_CONFIRMED') ||
         decision.reasonCodes.includes('PROFIT_RETENTION_OOR_P4_CONFIRMED') ||
         decision.reasonCodes.includes("POSITION_OOR_TOKEN_RISK") ||
@@ -787,7 +807,7 @@ async function observeAndPlanOwnedPositions(input: {
       ...(exitDecision.lpProfitHighWater?.pendingPeakObservedAt!==undefined?{lpMtmPendingObservedAt:exitDecision.lpProfitHighWater.pendingPeakObservedAt}:{}),
       lpMtmPendingConfirmations:exitDecision.lpProfitHighWater?.pendingPeakConfirmations??0,
       peakObservedAt:exitDecision.highWater.peakObservedAt,lastAction:exitDecision.action,reasonCodes:exitDecision.reasonCodes,
-      payload:{peakGivebackFraction:exitDecision.peakGivebackFraction,lpProfitGivebackFraction:exitDecision.lpProfitGivebackFraction??null,reasonFamily:exitDecision.reasonFamily,urgency:exitDecision.urgency,profitRetentionWatch:profitRetention.watch,profitRetentionAssessment:{kind:profitRetention.kind,reasonCodes:profitRetention.reasonCodes,rangeFraction:profitRetention.rangeFraction??null,policyVersion:exitPolicy.profitRetention.policyVersion},continuationEvLamports:continuation?.continuationEvLamports.toString()??null,expectedCloseCostLamports:closeCostLamports?.toString()??null,continuationCandidateId:continuation?.candidateId??null,geometryIdentity:continuation?.geometryIdentity??null,continuationConfirmationCount:confirmationCount,marketExitConfirmation:exitDecision.marketConfirmation,regime:regime??null,toxicity:toxicity??null,receiptLpMtm:lpMtm?{state:lpMtm.evidenceState,observedAt:lpMtm.observedAt,entryPositionValueUsd:lpMtm.entryPositionValueUsd??null,currentPositionValueUsd:lpMtm.currentPositionValueUsd??null,netPnlUsd:lpMtm.netPnlUsd??null,netReturnFraction:lpMtm.netReturnFraction??null,realizedFeeValueUsd:lpMtm.realizedFeeValueUsd??null,realizedWithdrawalValueUsd:lpMtm.realizedWithdrawalValueUsd??null,reasonCodes:lpMtm.reasonCodes,provenance:lpMtmProvenance??null}:null,liveControlPnl:{state:liveControlPnl.evidenceState,observedAt:liveControlPnl.observedAt,fetchedAt:liveControlPnl.fetchedAt,source:liveControlPnl.source,scope:liveControlPnl.scope,positionAddress:liveControlPnl.positionAddress??null,depositsUsd:liveControlPnl.depositsUsd??null,balanceUsd:liveControlPnl.balanceUsd??null,withdrawalsUsd:liveControlPnl.withdrawalsUsd??null,claimedFeesUsd:liveControlPnl.claimedFeesUsd??null,unclaimedFeeXUsd:liveControlPnl.unclaimedFeeXUsd??null,unclaimedFeeYUsd:liveControlPnl.unclaimedFeeYUsd??null,currentPositionValueUsd:liveControlPnl.currentPositionValueUsd??null,netPnlUsd:liveControlPnl.netPnlUsd??null,netReturnFraction:liveControlPnl.netReturnFraction??null,reportedNetReturnFraction:liveControlPnl.reportedNetReturnFraction??null,reportedReturnDeltaFraction:liveControlPnl.reportedReturnDeltaFraction??null,reasonCodes:liveControlPnl.reasonCodes},managedEconomicMtmScope:'MANAGED_ECONOMIC_MTM'}
+      payload:{peakGivebackFraction:exitDecision.peakGivebackFraction,lpProfitGivebackFraction:exitDecision.lpProfitGivebackFraction??null,reasonFamily:exitDecision.reasonFamily,urgency:exitDecision.urgency,...(stateADeterioration.detected?{state_a_detected_at:stateADeterioration.detectedAt,state_a_peak_return:stateADeterioration.peakReturnFraction,state_a_current_return:stateADeterioration.currentReturnFraction,state_a_giveback:stateADeterioration.givebackFraction,state_a_action:stateAPolicy.action,state_a_context:{active_bin:activeBinId,range_position:!fact?'UNKNOWN':direction??'IN_RANGE',inventory_state:inventoryClassification}}:{}),profitRetentionWatch:profitRetention.watch,profitRetentionAssessment:{kind:profitRetention.kind,reasonCodes:profitRetention.reasonCodes,rangeFraction:profitRetention.rangeFraction??null,policyVersion:exitPolicy.profitRetention.policyVersion},continuationEvLamports:continuation?.continuationEvLamports.toString()??null,expectedCloseCostLamports:closeCostLamports?.toString()??null,continuationCandidateId:continuation?.candidateId??null,geometryIdentity:continuation?.geometryIdentity??null,continuationConfirmationCount:confirmationCount,marketExitConfirmation:exitDecision.marketConfirmation,regime:regime??null,toxicity:toxicity??null,receiptLpMtm:lpMtm?{state:lpMtm.evidenceState,observedAt:lpMtm.observedAt,entryPositionValueUsd:lpMtm.entryPositionValueUsd??null,currentPositionValueUsd:lpMtm.currentPositionValueUsd??null,netPnlUsd:lpMtm.netPnlUsd??null,netReturnFraction:lpMtm.netReturnFraction??null,realizedFeeValueUsd:lpMtm.realizedFeeValueUsd??null,realizedWithdrawalValueUsd:lpMtm.realizedWithdrawalValueUsd??null,reasonCodes:lpMtm.reasonCodes,provenance:lpMtmProvenance??null}:null,liveControlPnl:{state:liveControlPnl.evidenceState,observedAt:liveControlPnl.observedAt,fetchedAt:liveControlPnl.fetchedAt,source:liveControlPnl.source,scope:liveControlPnl.scope,positionAddress:liveControlPnl.positionAddress??null,depositsUsd:liveControlPnl.depositsUsd??null,balanceUsd:liveControlPnl.balanceUsd??null,withdrawalsUsd:liveControlPnl.withdrawalsUsd??null,claimedFeesUsd:liveControlPnl.claimedFeesUsd??null,unclaimedFeeXUsd:liveControlPnl.unclaimedFeeXUsd??null,unclaimedFeeYUsd:liveControlPnl.unclaimedFeeYUsd??null,currentPositionValueUsd:liveControlPnl.currentPositionValueUsd??null,netPnlUsd:liveControlPnl.netPnlUsd??null,netReturnFraction:liveControlPnl.netReturnFraction??null,reportedNetReturnFraction:liveControlPnl.reportedNetReturnFraction??null,reportedReturnDeltaFraction:liveControlPnl.reportedReturnDeltaFraction??null,reasonCodes:liveControlPnl.reasonCodes},managedEconomicMtmScope:'MANAGED_ECONOMIC_MTM'}
     };
     // A confirmed TS/P4 watch is written by the same transaction that owns
     // its close intent below.  Other observations retain the established
@@ -795,6 +815,7 @@ async function observeAndPlanOwnedPositions(input: {
     if(!profitRetentionConfirmed)await input.store.upsertPositionExitState(exitStateUpdate);
     await input.store.insertPositionManagementDecisionAudit({lpforgePositionId:position.lpforgePositionId,positionAddress:position.positionAddress,observedAt:input.observedAt,activeBinId,lowerBinId:position.lowerBinId,upperBinId:position.upperBinId,...(continuation?{positionContinuationEvLamports:continuation.continuationEvLamports,forecastHorizonMinutes:continuation.forecastHorizonMinutes}:{}),...(current?.shadow?.recommendationId?{sourceDecisionId:current.shadow.recommendationId}:{}),...(continuation?{sourceEconomicsId:continuation.candidateId}:{}),...(continuation?.uncertainty!==undefined?{uncertainty:continuation.uncertainty}:{}),...(closeCostLamports!==undefined?{expectedCloseCostLamports:closeCostLamports}:{}),geometryIdentity:continuation?.geometryIdentity??`${position.positionAddress}:${position.strategy}:${position.orientation}:${position.lowerBinId}:${position.upperBinId}`,managementAction:decision.action,exitReasonFamily:exitDecision.reasonFamily,reasonCodes:exitDecision.reasonCodes,confirmationSequenceCount:confirmationCount,validContinuationEvidence:continuation!==undefined&&closeCostLamports!==undefined});
     const alertBase={entityType:'POSITION' as const,entityId:position.positionAddress,positionId:position.lpforgePositionId,positionAddress:position.positionAddress,poolAddress:position.poolAddress,observedAt:input.observedAt};
+    if(stateADeterioration.detected&&priorPayload.state_a_detected_at!==stateADeterioration.detectedAt)await queueLifecycleAlert({...alertBase,severity:'WARNING',code:'STATE_A_DETERIORATION_DETECTED',title:'LPForge State A Trigger',message:'A durable positive live-control peak gave back through the configured breakeven threshold. LPForge requested the configured protective close; execution will still recheck live chain and safety facts.\nAction needed: none right now.',transitionKey:`STATE_A->${stateADeterioration.detectedAt}`,topic:'RISK',reasonCodes:stateADeterioration.reasonCodes,details:{Pool:position.poolAddress,Peak:pct(stateADeterioration.peakReturnFraction),Current:pct(stateADeterioration.currentReturnFraction),Giveback:pct(stateADeterioration.givebackFraction),Action:stateAPolicy.action,'Active bin':activeBinId,'Range position':!fact?'UNKNOWN':direction??'IN_RANGE',Inventory:inventoryClassification}});
     // Live control PnL is the only numerical exit authority. Alert only on a
     // state transition so a provider outage cannot flood the operator.
     const priorControl=(priorPayload.liveControlPnl&&typeof priorPayload.liveControlPnl==='object'&&!Array.isArray(priorPayload.liveControlPnl)?priorPayload.liveControlPnl:null) as Record<string,unknown>|null;
@@ -895,6 +916,7 @@ async function observeAndPlanOwnedPositions(input: {
       (planAction === "CLOSE" &&
         (exitDecision.reasonFamily === "EMERGENCY" ||
           exitDecision.reasonCodes.includes("EXIT_HARD_POSITION_STOP_LOSS") ||
+          exitDecision.reasonCodes.includes('EXIT_STATE_A_DETERIORATION') ||
           decision.reasonCodes.includes('PROFIT_RETENTION_TS5_CONFIRMED') ||
           decision.reasonCodes.includes('PROFIT_RETENTION_OOR_P4_CONFIRMED') ||
           exitDecision.reasonCodes.includes("EXIT_LP_POSITION_PROFIT_GIVEBACK_LIMIT") ||
@@ -960,7 +982,7 @@ async function observeAndPlanOwnedPositions(input: {
         sourcePositionAddress: position.positionAddress,
         orientation: position.orientation,
         entryFunding: { rebuildFromRemovedPosition: true },
-        exitGovernor: { reasonFamily: exitDecision.reasonFamily, reasonCodes: exitDecision.reasonCodes, economics: exitDecision.economics, highWater: exitDecision.highWater, peakGivebackFraction: exitDecision.peakGivebackFraction },
+        exitGovernor: { reasonFamily: exitDecision.reasonFamily, reasonCodes: exitDecision.reasonCodes, economics: exitDecision.economics, highWater: exitDecision.highWater, peakGivebackFraction: exitDecision.peakGivebackFraction, stateADeterioration },
         ...(executionMode?{closeExecution:{mode:executionMode,decisionAt:input.observedAt,reasonCodes:exitDecision.reasonCodes}}:{}),
       },
     });
