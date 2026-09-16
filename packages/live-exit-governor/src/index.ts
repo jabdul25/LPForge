@@ -11,8 +11,12 @@ export interface ProfitProtectionPolicy {enabled:boolean;triggerFraction:number;
  * The canonical live-execution policy owns these values.  This package only
  * evaluates the supplied immutable policy; it is never a second authority.
  */
-export interface StateADeteriorationProtectionPolicy {enabled:boolean;action:'CLOSE';minimumPeakReturnFraction:number;givebackFraction:number;minimumReturnThresholdFraction:number;cooldownSeconds:number;maximumObservationAgeSeconds:number;}
-export interface StateADeteriorationAssessment {detected:boolean;reasonCodes:string[];peakReturnFraction?:number;currentReturnFraction?:number;givebackFraction?:number;detectedAt?:string;}
+export interface StateADeteriorationProtectionPolicy {enabled:boolean;action:'CLOSE';minimumPeakReturnFraction:number;givebackFraction:number;minimumReturnThresholdFraction:number;confirmationSeconds:number;cooldownSeconds:number;maximumObservationAgeSeconds:number;}
+/** Durable per-position confirmation state. The owning exit-state row supplies
+ * the position identity, so this object is never a process-global timer. */
+export interface StateAPendingConfirmation {schemaVersion:1;firstDetectedAt:string;confirmationDueAt:string;peakReturnFraction:number;currentReturnFraction:number;givebackFraction:number;}
+export type StateADeteriorationStatus='NONE'|'PENDING'|'RECOVERED'|'CONFIRMED'|'EVIDENCE_UNAVAILABLE'|'SUPERSEDED';
+export interface StateADeteriorationAssessment {detected:boolean;status:StateADeteriorationStatus;reasonCodes:string[];peakReturnFraction?:number;currentReturnFraction?:number;givebackFraction?:number;detectedAt?:string;confirmationDueAt?:string;pending?:StateAPendingConfirmation;}
 /**
  * The historical +8% Meteora-compatible profit protection remains its own
  * authority.  This narrower policy governs only the two independently
@@ -505,25 +509,38 @@ export function assessStateADeterioration(input:{
   positionOpen:boolean;
   reconciliationClean:boolean;
   noActiveManagementPlan:boolean;
-  priorDetectedAt?:string|undefined;
+  /** Pending State A confirmation loaded from this position's durable exit state. */
+  priorPending?:StateAPendingConfirmation|undefined;
+  /** A prior confirmed State A event only; cancelled pending states never cool down a new deterioration. */
+  priorConfirmedAt?:string|undefined;
 }):StateADeteriorationAssessment{
   const p=input.policy;
-  if(!p.enabled)return{detected:false,reasonCodes:['STATE_A_DISABLED']};
-  if(p.action!=='CLOSE')return{detected:false,reasonCodes:['STATE_A_ACTION_INVALID']};
-  if(!input.positionOpen)return{detected:false,reasonCodes:['STATE_A_POSITION_NOT_OPEN']};
-  if(!input.currentFactsFresh)return{detected:false,reasonCodes:['STATE_A_CURRENT_FACTS_STALE']};
-  if(!input.reconciliationClean)return{detected:false,reasonCodes:['STATE_A_RECONCILIATION_DEBT']};
-  if(!input.noActiveManagementPlan)return{detected:false,reasonCodes:['STATE_A_ACTIVE_CLOSE_OR_MANAGEMENT_PLAN']};
+  const pending=input.priorPending&&Number.isFinite(Date.parse(input.priorPending.firstDetectedAt))&&Number.isFinite(Date.parse(input.priorPending.confirmationDueAt))?input.priorPending:undefined;
+  const supersede=(code:string):StateADeteriorationAssessment=>({detected:false,status:pending?'SUPERSEDED':'NONE',reasonCodes:[code]});
+  if(!p.enabled)return supersede('STATE_A_DISABLED');
+  if(p.action!=='CLOSE')return supersede('STATE_A_ACTION_INVALID');
+  if(!input.positionOpen)return supersede('STATE_A_POSITION_NOT_OPEN');
+  if(!input.reconciliationClean)return supersede('STATE_A_RECONCILIATION_DEBT');
+  if(!input.noActiveManagementPlan)return supersede('STATE_A_ACTIVE_CLOSE_OR_MANAGEMENT_PLAN');
   const control=input.liveControlPnl;
-  if(input.liveControlPnlFresh!==true||control?.evidenceState!=='AVAILABLE'||control.source!=='METEORA_POSITION_PNL_API'||control.scope!=='LIVE_POSITION_CONTROL'||!finite(control.netReturnFraction))return{detected:false,reasonCodes:['STATE_A_LIVE_CONTROL_PNL_UNAVAILABLE']};
+  // A pending State A must not confirm from an unavailable or stale mark. It
+  // remains pending until the next fresh canonical observation can either
+  // confirm persistence or cancel on recovery.
+  if(!input.currentFactsFresh||input.liveControlPnlFresh!==true||control?.evidenceState!=='AVAILABLE'||control.source!=='METEORA_POSITION_PNL_API'||control.scope!=='LIVE_POSITION_CONTROL'||!finite(control.netReturnFraction))return pending?{detected:false,status:'EVIDENCE_UNAVAILABLE',reasonCodes:[!input.currentFactsFresh?'STATE_A_CURRENT_FACTS_STALE':'STATE_A_LIVE_CONTROL_PNL_UNAVAILABLE'],pending}:{detected:false,status:'NONE',reasonCodes:[!input.currentFactsFresh?'STATE_A_CURRENT_FACTS_STALE':'STATE_A_LIVE_CONTROL_PNL_UNAVAILABLE']};
   const peak=input.lpProfitHighWater?.peakNetReturnFraction,current=control.netReturnFraction;
-  if(!finite(peak)||peak<=0||peak<p.minimumPeakReturnFraction)return{detected:false,reasonCodes:['STATE_A_DURABLE_POSITIVE_PEAK_NOT_MET']};
-  if(current>p.minimumReturnThresholdFraction)return{detected:false,reasonCodes:['STATE_A_BREAKEVEN_THRESHOLD_NOT_MET'],peakReturnFraction:peak,currentReturnFraction:current};
+  const recovered=(code:string):StateADeteriorationAssessment=>pending?{detected:false,status:'RECOVERED',reasonCodes:['STATE_A_RECOVERED',code],...(finite(peak)?{peakReturnFraction:peak}:{}),currentReturnFraction:current}:{detected:false,status:'NONE',reasonCodes:[code],...(finite(peak)?{peakReturnFraction:peak}:{}),currentReturnFraction:current};
+  if(!finite(peak)||peak<=0||peak<p.minimumPeakReturnFraction)return recovered('STATE_A_DURABLE_POSITIVE_PEAK_NOT_MET');
+  if(current>p.minimumReturnThresholdFraction)return recovered('STATE_A_BREAKEVEN_THRESHOLD_NOT_MET');
   const giveback=peak-current,givebackOfPeak=giveback/peak;
-  if(givebackOfPeak<p.givebackFraction)return{detected:false,reasonCodes:['STATE_A_GIVEBACK_THRESHOLD_NOT_MET'],peakReturnFraction:peak,currentReturnFraction:current,givebackFraction:giveback};
-  const now=Date.parse(input.observedAt),prior=Date.parse(input.priorDetectedAt??'');
-  if(p.cooldownSeconds>0&&Number.isFinite(now)&&Number.isFinite(prior)&&now-prior<p.cooldownSeconds*1000)return{detected:false,reasonCodes:['STATE_A_COOLDOWN_ACTIVE'],peakReturnFraction:peak,currentReturnFraction:current,givebackFraction:giveback};
-  return{detected:true,reasonCodes:['EXIT_STATE_A_DETERIORATION'],peakReturnFraction:peak,currentReturnFraction:current,givebackFraction:giveback,detectedAt:input.observedAt};
+  if(givebackOfPeak<p.givebackFraction)return recovered('STATE_A_GIVEBACK_THRESHOLD_NOT_MET');
+  const now=Date.parse(input.observedAt),priorConfirmed=Date.parse(input.priorConfirmedAt??'');
+  if(p.cooldownSeconds>0&&Number.isFinite(now)&&Number.isFinite(priorConfirmed)&&now-priorConfirmed<p.cooldownSeconds*1000)return{detected:false,status:pending?'PENDING':'NONE',reasonCodes:['STATE_A_COOLDOWN_ACTIVE'],peakReturnFraction:peak,currentReturnFraction:current,givebackFraction:giveback,...(pending?{pending,confirmationDueAt:pending.confirmationDueAt}:{})};
+  if(!Number.isFinite(now))return{detected:false,status:pending?'EVIDENCE_UNAVAILABLE':'NONE',reasonCodes:['STATE_A_OBSERVED_AT_INVALID'],...(pending?{pending,confirmationDueAt:pending.confirmationDueAt}:{})};
+  const start=pending?.firstDetectedAt??input.observedAt;
+  const due=pending?.confirmationDueAt??new Date(now+p.confirmationSeconds*1000).toISOString();
+  const nextPending:StateAPendingConfirmation={schemaVersion:1,firstDetectedAt:start,confirmationDueAt:due,peakReturnFraction:peak,currentReturnFraction:current,givebackFraction:giveback};
+  if(now<Date.parse(due))return{detected:false,status:'PENDING',reasonCodes:['STATE_A_PENDING'],pending:nextPending,detectedAt:start,confirmationDueAt:due,peakReturnFraction:peak,currentReturnFraction:current,givebackFraction:giveback};
+  return{detected:true,status:'CONFIRMED',reasonCodes:['EXIT_STATE_A_DETERIORATION','STATE_A_DETERIORATION_CONFIRMED'],peakReturnFraction:peak,currentReturnFraction:current,givebackFraction:giveback,detectedAt:start,confirmationDueAt:due};
 }
 function marketAuthority(input:LiveExitGovernorInput):{confirmed:boolean;pending:boolean;reasonCodes:string[];confirmation:MarketExitConfirmationState}{
   const prior=input.marketConfirmation?.families??{}, next:Partial<Record<MarketExitEvidenceFamily,number>>={}, trustworthy=new Map<MarketExitEvidenceFamily,MarketExitEvidence>();

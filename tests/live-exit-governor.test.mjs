@@ -5,9 +5,13 @@ const p=parseLiveExitGovernorPolicy({schemaVersion:1,enabled:true,hardStopLossFr
 const e=(r)=>({evidenceState:'AVAILABLE',observedAt:'2026-08-13T14:00:00Z',initialCapitalUsd:100,currentEconomicValueUsd:100*(1+r),netPnlUsd:100*r,netReturnFraction:r,feesValueUsd:2,reasonCodes:['EXIT_VALUATION_COMPLETE_MANAGED_NAV']});
 const lp=(r)=>({evidenceState:'AVAILABLE',observedAt:'2026-08-13T14:00:00Z',entryPositionValueUsd:100,currentPositionValueUsd:100*(1+r),netPnlUsd:100*r,netReturnFraction:r,reasonCodes:['LP_POSITION_MARK_TO_MARKET','LP_POSITION_RECEIPT_BACKED_DEPOSIT']});
 const meteoraLp=(r)=>({evidenceState:'AVAILABLE',observedAt:'2026-08-13T14:00:00Z',entryPositionValueUsd:100,currentPositionValueUsd:100*(1+r),netPnlUsd:100*r,netReturnFraction:r,source:'METEORA_POSITION_PNL_API',scope:'LIVE_POSITION_CONTROL',reasonCodes:['LIVE_CONTROL_PNL_AVAILABLE']});
-const stateA={enabled:true,action:'CLOSE',minimumPeakReturnFraction:0,givebackFraction:.5,minimumReturnThresholdFraction:0,cooldownSeconds:0,maximumObservationAgeSeconds:300};
+const stateA={enabled:true,action:'CLOSE',minimumPeakReturnFraction:0,givebackFraction:.5,minimumReturnThresholdFraction:0,confirmationSeconds:30,cooldownSeconds:0,maximumObservationAgeSeconds:300};
 const assessStateA=(overrides={})=>assessStateADeterioration({policy:stateA,observedAt:'2026-09-16T00:00:00.000Z',liveControlPnl:meteoraLp(-.01),liveControlPnlFresh:true,lpProfitHighWater:{peakNetReturnFraction:.04,peakPositionValueUsd:104,peakObservedAt:'2026-09-15T23:59:00.000Z',pendingPeakConfirmations:0},currentFactsFresh:true,positionOpen:true,reconciliationClean:true,noActiveManagementPlan:true,...overrides});
-test('State A detects a durable positive live-control peak, 50% giveback, and breakeven loss',()=>{const r=assessStateA();assert.equal(r.detected,true);assert.deepEqual(r.reasonCodes,['EXIT_STATE_A_DETERIORATION']);assert.equal(r.peakReturnFraction,.04);assert.equal(r.currentReturnFraction,-.01);assert.equal(r.givebackFraction,.05);});
+test('State A first qualifying observation becomes durable pending state rather than an immediate close',()=>{const r=assessStateA();assert.equal(r.detected,false);assert.equal(r.status,'PENDING');assert.deepEqual(r.reasonCodes,['STATE_A_PENDING']);assert.equal(r.confirmationDueAt,'2026-09-16T00:00:30.000Z');assert.equal(r.pending?.firstDetectedAt,'2026-09-16T00:00:00.000Z');});
+test('State A cancels an EMBER-shaped fast recovery and starts a fresh independent window for later deterioration',()=>{const first=assessStateA();const recovered=assessStateA({observedAt:'2026-09-16T00:00:11.000Z',liveControlPnl:meteoraLp(.0003),priorPending:first.pending});assert.equal(recovered.detected,false);assert.equal(recovered.status,'RECOVERED');assert.ok(recovered.reasonCodes.includes('STATE_A_RECOVERED'));const second=assessStateA({observedAt:'2026-09-16T00:00:20.000Z',priorPending:undefined});assert.equal(second.status,'PENDING');assert.equal(second.confirmationDueAt,'2026-09-16T00:00:50.000Z');});
+test('State A confirms only on a fresh qualifying observation at or after the persistence due time',()=>{const first=assessStateA();for(const second of [15,29]){const r=assessStateA({observedAt:`2026-09-16T00:00:${String(second).padStart(2,'0')}.000Z`,priorPending:first.pending});assert.equal(r.detected,false);assert.equal(r.status,'PENDING');}const confirmed=assessStateA({observedAt:'2026-09-16T00:00:30.000Z',priorPending:first.pending});assert.equal(confirmed.detected,true);assert.equal(confirmed.status,'CONFIRMED');assert.ok(confirmed.reasonCodes.includes('EXIT_STATE_A_DETERIORATION'));assert.ok(confirmed.reasonCodes.includes('STATE_A_DETERIORATION_CONFIRMED'));});
+test('State A recovery at 29 seconds cancels without a close and terminal positions retain no pending state',()=>{const first=assessStateA();const recovered=assessStateA({observedAt:'2026-09-16T00:00:29.000Z',liveControlPnl:meteoraLp(.0001),priorPending:first.pending});assert.equal(recovered.status,'RECOVERED');assert.equal(recovered.pending,undefined);const terminal=assessStateA({positionOpen:false,priorPending:first.pending});assert.equal(terminal.status,'SUPERSEDED');assert.equal(terminal.pending,undefined);});
+test('State A durable pending survives restart timing, fails closed on stale evidence, and zero confirmation preserves legacy immediate close',()=>{const first=assessStateA();const afterRestart=assessStateA({observedAt:'2026-09-16T00:00:40.000Z',priorPending:first.pending});assert.equal(afterRestart.detected,true);assert.equal(afterRestart.detectedAt,'2026-09-16T00:00:00.000Z');assert.equal(assessStateA({observedAt:'2026-09-16T00:00:40.000Z',priorPending:first.pending,currentFactsFresh:false}).status,'EVIDENCE_UNAVAILABLE');const legacy=assessStateA({policy:{...stateA,confirmationSeconds:0}});assert.equal(legacy.detected,true);assert.equal(legacy.status,'CONFIRMED');});
 test('State A fails closed for no positive peak, insufficient giveback, stale valuation, reconciliation debt, and an active plan',()=>{
   assert.equal(assessStateA({lpProfitHighWater:{peakNetReturnFraction:0,pendingPeakConfirmations:0}}).detected,false);
   assert.equal(assessStateA({liveControlPnl:meteoraLp(.01)}).detected,false);
@@ -16,9 +20,28 @@ test('State A fails closed for no positive peak, insufficient giveback, stale va
   assert.equal(assessStateA({reconciliationClean:false}).detected,false);
   assert.equal(assessStateA({noActiveManagementPlan:false}).detected,false);
 });
-test('State A disabled policy and cooldown prevent a duplicate close candidate',()=>{
+test('State A disabled policy and post-confirmation cooldown prevent a duplicate close candidate without cooling down a cancelled pending state',()=>{
   assert.equal(assessStateA({policy:{...stateA,enabled:false}}).detected,false);
-  assert.equal(assessStateA({policy:{...stateA,cooldownSeconds:60},priorDetectedAt:'2026-09-15T23:59:30.000Z'}).detected,false);
+  assert.equal(assessStateA({policy:{...stateA,confirmationSeconds:0,cooldownSeconds:60},priorConfirmedAt:'2026-09-15T23:59:30.000Z'}).detected,false);
+});
+test('State A pending state is position-local and an active close plan suppresses duplicate State A closes',()=>{
+  const positionA=assessStateA({observedAt:'2026-09-16T00:00:00.000Z'});
+  const positionB=assessStateA({observedAt:'2026-09-16T00:00:09.000Z'});
+  assert.equal(positionA.pending?.confirmationDueAt,'2026-09-16T00:00:30.000Z');
+  assert.equal(positionB.pending?.confirmationDueAt,'2026-09-16T00:00:39.000Z');
+  const confirmed=assessStateA({observedAt:'2026-09-16T00:00:30.000Z',priorPending:positionA.pending});
+  assert.equal(confirmed.detected,true);
+  const duplicate=assessStateA({observedAt:'2026-09-16T00:00:31.000Z',noActiveManagementPlan:false});
+  assert.equal(duplicate.detected,false);
+  assert.equal(duplicate.status,'NONE');
+});
+test('independent hard and emergency protections remain immediately actionable while State A is pending',()=>{
+  const pending=assessStateA();
+  assert.equal(pending.status,'PENDING');
+  const hard=assessLiveExit({policy:p,economics:e(-.13),liveControlPnl:meteoraLp(-.13),liveControlPnlFresh:true});
+  const emergency=assessLiveExit({policy:p,economics:e(-.21),liveControlPnl:meteoraLp(-.21),liveControlPnlFresh:true});
+  assert.equal(hard.action,'CLOSE');
+  assert.equal(emergency.action,'EMERGENCY_CLOSE');
 });
 test('hard stop uses only the fresh Meteora-compatible live control return',()=>{const r=assessLiveExit({policy:p,economics:e(-.13),lpPositionMtm:lp(-.30),lpPositionMtmFresh:true,liveControlPnl:meteoraLp(-.13),liveControlPnlFresh:true});assert.equal(r.action,'CLOSE');assert.ok(r.reasonCodes.includes('EXIT_HARD_POSITION_STOP_LOSS'));});
 test('fresh Meteora-compatible emergency stop overrides ordinary close',()=>{const r=assessLiveExit({policy:p,economics:e(-.21),lpPositionMtm:lp(-.01),lpPositionMtmFresh:true,liveControlPnl:meteoraLp(-.21),liveControlPnlFresh:true});assert.equal(r.action,'EMERGENCY_CLOSE');assert.equal(assessLiveExit({policy:p,economics:e(-.21),lpPositionMtm:lp(-.30),lpPositionMtmFresh:true}).action,'HOLD');});
