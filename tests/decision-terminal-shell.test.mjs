@@ -102,6 +102,27 @@ test('fills explicitly labels lifecycle status and preserves the live-versus-rea
   assert.match(output, /PROFIT GIVEBACK \/ TS-5/);
 });
 
+test('fills highlight settled outcomes as rows without promoting live PnL into an outcome state', () => {
+  const source = snapshot();
+  source.recentPositions[0] = { ...source.recentPositions[0], liveControlReturnFraction: -.024 };
+  source.recentPositions.push({
+    ...source.recentPositions[1], lifecycleId: 'closed:winner', poolDisplay: 'WINNER/SOL',
+    observedAt: '2026-09-11T08:00:00.000Z', realizedReturnFraction: .024
+  });
+  const output = terminal.renderDecisionTerminal(source, { columns: 220, rows: 50, color: true, positionFilter: 'ALL' });
+  const lines = output.split('\n');
+  const live = lines.find(line => line.includes('TOKEN/SOL'));
+  const loss = lines.find(line => line.includes('OTHER/SOL'));
+  const winner = lines.find(line => line.includes('WINNER/SOL'));
+  const red = '\u001b[38;5;204m';
+  const green = '\u001b[38;5;84m';
+
+  assert.ok(live && loss && winner);
+  assert.ok(loss.indexOf(red) < loss.indexOf('OTHER/SOL'), 'negative settled row is red from its start');
+  assert.ok(winner.indexOf(green) < winner.indexOf('WINNER/SOL'), 'positive settled row is green from its start');
+  assert.equal(live.slice(0, live.indexOf('TOKEN/SOL')).includes(red), false, 'a live row is not outcome-highlighted as a loss');
+});
+
 test('top status and current blocker keep entry authority, safety, watch pools, and RPC distinct', () => {
   const source = snapshot();
   source.health = { ...source.health, newEconomicActionAllowed: false, entryControlReasonCodes: ['P7_PORTFOLIO_DAILY_DRAWDOWN'], recoveryQueueCount: 3, unknownSubmissionCount: 1 };

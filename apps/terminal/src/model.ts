@@ -696,14 +696,23 @@ function recentPositionLines(snapshot: TerminalSnapshot, width: number, filter: 
     ? `${pad('TIME', 13)} ${pad('STATUS', 8)} ${pad('POOL', 10)} ${pad('RANGE', 13)} ${pad('RETURN', 10)} ${pad('LIVE PEAK', 9)} ${pad('PEAK GAP', 8)} PATH / RECORDED REASON`
     : `${pad('TIME', 13)} ${pad('STATUS', 10)} ${pad('POOL', 11)} ${pad('ENTRY RANGE', 13)} ${pad('EXIT TYPE', 14)} ${pad('RETURN', 10)} ${pad('LIVE-CONTROL PEAK', 17)} ${pad('PEAK GIVEBACK', 14)} ${pad('OBSERVED LOSS PATH', 22)} RECORDED EXIT/PROTECTION REASON`;
   return [paint(head, 'muted', color), ...rows.map(row => {
-    const value = row.state === 'OPEN' ? signedPercent(row.liveControlReturnFraction, color) : signedPercent(row.realizedReturnFraction, color);
-    const status = row.state === 'OPEN' ? paint('● LIVE', 'green', color) : paint('✓ CLOSED', 'muted', color);
+    const rawReturn = row.state === 'OPEN' ? row.liveControlReturnFraction : row.realizedReturnFraction;
+    const outcomeColor: 'red' | 'green' | undefined = row.state === 'CLOSED' && rawReturn !== undefined
+      ? rawReturn < 0 ? 'red' : rawReturn > 0 ? 'green' : undefined
+      : undefined;
+    // Closed rows receive a single outcome colour. Disable per-cell ANSI in
+    // that case so a nested reset cannot break the row-level highlight.
+    const cellColor = outcomeColor ? false : color;
+    const value = signedPercent(rawReturn, cellColor);
+    const status = row.state === 'OPEN' ? paint('● LIVE', 'green', color) : paint('✓ CLOSED', 'muted', cellColor);
     const range = row.entryRange || '—';
-    const peak = row.liveControlPeakReturnFraction === undefined ? paint('UNAVAILABLE', 'muted', color) : signedPercent(row.liveControlPeakReturnFraction, color);
-    const gap = row.liveControlPeakGivebackFraction === undefined ? paint('N/A', 'muted', color) : signedPercent(row.liveControlPeakGivebackFraction, color);
+    const peak = row.liveControlPeakReturnFraction === undefined ? paint('UNAVAILABLE', 'muted', cellColor) : signedPercent(row.liveControlPeakReturnFraction, cellColor);
+    const gap = row.liveControlPeakGivebackFraction === undefined ? paint('N/A', 'muted', cellColor) : signedPercent(row.liveControlPeakGivebackFraction, cellColor);
     const time = terminalTimestamp(row);
-    if (compact) return `${pad(time, 13)} ${pad(status, 8)} ${pad(row.poolDisplay, 10)} ${pad(range, 13)} ${pad(value, 10)} ${pad(peak, 9)} ${pad(gap, 8)} ${clip(row.state === 'OPEN' ? row.protectionUsed || 'LIVE' : `${row.lossClass || '—'} / ${row.protectionUsed || '—'}`, Math.max(8, width - 75))}`;
-    return `${pad(time, 13)} ${pad(status, 10)} ${pad(row.poolDisplay, 11)} ${pad(range, 13)} ${pad(row.exitReason || (row.state === 'OPEN' ? 'LIVE' : '—'), 14)} ${pad(value, 10)} ${pad(peak, 17)} ${pad(gap, 14)} ${pad(row.lossClass || '—', 22)} ${clip(row.protectionUsed || '—', Math.max(8, width - 144))}`;
+    const line = compact
+      ? `${pad(time, 13)} ${pad(status, 8)} ${pad(row.poolDisplay, 10)} ${pad(range, 13)} ${pad(value, 10)} ${pad(peak, 9)} ${pad(gap, 8)} ${clip(row.state === 'OPEN' ? row.protectionUsed || 'LIVE' : `${row.lossClass || '—'} / ${row.protectionUsed || '—'}`, Math.max(8, width - 75))}`
+      : `${pad(time, 13)} ${pad(status, 10)} ${pad(row.poolDisplay, 11)} ${pad(range, 13)} ${pad(row.exitReason || (row.state === 'OPEN' ? 'LIVE' : '—'), 14)} ${pad(value, 10)} ${pad(peak, 17)} ${pad(gap, 14)} ${pad(row.lossClass || '—', 22)} ${clip(row.protectionUsed || '—', Math.max(8, width - 144))}`;
+    return outcomeColor ? paint(line, outcomeColor, color) : line;
   })];
 }
 function entryBlockSummary(health: TerminalHealth): string | undefined {
