@@ -25,8 +25,11 @@ test('shell terminal renders the operator-intelligence panels from bounded read-
   assert.match(output, /LIVE PEAK/);
   assert.match(output, /PEAK GAP/);
   assert.match(output, /STATUS/);
+  assert.match(output, /LIFECYCLE TIME/);
   assert.match(output, /● LIVE/);
   assert.match(output, /✓ CLOSED/);
+  assert.match(output, /OPEN 10:00/);
+  assert.match(output, /CLOSED Sep 11 09:00/);
   assert.match(output, /LIVE \+2\.40%/);
   assert.match(output, /REALIZED -1\.37%/);
   assert.match(output, /PATH \/ RECORDED REASON/);
@@ -88,6 +91,9 @@ test('fills explicitly labels lifecycle status and preserves the live-versus-rea
 
   assert.ok(live >= 0 && closed > live, 'active lifecycles must render before settled history');
   assert.match(output, /STATUS/);
+  assert.match(output, /LIFECYCLE TIME/);
+  assert.match(output, /OPEN 10:00/);
+  assert.match(output, /CLOSED Sep 11 09:00/);
   assert.match(output, /LIVE \+2\.40%/);
   assert.match(output, /REALIZED -1\.37%/);
   assert.match(output, /TS-5 WATCH/);
