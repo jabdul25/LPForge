@@ -677,18 +677,20 @@ function engineLines(snapshot: TerminalSnapshot, width: number, color: boolean):
 function recentPositionLines(snapshot: TerminalSnapshot, width: number, filter: TerminalRenderOptions['positionFilter'], color: boolean): string[] {
   const rows = snapshot.recentPositions.filter(row => !filter || filter === 'ALL' || row.state === filter).slice(0, 8);
   if (!rows.length) return [paint('No matching canonical lifecycle.', 'muted', color)];
-  const compact = width < 108;
+  const compact = width < 154;
   const head = compact
-    ? `${pad('POOL', 12)} ${pad('RANGE', 13)} ${pad('RETURN', 10)} ${pad('LIVE PEAK', 10)} ${pad('PEAK GAP', 10)} PATH / RECORDED REASON`
-    : `${pad('TIME', 8)} ${pad('POOL', 11)} ${pad('ENTRY RANGE', 13)} ${pad('EXIT TYPE', 14)} ${pad('RETURN', 10)} ${pad('LIVE-CONTROL PEAK', 17)} ${pad('PEAK GIVEBACK', 14)} ${pad('OBSERVED LOSS PATH', 22)} RECORDED EXIT/PROTECTION REASON`;
+    ? `${pad('STATUS', 9)} ${pad('POOL', 12)} ${pad('RANGE', 13)} ${pad('RETURN', 16)} ${pad('LIVE PEAK', 10)} ${pad('PEAK GAP', 10)} PATH / RECORDED REASON`
+    : `${pad('TIME', 8)} ${pad('STATUS', 10)} ${pad('POOL', 11)} ${pad('ENTRY RANGE', 13)} ${pad('EXIT TYPE', 14)} ${pad('RETURN (LIVE/REALIZED)', 22)} ${pad('LIVE-CONTROL PEAK', 17)} ${pad('PEAK GIVEBACK', 14)} ${pad('OBSERVED LOSS PATH', 22)} RECORDED EXIT/PROTECTION REASON`;
   return [paint(head, 'muted', color), ...rows.map(row => {
     const value = row.state === 'OPEN' ? signedPercent(row.liveControlReturnFraction, color) : signedPercent(row.realizedReturnFraction, color);
+    const status = row.state === 'OPEN' ? paint('● LIVE', 'green', color) : paint('✓ CLOSED', 'muted', color);
+    const returnLabel = `${row.state === 'OPEN' ? 'LIVE' : 'REALIZED'} ${value}`;
     const range = row.entryRange || '—';
     const peak = row.liveControlPeakReturnFraction === undefined ? paint('UNAVAILABLE', 'muted', color) : signedPercent(row.liveControlPeakReturnFraction, color);
     const gap = row.liveControlPeakGivebackFraction === undefined ? paint('N/A', 'muted', color) : signedPercent(row.liveControlPeakGivebackFraction, color);
-    if (compact) return `${pad(row.poolDisplay, 12)} ${pad(range, 13)} ${pad(value, 10)} ${pad(peak, 10)} ${pad(gap, 10)} ${clip(row.state === 'OPEN' ? row.protectionUsed || 'LIVE' : `${row.lossClass || '—'} / ${row.protectionUsed || '—'}`, Math.max(8, width - 62))}`;
+    if (compact) return `${pad(status, 9)} ${pad(row.poolDisplay, 12)} ${pad(range, 13)} ${pad(returnLabel, 16)} ${pad(peak, 10)} ${pad(gap, 10)} ${clip(row.state === 'OPEN' ? row.protectionUsed || 'LIVE' : `${row.lossClass || '—'} / ${row.protectionUsed || '—'}`, Math.max(8, width - 79))}`;
     const time = new Date(row.observedAt).toISOString().slice(5, 16).replace('T', ' ');
-    return `${pad(time, 8)} ${pad(row.poolDisplay, 11)} ${pad(range, 13)} ${pad(row.exitReason || (row.state === 'OPEN' ? 'LIVE' : '—'), 14)} ${pad(value, 10)} ${pad(peak, 17)} ${pad(gap, 14)} ${pad(row.lossClass || '—', 22)} ${clip(row.protectionUsed || '—', Math.max(8, width - 124))}`;
+    return `${pad(time, 8)} ${pad(status, 10)} ${pad(row.poolDisplay, 11)} ${pad(range, 13)} ${pad(row.exitReason || (row.state === 'OPEN' ? 'LIVE' : '—'), 14)} ${pad(returnLabel, 22)} ${pad(peak, 17)} ${pad(gap, 14)} ${pad(row.lossClass || '—', 22)} ${clip(row.protectionUsed || '—', Math.max(8, width - 151))}`;
   })];
 }
 function entryBlockSummary(health: TerminalHealth): string | undefined {

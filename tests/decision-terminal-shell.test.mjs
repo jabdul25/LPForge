@@ -22,9 +22,14 @@ test('shell terminal renders the operator-intelligence panels from bounded read-
   const output = terminal.renderDecisionTerminal(snapshot(), { columns: 220, color: false, eventFilter: 'ALL', positionFilter: 'ALL' });
   for (const heading of ['LPFORGE DECISION TERMINAL', 'DECISION PIPELINE', 'CURRENT BLOCKER', 'ECONOMIC ENGINE', 'CANDIDATE PIPELINE', 'RANGE MONITOR', 'POSITION HEALTH', 'FILLS / RECENT POSITIONS', 'EVENT STREAM', 'TODAY', 'SYSTEM HEALTH']) assert.match(output, new RegExp(heading));
   assert.match(output, /ACTIVE POLICY 60–100 bins/);
-  assert.match(output, /LIVE-CONTROL PEAK/);
-  assert.match(output, /PEAK GIVEBACK/);
-  assert.match(output, /OBSERVED LOSS PATH/);
+  assert.match(output, /LIVE PEAK/);
+  assert.match(output, /PEAK GAP/);
+  assert.match(output, /STATUS/);
+  assert.match(output, /● LIVE/);
+  assert.match(output, /✓ CLOSED/);
+  assert.match(output, /LIVE \+2\.40%/);
+  assert.match(output, /REALIZED -1\.37%/);
+  assert.match(output, /PATH \/ RECORDED REASON/);
   assert.match(output, /TS-5/);
   assert.match(output, /NET PNL/);
   for (const field of ['P7 MODE', 'P7 HEALTH', 'SAFETY', 'NEW ENTRIES', 'RPC PRODUCTION', 'RPC DISCOVERY', 'RPC EXECUTION', 'RECOVERY QUEUE', 'UNKNOWN TX', 'ACTIVE PLANS', 'PARTIAL ENTRY', 'INCIDENTS', 'TELEGRAM', 'RELEASE SHA']) assert.match(output, new RegExp(field));
@@ -74,6 +79,19 @@ test('recent-position ordering always keeps live positions before newer settled 
 
   assert.deepEqual(ordered.map(position => position.lifecycleId), [live.lifecycleId, newerClosed.lifecycleId, closed.lifecycleId]);
   assert.deepEqual(source.recentPositions.map(position => position.lifecycleId), [live.lifecycleId, closed.lifecycleId]);
+});
+
+test('fills explicitly labels lifecycle status and preserves the live-versus-realized return authority', () => {
+  const output = terminal.renderDecisionTerminal(snapshot(), { columns: 220, rows: 50, color: false, positionFilter: 'ALL' });
+  const live = output.indexOf('● LIVE');
+  const closed = output.indexOf('✓ CLOSED');
+
+  assert.ok(live >= 0 && closed > live, 'active lifecycles must render before settled history');
+  assert.match(output, /STATUS/);
+  assert.match(output, /LIVE \+2\.40%/);
+  assert.match(output, /REALIZED -1\.37%/);
+  assert.match(output, /TS-5 WATCH/);
+  assert.match(output, /PROFIT GIVEBACK \/ TS-5/);
 });
 
 test('top status and current blocker keep entry authority, safety, watch pools, and RPC distinct', () => {
