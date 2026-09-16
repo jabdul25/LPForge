@@ -240,7 +240,7 @@ export function operatorVisibleCandidateReasonCodes(candidate: TerminalCandidate
 }
 
 const ansi = {
-  reset: '\u001b[0m', bold: '\u001b[1m', dim: '\u001b[2m', lime: '\u001b[38;5;154m', green: '\u001b[38;5;84m', cyan: '\u001b[38;5;80m', amber: '\u001b[38;5;220m', magenta: '\u001b[38;5;205m', red: '\u001b[38;5;204m', gray: '\u001b[38;5;250m', muted: '\u001b[38;5;245m'
+  reset: '\u001b[0m', bold: '\u001b[1m', dim: '\u001b[2m', lime: '\u001b[38;5;154m', green: '\u001b[38;5;84m', cyan: '\u001b[38;5;80m', amber: '\u001b[38;5;220m', magenta: '\u001b[38;5;205m', red: '\u001b[31m', gray: '\u001b[38;5;250m', muted: '\u001b[38;5;245m'
 } as const;
 
 function paint(value: string, color: keyof typeof ansi, enabled: boolean): string {

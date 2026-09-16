@@ -114,7 +114,7 @@ test('fills highlight every negative return and settled positive outcomes as row
   const live = lines.find(line => line.includes('TOKEN/SOL'));
   const loss = lines.find(line => line.includes('OTHER/SOL'));
   const winner = lines.find(line => line.includes('WINNER/SOL'));
-  const red = '\u001b[38;5;204m';
+  const red = '\u001b[31m';
   const green = '\u001b[38;5;84m';
 
   assert.ok(live && loss && winner);
