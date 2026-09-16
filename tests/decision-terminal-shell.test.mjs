@@ -121,6 +121,10 @@ test('fills highlight every negative return and settled positive outcomes as row
   assert.ok(live.indexOf(red) < live.indexOf('TOKEN/SOL'), 'negative live row is red from its start');
   assert.ok(loss.indexOf(red) < loss.indexOf('OTHER/SOL'), 'negative settled row is red from its start');
   assert.ok(winner.indexOf(green) < winner.indexOf('WINNER/SOL'), 'positive settled row is green from its start');
+
+  const narrowOutput = terminal.renderDecisionTerminal(source, { columns: 160, rows: 50, color: true, positionFilter: 'ALL' });
+  const narrowLoss = narrowOutput.split('\n').find(line => line.includes('OTHER/SOL'));
+  assert.ok(narrowLoss && narrowLoss.indexOf(red) < narrowLoss.indexOf('OTHER/SOL'), 'a clipped negative row preserves its red styling');
 });
 
 test('top status and current blocker keep entry authority, safety, watch pools, and RPC distinct', () => {

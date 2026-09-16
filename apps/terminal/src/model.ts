@@ -251,7 +251,29 @@ function visible(value: string): string { return value.replace(/\u001b\[[0-9;]*m
 function clip(value: string, width: number): string {
   if (width <= 0) return '';
   const raw = visible(value);
-  return raw.length <= width ? value : `${raw.slice(0, Math.max(0, width - 1))}…`;
+  if (raw.length <= width) return value;
+
+  // Preserve display attributes while truncating. The prior implementation
+  // truncated `visible(value)`, silently removing ANSI colour from long rows
+  // such as FILLS even though short metrics (for example AVERAGE LOSS) kept
+  // their negative-return colour.
+  const limit = Math.max(0, width - 1);
+  const tokens = value.match(/\u001b\[[0-9;]*m|[\s\S]/g) || [];
+  let clipped = '';
+  let displayed = 0;
+  let styleActive = false;
+  for (const token of tokens) {
+    if (token.startsWith('\u001b[')) {
+      if (displayed >= limit) break;
+      clipped += token;
+      styleActive = token !== ansi.reset;
+      continue;
+    }
+    if (displayed >= limit) break;
+    clipped += token;
+    displayed += 1;
+  }
+  return `${clipped}…${styleActive ? ansi.reset : ''}`;
 }
 function pad(value: string, width: number): string {
   const clipped = clip(value, width);
