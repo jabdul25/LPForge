@@ -102,7 +102,7 @@ test('fills explicitly labels lifecycle status and preserves the live-versus-rea
   assert.match(output, /PROFIT GIVEBACK \/ TS-5/);
 });
 
-test('fills highlight settled outcomes as rows without promoting live PnL into an outcome state', () => {
+test('fills highlight every negative return and settled positive outcomes as rows', () => {
   const source = snapshot();
   source.recentPositions[0] = { ...source.recentPositions[0], liveControlReturnFraction: -.024 };
   source.recentPositions.push({
@@ -118,9 +118,9 @@ test('fills highlight settled outcomes as rows without promoting live PnL into a
   const green = '\u001b[38;5;84m';
 
   assert.ok(live && loss && winner);
+  assert.ok(live.indexOf(red) < live.indexOf('TOKEN/SOL'), 'negative live row is red from its start');
   assert.ok(loss.indexOf(red) < loss.indexOf('OTHER/SOL'), 'negative settled row is red from its start');
   assert.ok(winner.indexOf(green) < winner.indexOf('WINNER/SOL'), 'positive settled row is green from its start');
-  assert.equal(live.slice(0, live.indexOf('TOKEN/SOL')).includes(red), false, 'a live row is not outcome-highlighted as a loss');
 });
 
 test('top status and current blocker keep entry authority, safety, watch pools, and RPC distinct', () => {

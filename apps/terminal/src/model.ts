@@ -697,14 +697,16 @@ function recentPositionLines(snapshot: TerminalSnapshot, width: number, filter: 
     : `${pad('TIME', 13)} ${pad('STATUS', 10)} ${pad('POOL', 11)} ${pad('ENTRY RANGE', 13)} ${pad('EXIT TYPE', 14)} ${pad('RETURN', 10)} ${pad('LIVE-CONTROL PEAK', 17)} ${pad('PEAK GIVEBACK', 14)} ${pad('OBSERVED LOSS PATH', 22)} RECORDED EXIT/PROTECTION REASON`;
   return [paint(head, 'muted', color), ...rows.map(row => {
     const rawReturn = row.state === 'OPEN' ? row.liveControlReturnFraction : row.realizedReturnFraction;
-    const outcomeColor: 'red' | 'green' | undefined = row.state === 'CLOSED' && rawReturn !== undefined
-      ? rawReturn < 0 ? 'red' : rawReturn > 0 ? 'green' : undefined
+    const outcomeColor: 'red' | 'green' | undefined = rawReturn !== undefined
+      ? rawReturn < 0 ? 'red' : row.state === 'CLOSED' && rawReturn > 0 ? 'green' : undefined
       : undefined;
-    // Closed rows receive a single outcome colour. Disable per-cell ANSI in
-    // that case so a nested reset cannot break the row-level highlight.
+    // Every negative return is a single red row; settled gains are green.
+    // Disable per-cell ANSI in that case so a nested reset cannot break it.
     const cellColor = outcomeColor ? false : color;
     const value = signedPercent(rawReturn, cellColor);
-    const status = row.state === 'OPEN' ? paint('● LIVE', 'green', color) : paint('✓ CLOSED', 'muted', cellColor);
+    const status = row.state === 'OPEN'
+      ? paint('● LIVE', outcomeColor ? 'red' : 'green', cellColor)
+      : paint('✓ CLOSED', 'muted', cellColor);
     const range = row.entryRange || '—';
     const peak = row.liveControlPeakReturnFraction === undefined ? paint('UNAVAILABLE', 'muted', cellColor) : signedPercent(row.liveControlPeakReturnFraction, cellColor);
     const gap = row.liveControlPeakGivebackFraction === undefined ? paint('N/A', 'muted', cellColor) : signedPercent(row.liveControlPeakGivebackFraction, cellColor);
