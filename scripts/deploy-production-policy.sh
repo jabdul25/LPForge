@@ -138,7 +138,7 @@ if [[ " ${requested_services[*]} " == *' production '* || " ${requested_services
   terminal_ready=false
   for attempt in $(seq 1 12); do
     terminal_output="$(cd "$new_release" && timeout 20 bash scripts/start-lpforge-service.sh terminal --once --plain)" || terminal_output=""
-    if grep -q 'P7 HEALTHY' <<<"$terminal_output" && grep -Eq 'P6 EXECUTION[[:space:]]+READY' <<<"$terminal_output"; then
+    if grep -Eq 'P7 HEALTH[[:space:]]+HEALTHY' <<<"$terminal_output" && grep -Eq 'RECOVERY QUEUE[[:space:]]+0[[:space:]]+\|[[:space:]]+UNKNOWN TX[[:space:]]+0' <<<"$terminal_output" && grep -Eq 'PARTIAL ENTRY[[:space:]]+0' <<<"$terminal_output"; then
       terminal_ready=true
       break
     fi
