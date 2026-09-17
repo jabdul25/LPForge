@@ -87,6 +87,9 @@ if [[ "$dry_run" == true ]]; then
   exit 0
 fi
 
+fail_stage="BUILD_TEST_ARTIFACTS"
+pnpm build
+
 fail_stage="FOCUSED_VALIDATION"
 test_files=(tests/central-runtime-config.test.mjs tests/runtime-release-identity.test.mjs)
 for service in "${requested_services[@]}"; do

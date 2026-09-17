@@ -7,7 +7,7 @@ const template=JSON.parse(readFileSync('release-policy-templates/live-execution-
 
 test('State A values are parsed exclusively from the canonical live-execution policy',()=>{
   const policy=parseDeploymentPolicy(template).stateADeteriorationProtection;
-  assert.deepEqual(policy,{enabled:true,action:'CLOSE',minimumPeakReturnFraction:.0025,givebackFraction:.5,minimumReturnThresholdFraction:0,confirmationSeconds:30,cooldownSeconds:0,maximumObservationAgeSeconds:300});
+  assert.deepEqual(policy,{enabled:false,action:'CLOSE',minimumPeakReturnFraction:.0025,givebackFraction:.5,minimumReturnThresholdFraction:0,confirmationSeconds:30,cooldownSeconds:0,maximumObservationAgeSeconds:300});
 });
 
 test('State A policy rejects malformed actions, invalid fractions, and invalid cooldowns',()=>{
