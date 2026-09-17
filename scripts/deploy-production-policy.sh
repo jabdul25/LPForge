@@ -135,9 +135,16 @@ const live=JSON.parse(fs.readFileSync(`${runtime}/live-execution-policy.json`,'u
 console.log(`LPFORGE_POLICY_DEPLOY_RUNTIME min=${live.range.minimumIncludedBins} max=${live.positionConstruction.maxInitialPositionWidthBins} release=${manifest.sourceCommit}`);
 NODE
 if [[ " ${requested_services[*]} " == *' production '* || " ${requested_services[*]} " == *' execution '* ]]; then
-  terminal_output="$(cd "$new_release" && timeout 20 bash scripts/start-lpforge-service.sh terminal --once --plain)" || die 'terminal health verification failed'
-  grep -q 'P7 HEALTHY' <<<"$terminal_output" || die 'P7 health verification failed'
-  grep -Eq 'P6 EXECUTION[[:space:]]+READY' <<<"$terminal_output" || die 'P6 health verification failed'
+  terminal_ready=false
+  for attempt in $(seq 1 12); do
+    terminal_output="$(cd "$new_release" && timeout 20 bash scripts/start-lpforge-service.sh terminal --once --plain)" || terminal_output=""
+    if grep -q 'P7 HEALTHY' <<<"$terminal_output" && grep -Eq 'P6 EXECUTION[[:space:]]+READY' <<<"$terminal_output"; then
+      terminal_ready=true
+      break
+    fi
+    [[ "$attempt" -lt 12 ]] && sleep 5
+  done
+  [[ "$terminal_ready" == true ]] || die 'P7/P6 terminal health verification failed after readiness wait'
 fi
 
 rollback_required=false
