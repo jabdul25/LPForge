@@ -715,8 +715,8 @@ function recentPositionLines(snapshot: TerminalSnapshot, width: number, filter: 
   if (!rows.length) return [paint('No matching canonical lifecycle.', 'muted', color)];
   const compact = width < 154;
   const head = compact
-    ? `${pad('TIME', 13)} ${pad('STATUS', 8)} ${pad('POOL', 10)} ${pad('RANGE', 13)} ${pad('RETURN', 10)} ${pad('LIVE PEAK', 9)} ${pad('PEAK GAP', 8)} PATH / RECORDED REASON`
-    : `${pad('TIME', 13)} ${pad('STATUS', 10)} ${pad('POOL', 11)} ${pad('ENTRY RANGE', 13)} ${pad('EXIT TYPE', 14)} ${pad('RETURN', 10)} ${pad('LIVE-CONTROL PEAK', 17)} ${pad('PEAK GIVEBACK', 14)} ${pad('OBSERVED LOSS PATH', 22)} RECORDED EXIT/PROTECTION REASON`;
+    ? `${pad('TIME', 13)} ${pad('STATUS', 8)} ${pad('POOL', 10)} ${pad('RANGE', 13)} ${pad('RETURN', 10)} ${pad('LIVE PEAK', 9)} ${pad('FEES SOL', 9)} PATH / RECORDED REASON`
+    : `${pad('TIME', 13)} ${pad('STATUS', 10)} ${pad('POOL', 11)} ${pad('ENTRY RANGE', 13)} ${pad('EXIT TYPE', 14)} ${pad('RETURN', 10)} ${pad('LIVE-CONTROL PEAK', 17)} ${pad('FEES EARNED SOL', 16)} ${pad('OBSERVED LOSS PATH', 22)} RECORDED EXIT/PROTECTION REASON`;
   return [paint(head, 'muted', color), ...rows.map(row => {
     const rawReturn = row.state === 'OPEN' ? row.liveControlReturnFraction : row.realizedReturnFraction;
     const outcomeColor: 'red' | 'green' | undefined = rawReturn !== undefined
@@ -731,11 +731,11 @@ function recentPositionLines(snapshot: TerminalSnapshot, width: number, filter: 
       : paint('✓ CLOSED', 'muted', cellColor);
     const range = row.entryRange || '—';
     const peak = row.liveControlPeakReturnFraction === undefined ? paint('UNAVAILABLE', 'muted', cellColor) : signedPercent(row.liveControlPeakReturnFraction, cellColor);
-    const gap = row.liveControlPeakGivebackFraction === undefined ? paint('N/A', 'muted', cellColor) : signedPercent(row.liveControlPeakGivebackFraction, cellColor);
+    const fees = row.feeLamports === undefined ? paint('N/A', 'muted', cellColor) : (Number(row.feeLamports) / 1_000_000_000).toFixed(5);
     const time = terminalTimestamp(row);
     const line = compact
-      ? `${pad(time, 13)} ${pad(status, 8)} ${pad(row.poolDisplay, 10)} ${pad(range, 13)} ${pad(value, 10)} ${pad(peak, 9)} ${pad(gap, 8)} ${clip(row.state === 'OPEN' ? row.protectionUsed || 'LIVE' : `${row.lossClass || '—'} / ${row.protectionUsed || '—'}`, Math.max(8, width - 75))}`
-      : `${pad(time, 13)} ${pad(status, 10)} ${pad(row.poolDisplay, 11)} ${pad(range, 13)} ${pad(row.exitReason || (row.state === 'OPEN' ? 'LIVE' : '—'), 14)} ${pad(value, 10)} ${pad(peak, 17)} ${pad(gap, 14)} ${pad(row.lossClass || '—', 22)} ${clip(row.protectionUsed || '—', Math.max(8, width - 144))}`;
+      ? `${pad(time, 13)} ${pad(status, 8)} ${pad(row.poolDisplay, 10)} ${pad(range, 13)} ${pad(value, 10)} ${pad(peak, 9)} ${pad(fees, 9)} ${clip(row.state === 'OPEN' ? row.protectionUsed || 'LIVE' : `${row.lossClass || '—'} / ${row.protectionUsed || '—'}`, Math.max(8, width - 75))}`
+      : `${pad(time, 13)} ${pad(status, 10)} ${pad(row.poolDisplay, 11)} ${pad(range, 13)} ${pad(row.exitReason || (row.state === 'OPEN' ? 'LIVE' : '—'), 14)} ${pad(value, 10)} ${pad(peak, 17)} ${pad(fees, 16)} ${pad(row.lossClass || '—', 22)} ${clip(row.protectionUsed || '—', Math.max(8, width - 144))}`;
     return outcomeColor ? paint(line, outcomeColor, color) : line;
   })];
 }
