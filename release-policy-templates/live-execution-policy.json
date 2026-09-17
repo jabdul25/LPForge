@@ -37,7 +37,7 @@
   "stateADeteriorationProtection": {
     "enabled": true,
     "action": "CLOSE",
-    "minimumPeakReturnFraction": 0,
+    "minimumPeakReturnFraction": 0.0025,
     "givebackFraction": 0.5,
     "minimumReturnThresholdFraction": 0,
     "confirmationSeconds": 30,
