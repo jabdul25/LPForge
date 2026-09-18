@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {assessLiveExit,derivePositionEconomics,parseLiveExitGovernorPolicy} from '../.build/packages/live-exit-governor/src/index.js';
-import {assessOpenChunkConstruction,assessTerminalPartialOpenRecovery,assessTerminalPartialOpenResidualLot,classifyKnownOpenChunkSignatureTruth,shouldRebroadcastKnownOpenChunk} from '../.build/packages/phase6-live-worker/src/index.js';
+import {assessOpenChunkConstruction,assessTerminalPartialOpenRecovery,assessTerminalPartialOpenResidualLot,classifyKnownOpenChunkSignatureTruth,isExpiredUnsignedOpenChunk,shouldRebroadcastKnownOpenChunk} from '../.build/packages/phase6-live-worker/src/index.js';
 
 const sol='So11111111111111111111111111111111111111112';
 const policy=parseLiveExitGovernorPolicy({schemaVersion:1,enabled:true,hardStopLossFraction:.12,emergencyStopLossFraction:.20,takeProfitFraction:0,profitProtection:{enabled:true,triggerFraction:.08,maxGivebackFraction:.05,minRetainedProfitFraction:.02},profitRetention:{enabled:true,policyVersion:'profit-retention-ts5-oor-p4-v1',ts5:{enabled:true,mfeActivationFraction:.04,givebackFraction:.02,watchSeconds:300,lowerRangeFraction:1/3,model:'EXPIRE_REARM',previousUsableMaxAgeSeconds:300},oorP4:{enabled:true,mfeActivationFraction:.02,requiresBelowMin:true,requiresTokenExposure:true}},closeOnThesisInvalidated:true,closeOnNonPositiveForwardEv:true,reduceOnRiskBlock:true,reduceFraction:.5,maxHoldMinutes:0,maxHoldRequiresNonPositiveForwardEv:true,toxicityCloseThreshold:.8,toxicityEmergencyThreshold:.95});
@@ -32,6 +32,13 @@ test('only fully terminal missing children may become OPEN_RECOVERED',()=>{
   assert.equal(recovered.eligible,true);
   const unknown=assessTerminalPartialOpenRecovery({planned,dispositions:[{transactionId:'chunk-1',disposition:'CONFIRMED'},{transactionId:'chunk-2',disposition:'UNKNOWN_SUBMISSION'}]});
   assert.equal(unknown.eligible,false);assert.ok(unknown.reasonCodes.includes('P6_OPEN_RECOVERED_CHILD_CHAIN_TRUTH_UNRESOLVED'));
+});
+
+test('an unsigned pending child becomes no-effect only after its parent plan expires',()=>{
+  const base={disposition:'PENDING',signature:undefined,planExpiresAt:'2026-09-18T02:04:30.559Z'};
+  assert.equal(isExpiredUnsignedOpenChunk({...base,observedAt:'2026-09-18T02:04:30.558Z'}),false);
+  assert.equal(isExpiredUnsignedOpenChunk({...base,observedAt:'2026-09-18T02:04:30.559Z'}),true);
+  assert.equal(isExpiredUnsignedOpenChunk({...base,signature:'signed-child',observedAt:'2026-09-18T03:00:00.000Z'}),false);
 });
 
 test('only the exact signed UNKNOWN chunk is eligible for a bounded rebroadcast',()=>{

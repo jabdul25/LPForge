@@ -370,6 +370,18 @@ export function assessTerminalPartialOpenRecovery(input:{
 }
 
 /**
+ * A recovery row means the parent OPEN has already left its normal execution
+ * path. An unsigned PENDING child after that parent's immutable expiry has
+ * no transaction identity, hence no possible chain effect to reconcile. It
+ * may safely become terminal no-effect evidence; this never signs, submits,
+ * or retries the missing liquidity child.
+ */
+export function isExpiredUnsignedOpenChunk(input:{disposition:string;signature?:string|undefined;planExpiresAt:string;observedAt:string}):boolean{
+  const expiresAt=Date.parse(input.planExpiresAt),observedAt=Date.parse(input.observedAt);
+  return input.disposition==='PENDING'&&!input.signature&&Number.isFinite(expiresAt)&&Number.isFinite(observedAt)&&observedAt>=expiresAt;
+}
+
+/**
  * Rebroadcasting is only permitted for the exact already-signed wire payload.
  * It is not a re-sign/rebuild path and therefore cannot create a second
  * economic chunk.  Terminal confirmation always wins over retransmission.
@@ -2554,17 +2566,23 @@ async function refreshTerminalOpenChunkTruth(input:{
   store:Phase1Store;
   config:LiveWorkerConfig;
   planId:string;
+  planExpiresAt:string;
   dispositions:OpenChunkDispositionRecord[];
 }):Promise<OpenChunkDispositionRecord[]>{
+  const observedAt=new Date().toISOString();
+  for(const candidate of input.dispositions)if(isExpiredUnsignedOpenChunk({disposition:candidate.disposition,signature:candidate.signature,planExpiresAt:input.planExpiresAt,observedAt})){
+    await input.store.upsertOpenChunkDisposition({...candidate,disposition:'EXPIRED_PRE_SUBMISSION',observedAt,payload:{...candidate.payload,recovery:'P6_OPEN_CHUNK_EXPIRED_PRE_SUBMISSION_NO_CHAIN_EFFECT'}});
+  }
+  const refreshed=await input.store.loadOpenChunkDispositions(input.planId);
   const candidates=input.dispositions.filter(row=>
     ['PENDING','SIGNING','SIGNED','SUBMITTED','UNKNOWN_SUBMISSION'].includes(row.disposition)&&
     Boolean(row.signature)&&
     row.lastValidBlockHeight!==undefined,
   );
-  if(candidates.length===0)return input.dispositions;
+  if(candidates.length===0)return refreshed;
   const connection=createGovernedConnection({rpcUrl:input.config.rpcUrl,priority:'P1_RECOVERY_CRITICAL'});
   let currentBlockHeight:number;
-  try{currentBlockHeight=await connection.getBlockHeight('confirmed');}catch{return input.dispositions;}
+  try{currentBlockHeight=await connection.getBlockHeight('confirmed');}catch{return refreshed;}
   for(const candidate of candidates){
     let status:Awaited<ReturnType<typeof connection.getSignatureStatus>>['value'];
     try{status=(await connection.getSignatureStatus(candidate.signature!,{searchTransactionHistory:true})).value;}catch{continue;}
@@ -2670,7 +2688,7 @@ export async function recoverPartialEntryFunding(input: {
       continue;
     }
     if(plan?.action==='OPEN'&&construction&&!construction.fullyConstructed){
-      const refreshedDispositions=await refreshTerminalOpenChunkTruth({store:input.store,config:input.config,planId,dispositions:await input.store.loadOpenChunkDispositions(planId)}),refreshedConstruction=assessOpenChunkConstruction({planned:plannedChunks,dispositions:refreshedDispositions}),terminal=assessTerminalPartialOpenRecovery({planned:plannedChunks,dispositions:refreshedDispositions});
+      const refreshedDispositions=await refreshTerminalOpenChunkTruth({store:input.store,config:input.config,planId,planExpiresAt:plan.expiresAt,dispositions:await input.store.loadOpenChunkDispositions(planId)}),refreshedConstruction=assessOpenChunkConstruction({planned:plannedChunks,dispositions:refreshedDispositions}),terminal=assessTerminalPartialOpenRecovery({planned:plannedChunks,dispositions:refreshedDispositions});
       if(refreshedConstruction.fullyConstructed){
         const recovered=await reconcileRecoveredChunkedOpen({store:input.store,config:input.config,row,plan,dispositions:refreshedDispositions,partial:false});
         results.push({planId,action:'HOLD',reasonCodes:recovered.reasonCodes});
