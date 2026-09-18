@@ -2463,6 +2463,16 @@ async function unwindPartialEntry(input: {
   });
 }
 
+/** A partial-entry payload may retain the generated position address after an
+ * interrupted parent plan. It is only a recovery candidate: callers must
+ * still prove owner, pool, and geometry against current chain truth. */
+export function partialRecoveryPositionAddress(input:{planPositionAddress?:string|undefined;recoveryPayload?:unknown}):string|undefined{
+  const fromPlan=typeof input.planPositionAddress==='string'&&input.planPositionAddress.trim()?input.planPositionAddress.trim():undefined;
+  if(fromPlan)return fromPlan;
+  const payload=input.recoveryPayload&&typeof input.recoveryPayload==='object'&&!Array.isArray(input.recoveryPayload)?input.recoveryPayload as Record<string,unknown>:{};
+  return typeof payload.positionAddress==='string'&&payload.positionAddress.trim()?payload.positionAddress.trim():undefined;
+}
+
 /**
  * Reconciles a recovered chunked position from its original signed children.
  * A fully confirmed construction becomes a normal OPEN; a provably missing
@@ -2477,7 +2487,7 @@ async function reconcileRecoveredChunkedOpen(input:{
   dispositions:OpenChunkDispositionRecord[];
   partial:boolean;
 }):Promise<{recovered:boolean;reasonCodes:string[]}>{
-  const positionAddress=input.plan.positionAddress;
+  const positionAddress=partialRecoveryPositionAddress({planPositionAddress:input.plan.positionAddress,recoveryPayload:input.row.payload});
   if(!positionAddress)return{recovered:false,reasonCodes:['P6_OPEN_RECOVERED_POSITION_IDENTITY_MISSING']};
   const intended=(input.row.intended_range??{}) as Record<string,unknown>;
   const lower=Number(intended.lowerBinId),upper=Number(intended.upperBinId);

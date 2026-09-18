@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {assessLiveExit,derivePositionEconomics,parseLiveExitGovernorPolicy} from '../.build/packages/live-exit-governor/src/index.js';
 import {toIsoTimestamp} from '../.build/packages/db/src/index.js';
-import {assessOpenChunkConstruction,assessTerminalPartialOpenRecovery,assessTerminalPartialOpenResidualLot,classifyKnownOpenChunkSignatureTruth,isExpiredUnsignedOpenChunk,shouldRebroadcastKnownOpenChunk} from '../.build/packages/phase6-live-worker/src/index.js';
+import {assessOpenChunkConstruction,assessTerminalPartialOpenRecovery,assessTerminalPartialOpenResidualLot,classifyKnownOpenChunkSignatureTruth,isExpiredUnsignedOpenChunk,partialRecoveryPositionAddress,shouldRebroadcastKnownOpenChunk} from '../.build/packages/phase6-live-worker/src/index.js';
 
 const sol='So11111111111111111111111111111111111111112';
 const policy=parseLiveExitGovernorPolicy({schemaVersion:1,enabled:true,hardStopLossFraction:.12,emergencyStopLossFraction:.20,takeProfitFraction:0,profitProtection:{enabled:true,triggerFraction:.08,maxGivebackFraction:.05,minRetainedProfitFraction:.02},profitRetention:{enabled:true,policyVersion:'profit-retention-ts5-oor-p4-v1',ts5:{enabled:true,mfeActivationFraction:.04,givebackFraction:.02,watchSeconds:300,lowerRangeFraction:1/3,model:'EXPIRE_REARM',previousUsableMaxAgeSeconds:300},oorP4:{enabled:true,mfeActivationFraction:.02,requiresBelowMin:true,requiresTokenExposure:true}},closeOnThesisInvalidated:true,closeOnNonPositiveForwardEv:true,reduceOnRiskBlock:true,reduceFraction:.5,maxHoldMinutes:0,maxHoldRequiresNonPositiveForwardEv:true,toxicityCloseThreshold:.8,toxicityEmergencyThreshold:.95});
@@ -45,6 +45,12 @@ test('an unsigned pending child becomes no-effect only after its parent plan exp
 test('partial-entry recovery serializes PostgreSQL Date funding provenance as ISO',()=>{
   const fundedAt=new Date('2026-09-18T01:59:50.121Z');
   assert.equal(toIsoTimestamp(fundedAt),'2026-09-18T01:59:50.121Z');
+});
+
+test('partial-entry recovery treats the persisted address as a candidate only when the plan lacks one',()=>{
+  assert.equal(partialRecoveryPositionAddress({planPositionAddress:'plan-address',recoveryPayload:{positionAddress:'payload-address'}}),'plan-address');
+  assert.equal(partialRecoveryPositionAddress({recoveryPayload:{positionAddress:'payload-address'}}),'payload-address');
+  assert.equal(partialRecoveryPositionAddress({recoveryPayload:{positionAddress:'  '}}),undefined);
 });
 
 test('only the exact signed UNKNOWN chunk is eligible for a bounded rebroadcast',()=>{
