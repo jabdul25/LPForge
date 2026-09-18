@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {assessLiveExit,derivePositionEconomics,parseLiveExitGovernorPolicy} from '../.build/packages/live-exit-governor/src/index.js';
+import {toIsoTimestamp} from '../.build/packages/db/src/index.js';
 import {assessOpenChunkConstruction,assessTerminalPartialOpenRecovery,assessTerminalPartialOpenResidualLot,classifyKnownOpenChunkSignatureTruth,isExpiredUnsignedOpenChunk,shouldRebroadcastKnownOpenChunk} from '../.build/packages/phase6-live-worker/src/index.js';
 
 const sol='So11111111111111111111111111111111111111112';
@@ -39,6 +40,11 @@ test('an unsigned pending child becomes no-effect only after its parent plan exp
   assert.equal(isExpiredUnsignedOpenChunk({...base,observedAt:'2026-09-18T02:04:30.558Z'}),false);
   assert.equal(isExpiredUnsignedOpenChunk({...base,observedAt:'2026-09-18T02:04:30.559Z'}),true);
   assert.equal(isExpiredUnsignedOpenChunk({...base,signature:'signed-child',observedAt:'2026-09-18T03:00:00.000Z'}),false);
+});
+
+test('partial-entry recovery serializes PostgreSQL Date funding provenance as ISO',()=>{
+  const fundedAt=new Date('2026-09-18T01:59:50.121Z');
+  assert.equal(toIsoTimestamp(fundedAt),'2026-09-18T01:59:50.121Z');
 });
 
 test('only the exact signed UNKNOWN chunk is eligible for a bounded rebroadcast',()=>{
