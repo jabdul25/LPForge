@@ -12,6 +12,15 @@ export interface ProfitProtectionPolicy {enabled:boolean;triggerFraction:number;
  * evaluates the supplied immutable policy; it is never a second authority.
  */
 export interface StateADeteriorationProtectionPolicy {enabled:boolean;action:'CLOSE';minimumPeakReturnFraction:number;givebackFraction:number;minimumReturnThresholdFraction:number;confirmationSeconds:number;cooldownSeconds:number;maximumObservationAgeSeconds:number;}
+/**
+ * A separate, policy-owned capital containment signal.  It deliberately
+ * shares State A's durable confirmation semantics, but it does not require a
+ * positive MFE: it protects a sustained, fresh live-control loss.
+ */
+export interface LiveControlLossProtectionPolicy {enabled:boolean;thresholdReturnFraction:number;confirmationSeconds:number;}
+export interface LiveControlLossPendingConfirmation {schemaVersion:1;firstDetectedAt:string;confirmationDueAt:string;thresholdReturnFraction:number;currentReturnFraction:number;evidenceObservedAt:string;}
+export type LiveControlLossProtectionStatus='NONE'|'PENDING'|'RECOVERED'|'CONFIRMED'|'EVIDENCE_UNAVAILABLE'|'SUPERSEDED';
+export interface LiveControlLossProtectionAssessment {detected:boolean;status:LiveControlLossProtectionStatus;reasonCodes:string[];currentReturnFraction?:number;detectedAt?:string;confirmationDueAt?:string;pending?:LiveControlLossPendingConfirmation;}
 /** Durable per-position confirmation state. The owning exit-state row supplies
  * the position identity, so this object is never a process-global timer. */
 export interface StateAPendingConfirmation {schemaVersion:1;firstDetectedAt:string;confirmationDueAt:string;peakReturnFraction:number;currentReturnFraction:number;givebackFraction:number;}
@@ -541,6 +550,46 @@ export function assessStateADeterioration(input:{
   const nextPending:StateAPendingConfirmation={schemaVersion:1,firstDetectedAt:start,confirmationDueAt:due,peakReturnFraction:peak,currentReturnFraction:current,givebackFraction:giveback};
   if(now<Date.parse(due))return{detected:false,status:'PENDING',reasonCodes:['STATE_A_PENDING'],pending:nextPending,detectedAt:start,confirmationDueAt:due,peakReturnFraction:peak,currentReturnFraction:current,givebackFraction:giveback};
   return{detected:true,status:'CONFIRMED',reasonCodes:['EXIT_STATE_A_DETERIORATION','STATE_A_DETERIORATION_CONFIRMED'],peakReturnFraction:peak,currentReturnFraction:current,givebackFraction:giveback,detectedAt:start,confirmationDueAt:due};
+}
+/**
+ * Evaluate the policy-owned sustained live-control loss containment signal.
+ * There is no process timer: callers persist `pending` on the canonical exit
+ * state and re-supply it on every fresh management observation.
+ */
+export function assessLiveControlLossProtection(input:{
+  policy:LiveControlLossProtectionPolicy;
+  observedAt:string;
+  liveControlPnl?:LiveControlPnlSnapshot;
+  liveControlPnlFresh?:boolean;
+  currentFactsFresh:boolean;
+  positionOpen:boolean;
+  reconciliationClean:boolean;
+  noActiveManagementPlan:boolean;
+  priorPending?:LiveControlLossPendingConfirmation|undefined;
+}):LiveControlLossProtectionAssessment{
+  const p=input.policy;
+  const pending=input.priorPending&&Number.isFinite(Date.parse(input.priorPending.firstDetectedAt))&&Number.isFinite(Date.parse(input.priorPending.confirmationDueAt))&&finite(input.priorPending.thresholdReturnFraction)&&finite(input.priorPending.currentReturnFraction)&&typeof input.priorPending.evidenceObservedAt==='string'&&Number.isFinite(Date.parse(input.priorPending.evidenceObservedAt))?input.priorPending:undefined;
+  const supersede=(code:string):LiveControlLossProtectionAssessment=>({detected:false,status:pending?'SUPERSEDED':'NONE',reasonCodes:[code]});
+  if(!p.enabled)return supersede('LIVE_CONTROL_LOSS_PROTECTION_DISABLED');
+  if(!finite(p.thresholdReturnFraction)||p.thresholdReturnFraction< -1||p.thresholdReturnFraction>=0||!Number.isSafeInteger(p.confirmationSeconds)||p.confirmationSeconds<0)return supersede('LIVE_CONTROL_LOSS_PROTECTION_POLICY_INVALID');
+  if(!input.positionOpen)return supersede('LIVE_CONTROL_LOSS_POSITION_NOT_OPEN');
+  if(!input.reconciliationClean)return supersede('LIVE_CONTROL_LOSS_RECONCILIATION_DEBT');
+  if(!input.noActiveManagementPlan)return supersede('LIVE_CONTROL_LOSS_ACTIVE_CLOSE_OR_MANAGEMENT_PLAN');
+  const control=input.liveControlPnl;
+  // Unavailable or stale evidence cannot establish continuity and cannot
+  // confirm a close. Retain pending state until a fresh mark confirms or
+  // cancels it, exactly as State A does.
+  if(!input.currentFactsFresh||input.liveControlPnlFresh!==true||control?.evidenceState!=='AVAILABLE'||control.source!=='METEORA_POSITION_PNL_API'||control.scope!=='LIVE_POSITION_CONTROL'||!finite(control.netReturnFraction))return pending?{detected:false,status:'EVIDENCE_UNAVAILABLE',reasonCodes:[!input.currentFactsFresh?'LIVE_CONTROL_LOSS_CURRENT_FACTS_STALE':'LIVE_CONTROL_LOSS_PNL_UNAVAILABLE'],pending}:{detected:false,status:'NONE',reasonCodes:[!input.currentFactsFresh?'LIVE_CONTROL_LOSS_CURRENT_FACTS_STALE':'LIVE_CONTROL_LOSS_PNL_UNAVAILABLE']};
+  const current=control.netReturnFraction;
+  const recovered=(code:string):LiveControlLossProtectionAssessment=>pending?{detected:false,status:'RECOVERED',reasonCodes:['LIVE_CONTROL_LOSS_PENDING_CANCELLED',code],currentReturnFraction:current}:{detected:false,status:'NONE',reasonCodes:[code],currentReturnFraction:current};
+  if(current>p.thresholdReturnFraction)return recovered('LIVE_CONTROL_LOSS_THRESHOLD_NOT_MET');
+  const now=Date.parse(input.observedAt);
+  if(!Number.isFinite(now))return{detected:false,status:pending?'EVIDENCE_UNAVAILABLE':'NONE',reasonCodes:['LIVE_CONTROL_LOSS_OBSERVED_AT_INVALID'],...(pending?{pending,confirmationDueAt:pending.confirmationDueAt}:{})};
+  const start=pending?.firstDetectedAt??input.observedAt;
+  const due=pending?.confirmationDueAt??new Date(now+p.confirmationSeconds*1000).toISOString();
+  const nextPending:LiveControlLossPendingConfirmation={schemaVersion:1,firstDetectedAt:start,confirmationDueAt:due,thresholdReturnFraction:p.thresholdReturnFraction,currentReturnFraction:current,evidenceObservedAt:control.observedAt};
+  if(now<Date.parse(due))return{detected:false,status:'PENDING',reasonCodes:['LIVE_CONTROL_LOSS_PENDING'],pending:nextPending,detectedAt:start,confirmationDueAt:due,currentReturnFraction:current};
+  return{detected:true,status:'CONFIRMED',reasonCodes:['EXIT_LIVE_CONTROL_LOSS_PROTECTION','LIVE_CONTROL_LOSS_PROTECTION_CONFIRMED'],currentReturnFraction:current,detectedAt:start,confirmationDueAt:due};
 }
 function marketAuthority(input:LiveExitGovernorInput):{confirmed:boolean;pending:boolean;reasonCodes:string[];confirmation:MarketExitConfirmationState}{
   const prior=input.marketConfirmation?.families??{}, next:Partial<Record<MarketExitEvidenceFamily,number>>={}, trustworthy=new Map<MarketExitEvidenceFamily,MarketExitEvidence>();

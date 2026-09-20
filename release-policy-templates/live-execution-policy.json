@@ -44,6 +44,11 @@
     "cooldownSeconds": 0,
     "maximumObservationAgeSeconds": 300
   },
+  "liveControlLossProtection": {
+    "enabled": true,
+    "thresholdReturnFraction": -0.08,
+    "confirmationSeconds": 60
+  },
   "feeClaim": {
     "minimumClaimValueUsd": 0.50
   },
