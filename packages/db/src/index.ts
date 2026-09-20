@@ -5636,7 +5636,12 @@ return 'APPLIED';
            )
            SELECT latest.plan_id,latest.status,latest.observed_at,
                   i.pool_address,i.owner_address,i.position_address,
-                  i.payload->>'predecessorPlanId' AS predecessor_plan_id,
+                  -- Terminal retries may have an expired account-close
+                  -- intermediate with no reconciliation row of its own. The
+                  -- immutable root binding is the direct reconciliation
+                  -- family edge; fall back to the immediate predecessor for
+                  -- ordinary recovery plans.
+                  COALESCE(NULLIF(p.payload->'autonomous_dispatch'->>'terminalRootClosePlanId',''),i.payload->>'predecessorPlanId') AS predecessor_plan_id,
                   COALESCE(i.payload->'terminalRecovery'='true'::jsonb,false) AS terminal_recovery
            FROM latest
            JOIN execution.transaction_plans p ON p.plan_id=latest.plan_id
