@@ -10,6 +10,7 @@ import {
   selectReceiptBoundFeeClaimResidual,
   shouldResumeCloseSettlement,
   shouldRehydratePostUnwindVerification,
+  shouldRetryExpiredAccountCloseOnly,
 } from '../.build/packages/phase6-live-worker/src/index.js';
 
 test('expired account-close resumes a receipt-bound fee-claim residual before a fresh close child', async () => {
@@ -193,6 +194,18 @@ test('only a receipt-confirmed historical post-unwind verification hold may rehy
   const source = await import('node:fs/promises').then(fs => fs.readFile('packages/phase6-live-worker/src/index.ts', 'utf8'));
   assert.match(source,/P6_CLOSE_POST_UNWIND_VERIFICATION_REHYDRATED/);
   assert.match(source,/residualVerificationPending: true/);
+});
+
+test('only a proven-expired empty-account close can receive a fresh terminal successor', async () => {
+  const base = {action:'CLOSE',planState:'RECONCILIATION_REQUIRED',accountCloseOnly:true,stage:'ACCOUNT_CLOSE_ONLY_SUBMITTED',positionExists:true,confirmationStatus:'EXPIRED'};
+  assert.equal(shouldRetryExpiredAccountCloseOnly(base), true);
+  for (const incompatible of [
+    {action:'EMERGENCY_CLOSE'}, {planState:'RECOVERING'}, {accountCloseOnly:false},
+    {stage:'CLOSE_POSITION_PENDING'}, {positionExists:false}, {confirmationStatus:'UNKNOWN'},
+  ]) assert.equal(shouldRetryExpiredAccountCloseOnly({...base, ...incompatible}), false);
+  const source = await import('node:fs/promises').then(fs => fs.readFile('packages/phase6-live-worker/src/index.ts', 'utf8'));
+  assert.match(source,/P6_ACCOUNT_CLOSE_ONLY_EXPIRED_RETRY_SUCCESSOR_CREATED/);
+  assert.match(source,/createAccountCloseOnlySuccessor/);
 });
 
 test('close workflow preserves every durable settlement stage and resumes from it', async () => {

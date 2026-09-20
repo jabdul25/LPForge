@@ -4622,6 +4622,27 @@ export function shouldRehydratePostUnwindVerification(value: {
   );
 }
 
+/** A no-effect account-close child may receive one fresh, separately durable
+ * terminal successor. It is intentionally unavailable to normal close plans
+ * and never recreates any economic child. */
+export function shouldRetryExpiredAccountCloseOnly(value: {
+  action: string;
+  planState: string;
+  accountCloseOnly: boolean;
+  stage?: string | undefined;
+  positionExists: boolean;
+  confirmationStatus: string;
+}): boolean {
+  return (
+    value.action === "CLOSE" &&
+    value.planState === "RECONCILIATION_REQUIRED" &&
+    value.accountCloseOnly &&
+    value.stage === "ACCOUNT_CLOSE_ONLY_SUBMITTED" &&
+    value.positionExists &&
+    value.confirmationStatus === "EXPIRED"
+  );
+}
+
 /**
  * A deterministic pre-submission CLOSE failure has no economic effect only
  * when every boundary below is independently true. This predicate is shared
@@ -7169,6 +7190,45 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         payload:{stage:'CLOSE_POSITION_PENDING',retryTransactionId:retryTransactionId??null,unwindTransactionId:unwindTransactionId??null,retrySubmissionPresent:Boolean(retrySubmission)},
       });
       results.push({planId:plan.planId,action:'HOLD_FOR_OPERATOR',reasonCodes:['P6_CLOSE_ACCOUNT_RETRY_STEP_RECOVERY_PROOF_MISSING']});
+      continue;
+    }
+    // An account-close-only child has no liquidity, claim, or inventory
+    // effect. If its exact signed identity is proven expired, create one new
+    // account-close-only successor through the existing durable constructor.
+    // This deliberately cannot replay the terminal root's economic children.
+    if(
+      shouldRetryExpiredAccountCloseOnly({
+        action: plan.action,
+        planState: plan.state,
+        accountCloseOnly: isAccountCloseOnlyPlan(plan),
+        stage: recoveryCloseStage,
+        positionExists: positionTruth.exists === true,
+        confirmationStatus,
+      }) && recoveryPositionAddress
+    ) {
+      const successor = await createAccountCloseOnlySuccessor({
+        store: input.store,
+        plan,
+        positionAddress: recoveryPositionAddress,
+        positionTruth,
+        now: input.now,
+      });
+      if (successor.created) {
+        results.push({planId:plan.planId,action:"RETURN_EXISTING_PLAN",reasonCodes:["P6_ACCOUNT_CLOSE_ONLY_EXPIRED_RETRY_SUCCESSOR_CREATED",...successor.reasonCodes]});
+        continue;
+      }
+      if (successor.planId) {
+        results.push({planId:plan.planId,action:"RETURN_EXISTING_PLAN",reasonCodes:["P6_ACCOUNT_CLOSE_ONLY_EXPIRED_RETRY_SUCCESSOR_ALREADY_ACTIVE",...successor.reasonCodes]});
+        continue;
+      }
+      await input.store.transitionAutonomousPlan({
+        planId: plan.planId,
+        state: "RECONCILIATION_REQUIRED",
+        at: input.now,
+        reasonCodes: ["P6_ACCOUNT_CLOSE_ONLY_EXPIRED_RETRY_BLOCKED", ...successor.reasonCodes],
+        payload: {stage:"ACCOUNT_CLOSE_ONLY_SUBMITTED",accountCloseOnlyExpired:true},
+      });
+      results.push({planId:plan.planId,action:"HOLD_FOR_OPERATOR",reasonCodes:["P6_ACCOUNT_CLOSE_ONLY_EXPIRED_RETRY_BLOCKED",...successor.reasonCodes]});
       continue;
     }
     const action = determineRecoveryAction({
