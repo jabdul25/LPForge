@@ -4599,6 +4599,30 @@ export function shouldResumeCloseSettlement(value: {
 }
 
 /**
+ * A wallet-balance read immediately after a receipt-confirmed Jupiter unwind
+ * can be stale. This is a narrowly bound recovery, not a generic reopening
+ * of reconciliation-required closes: the bound PositionV2 must still exist
+ * and the next close-settlement pass obtains fresh wallet truth before the
+ * account-close child is built.
+ */
+export function shouldRehydratePostUnwindVerification(value: {
+  action: string;
+  planState: string;
+  stage?: string | undefined;
+  positionExists: boolean;
+  confirmationStatus: string;
+}): boolean {
+  return (
+    (value.action === "CLOSE" || value.action === "EMERGENCY_CLOSE") &&
+    value.planState === "RECONCILIATION_REQUIRED" &&
+    value.stage === "CLOSE_UNWIND_VERIFY" &&
+    value.positionExists &&
+    (value.confirmationStatus === "CONFIRMED" ||
+      value.confirmationStatus === "FINALIZED")
+  );
+}
+
+/**
  * A deterministic pre-submission CLOSE failure has no economic effect only
  * when every boundary below is independently true. This predicate is shared
  * by recovery and tests so a generic reconciliation-required plan cannot be
@@ -5069,7 +5093,11 @@ async function executeCloseSettlement(input: {
       at: new Date().toISOString(),
       reasonCodes: ["P6_CLOSE_TOKEN_X_RESIDUAL"],
       payload: {
-        stage: "CLOSE_UNWIND_VERIFY",
+        // Preserve the last receipt-confirmed settlement stage. A later
+        // recovery may only re-check fresh wallet truth from this point; it
+        // cannot resend REMOVE, CLAIM, or the confirmed Jupiter unwind.
+        stage: "CLOSE_INVENTORY_UNWOUND",
+        residualVerificationPending: true,
         tokenXBefore: tokenXBefore.toString(),
         tokenXPostUnwind: tokenXPostUnwind.toString(),
       },
@@ -5958,6 +5986,50 @@ export async function recoverUnfinishedAutonomousPlans(input: {
         });
         continue;
       }
+    }
+    // Compatibility for the short-lived release that recorded a same-tick,
+    // post-unwind balance read as CLOSE_UNWIND_VERIFY. Rehydrate only the
+    // exact receipt-confirmed unwind stage, then let the ordinary close path
+    // make a fresh chain read before a final account-close transaction.
+    if(
+      shouldRehydratePostUnwindVerification({
+        action: plan.action,
+        planState: plan.state,
+        stage: recoveryCloseStage,
+        positionExists: positionTruth.exists === true,
+        confirmationStatus,
+      })
+    ) {
+      const dispatch = closeSettlementDispatch(plan),
+        unwindTransactionId = typeof dispatch.unwindTransactionId === "string" ? dispatch.unwindTransactionId : undefined,
+        unwindStep = unwindTransactionId ? plan.steps.find((step) => step.transactionId === unwindTransactionId && step.kind === "JUPITER_UNWIND") : undefined,
+        inputMint = typeof dispatch.tokenXMint === "string" ? dispatch.tokenXMint : undefined,
+        inputAmountRaw = closeSettlementAmount(dispatch.attributableTokenX),
+        lotAllocations = parseDurableCloseLotAllocations(dispatch.attributableFeeLotAllocations);
+      const confirmedUnwind = unwindStep ? await input.store.loadConfirmedSubmissionByTransactionId(unwindStep.transactionId) : undefined;
+      if (!connection || !recoveryPositionAddress || !unwindStep || !confirmedUnwind || !inputMint || inputAmountRaw === undefined || !lotAllocations.ok) {
+        await input.store.transitionAutonomousPlan({planId:plan.planId,state:"RECONCILIATION_REQUIRED",at:input.now,reasonCodes:["P6_CLOSE_POST_UNWIND_VERIFICATION_RECOVERY_PROOF_MISSING"],payload:{stage:"CLOSE_UNWIND_VERIFY"}});
+        results.push({planId:plan.planId,action:"HOLD_FOR_OPERATOR",reasonCodes:["P6_CLOSE_POST_UNWIND_VERIFICATION_RECOVERY_PROOF_MISSING"]});
+        continue;
+      }
+      const settlement = await reconcileConfirmedCloseUnwind({
+        store: input.store, connection, plan, positionAddress: recoveryPositionAddress,
+        signature: confirmedUnwind.signature, transactionId: unwindStep.transactionId,
+        inputMint, inputAmountRaw, observedAt: input.now,
+        ...(lotAllocations.allocations.length ? {lotAllocations: lotAllocations.allocations} : {}),
+      });
+      if (!settlement.ok) {
+        await input.store.transitionAutonomousPlan({planId:plan.planId,state:"RECONCILIATION_REQUIRED",at:input.now,reasonCodes:["P6_CLOSE_POST_UNWIND_VERIFICATION_RECEIPT_REJECTED",...settlement.reasonCodes],payload:{stage:"CLOSE_UNWIND_VERIFY",unwindTransactionId}});
+        results.push({planId:plan.planId,action:"HOLD_FOR_OPERATOR",reasonCodes:["P6_CLOSE_POST_UNWIND_VERIFICATION_RECEIPT_REJECTED",...settlement.reasonCodes]});
+        continue;
+      }
+      await input.store.transitionAutonomousPlan({
+        planId: plan.planId, state: "RECONCILING", at: input.now,
+        reasonCodes: ["P6_CLOSE_POST_UNWIND_VERIFICATION_REHYDRATED"],
+        payload: {stage:"CLOSE_INVENTORY_UNWOUND",pendingStage:null,pendingSignature:null,residualVerificationPending:true,unwindTransactionId,unwindSignature:confirmedUnwind.signature,swapProceedsLamports:settlement.swapProceedsLamports.toString()},
+      });
+      results.push({planId:plan.planId,action:"RESUME_CLOSE_SETTLEMENT",reasonCodes:["P6_CLOSE_POST_UNWIND_VERIFICATION_REHYDRATED"]});
+      continue;
     }
     // Historical compatibility: before the sequential-child journal contract
     // was deployed, a confirmed CLAIM/UNWIND could leave the shared close
