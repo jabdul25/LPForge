@@ -51,6 +51,15 @@ test('account-close successor identity uses explicit provenance, never a matchin
   assert.equal(isExactAccountCloseOnlySuccessor({parent,successor:{...successor,positionAddress:'other'}}),false);
 });
 
+test('a retry successor preserves the immutable economic root while binding its immediate expired parent',()=>{
+  const root=plan({planId:'root'});
+  const expiredChild=plan({planId:'root:account-close-only:1',predecessorPlanId:'root'});
+  const retry=plan({planId:'root:account-close-only:1:account-close-only:1',predecessorPlanId:expiredChild.planId});
+  retry.planPayload.autonomous_dispatch.terminalRootClosePlanId=root.planId;
+  assert.equal(isExactAccountCloseOnlySuccessor({parent:expiredChild,successor:retry}),true);
+  assert.equal(isExactAccountCloseOnlySuccessor({parent:root,successor:retry}),false);
+});
+
 test('terminal effect selects exact confirmed retry and ignores expired predecessor or unrelated lifecycle child',()=>{
   const transactions=[
     {planId:'parent',transactionId:'claim',signature:'expired',state:'FAILED_FINAL'},

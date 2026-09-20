@@ -4052,6 +4052,10 @@ export function isExactAccountCloseOnlySuccessor(input:{parent:AutonomousPlan;su
   const parent=input.parent,successor=input.successor,
     provenance=(successor.planPayload.provenance??{}) as Record<string,unknown>,
     dispatch=closeSettlementDispatch(successor),
+    parentDispatch=closeSettlementDispatch(parent),
+    terminalRootClosePlanId=typeof parentDispatch.terminalRootClosePlanId==='string'
+      ? parentDispatch.terminalRootClosePlanId
+      : parent.planId,
     recoverySteps=successor.steps.filter(step=>step.metadata.accountCloseOnly===true),
     generations=[dispatch.accountCloseOnlyRecoveryGeneration,...recoverySteps.map(step=>step.metadata.recoveryGeneration)].map(Number);
   return successor.action==='CLOSE'&&
@@ -4063,7 +4067,7 @@ export function isExactAccountCloseOnlySuccessor(input:{parent:AutonomousPlan;su
     provenance.predecessorPlanId===parent.planId&&
     provenance.terminalRecovery===true&&
     dispatch.accountCloseOnly===true&&
-    dispatch.terminalRootClosePlanId===parent.planId&&
+    dispatch.terminalRootClosePlanId===terminalRootClosePlanId&&
     recoverySteps.length===1&&
     recoverySteps[0]!.metadata.predecessorPlanId===parent.planId&&
     generations.length===2&&generations.every(value=>Number.isSafeInteger(value)&&value>=1)&&
@@ -5658,16 +5662,21 @@ async function createAccountCloseOnlySuccessor(input:{store:Phase1Store;plan:Aut
     }
     return{created:false,planId:canonical.planId,reasonCodes:[...(selected.duplicates.length>0?['P6_ACCOUNT_CLOSE_ONLY_DUPLICATE_SUPPRESSED']:[]),'P6_ACCOUNT_CLOSE_ONLY_SUCCESSOR_ALREADY_ACTIVE']};
   }
-  const dispatch=closeSettlementDispatch(input.plan),settlement=await input.store.loadLifecycleSettlementInput(input.positionAddress);
+  const dispatch=closeSettlementDispatch(input.plan),
+    terminalRootPlanId=typeof dispatch.terminalRootClosePlanId==='string'?dispatch.terminalRootClosePlanId:input.plan.planId,
+    terminalRootPlan=terminalRootPlanId===input.plan.planId?input.plan:await input.store.loadAutonomousPlan(terminalRootPlanId),
+    terminalRootDispatch=terminalRootPlan?closeSettlementDispatch(terminalRootPlan):undefined,
+    settlement=await input.store.loadLifecycleSettlementInput(input.positionAddress);
+  if(!terminalRootPlan||!terminalRootDispatch)return{created:false,reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_TERMINAL_ROOT_MISSING']};
   if(!settlement)return{created:false,reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_LIFECYCLE_MISSING']};
   const stringList=(value:unknown):string[]=>Array.isArray(value)?value.filter((item):item is string=>typeof item==='string'):[],
-    removeIds=stringList(dispatch.removeTransactionIds).length>0?stringList(dispatch.removeTransactionIds):stringList(dispatch.removeChildTransactionIds),
-    claimIds=stringList(dispatch.claimTransactionIds).length>0?stringList(dispatch.claimTransactionIds):typeof dispatch.claimTransactionId==='string'?[dispatch.claimTransactionId]:[],
-    primaryUnwindIds=typeof dispatch.unwindTransactionId==='string'?[dispatch.unwindTransactionId]:[],
-    residualUnwindIds=typeof dispatch.recoveredOpenResidualUnwindTransactionId==='string'?[dispatch.recoveredOpenResidualUnwindTransactionId]:[],
-    effect=(transactionIds:string[],required=false)=>canonicalTerminalActionEffect({transactions:settlement.transactions,planId:input.plan.planId,transactionIds,required}),
+    removeIds=stringList(terminalRootDispatch.removeTransactionIds).length>0?stringList(terminalRootDispatch.removeTransactionIds):stringList(terminalRootDispatch.removeChildTransactionIds),
+    claimIds=stringList(terminalRootDispatch.claimTransactionIds).length>0?stringList(terminalRootDispatch.claimTransactionIds):typeof terminalRootDispatch.claimTransactionId==='string'?[terminalRootDispatch.claimTransactionId]:[],
+    primaryUnwindIds=typeof terminalRootDispatch.unwindTransactionId==='string'?[terminalRootDispatch.unwindTransactionId]:[],
+    residualUnwindIds=typeof terminalRootDispatch.recoveredOpenResidualUnwindTransactionId==='string'?[terminalRootDispatch.recoveredOpenResidualUnwindTransactionId]:[],
+    effect=(transactionIds:string[],required=false)=>canonicalTerminalActionEffect({transactions:settlement.transactions,planId:terminalRootPlan.planId,transactionIds,required}),
     lots=await input.store.loadPositionInventoryLots(input.positionAddress),check=assessAccountCloseOnlyRecovery({
-    priorAccountClose:'EXPIRED_NO_EFFECT',remove:effect(removeIds,true),claim:dispatch.claimTransactionSkipped===true?'NOT_REQUIRED':effect(claimIds,true),primaryUnwind:effect(primaryUnwindIds),residualUnwind:effect(residualUnwindIds),positionExists:input.positionTruth.exists===true?true:input.positionTruth.exists===false?false:'UNKNOWN',totalXAmount:BigInt(String(input.positionTruth.totalXAmount??'0')),totalYAmount:BigInt(String(input.positionTruth.totalYAmount??'0')),feeX:BigInt(String(input.positionTruth.feeX??'0')),feeY:BigInt(String(input.positionTruth.feeY??'0')),rewardOne:BigInt(String(input.positionTruth.rewardOne??'0')),rewardTwo:BigInt(String(input.positionTruth.rewardTwo??'0')),unresolvedInventoryLots:lots.filter(lot=>lot.remainingRawAmount>0n).length,
+    priorAccountClose:'EXPIRED_NO_EFFECT',remove:effect(removeIds,true),claim:terminalRootDispatch.claimTransactionSkipped===true?'NOT_REQUIRED':effect(claimIds,true),primaryUnwind:effect(primaryUnwindIds),residualUnwind:effect(residualUnwindIds),positionExists:input.positionTruth.exists===true?true:input.positionTruth.exists===false?false:'UNKNOWN',totalXAmount:BigInt(String(input.positionTruth.totalXAmount??'0')),totalYAmount:BigInt(String(input.positionTruth.totalYAmount??'0')),feeX:BigInt(String(input.positionTruth.feeX??'0')),feeY:BigInt(String(input.positionTruth.feeY??'0')),rewardOne:BigInt(String(input.positionTruth.rewardOne??'0')),rewardTwo:BigInt(String(input.positionTruth.rewardTwo??'0')),unresolvedInventoryLots:lots.filter(lot=>lot.remainingRawAmount>0n).length,
   });
   if(!check.eligible)return{created:false,reasonCodes:check.reasonCodes};
   const priorGeneration=Number(dispatch.accountCloseOnlyRecoveryGeneration??0),generation=Number.isInteger(priorGeneration)&&priorGeneration>=0?priorGeneration+1:1,id=accountCloseOnlySuccessorIdentity({planId:input.plan.planId,generation}),capitalLamports=String((input.plan.planPayload.intent as Record<string,unknown>|undefined)?.capitalLamports??'');
@@ -5676,7 +5685,7 @@ async function createAccountCloseOnlySuccessor(input:{store:Phase1Store;plan:Aut
   const secret=process.env.LPFORGE_PLAN_PROVENANCE_SECRET;
   if(secret){provenance.hmac=computePlanProvenanceHmac({producer:'LPFORGE_PRODUCTION',schemaVersion:1,intentId:id.intentId,poolAddress:input.plan.poolAddress,observedAt:input.now,action:'CLOSE',ownerAddress:input.plan.ownerAddress,positionAddress:input.positionAddress,expiresAt,immutablePlan:{intentPayload,planIntent,steps:steps.map(step=>({transactionId:step.transactionId,sequence:step.sequence,kind:step.kind,requiredSignerAddresses:[...step.requiredSignerAddresses],metadata:step.metadata}))},phase7Control:(provenance.phase7Control??null) as Record<string,unknown>|null},secret);}
   await input.store.insertExecutionIntent({intentId:id.intentId,idempotencyKey:id.idempotencyKey,action:'CLOSE',poolAddress:input.plan.poolAddress,ownerAddress:input.plan.ownerAddress,positionAddress:input.positionAddress,thesisId:input.plan.thesisId,observedAt:input.now,expiresAt,payload:intentPayload});
-  await input.store.insertTransactionPlan({planId:id.planId,intentId:id.intentId,cluster:'mainnet-beta',state:'PLANNED',createdAt:input.now,expiresAt,payload:{reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_SUCCESSOR'],authority:'AUTONOMOUS_TERMINAL_RECOVERY',provenance,immutablePlanVersion:1,intent:planIntent,autonomous_dispatch:{accountCloseOnly:true,terminalRootClosePlanId:input.plan.planId,accountCloseOnlyRecoveryGeneration:generation,stage:'ACCOUNT_CLOSE_ONLY_READY',removeTransactionId:dispatch.removeTransactionId,removeTransactionIds:removeIds,removeChildTransactionIds:removeIds,removeChildCount:removeIds.length,removeChildrenConfirmed:removeIds,claimTransactionId:claimIds.at(-1),claimTransactionIds:claimIds,unwindTransactionId:dispatch.unwindTransactionId,recoveredOpenResidualUnwindTransactionId:dispatch.recoveredOpenResidualUnwindTransactionId,claimTransactionSkipped:dispatch.claimTransactionSkipped===true,closeSettlementIncomplete:true}},steps});
+  await input.store.insertTransactionPlan({planId:id.planId,intentId:id.intentId,cluster:'mainnet-beta',state:'PLANNED',createdAt:input.now,expiresAt,payload:{reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_SUCCESSOR'],authority:'AUTONOMOUS_TERMINAL_RECOVERY',provenance,immutablePlanVersion:1,intent:planIntent,autonomous_dispatch:{accountCloseOnly:true,terminalRootClosePlanId:terminalRootPlan.planId,accountCloseOnlyRecoveryGeneration:generation,stage:'ACCOUNT_CLOSE_ONLY_READY',removeTransactionId:terminalRootDispatch.removeTransactionId,removeTransactionIds:removeIds,removeChildTransactionIds:removeIds,removeChildCount:removeIds.length,removeChildrenConfirmed:removeIds,claimTransactionId:claimIds.at(-1),claimTransactionIds:claimIds,unwindTransactionId:terminalRootDispatch.unwindTransactionId,recoveredOpenResidualUnwindTransactionId:terminalRootDispatch.recoveredOpenResidualUnwindTransactionId,claimTransactionSkipped:terminalRootDispatch.claimTransactionSkipped===true,closeSettlementIncomplete:true}},steps});
   await input.store.markOwnedPositionLifecycle({positionAddress:input.positionAddress,lifecycleState:'RECONCILIATION_REQUIRED',reconciliationStatus:'TERMINALIZATION_DEBT',lastPlanId:id.planId,at:input.now,payload:{stage:'ACCOUNT_CLOSE_ONLY_SUCCESSOR_PLANNED',terminalizationDebt:true,predecessorPlanId:input.plan.planId,successorPlanId:id.planId,reasonCodes:['P6_TERMINALIZATION_DEBT_ACCOUNT_CLOSE_ONLY']}});
   await input.store.completeAutonomousPlan({planId:input.plan.planId,state:'FAILED',at:input.now,payload:{action:input.plan.action,recovery:'ACCOUNT_CLOSE_ONLY_SUCCESSOR_CREATED',accountCloseOnlySuccessorPlanId:id.planId,accountCloseOnlyRecoveryGeneration:generation,pendingStage:'CLOSE_POSITION_SUBMITTED'}});
   return{created:true,planId:id.planId,reasonCodes:['P6_ACCOUNT_CLOSE_ONLY_SUCCESSOR_CREATED','P6_TERMINALIZATION_DEBT_ACCOUNT_CLOSE_ONLY']};

@@ -206,6 +206,8 @@ test('only a proven-expired empty-account close can receive a fresh terminal suc
   const source = await import('node:fs/promises').then(fs => fs.readFile('packages/phase6-live-worker/src/index.ts', 'utf8'));
   assert.match(source,/P6_ACCOUNT_CLOSE_ONLY_EXPIRED_RETRY_SUCCESSOR_CREATED/);
   assert.match(source,/createAccountCloseOnlySuccessor/);
+  assert.match(source,/terminalRootPlanId/);
+  assert.match(source,/terminalRootDispatch/);
 });
 
 test('close workflow preserves every durable settlement stage and resumes from it', async () => {
