@@ -46,7 +46,7 @@
   },
   "liveControlLossProtection": {
     "enabled": true,
-    "thresholdReturnFraction": -0.08,
+    "thresholdReturnFraction": -0.07,
     "confirmationSeconds": 60
   },
   "feeClaim": {
