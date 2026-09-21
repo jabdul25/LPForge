@@ -480,7 +480,13 @@ function primaryCandidate(snapshot: TerminalSnapshot): TerminalCandidate | undef
   return snapshot.candidates[snapshot.selectedCandidateIndex] || snapshot.candidates[0] || snapshot.entryWatchPools[0];
 }
 function primaryBlockerCode(snapshot: TerminalSnapshot): string | undefined {
-  if (snapshot.health.newEconomicActionAllowed === false) return snapshot.health.entryControlReasonCodes[0];
+  if (snapshot.health.newEconomicActionAllowed === false) {
+    // This is an authority-mode marker, not an entry-block cause. Prefer the
+    // actionable reason so a short recovery hold is not misreported as a
+    // permanent bounded-unattended-production block.
+    return snapshot.health.entryControlReasonCodes.find(code => code !== 'P7_BOUNDED_UNATTENDED_PRODUCTION')
+      ?? 'P7_ENTRY_AUTHORITY_UNAVAILABLE';
+  }
   const candidate = primaryCandidate(snapshot);
   return candidate ? operatorVisibleCandidateReasonCodes(candidate)[0] : undefined;
 }

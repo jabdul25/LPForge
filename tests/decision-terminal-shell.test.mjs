@@ -141,6 +141,18 @@ test('top status and current blocker keep entry authority, safety, watch pools, 
   assert.match(output, /q quit  h\/l candidate/);
 });
 
+test('current blocker does not present bounded unattended mode as the entry-block cause', () => {
+  const source = snapshot();
+  source.health = {
+    ...source.health,
+    newEconomicActionAllowed: false,
+    entryControlReasonCodes: ['P7_BOUNDED_UNATTENDED_PRODUCTION', 'P7_CONTROL_RECOVERY_PENDING']
+  };
+  const output = terminal.renderDecisionTerminal(source, { columns: 180, rows: 50, color: false });
+  assert.match(output, /Recovery or reconciliation must finish before a new action\./);
+  assert.doesNotMatch(output, /STATE \/ REASON BLOCKED — P7 Bounded Unattended Production/);
+});
+
 test('header explains an entry block caused by the open-position limit', () => {
   const source = snapshot();
   source.health = { ...source.health, newEconomicActionAllowed: false, entryControlReasonCodes: ['P7_PORTFOLIO_POSITION_LIMIT'] };
