@@ -1437,6 +1437,9 @@ export interface Phase1Store {
   loadPhase7PortfolioRiskState(ownerAddress:string):Promise<Record<string,unknown>|undefined>;
   upsertPhase7PortfolioRiskState(value:{ownerAddress:string;dayStart:string;dailyStartEquityLamports:bigint;peakEquityLamports:bigint;currentEquityLamports:bigint;observedAt:string;valuationState:'RECONCILED'|'UNAVAILABLE';reasonCodes:string[];payload:Record<string,unknown>}):Promise<void>;
   loadPositionExitState(lpforgePositionId: string): Promise<Record<string, unknown> | null>;
+  /** Immutable P3/thesis facts linked to the exact entry lifecycle.  This is
+   * read-only context for observe-only continuation assessments. */
+  loadPositionContinuationEntryContext(positionAddress:string): Promise<{entryAt:string;recommendationId?:string;thesisId?:string;entryReasonCodes:string[];economics:Record<string,unknown>;thesis:Record<string,unknown>}|null>;
   /** Deterministic predecessor for an independently-protective managed mark.
    * It is intentionally queried from the durable observation stream, never
    * process memory, and excludes observations that were not safe to manage. */
@@ -4211,6 +4214,23 @@ return 'APPLIED';
       const r=await db.query(`SELECT * FROM execution.position_exit_state WHERE lpforge_position_id=$1`,[lpforgePositionId]);
       return (r.rows[0] as Record<string,unknown>|undefined)??null;
     },
+    async loadPositionContinuationEntryContext(positionAddress) {
+      const r=await db.query(
+        `SELECT l.created_at AS entry_at,line.recommendation_id,line.thesis_id,sr.reason_codes,sr.economics,t.thesis
+           FROM execution.position_lifecycles l
+           LEFT JOIN research.lifecycle_prediction_lineage line ON line.lifecycle_id=l.lifecycle_id
+           LEFT JOIN research.shadow_recommendations sr ON sr.recommendation_id=line.recommendation_id
+           LEFT JOIN research.lp_theses t ON t.thesis_id=line.thesis_id
+          WHERE l.position_address=$1
+          ORDER BY l.created_at DESC LIMIT 1`,
+        [positionAddress],
+      );
+      const row=r.rows[0];
+      if(!row?.entry_at)return null;
+      const reasons=Array.isArray(row.reason_codes)?row.reason_codes.filter((code:unknown):code is string=>typeof code==='string'):[];
+      const record=(value:unknown)=>value&&typeof value==='object'&&!Array.isArray(value)?value as Record<string,unknown>:{};
+      return{entryAt:toIsoTimestamp(row.entry_at),...(row.recommendation_id?{recommendationId:String(row.recommendation_id)}:{}),...(row.thesis_id?{thesisId:String(row.thesis_id)}:{}),entryReasonCodes:reasons,economics:record(row.economics),thesis:record(row.thesis)};
+    },
     async loadPreviousUsableManagedEconomicObservation(v) {
       const r=await db.query(
         `SELECT observed_at,
@@ -6079,6 +6099,7 @@ export function createMemoryStore(): Phase1Store {
     async loadPhase7PortfolioRiskState() { return undefined; },
     async upsertPhase7PortfolioRiskState() {},
     async loadPositionExitState() { return null; },
+    async loadPositionContinuationEntryContext() { return null; },
     async loadPreviousUsableManagedEconomicObservation() { return null; },
     async upsertPositionExitState() {},
     async hasActiveAutonomousPlan() {

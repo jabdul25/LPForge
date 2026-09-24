@@ -35,7 +35,7 @@
     "minimumIncludedBins": 60
   },
   "stateADeteriorationProtection": {
-    "enabled": true,
+    "enabled": false,
     "action": "CLOSE",
     "minimumPeakReturnFraction": 0.0025,
     "givebackFraction": 0.5,
@@ -46,8 +46,12 @@
   },
   "liveControlLossProtection": {
     "enabled": true,
-    "thresholdReturnFraction": -0.08,
+    "thresholdReturnFraction": -0.07,
     "confirmationSeconds": 60
+  },
+  "positionContinuationAssessment": {
+    "enabled": true,
+    "firstAssessmentMinutes": 60
   },
   "feeClaim": {
     "minimumClaimValueUsd": 0.50

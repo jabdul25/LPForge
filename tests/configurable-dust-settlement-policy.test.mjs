@@ -7,14 +7,14 @@ import {assessResidualDustDisposition} from '../.build/packages/phase6-live-work
 const now='2026-09-04T12:00:00.000Z';
 const dust=(threshold,price=.0004)=>assessResidualDustDisposition({rawAmount:100_000_000_000n,decimals:9,unitPriceUsd:price,valuationAt:now,now,thresholdUsd:threshold});
 test('policy dust threshold is numeric, finite, and defaults fail-closed',()=>{
-  const base={schemaVersion:1,policyId:'p',status:'ENABLED',approvalTtlMs:15000,minDevnetConfirmedRuns:1,maxActionsPerDay:1,maxOpenPositions:1,pools:[{address:'pool',maxCapitalSol:'0.03',maxOpenPositions:1}],liveControlLossProtection:{enabled:false,thresholdReturnFraction:-.08,confirmationSeconds:60},settlement:{residualDustThresholdUsd:.10}};
+  const base={schemaVersion:1,policyId:'p',status:'ENABLED',approvalTtlMs:15000,minDevnetConfirmedRuns:1,maxActionsPerDay:1,maxOpenPositions:1,pools:[{address:'pool',maxCapitalSol:'0.03',maxOpenPositions:1}],liveControlLossProtection:{enabled:false,thresholdReturnFraction:-.08,confirmationSeconds:60},positionContinuationAssessment:{enabled:false,firstAssessmentMinutes:60},settlement:{residualDustThresholdUsd:.10}};
   assert.equal(parseDeploymentPolicy(base).settlement.residualDustThresholdUsd,.10);
   assert.equal(parseDeploymentPolicy({...base,settlement:undefined}).settlement.residualDustThresholdUsd,0);
   assert.throws(()=>parseDeploymentPolicy({...base,settlement:{residualDustThresholdUsd:-.01}}),/RESIDUAL_DUST_THRESHOLD_USD/);
   assert.throws(()=>parseDeploymentPolicy({...base,settlement:{residualDustThresholdUsd:'no'}}),/RESIDUAL_DUST_THRESHOLD_USD/);
 });
 test('routine fee-claim minimum is explicit, configurable, and fails closed when malformed',()=>{
-  const base={schemaVersion:1,policyId:'p',status:'ENABLED',approvalTtlMs:15000,minDevnetConfirmedRuns:1,maxActionsPerDay:1,maxOpenPositions:1,pools:[{address:'pool',maxCapitalSol:'0.03',maxOpenPositions:1}],liveControlLossProtection:{enabled:false,thresholdReturnFraction:-.08,confirmationSeconds:60},feeClaim:{minimumClaimValueUsd:.10}};
+  const base={schemaVersion:1,policyId:'p',status:'ENABLED',approvalTtlMs:15000,minDevnetConfirmedRuns:1,maxActionsPerDay:1,maxOpenPositions:1,pools:[{address:'pool',maxCapitalSol:'0.03',maxOpenPositions:1}],liveControlLossProtection:{enabled:false,thresholdReturnFraction:-.08,confirmationSeconds:60},positionContinuationAssessment:{enabled:false,firstAssessmentMinutes:60},feeClaim:{minimumClaimValueUsd:.10}};
   assert.equal(parseDeploymentPolicy(base).feeClaim.minimumClaimValueUsd,.10);
   assert.equal(parseDeploymentPolicy({...base,feeClaim:{minimumClaimValueUsd:.25}}).feeClaim.minimumClaimValueUsd,.25);
   assert.throws(()=>parseDeploymentPolicy({...base,feeClaim:{minimumClaimValueUsd:0}}),/FEE_CLAIM_MINIMUM_VALUE_USD/);
@@ -22,7 +22,7 @@ test('routine fee-claim minimum is explicit, configurable, and fails closed when
   assert.throws(()=>parseDeploymentPolicy({...base,feeClaim:{minimumClaimValueUsd:'NaN'}}),/FEE_CLAIM_MINIMUM_VALUE_USD/);
 });
 test('pool re-entry cooldowns are explicit policy, not selector defaults',()=>{
-  const base={schemaVersion:1,policyId:'p',status:'ENABLED',approvalTtlMs:15000,minDevnetConfirmedRuns:1,maxActionsPerDay:1,maxOpenPositions:1,pools:[{address:'pool',maxCapitalSol:'0.03',maxOpenPositions:1}],liveControlLossProtection:{enabled:false,thresholdReturnFraction:-.08,confirmationSeconds:60},poolReentry:{policyVersion:'pool-reentry-cooldown-v1',normalProfitCloseCooldownMinutes:120,discretionaryLossCooldownMinutes:240,hardStopCooldownMinutes:480,oorTokenRiskCooldownMinutes:720,emergencyCooldownMinutes:720,twoLossesWindowHours:24,twoLossesCooldownMinutes:1440,threeLossesWindowHours:168,threeLossesCooldownMinutes:4320}};
+  const base={schemaVersion:1,policyId:'p',status:'ENABLED',approvalTtlMs:15000,minDevnetConfirmedRuns:1,maxActionsPerDay:1,maxOpenPositions:1,pools:[{address:'pool',maxCapitalSol:'0.03',maxOpenPositions:1}],liveControlLossProtection:{enabled:false,thresholdReturnFraction:-.08,confirmationSeconds:60},positionContinuationAssessment:{enabled:false,firstAssessmentMinutes:60},poolReentry:{policyVersion:'pool-reentry-cooldown-v1',normalProfitCloseCooldownMinutes:120,discretionaryLossCooldownMinutes:240,hardStopCooldownMinutes:480,oorTokenRiskCooldownMinutes:720,emergencyCooldownMinutes:720,twoLossesWindowHours:24,twoLossesCooldownMinutes:1440,threeLossesWindowHours:168,threeLossesCooldownMinutes:4320}};
   assert.equal(parseDeploymentPolicy(base).poolReentry?.hardStopCooldownMinutes,480);
   assert.throws(()=>parseDeploymentPolicy({...base,poolReentry:{...base.poolReentry,threeLossesCooldownMinutes:0}}),/POOL_REENTRY_THREE_LOSSES_COOLDOWN_MINUTES/);
 });

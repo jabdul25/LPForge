@@ -49,7 +49,7 @@ test('final width is the maximum of policy, volatility, and survival requirement
 
 test('RangeForge, deployment validation, and P6-bound geometry obey arbitrary supplied min/max policy',()=>{
   for(const [minimumIncludedBins,maximumIncludedBins] of [[35,100],[60,100],[65,100],[75,90]]){
-    const policy=parseDeploymentPolicy({schemaVersion:1,policyId:'fixture',status:'DISABLED',approvalTtlMs:5000,minDevnetConfirmedRuns:1,maxActionsPerDay:1,maxOpenPositions:1,pools:[],liveControlLossProtection:{enabled:false,thresholdReturnFraction:-.08,confirmationSeconds:60},range:{minimumIncludedBins},positionConstruction:{maxInitialPositionWidthBins:maximumIncludedBins,maxPositionAccountRentSol:'0.01',requirePreinitializedBinArrays:true,liquiditySlippageBps:100}});
+    const policy=parseDeploymentPolicy({schemaVersion:1,policyId:'fixture',status:'DISABLED',approvalTtlMs:5000,minDevnetConfirmedRuns:1,maxActionsPerDay:1,maxOpenPositions:1,pools:[],liveControlLossProtection:{enabled:false,thresholdReturnFraction:-.08,confirmationSeconds:60},positionContinuationAssessment:{enabled:false,firstAssessmentMinutes:60},range:{minimumIncludedBins},positionConstruction:{maxInitialPositionWidthBins:maximumIncludedBins,maxPositionAccountRentSol:'0.01',requirePreinitializedBinArrays:true,liquiditySlippageBps:100}});
     const bounds=requireInitialRangeConstructionPolicy(policy);
     const valid=width=>initialIncludedBinCountWithinPolicy({lowerBinId:100,upperBinId:100+width-1,minimumIncludedBins:bounds.minimumIncludedBins,maximumIncludedBins:bounds.maximumIncludedBins});
     assert.equal(valid(minimumIncludedBins-1),false,`min ${minimumIncludedBins}`);

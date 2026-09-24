@@ -62,7 +62,7 @@ test('structured lamport evidence serializes safely into the durable outbox payl
 });
 
 test('the versioned reporting cohort is validated by deployment policy rather than a source literal',()=>{
-  const policy={schemaVersion:1,policyId:'test',status:'ENABLED',approvalTtlMs:15000,minDevnetConfirmedRuns:3,maxActionsPerDay:3,maxOpenPositions:2,pools:[],productionAdmission:{enabled:true,eligibleTiers:['A'],maxCandidates:1,maxCandidateAgeMs:60000,maxCapitalSol:'0.5',maxOpenPositions:2},liveControlLossProtection:{enabled:false,thresholdReturnFraction:-.08,confirmationSeconds:60},settlement:{residualDustThresholdUsd:0},postTradeReporting:{enabled:true,policyVersion:'post-trade-reporting-v1',runningStatsStartAt:'2026-09-01T00:00:00.000Z'}};
+  const policy={schemaVersion:1,policyId:'test',status:'ENABLED',approvalTtlMs:15000,minDevnetConfirmedRuns:3,maxActionsPerDay:3,maxOpenPositions:2,pools:[],productionAdmission:{enabled:true,eligibleTiers:['A'],maxCandidates:1,maxCandidateAgeMs:60000,maxCapitalSol:'0.5',maxOpenPositions:2},liveControlLossProtection:{enabled:false,thresholdReturnFraction:-.08,confirmationSeconds:60},positionContinuationAssessment:{enabled:false,firstAssessmentMinutes:60},settlement:{residualDustThresholdUsd:0},postTradeReporting:{enabled:true,policyVersion:'post-trade-reporting-v1',runningStatsStartAt:'2026-09-01T00:00:00.000Z'}};
   assert.equal(parseDeploymentPolicy(policy).postTradeReporting?.runningStatsStartAt,'2026-09-01T00:00:00.000Z');
   assert.throws(()=>parseDeploymentPolicy({...policy,postTradeReporting:{...policy.postTradeReporting,runningStatsStartAt:'not-a-time'}}),/POST_TRADE_REPORTING/);
 });
