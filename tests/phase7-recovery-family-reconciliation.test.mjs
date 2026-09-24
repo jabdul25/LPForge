@@ -14,6 +14,16 @@ test('P7 recovery family: explicit terminal successor MATCH supersedes only its 
   assert.deepEqual(result.map(x=>({root:x.rootPlanId,outcome:x.canonicalOutcome,members:x.memberPlanIds})),[{root:parent.planId,outcome:'MATCH',members:[parent.planId,successor.planId].sort()}]);
 });
 
+test('P7 recovery family: a root-bound terminal retry resolves its root despite an expired intermediate',()=>{
+  const root=member('root','UNKNOWN');
+  // The SQL projection supplies terminalRootClosePlanId as this direct edge;
+  // the intermediate no-effect account-close attempt intentionally has no
+  // reconciliation row to count as a separate current failure.
+  const retry=member('root:account-close-only:1:account-close-only:2','MATCH',{predecessorPlanId:root.planId,terminalRecovery:true});
+  const result=family([root,retry]);
+  assert.deepEqual(result.map(x=>({root:x.rootPlanId,outcome:x.canonicalOutcome})),[{root:root.planId,outcome:'MATCH'}]);
+});
+
 test('P7 recovery family: no explicit relationship, even with a matching-looking plan id, cannot supersede',()=>{
   const parent=member('plan-parent','UNKNOWN');
   const unrelated=member('plan-parent:account-close-only:1','MATCH',{terminalRecovery:true});
@@ -47,4 +57,3 @@ test('P7 recovery family: an unresolved sibling prevents family MATCH and one fa
   assert.equal(result.length,1);
   assert.equal(result[0].canonicalOutcome,'UNKNOWN');
 });
-
